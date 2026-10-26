@@ -1,0 +1,167 @@
+// Opening a disc: a DVD-Video or Blu-ray folder (the disc's root, its
+// VIDEO_TS / BDMV folder, or a file inside them like VIDEO_TS.IFO or
+// index.bdmv) or an ISO image of one.
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+// What a path is: "dvd", "bluray", "iso" or "" — cheap (no file is read;
+// an .iso counts by its name).
+public fn probe(_ path: String) -> String {
+    if !isFolder(path) && path.lowercase().hasSuffix(".iso") {
+        return if fileExists(path) { "iso" } else { "" }
+    }
+    let root = discRootOf(path)
+    if fileExists(joinPath(joinPath(root, "VIDEO_TS"), "VIDEO_TS.IFO")) || fileExists(joinPath(joinPath(root, "VIDEO_TS"), "VIDEO_TS.BUP")) {
+        return "dvd"
+    }
+    if fileExists(joinPath(joinPath(root, "BDMV"), "index.bdmv")) || isFolder(joinPath(joinPath(root, "BDMV"), "PLAYLIST")) {
+        return "bluray"
+    }
+    ""
+}
+
+// The disc root a path names.
+fn discRootOf(_ path: String) -> String {
+    var p = path
+    while p.hasSuffix("/") && p.count > 1 {
+        p = p.substring(from: 0, to: p.count - 1)
+    }
+    if !isFolder(p) {
+        p = p.folder
+    }
+    let name = p.fileName.uppercase()
+    if name == "VIDEO_TS" || name == "BDMV" {
+        return p.folder
+    }
+    let up = p.folder
+    if (name == "PLAYLIST" || name == "CLIPINF" || name == "STREAM" || name == "BACKUP") && up.fileName.uppercase() == "BDMV" {
+        return up.folder
+    }
+    p
+}
+
+// Opens the disc in a file system (a folder's or an image's).
+public fn openFs(_ fs: DiscFs) -> Result<Disc> {
+    let hasDvd = discFind(fs, "VIDEO_TS/VIDEO_TS.IFO") != nil || discFind(fs, "VIDEO_TS/VIDEO_TS.BUP") != nil
+    let hasBd = discFind(fs, "BDMV/index.bdmv") != nil || !discFilesIn(fs, "BDMV/PLAYLIST").isEmpty
+    if hasDvd {
+        let info = try readDvdInfo(fs)
+        var d = Disc(kind: "dvd", path: fs.root)
+        d.iso = fs.iso
+        d.volumeName = fs.volumeName
+        d.warnings = fs.warnings + info.warnings
+        d.titles = dvdTitles(info)
+        return Result.ok(value: discMarkMain(d))
+    }
+    if hasBd {
+        let info = try readBlurayInfo(fs)
+        var d = Disc(kind: "bluray", path: fs.root)
+        d.iso = fs.iso
+        d.volumeName = fs.volumeName
+        d.warnings = fs.warnings + info.warnings
+        d.titles = blurayTitles(fs, info)
+        var i = 0
+        while i < d.titles.count {
+            if d.titles[i].mainFeature {
+                d.main = i
+            }
+            i += 1
+        }
+        return Result.ok(value: d)
+    }
+    Result.failure(error: Error("no VIDEO_TS or BDMV folder found"))
+}
+
+// DVD: marks the main feature (see pickMainDvd).
+fn discMarkMain(_ disc: Disc) -> Disc {
+    var d = disc
+    d.main = pickMainDvd(d.titles)
+    if d.main >= 0 {
+        d.titles[d.main].mainFeature = true
+    }
+    d
+}
+
+// The DVD title that is most likely the film: the longest one, leaving
+// out titles that look made up (some discs add dozens of bogus titles to
+// confuse copiers): ones that play the same cell sectors more than once,
+// or whose data rate can't be real video (under 10 KB/s or over 1.6 MB/s,
+// DVD's maximum being 10.08 Mbit/s). If every title looks wrong, the
+// longest one. −1 without titles.
+public fn pickMainDvd(_ titles: [Title]) -> Int {
+    var best = -1
+    var fallback = -1
+    var i = 0
+    while i < titles.count {
+        let t = titles[i]
+        if fallback < 0 || t.duration > titles[fallback].duration + 0.5 {
+            fallback = i
+        }
+        var plausible = t.duration > 0.0 && t.size > 0
+        if plausible {
+            let rate = Float(t.size) / t.duration
+            plausible = rate >= 10000.0 && rate <= 1600000.0
+        }
+        var seen: Set<String> = []
+        for s in t.segments {
+            let key = "{s.path}:{s.from}"
+            if seen.contains(key) {
+                plausible = false
+            }
+            seen.insert(key)
+        }
+        if plausible && (best < 0 || t.duration > titles[best].duration + 0.5) {
+            best = i
+        }
+        i += 1
+    }
+    if best < 0 {
+        return fallback
+    }
+    best
+}
+
+// The file system of a path: a folder's, or an image's (read whole).
+public fn openDiscFs(_ path: String) -> Result<DiscFs> {
+    if !isFolder(path) && path.lowercase().hasSuffix(".iso") {
+        return isoFs(path)
+    }
+    if !fileExists(path) {
+        return Result.failure(error: Error("{path} doesn't exist"))
+    }
+    Result.ok(value: folderFs(discRootOf(path)))
+}
+
+// Opens a disc folder or image.
+public fn open(_ path: String) -> Result<Disc> {
+    let fs = try openDiscFs(path)
+    openFs(fs)
+}
+
+// One title again with another angle (DVD or Blu-ray); the title as it
+// is when the disc has no such title.
+public fn withAngle(_ fs: DiscFs, _ t: Title, angle: Int) -> Title {
+    if t.kind == "dvd" {
+        if let info = readDvdInfo(fs).value() {
+            for e in info.vmg.titles {
+                if e.number == t.number {
+                    var out = dvdTitle(info, e, angle: angle)
+                    out.mainFeature = t.mainFeature
+                    return out
+                }
+            }
+        }
+        return t
+    }
+    if let info = readBlurayInfo(fs).value() {
+        for p in info.playlists {
+            if p.number == t.playlist {
+                var out = blurayTitle(fs, info, p, angle: angle)
+                out.mainFeature = t.mainFeature
+                return out
+            }
+        }
+    }
+    t
+}

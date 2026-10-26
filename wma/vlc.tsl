@@ -1,0 +1,131 @@
+// Huffman (variable length code) tables for the WMA decoders, as flat
+// lookup tables read `bits` at a time, with second- and third-level
+// tables for longer codes.
+//
+// An entry is 0 (no code), a leaf (symbol << 5 | length of the code's
+// bits read at this level, 1 to 31), or a link to a sub-table, negative:
+// -(start << 5 | the sub-table's bits).
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../core"
+
+// One code: its bits (right-aligned), its length and its symbol (0 or more).
+struct WmaCode {
+    code: Int
+    len: Int
+    sym: Int
+}
+
+// A table from explicit codes and lengths; symbol i is codes[i].
+fn wmaVlcFromCodes(_ codes: [Int], _ lens: [Int], bits: Int) -> [Int] {
+    var all: [WmaCode] = []
+    for i in 0..codes.count {
+        if lens[i] > 0 {
+            all.append(WmaCode(code: codes[i], len: lens[i], sym: i))
+        }
+    }
+    var table: [Int] = []
+    wmaVlcBuild(all, 0, bits, table)
+    table
+}
+
+// A table from lengths alone (ffmpeg's ff_vlc_init_from_lengths): the
+// codes are given out in order, each the next one of its length, so the
+// list is in code order. `symbols` may be empty (symbol = position).
+fn wmaVlcFromLengths(_ lens: [Int], _ symbols: [Int], bits: Int, offset: Int = 0) -> [Int] {
+    var all: [WmaCode] = []
+    // A 32-bit left-aligned running code.
+    var code = 0
+    for i in 0..lens.count {
+        let len = lens[i]
+        if len <= 0 {
+            continue
+        }
+        let sym = (if symbols.isEmpty { i } else { symbols[i] }) + offset
+        all.append(WmaCode(code: code >> (32 - len), len: len, sym: sym))
+        code += 1 << (32 - len)
+    }
+    var table: [Int] = []
+    wmaVlcBuild(all, 0, bits, table)
+    table
+}
+
+// Adds a table of `bits` bits for `codes`, of which `used` bits are
+// already read, to `table`; returns where it starts.
+fn wmaVlcBuild(_ codes: [WmaCode], _ used: Int, _ bits: Int, _ table: bind [Int]) -> Int {
+    let start = table.count
+    let size = 1 << bits
+    for _ in 0..size {
+        table.append(0)
+    }
+    // Codes that end in this table.
+    var longer: [WmaCode] = []
+    for c in codes {
+        let r = c.len - used
+        let low = c.code & ((1 << r) - 1)
+        if r <= bits {
+            let first = low << (bits - r)
+            for k in 0..(1 << (bits - r)) {
+                table[start + first + k] = (c.sym << 5) | r
+            }
+        } else {
+            longer.append(c)
+        }
+    }
+    // Longer codes, grouped by their next `bits` bits.
+    var done: [Bool] = []
+    for _ in 0..longer.count {
+        done.append(false)
+    }
+    for i in 0..longer.count {
+        if done[i] {
+            continue
+        }
+        let c = longer[i]
+        let r = c.len - used
+        let idx = (c.code >> (r - bits)) & (size - 1)
+        var group: [WmaCode] = []
+        var most = 0
+        for j in i..longer.count {
+            let d = longer[j]
+            let rd = d.len - used
+            if !done[j] && ((d.code >> (rd - bits)) & (size - 1)) == idx {
+                group.append(d)
+                done[j] = true
+                most = max(most, rd - bits)
+            }
+        }
+        let subBits = min(most, bits)
+        let sub = wmaVlcBuild(group, used + bits, subBits, table)
+        table[start + idx] = -((sub << 5) | subBits)
+    }
+    start
+}
+
+// Encodes every symbol of the AAC scalefactor code and the first WMA
+// coefficient table and decodes them back; returns the number that fail.
+public fn vlcSelfTest() -> Int {
+    var bad = 0
+    for which in 0..2 {
+        let codes = if which == 0 { wmaAacScalefactorCode } else { wmaCoef0Huffcodes }
+        let lens = if which == 0 { wmaAacScalefactorBits } else { wmaCoef0Huffbits }
+        let table = wmaVlcFromCodes(codes, lens, bits: if which == 0 { 8 } else { 9 })
+        for i in 0..codes.count {
+            // The code, left-aligned in 32 bits, as 4 bytes.
+            let v = codes[i] << (32 - lens[i])
+            let d = Data(bytes: [(v >> 24) & 255, (v >> 16) & 255, (v >> 8) & 255, v & 255, 0, 0, 0, 0])
+            var s = WmaStd()
+            s.br = core.bitReader(d)
+            let got = s.readVlc(table, if which == 0 { 8 } else { 9 })
+            if got != i || s.br.position != lens[i] {
+                if bad < 5 {
+                    print("table {which} symbol {i}: got {got}, read {s.br.position} of {lens[i]} bits")
+                }
+                bad += 1
+            }
+        }
+    }
+    bad
+}

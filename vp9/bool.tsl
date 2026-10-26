@@ -1,0 +1,471 @@
+// The VP9 boolean (arithmetic) decoder, spec section 9.2 (init_bool,
+// read_bool, read_literal, exit_bool) and the coefficient token reader of
+// 9.3 / 6.4.24 (residual tokens, with the Pareto model of 10.5), which is
+// the hottest loop of the parser and so lives next to the decoder state.
+//
+// The decoder follows libvpx's vpx_reader: `value` holds up to 56 bits of
+// the coded stream with the current 8-bit window at bits 48…55, `count` is
+// how many bits beyond that window are loaded (refilled when it goes
+// negative), and `range` is 128…255 after renormalising. Reading past the
+// end reads zero bits (the spec's padding); damaged() tells when a tile
+// has read far beyond its data.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+let vp9NormShift: [Int] = vp9MakeNorm()
+
+fn vp9MakeNorm() -> [Int] {
+    var out: [Int] = [0]
+    for r in 1..256 {
+        var v = r
+        var n = 0
+        while v < 128 {
+            v = v << 1
+            n += 1
+        }
+        out.append(n)
+    }
+    out
+}
+
+struct Vp9Bool {
+    data: [Int] = []
+    pos: Int = 0
+    end: Int = 0
+    value: Int = 0
+    count: Int = -8
+    range: Int = 255
+    norm: [Int] = []
+    // Token class of each coefficient position decoded so far in the
+    // current transform block (the "token cache" of 9.3.3), by raster
+    // position.
+    cache: [Int] = []
+    // Output: per transform block the number of non-zero coefficients n,
+    // then n entries value * 1024 + raster position.
+    coefs: [Int] = []
+    // Coefficient token counts [tx][plane][ref][band][ctx][3] and the
+    // "more coefficients" counts [..][2] (8.4.2).
+    cntCoef: [Int] = []
+    cntEob: [Int] = []
+    // Active coefficient probabilities [tx][plane][ref][band][ctx][11].
+    coefP: [Int] = []
+    bitDepth: Int = 8
+    // Whether symbol counts are kept (only when the frame adapts its
+    // probabilities).
+    countOn: Bool = true
+    bands: [Int] = []
+
+    fn setup() {
+        if norm.isEmpty {
+            norm = vp9NormShift
+            cache = vp9Zeros(1024)
+            cntCoef = vp9Zeros(1728)
+            cntEob = vp9Zeros(1152)
+            coefP = vp9Zeros(6336)
+            bands = vp9MakeBands()
+        }
+    }
+
+    // init_bool(sz) over data[start ..< start + size].
+    fn start(_ d: [Int], _ start: Int, _ size: Int) {
+        data = d
+        pos = start
+        end = min(start + size, d.count)
+        value = 0
+        count = -8
+        range = 255
+        fill()
+    }
+
+    fn fill() {
+        var shift = 40 - count
+        while shift >= 0 {
+            if pos < end {
+                value = value | (data[pos] << shift)
+                pos += 1
+            } else {
+                pos += 1
+            }
+            count += 8
+            shift -= 8
+        }
+    }
+
+    // read_bool(p): one bool whose probability of being 0 is p / 256.
+    fn read(_ p: Int) -> Int {
+        let split = (range * p + 256 - p) >> 8
+        if count < 0 {
+            fill()
+        }
+        let big = split << 48
+        var bit = 0
+        if value >= big {
+            range -= split
+            value -= big
+            bit = 1
+        } else {
+            range = split
+        }
+        let sh = norm[range]
+        range = range << sh
+        value = value << sh
+        count -= sh
+        bit
+    }
+
+    // An equiprobable bit (read_bool(128)).
+    fn bit() -> Int {
+        read(128)
+    }
+
+    // read_literal(n).
+    fn literal(_ n: Int) -> Int {
+        var v = 0
+        for _ in 0..n {
+            v = (v << 1) | read(128)
+        }
+        v
+    }
+
+    // A symbol of a coding tree (9.3.1) with its node probabilities at
+    // probs[base + node].
+    fn tree(_ t: [Int], _ probs: [Int], _ base: Int) -> Int {
+        var i = 0
+        while true {
+            i = t[2 * i + read(probs[base + i])]
+            if i <= 0 {
+                break
+            }
+        }
+        -i
+    }
+
+    // Drops coefficient entries back to n.
+    fn truncate(_ n: Int) {
+        while coefs.count > n {
+            coefs.removeLast()
+        }
+    }
+
+    // Bits remaining are padding: true when the decoder has read past the
+    // end by more than the spec's allowance (a damaged tile).
+    fn damaged() -> Bool {
+        pos * 8 - count - 8 > end * 8 + 256
+    }
+
+    // The residual tokens of one transform block (6.4.24 / 9.3): returns
+    // the end of block position (0 when it has no coefficients). Writes
+    // the non-zero dequantised coefficients to `coefs`.
+    //   nCoefs   16, 64, 256 or 1024; tx32 halves the dequantised values
+    //   pBase    index of [band 0][ctx 0][0] in coefP, cBase/eBase the same
+    //            in cntCoef (×3) and cntEob (×2) units
+    //   nnz      the starting context (0, 1 or 2)
+    //   scan/nb  the scan table and its neighbour table at sOff / sOff*2
+    //   dcQ/acQ  dequantisation factors (DC for scan position 0)
+    // The common bools (more coefficients, zero, one, sign) are read with
+    // the decoder state in locals; the rarer ones through read().
+    fn tokens(_ nCoefs: Int, _ tx32: Bool, _ pBase: Int, _ cBase: Int, _ eBase: Int, _ nnz0: Int,
+              _ scan: [Int], _ nb: [Int], _ sOff: Int, _ dcQ: Int, _ acQ: Int) -> Int {
+        let headAt = coefs.count
+        coefs.append(0)
+        var n = 0
+        var i = 0
+        var nnz = nnz0
+        let wide = bitDepth > 8
+        let bt = bands
+        let bOff = if nCoefs == 16 { 0 } else { 16 }
+        let cp = coefP
+        let nm = norm
+        let dt = data
+        let en = end
+        var vl = value
+        var cn = count
+        var rg = range
+        var ps = pos
+        let counting = countOn
+        while i < nCoefs {
+            var band = bt[bOff + i]
+            var tp = pBase + (band * 6 + nnz) * 11
+            // More coefficients?
+            // read_bool(cp[tp]), inline
+            var e = 0
+            if true {
+                let pr = cp[tp]
+                let split = (rg * pr + 256 - pr) >> 8
+                if cn < 0 {
+                    var shift = 40 - cn
+                    while shift >= 0 {
+                        if ps < en {
+                            vl = vl | (dt[ps] << shift)
+                        }
+                        ps += 1
+                        cn += 8
+                        shift -= 8
+                    }
+                }
+                let big = split << 48
+                if vl >= big {
+                    rg -= split
+                    vl -= big
+                    e = 1
+                } else {
+                    rg = split
+                }
+                let sh = nm[rg]
+                rg = rg << sh
+                vl = vl << sh
+                cn -= sh
+            }
+            if counting {
+                cntEob[eBase + (band * 6 + nnz) * 2 + e] += 1
+            }
+            if e == 0 {
+                break
+            }
+            // Zero tokens until a non-zero one.
+            var done = false
+            while true {
+                // read_bool(cp[tp + 1]), inline
+                var nz = 0
+                if true {
+                    let pr = cp[tp + 1]
+                    let split = (rg * pr + 256 - pr) >> 8
+                    if cn < 0 {
+                        var shift = 40 - cn
+                        while shift >= 0 {
+                            if ps < en {
+                                vl = vl | (dt[ps] << shift)
+                            }
+                            ps += 1
+                            cn += 8
+                            shift -= 8
+                        }
+                    }
+                    let big = split << 48
+                    if vl >= big {
+                        rg -= split
+                        vl -= big
+                        nz = 1
+                    } else {
+                        rg = split
+                    }
+                    let sh = nm[rg]
+                    rg = rg << sh
+                    vl = vl << sh
+                    cn -= sh
+                }
+                if nz == 1 {
+                    break
+                }
+                if counting {
+                    cntCoef[cBase + (band * 6 + nnz) * 3] += 1
+                }
+                cache[scan[sOff + i]] = 0
+                let nbi = (sOff + i) * 2
+                nnz = (1 + cache[nb[nbi]] + cache[nb[nbi + 1]]) >> 1
+                i += 1
+                if i == nCoefs {
+                    done = true
+                    break
+                }
+                band = bt[bOff + i]
+                tp = pBase + (band * 6 + nnz) * 11
+            }
+            if done {
+                break
+            }
+            let rc = scan[sOff + i]
+            var val = 1
+            // read_bool(cp[tp + 2]), inline
+            var big1 = 0
+            if true {
+                let pr = cp[tp + 2]
+                let split = (rg * pr + 256 - pr) >> 8
+                if cn < 0 {
+                    var shift = 40 - cn
+                    while shift >= 0 {
+                        if ps < en {
+                            vl = vl | (dt[ps] << shift)
+                        }
+                        ps += 1
+                        cn += 8
+                        shift -= 8
+                    }
+                }
+                let big = split << 48
+                if vl >= big {
+                    rg -= split
+                    vl -= big
+                    big1 = 1
+                } else {
+                    rg = split
+                }
+                let sh = nm[rg]
+                rg = rg << sh
+                vl = vl << sh
+                cn -= sh
+            }
+            if big1 == 0 {
+                if counting {
+                    cntCoef[cBase + (band * 6 + nnz) * 3 + 1] += 1
+                }
+                cache[rc] = 1
+            } else {
+                if counting {
+                    cntCoef[cBase + (band * 6 + nnz) * 3 + 2] += 1
+                }
+                value = vl
+                count = cn
+                range = rg
+                pos = ps
+                if read(cp[tp + 3]) == 0 {
+                    if read(cp[tp + 4]) == 0 {
+                        val = 2
+                        cache[rc] = 2
+                    } else {
+                        val = 3 + read(cp[tp + 5])
+                        cache[rc] = 3
+                    }
+                } else if read(cp[tp + 6]) == 0 {
+                    cache[rc] = 4
+                    if read(cp[tp + 7]) == 0 {
+                        val = read(159) + 5
+                    } else {
+                        val = (read(165) << 1) + 7
+                        val += read(145)
+                    }
+                } else {
+                    cache[rc] = 5
+                    val = bigToken(cp[tp + 8], cp[tp + 9], cp[tp + 10], wide)
+                }
+                vl = value
+                cn = count
+                rg = range
+                ps = pos
+            }
+            // read_bool(128), inline
+            var sgn = 0
+            if true {
+                let pr = 128
+                let split = (rg * pr + 256 - pr) >> 8
+                if cn < 0 {
+                    var shift = 40 - cn
+                    while shift >= 0 {
+                        if ps < en {
+                            vl = vl | (dt[ps] << shift)
+                        }
+                        ps += 1
+                        cn += 8
+                        shift -= 8
+                    }
+                }
+                let big = split << 48
+                if vl >= big {
+                    rg -= split
+                    vl -= big
+                    sgn = 1
+                } else {
+                    rg = split
+                }
+                let sh = nm[rg]
+                rg = rg << sh
+                vl = vl << sh
+                cn -= sh
+            }
+            let q = if i == 0 { dcQ } else { acQ }
+            var v = if sgn == 1 { -val } else { val }
+            v = v * q
+            if tx32 {
+                v = v / 2
+            }
+            if !wide {
+                // FFmpeg keeps 8-bit coefficients in 16 bits.
+                v = ((v + 32768) & 65535) - 32768
+            }
+            if v != 0 {
+                coefs.append(v * 1024 + rc)
+                n += 1
+            }
+            let nbi = (sOff + i) * 2
+            nnz = (1 + cache[nb[nbi]] + cache[nb[nbi + 1]]) >> 1
+            i += 1
+        }
+        value = vl
+        count = cn
+        range = rg
+        pos = ps
+        coefs[headAt] = n
+        i
+    }
+
+    // Tokens of category 3 … 6 (extra bits read with fixed probabilities).
+    fn bigToken(_ p8: Int, _ p9: Int, _ p10: Int, _ wide: Bool) -> Int {
+        var val = 0
+        if read(p8) == 0 {
+            if read(p9) == 0 {
+                val = 11 + (read(173) << 2)
+                val += read(148) << 1
+                val += read(140)
+            } else {
+                val = 19 + (read(176) << 3)
+                val += read(155) << 2
+                val += read(140) << 1
+                val += read(135)
+            }
+        } else if read(p10) == 0 {
+            val = (read(180) << 4) + 35
+            val += read(157) << 3
+            val += read(141) << 2
+            val += read(134) << 1
+            val += read(130)
+        } else {
+            val = 67
+            if wide {
+                if bitDepth == 12 {
+                    val += read(255) << 17
+                    val += read(255) << 16
+                }
+                val += read(255) << 15
+                val += read(255) << 14
+            }
+            val += read(254) << 13
+            val += read(254) << 12
+            val += read(254) << 11
+            val += read(252) << 10
+            val += read(249) << 9
+            val += read(243) << 8
+            val += read(230) << 7
+            val += read(196) << 6
+            val += read(177) << 5
+            val += read(153) << 4
+            val += read(140) << 3
+            val += read(133) << 2
+            val += read(130) << 1
+            val += read(129)
+        }
+        val
+    }
+}
+
+// The coefficient band of each scan position (6.4.24): 4x4 blocks, then
+// larger ones.
+fn vp9MakeBands() -> [Int] {
+    var out = [0, 1, 1, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 5, 5, 5]
+    let first = [0, 1, 1, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4]
+    for i in 0..1024 {
+        out.append(if i < 21 { first[i] } else { 5 })
+    }
+    out
+}
+
+// A list of n zeros.
+fn vp9Zeros(_ n: Int) -> [Int] {
+    var out: [Int] = []
+    var i = 0
+    while i < n {
+        out.append(0)
+        i += 1
+    }
+    out
+}

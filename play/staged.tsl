@@ -1,0 +1,301 @@
+// Video decoding in stages, for codecs whose decoders split into a parser
+// and reconstructors (H.264, HEVC, VP9, AV1): the app runs the parser in one
+// background job and the reconstructor in another, at the same time. For
+// H.264 the reconstruction itself splits into a luma and a chroma
+// reconstructor in two jobs (`split`), so one stream uses three cores. Each stage is plain data
+// handed to its job and back.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../core"
+import "../demux"
+import "../h264"
+import "../hevc"
+import "../vp9"
+import "../av1"
+
+// Whether a codec can be decoded in stages.
+public fn canStage(_ codec: String) -> Bool {
+    codec == "h264" || codec == "hevc" || codec == "vp9" || codec == "av1"
+}
+
+// Parsed pictures on their way to the reconstructors.
+public struct ParsedBatch {
+    h264: [h264.ParsedPicture] = []
+    hevc: [hevc.ParsedPicture] = []
+    vp9: [vp9.ParsedFrame] = []
+    // AV1: the frames of each packet (temporal unit) together; a unit
+    // shows only its last picture.
+    av1: [[av1.ParsedFrame]] = []
+}
+
+// Walks a track's packets and parses them.
+public struct StagedParser {
+    track: Int
+    codec: String = ""
+    next: Int = 0
+    done: Bool = false
+    h264: [h264.Parser] = []
+    hevc: [hevc.Parser] = []
+    vp9: [vp9.Parser] = []
+    av1: [av1.Parser] = []
+    // The packets are still arriving (a network stream): running out of
+    // them means wait, not the end.
+    growing: Bool = false
+    parseMs: Float = 0.0
+    parsed: Int = 0
+    warnings: [String] = []
+
+    // Parses until `count` pictures are parsed or the track ends (then the
+    // decoder's end-of-stream records come too).
+    fn run(_ file: Data, _ media: core.Media, count: Int) -> ParsedBatch {
+        var out = ParsedBatch()
+        let n = media.packets.count
+        var pictures = 0
+        while pictures < count && !done {
+            if next >= n && growing {
+                break
+            }
+            if next >= n {
+                let t0 = now()
+                if !h264.isEmpty {
+                    out.h264.appendAll(h264[0].flush())
+                }
+                if !hevc.isEmpty {
+                    out.hevc.appendAll(hevc[0].flush())
+                }
+                if !vp9.isEmpty {
+                    out.vp9.appendAll(vp9[0].flush())
+                }
+                if !av1.isEmpty {
+                    out.av1.append(av1[0].flush())
+                }
+                parseMs += (now() - t0) * 1000.0
+                done = true
+                break
+            }
+            let p = media.packets[next]
+            next += 1
+            if p.track != track {
+                continue
+            }
+            let bytes = core.packetBytes(file, media, p)
+            if !h264.isEmpty {
+                let t0 = now()
+                let got = h264[0].parse(bytes, pts: p.pts, dts: p.dts, key: p.key)
+                parseMs += (now() - t0) * 1000.0
+                for g in got {
+                    if g.hasPicture {
+                        pictures += 1
+                        parsed += 1
+                    }
+                }
+                out.h264.appendAll(got)
+            }
+            if !hevc.isEmpty {
+                let t0 = now()
+                let got = hevc[0].parse(bytes, pts: p.pts, dts: p.dts, key: p.key)
+                parseMs += (now() - t0) * 1000.0
+                pictures += max(got.count, 1)
+                parsed += got.count
+                out.hevc.appendAll(got)
+            }
+            if !vp9.isEmpty {
+                let t0 = now()
+                let got = vp9[0].parse(bytes, pts: p.pts, dts: p.dts, key: p.key)
+                parseMs += (now() - t0) * 1000.0
+                pictures += max(got.count, 1)
+                parsed += got.count
+                out.vp9.appendAll(got)
+            }
+            if !av1.isEmpty {
+                let t0 = now()
+                let got = av1[0].parse(bytes, pts: p.pts, dts: p.dts, key: p.key)
+                parseMs += (now() - t0) * 1000.0
+                pictures += max(got.count, 1)
+                parsed += got.count
+                out.av1.append(got)
+            }
+        }
+        if !h264.isEmpty && !h264[0].warnings.isEmpty {
+            warnings.appendAll(h264[0].warnings)
+            h264[0].warnings = []
+            if warnings.count > 50 {
+                warnings = warnings.suffix(50)
+            }
+        }
+        out
+    }
+
+    fn setSkipNonReference(_ on: Bool) {
+        if !h264.isEmpty {
+            h264[0].skipNonReference = on
+        }
+        if !hevc.isEmpty {
+            hevc[0].skipNonReference = on
+        }
+        if !vp9.isEmpty {
+            vp9[0].skipNonReference = on
+        }
+        if !av1.isEmpty {
+            av1[0].skipNonReference = on
+        }
+    }
+
+    fn seek(_ media: core.Media, to: Float) {
+        if !h264.isEmpty {
+            h264[0].reset()
+        }
+        if !hevc.isEmpty {
+            hevc[0].reset()
+        }
+        if !vp9.isEmpty {
+            vp9[0].reset()
+        }
+        if !av1.isEmpty {
+            av1[0].reset()
+        }
+        next = max(demux.keyBefore(media, track: track, seconds: to), 0)
+        done = false
+    }
+}
+
+// Rebuilds the pictures of parsed batches: one for luma, one for chroma.
+public struct StagedReconstructor {
+    h264: [h264.Reconstructor] = []
+    hevc: [hevc.Reconstructor] = []
+    vp9: [vp9.Reconstructor] = []
+    av1Rec: [av1.Reconstructor] = []
+    // AV1 (film grain deferred): the grain of each picture of the last run,
+    // for the converter to add.
+    grains: [av1.FilmGrain] = []
+    ms: Float = 0.0
+
+    fn run(_ batch: ParsedBatch) -> [core.Picture] {
+        var out: [core.Picture] = []
+        let t0 = now()
+        if !h264.isEmpty {
+            for p in batch.h264 {
+                out.appendAll(h264[0].reconstruct(p))
+            }
+        }
+        if !hevc.isEmpty {
+            for p in batch.hevc {
+                out.appendAll(hevc[0].reconstruct(p))
+            }
+        }
+        if !vp9.isEmpty {
+            for p in batch.vp9 {
+                out.appendAll(vp9[0].reconstruct(p))
+            }
+        }
+        grains = []
+        if !av1Rec.isEmpty {
+            for unit in batch.av1 {
+                let step = av1.reconstructStep(av1Rec[0], unit)
+                av1Rec[0] = step.reconstructor
+                out.appendAll(step.pictures)
+                for i in 0..step.pictures.count {
+                    grains.append(if i < step.grains.count { step.grains[i] } else { av1.FilmGrain() })
+                }
+            }
+        }
+        ms += (now() - t0) * 1000.0
+        out
+    }
+
+    fn reset() {
+        if !h264.isEmpty {
+            h264[0].reset()
+        }
+        if !hevc.isEmpty {
+            hevc[0].reset()
+        }
+        if !vp9.isEmpty {
+            vp9[0].reset()
+        }
+        if !av1Rec.isEmpty {
+            av1Rec[0].reset()
+        }
+    }
+}
+
+public struct Stages {
+    // Luma and chroma are rebuilt in two jobs (H.264); otherwise `luma`
+    // rebuilds whole pictures and `chroma` is unused.
+    split: Bool = false
+    parser: StagedParser
+    luma: StagedReconstructor
+    chroma: StagedReconstructor
+}
+
+public fn newStages(_ media: core.Media, track: Int) -> Result<Stages> {
+    let t = media.tracks[track]
+    var parser = StagedParser(track: track, codec: t.codec)
+    var luma = StagedReconstructor()
+    var chroma = StagedReconstructor()
+    match t.codec {
+        "h264" -> {
+            let pipe = try h264.newPipeline(t)
+            parser.h264 = [pipe.parser]
+            luma.h264 = [h264.newReconstructor(.luma)]
+            chroma.h264 = [h264.newReconstructor(.chroma)]
+            return Result.ok(value: Stages(split: true, parser: parser, luma: luma, chroma: chroma))
+        }
+        "hevc" -> {
+            parser.hevc = [try hevc.newParser(t)]
+            luma.hevc = [hevc.newReconstructor()]
+        }
+        "vp9" -> {
+            let pipe = try vp9.newPipeline(t)
+            parser.vp9 = [pipe.parser]
+            luma.vp9 = [pipe.reconstructor]
+        }
+        "av1" -> {
+            let pipe = try av1.newPipeline(t)
+            parser.av1 = [pipe.parser]
+            var rec = pipe.reconstructor
+            // Film grain is added by the converter, in another job.
+            rec.deferGrain = true
+            luma.av1Rec = [rec]
+        }
+        _ -> {
+            return Result.failure(error: Error("{t.codec} can't be decoded in stages"))
+        }
+    }
+    Result.ok(value: Stages(split: false, parser: parser, luma: luma, chroma: chroma))
+}
+
+// Puts the luma pictures and the chroma pictures of the same batch
+// together.
+public fn mergeStages(_ codec: String, _ luma: [core.Picture], _ chroma: [core.Picture]) -> [core.Picture] {
+    if codec == "h264" {
+        return h264.mergePlanes(luma, chroma)
+    }
+    luma
+}
+
+// For background jobs (they call top-level functions).
+public struct ParseResult {
+    parser: StagedParser
+    batch: ParsedBatch
+}
+
+public fn parseStage(_ parser: StagedParser, _ file: Data, _ media: core.Media, count: Int) -> ParseResult {
+    var p = parser
+    let b = p.run(file, media, count: count)
+    ParseResult(parser: p, batch: b)
+}
+
+public struct ReconstructResult {
+    rec: StagedReconstructor
+    pictures: [core.Picture]
+    grains: [av1.FilmGrain] = []
+}
+
+public fn reconstructStage(_ rec: StagedReconstructor, _ batch: ParsedBatch) -> ReconstructResult {
+    var r = rec
+    let pics = r.run(batch)
+    ReconstructResult(rec: r, pictures: pics, grains: r.grains)
+}

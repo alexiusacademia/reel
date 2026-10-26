@@ -1,0 +1,63 @@
+// Macroblock and sub-macroblock types (Tables 7-11, 7-13, 7-14, 7-17,
+// 7-18) as the bit sets of engine.tsl, with their partition counts,
+// Intra_16x16 prediction modes and implied coded_block_pattern.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+// I macroblock types 0..25 (Table 7-11): type bits, Intra16x16 prediction
+// mode, and coded_block_pattern (chroma << 4 | luma) implied by the type.
+let iMbTypeInfo: [Int] = [1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 4]
+let iMbPredMode: [Int] = [0, 0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3, 0]
+let iMbCbp: [Int] = [0, 0, 0, 0, 0, 16, 16, 16, 16, 32, 32, 32, 32, 15, 15, 15, 15, 31, 31, 31, 31, 47, 47, 47, 47, 0]
+// P macroblock types 0..4 (Table 7-13).
+let pMbTypeInfo: [Int] = [8 | 4096, 16 | 4096 | 8192, 32 | 4096 | 8192, 64 | 4096 | 8192, 64 | 4096 | 8192 | 8388608]
+let pMbPartCount: [Int] = [1, 2, 2, 4, 4]
+// P sub-macroblock types (Table 7-17): 8x8, 8x4, 4x8, 4x4 (the
+// partition bits are reused for sub-partition shapes).
+let pSubMbTypeInfo: [Int] = [8 | 4096, 16 | 4096, 32 | 4096, 64 | 4096]
+let pSubPartCount: [Int] = [1, 2, 2, 4]
+// B macroblock types 0..22 (Table 7-14).
+let bMbTypeInfo: [Int] = [
+    256 | 61440,
+    8 | 4096,
+    8 | 16384,
+    8 | 4096 | 16384,
+    16 | 4096 | 8192,
+    32 | 4096 | 8192,
+    16 | 16384 | 32768,
+    32 | 16384 | 32768,
+    16 | 4096 | 32768,
+    32 | 4096 | 32768,
+    16 | 16384 | 8192,
+    32 | 16384 | 8192,
+    16 | 4096 | 8192 | 32768,
+    32 | 4096 | 8192 | 32768,
+    16 | 16384 | 8192 | 32768,
+    32 | 16384 | 8192 | 32768,
+    16 | 4096 | 16384 | 8192,
+    32 | 4096 | 16384 | 8192,
+    16 | 4096 | 16384 | 32768,
+    32 | 4096 | 16384 | 32768,
+    16 | 61440,
+    32 | 61440,
+    64 | 61440,
+]
+let bMbPartCount: [Int] = [1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 4]
+// B sub-macroblock types 0..12 (Table 7-18).
+let bSubMbTypeInfo: [Int] = [
+    256,
+    8 | 4096,
+    8 | 16384,
+    8 | 4096 | 16384,
+    16 | 4096 | 8192,
+    32 | 4096 | 8192,
+    16 | 16384 | 32768,
+    32 | 16384 | 32768,
+    16 | 61440,
+    32 | 61440,
+    64 | 4096 | 8192,
+    64 | 16384 | 32768,
+    64 | 61440,
+]
+let bSubPartCount: [Int] = [1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 4, 4, 4]

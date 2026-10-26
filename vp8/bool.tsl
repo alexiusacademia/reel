@@ -1,0 +1,147 @@
+// The VP8 boolean entropy decoder (RFC 6386 section 7) and the readers
+// built on it: literals, signed values, and tree-coded symbols (8.1).
+//
+// The state follows libvpx's reader (bit-exact with the RFC's
+// bool_decoder.h): `value` holds up to 56 bits of the partition with the
+// current 8-bit window at bits 48…55, `count` is how many bits beyond the
+// window are loaded (refilled when it goes negative), and `range` is
+// 128…255 after renormalising. split = 1 + ((range - 1) * p >> 8), the
+// RFC's formula. Reading past the end of a partition reads zero bits, as
+// the reference decoder does; damaged() says when a partition has been
+// read far beyond its end (a truncated or damaged frame).
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+let vp8NormShift: [Int] = vp8MakeNorm()
+
+fn vp8MakeNorm() -> [Int] {
+    var out: [Int] = [0]
+    for r in 1..256 {
+        var v = r
+        var n = 0
+        while v < 128 {
+            v = v << 1
+            n += 1
+        }
+        out.append(n)
+    }
+    out
+}
+
+struct Vp8Bool {
+    data: [Int] = []
+    pos: Int = 0
+    end: Int = 0
+    value: Int = 0
+    count: Int = -8
+    range: Int = 255
+    norm: [Int] = []
+
+    fn setup() {
+        if norm.isEmpty {
+            norm = vp8NormShift
+        }
+    }
+
+    // init_bool_decoder over d[start ..< start + size].
+    fn start(_ d: [Int], _ start: Int, _ size: Int) {
+        setup()
+        data = d
+        pos = start
+        end = min(start + max(size, 0), d.count)
+        value = 0
+        count = -8
+        range = 255
+        fill()
+    }
+
+    fn fill() {
+        var shift = 40 - count
+        while shift >= 0 {
+            if pos < end {
+                value = value | (data[pos] << shift)
+            }
+            pos += 1
+            count += 8
+            shift -= 8
+        }
+    }
+
+    // bool_get(p): one bool whose probability of being 0 is p / 256.
+    fn read(_ p: Int) -> Int {
+        let split = (range * p + 256 - p) >> 8
+        if count < 0 {
+            fill()
+        }
+        let big = split << 48
+        var bit = 0
+        if value >= big {
+            range -= split
+            value -= big
+            bit = 1
+        } else {
+            range = split
+        }
+        let sh = norm[range]
+        range = range << sh
+        value = value << sh
+        count -= sh
+        bit
+    }
+
+    // bool_get_bit: an even bool.
+    fn bit() -> Int {
+        read(128)
+    }
+
+    // bool_get_uint(n): n bits, most significant first.
+    fn literal(_ n: Int) -> Int {
+        var v = 0
+        for _ in 0..n {
+            v = (v << 1) | read(128)
+        }
+        v
+    }
+
+    // bool_get_int(n): an n-bit magnitude, then a sign bit.
+    fn signedLiteral(_ n: Int) -> Int {
+        let v = literal(n)
+        if read(128) == 1 {
+            return -v
+        }
+        v
+    }
+
+    // bool_maybe_get_int(n): a flag, then (when set) a signed value.
+    fn maybeSigned(_ n: Int) -> Int {
+        if read(128) == 1 {
+            return signedLiteral(n)
+        }
+        0
+    }
+
+    // bool_read_tree (8.1): pairs of entries in t; a positive entry is the
+    // next pair's index, the others the leaf's -value. The bool at pair i
+    // has probability probs[base + i / 2].
+    fn tree(_ t: [Int], _ probs: [Int], _ base: Int) -> Int {
+        var i = 0
+        while true {
+            i = t[i + read(probs[base + (i >> 1)])]
+            if i <= 0 {
+                break
+            }
+        }
+        -i
+    }
+
+    // True when the decoder has read well past the end of its data.
+    fn damaged() -> Bool {
+        pos * 8 - count - 8 > end * 8 + 64
+    }
+
+    // Bits consumed so far beyond the partition's end (0 when inside).
+    fn overread() -> Int {
+        max(0, (pos * 8 - count - 8) - end * 8)
+    }
+}

@@ -1,0 +1,933 @@
+// The AAC core decoder for one stream: reading individual channel streams
+// (ISO/IEC 14496-3 4.4.2.7, ics_info, section data, scalefactors, pulse,
+// TNS and spectral data), noiseless decoding with the Huffman codebooks
+// (4.6.3), inverse quantisation and scalefactors (4.6.2-4.6.4), the stereo
+// tools M/S and intensity (4.6.8), perceptual noise substitution (4.6.13),
+// temporal noise shaping (4.6.9) and the filterbank: IMDCT, windows and
+// overlap-add (4.6.11).
+//
+// Channels live in "slots" (the output channel they become); every
+// per-channel value is a flat list indexed by slot, so nothing is
+// allocated while decoding. Samples come out in 16-bit units
+// (full scale = 32768), as the standard's formulas give them.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../core"
+
+// Window sequences (4.6.11.3.2, Table 4.129).
+let aacOnlyLong = 0
+let aacLongStart = 1
+let aacEightShort = 2
+let aacLongStop = 3
+
+// Band types / codebook numbers (4.6.3, Table 4.81).
+let aacZeroHcb = 0
+let aacNoiseHcb = 13
+let aacIntensityHcb2 = 14
+let aacIntensityHcb = 15
+
+// Per channel: the ics_info of the current frame and what the filterbank
+// remembers of the last one.
+struct AacIcs {
+    seq: Int = 0
+    prevSeq: Int = 0
+    kbd: Bool = false
+    prevKbd: Bool = false
+    maxSfb: Int = 0
+    numWindows: Int = 1
+    numGroups: Int = 1
+    groupLen: [Int] = [1, 0, 0, 0, 0, 0, 0, 0]
+    numSwb: Int = 0
+    tnsMaxBands: Int = 0
+}
+
+// x^(4/3) for the inverse quantiser (4.6.2.3), 0..8191.
+let aacPow43 = aacMakePow43()
+
+fn aacMakePow43() -> [Float] {
+    var t: [Float] = []
+    for i in 0..8192 {
+        t.append(pow(Float(i), 4.0 / 3.0))
+    }
+    t
+}
+
+// 2^((i - 200) / 4) for i = 0..427: scalefactor gains.
+let aacPow2Sf = aacMakePow2Sf()
+
+fn aacMakePow2Sf() -> [Float] {
+    var t: [Float] = []
+    for i in 0..428 {
+        t.append(pow(2.0, Float(i - 200) / 4.0))
+    }
+    t
+}
+
+// TNS coefficient values (4.6.9.3): for coef_res (3 or 4 bits) and
+// coef_compress, the sine of each transmitted index. Rows: compress 0
+// res 3, compress 0 res 4, compress 1 res 3, compress 1 res 4; 16 each.
+let aacTnsTable = aacMakeTnsTable()
+
+fn aacMakeTnsTable() -> [Float] {
+    var t: [Float] = []
+    for row in 0..4 {
+        let compress = row / 2
+        let resBits = 3 + row % 2
+        let coefLen = resBits - compress
+        let iqfac = (Float(1 << (resBits - 1)) - 0.5) / (pi / 2.0)
+        let iqfacM = (Float(1 << (resBits - 1)) + 0.5) / (pi / 2.0)
+        for v in 0..16 {
+            if v >= (1 << coefLen) {
+                t.append(0.0)
+                continue
+            }
+            // Sign-extend the coef_len-bit value.
+            var s = v
+            if v >= (1 << (coefLen - 1)) {
+                s = v - (1 << coefLen)
+            }
+            if s >= 0 {
+                t.append(sin(Float(s) / iqfac))
+            } else {
+                t.append(sin(Float(s) / iqfacM))
+            }
+        }
+    }
+    t
+}
+
+// Names of the AacCore.stats counters.
+let aacToolNames = ["short windows", "start/stop windows", "KBD windows", "TNS", "M/S bands", "intensity bands", "PNS bands", "pulses", "escape codes", "coupling elements", "SBR frames", "PS frames", "PS 34 bands", "PS IPD/OPD", "downsampled SBR"]
+
+struct AacCore {
+    br: core.BitReader
+    // Sampling frequency index (0..12) of the core coder.
+    sfIndex: Int = 4
+    // AAC Main/LC/LTP object type (1, 2, 4); Main prediction and LTP are
+    // not supported (LC is what's used in practice).
+    objectType: Int = 2
+    // Number of channel slots (output channels + 1 scratch slot for
+    // coupling channels, which are read and dropped).
+    slots: Int = 0
+    swbLong: [Int] = []
+    swbShort: [Int] = []
+    ics: [AacIcs] = []
+    bandType: [Int] = []
+    // Per band: the scalefactor (0..255), noise energy or intensity
+    // position, as transmitted.
+    sfo: [Int] = []
+    quant: [Int] = []
+    coef: [Float] = []
+    saved: [Float] = []
+    // The filterbank's output for the frame: 1024 samples per slot.
+    output: [Float] = []
+    // TNS per slot: filters per window [slot*8+w], and per filter
+    // [slot*24 + w*3 + f] length, order, direction, coefficients
+    // [(slot*24 + w*3 + f) * 32 + i].
+    tnsPresent: [Bool] = []
+    tnsFilters: [Int] = []
+    tnsLength: [Int] = []
+    tnsOrder: [Int] = []
+    tnsDir: [Int] = []
+    tnsCoef: [Float] = []
+    lpc: [Float] = []
+    lpcTmp: [Float] = []
+    msMask: [Int] = []
+    // Pulse data of the channel being read.
+    pulseCount: Int = 0
+    pulsePos: [Int] = [0, 0, 0, 0]
+    pulseAmp: [Int] = [0, 0, 0, 0]
+    // State of the noise generator used by PNS (as FFmpeg's, so the
+    // noise matches it sample for sample).
+    randomState: Int = 0x1f2e3d4c
+    long: AacDct4
+    short: AacDct4
+    win: [Float] = []
+    error: String = ""
+    // How often each coding tool was seen (see aacToolNames).
+    stats: [Int] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+
+    // --- Huffman decoding (4.6.3) ---
+
+    // One symbol from a multi-level lookup table (see tables.tsl).
+    fn huff(_ table: [Int], _ start: Int, _ rootBits: Int) -> Int {
+        var base = start
+        var bits = rootBits
+        while true {
+            let e = table[base + br.peek(bits)]
+            if e >= 0 {
+                br.bits(e & 31)
+                return e >> 5
+            }
+            if e == -1 {
+                return -1
+            }
+            br.bits(bits)
+            let v = -e
+            base = v >> 5
+            bits = v & 31
+        }
+        -1
+    }
+
+    fn scalefactorCode() -> Int {
+        huff(aacHcbSf, 0, 8)
+    }
+
+    // --- Setup ---
+
+    fn configure(sfIndex: Int, channels: Int) {
+        self.sfIndex = sfIndex
+        slots = channels + 1
+        swbLong = []
+        let ls = aacSwbLongStart[sfIndex]
+        for i in 0..(aacNumSwbLong[sfIndex] + 1) {
+            swbLong.append(aacSwbLong[ls + i])
+        }
+        swbShort = []
+        let ss = aacSwbShortStart[sfIndex]
+        for i in 0..(aacNumSwbShort[sfIndex] + 1) {
+            swbShort.append(aacSwbShort[ss + i])
+        }
+        ics = []
+        bandType = []
+        sfo = []
+        coef = []
+        saved = []
+        output = []
+        tnsPresent = []
+        tnsFilters = []
+        tnsLength = []
+        tnsOrder = []
+        tnsDir = []
+        tnsCoef = []
+        for _ in 0..slots {
+            ics.append(AacIcs())
+            tnsPresent.append(false)
+        }
+        for _ in 0..(slots * 128) {
+            bandType.append(0)
+            sfo.append(0)
+        }
+        for _ in 0..(slots * 1024) {
+            coef.append(0.0)
+            saved.append(0.0)
+            output.append(0.0)
+        }
+        for _ in 0..(slots * 8) {
+            tnsFilters.append(0)
+        }
+        for _ in 0..(slots * 24) {
+            tnsLength.append(0)
+            tnsOrder.append(0)
+            tnsDir.append(0)
+        }
+        for _ in 0..(slots * 24 * 32) {
+            tnsCoef.append(0.0)
+        }
+        quant = []
+        for _ in 0..1024 {
+            quant.append(0)
+        }
+        msMask = []
+        for _ in 0..128 {
+            msMask.append(0)
+        }
+        lpc = []
+        lpcTmp = []
+        for _ in 0..33 {
+            lpc.append(0.0)
+            lpcTmp.append(0.0)
+        }
+        win = []
+        for _ in 0..2048 {
+            win.append(0.0)
+        }
+    }
+
+    // Forget the filterbank's overlap (after a seek).
+    fn resetState() {
+        for i in 0..saved.count {
+            saved[i] = 0.0
+        }
+        for s in 0..ics.count {
+            ics[s] = AacIcs()
+        }
+    }
+
+    // --- ics_info (Table 4.6) ---
+
+    fn readIcsInfo(_ slot: Int) -> Bool {
+        if br.bit() == 1 {
+            // ics_reserved_bit: ignore, as FFmpeg does.
+        }
+        ics[slot].prevSeq = ics[slot].seq
+        ics[slot].seq = br.bits(2)
+        ics[slot].prevKbd = ics[slot].kbd
+        ics[slot].kbd = br.bit() == 1
+        ics[slot].numGroups = 1
+        ics[slot].groupLen[0] = 1
+        if ics[slot].seq == aacEightShort {
+            ics[slot].maxSfb = br.bits(4)
+            for _ in 0..7 {
+                if br.bit() == 1 {
+                    ics[slot].groupLen[ics[slot].numGroups - 1] += 1
+                } else {
+                    ics[slot].numGroups += 1
+                    ics[slot].groupLen[ics[slot].numGroups - 1] = 1
+                }
+            }
+            ics[slot].numWindows = 8
+            ics[slot].numSwb = aacNumSwbShort[sfIndex]
+            ics[slot].tnsMaxBands = aacTnsMaxBandsShort[sfIndex]
+        } else {
+            ics[slot].maxSfb = br.bits(6)
+            ics[slot].numWindows = 1
+            ics[slot].numSwb = aacNumSwbLong[sfIndex]
+            ics[slot].tnsMaxBands = aacTnsMaxBandsLong[sfIndex]
+            if br.bit() == 1 {
+                // predictor_data_present: AAC Main prediction / LTP,
+                // not allowed in AAC-LC.
+                error = "prediction (AAC Main/LTP) is not supported"
+                ics[slot].maxSfb = 0
+                return false
+            }
+        }
+        let seq = ics[slot].seq
+        if seq == aacEightShort {
+            stats[0] += 1
+        } else if seq != aacOnlyLong {
+            stats[1] += 1
+        }
+        if ics[slot].kbd {
+            stats[2] += 1
+        }
+        if ics[slot].maxSfb > ics[slot].numSwb {
+            error = "max_sfb {ics[slot].maxSfb} is more than the {ics[slot].numSwb} bands"
+            ics[slot].maxSfb = 0
+            return false
+        }
+        true
+    }
+
+    // --- section_data (Table 4.52) ---
+
+    fn readSectionData(_ slot: Int) -> Bool {
+        let short = ics[slot].seq == aacEightShort
+        let bits = if short { 3 } else { 5 }
+        let esc = (1 << bits) - 1
+        let maxSfb = ics[slot].maxSfb
+        for g in 0..ics[slot].numGroups {
+            var k = 0
+            while k < maxSfb {
+                let bt = br.bits(4)
+                if bt == 12 {
+                    error = "reserved band type 12"
+                    return false
+                }
+                var end = k
+                while true {
+                    let inc = br.bits(bits)
+                    end += inc
+                    if br.overrun {
+                        error = "section data past the end"
+                        return false
+                    }
+                    if end > maxSfb {
+                        error = "section ends past max_sfb"
+                        return false
+                    }
+                    if inc != esc {
+                        break
+                    }
+                }
+                while k < end {
+                    bandType[slot * 128 + g * maxSfb + k] = bt
+                    k += 1
+                }
+            }
+        }
+        true
+    }
+
+    // --- scale_factor_data (Table 4.53, 4.6.2.3.2) ---
+
+    fn readScalefactors(_ slot: Int, globalGain: Int) -> Bool {
+        var gain = globalGain
+        var noise = globalGain - 90
+        var position = 0
+        var noiseFirst = true
+        let maxSfb = ics[slot].maxSfb
+        for g in 0..ics[slot].numGroups {
+            for sfb in 0..maxSfb {
+                let idx = slot * 128 + g * maxSfb + sfb
+                let bt = bandType[idx]
+                if bt == aacZeroHcb {
+                    sfo[idx] = 0
+                } else if bt == aacIntensityHcb || bt == aacIntensityHcb2 {
+                    position += scalefactorCode() - 60
+                    sfo[idx] = position.clamped(min: -155, max: 100)
+                } else if bt == aacNoiseHcb {
+                    if noiseFirst {
+                        noise += br.bits(9) - 256
+                        noiseFirst = false
+                    } else {
+                        noise += scalefactorCode() - 60
+                    }
+                    sfo[idx] = noise.clamped(min: -100, max: 155)
+                } else {
+                    gain += scalefactorCode() - 60
+                    if gain < 0 || gain > 255 {
+                        error = "scalefactor {gain} out of range"
+                        return false
+                    }
+                    sfo[idx] = gain
+                }
+            }
+        }
+        true
+    }
+
+    // --- pulse_data (Table 4.7) ---
+
+    fn readPulses(_ slot: Int) -> Bool {
+        pulseCount = br.bits(2) + 1
+        let startSfb = br.bits(6)
+        let numSwb = ics[slot].numSwb
+        if startSfb >= numSwb {
+            return false
+        }
+        var pos = swbLong[startSfb]
+        for i in 0..pulseCount {
+            pos += br.bits(5)
+            if pos >= 1024 {
+                return false
+            }
+            pulsePos[i] = pos
+            pulseAmp[i] = br.bits(4)
+        }
+        true
+    }
+
+    // --- tns_data (Table 4.48) ---
+
+    fn readTns(_ slot: Int) -> Bool {
+        let short = ics[slot].seq == aacEightShort
+        let maxOrder = if short { 7 } else { 12 }
+        for w in 0..ics[slot].numWindows {
+            let n = br.bits(if short { 1 } else { 2 })
+            tnsFilters[slot * 8 + w] = n
+            if n == 0 {
+                continue
+            }
+            let coefRes = br.bit()
+            for f in 0..n {
+                let at = slot * 24 + w * 3 + f
+                tnsLength[at] = br.bits(if short { 4 } else { 6 })
+                let order = br.bits(if short { 3 } else { 5 })
+                if order > maxOrder {
+                    error = "TNS order {order} is more than {maxOrder}"
+                    tnsOrder[at] = 0
+                    return false
+                }
+                tnsOrder[at] = order
+                if order > 0 {
+                    tnsDir[at] = br.bit()
+                    let compress = br.bit()
+                    let len = coefRes + 3 - compress
+                    let row = (2 * compress + coefRes) * 16
+                    for i in 0..order {
+                        tnsCoef[at * 32 + i] = aacTnsTable[row + br.bits(len)]
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    // --- individual_channel_stream (Table 4.50) ---
+
+    // Reads one channel's stream into its slot: coefficients in coef
+    // (dequantised, 1024 per slot, short windows one after another).
+    fn readIcs(_ slot: Int, commonWindow: Bool) -> Bool {
+        let globalGain = br.bits(8)
+        if !commonWindow {
+            if !readIcsInfo(slot) {
+                return false
+            }
+        }
+        if !readSectionData(slot) {
+            return false
+        }
+        if !readScalefactors(slot, globalGain: globalGain) {
+            return false
+        }
+        pulseCount = 0
+        if br.bit() == 1 {
+            if ics[slot].seq == aacEightShort {
+                error = "pulse data in a short window"
+                return false
+            }
+            if !readPulses(slot) {
+                error = "bad pulse data"
+                return false
+            }
+        }
+        tnsPresent[slot] = br.bit() == 1
+        if tnsPresent[slot] {
+            stats[3] += 1
+            if !readTns(slot) {
+                tnsPresent[slot] = false
+                return false
+            }
+        }
+        if br.bit() == 1 {
+            error = "gain control (AAC SSR) is not supported"
+            return false
+        }
+        readSpectralData(slot)
+    }
+
+    // --- spectral_data (Table 4.56), 4.6.3 noiseless decoding, 4.6.2
+    // inverse quantisation and scaling, 4.6.13 PNS ---
+
+    fn readSpectralData(_ slot: Int) -> Bool {
+        let short = ics[slot].seq == aacEightShort
+        let off = if short { swbShort } else { swbLong }
+        let maxSfb = ics[slot].maxSfb
+        let cbase = slot * 1024
+        for i in 0..1024 {
+            quant[i] = 0
+        }
+        var win = 0
+        for g in 0..ics[slot].numGroups {
+            let glen = ics[slot].groupLen[g]
+            for sfb in 0..maxSfb {
+                let bt = bandType[slot * 128 + g * maxSfb + sfb]
+                if bt == aacZeroHcb || bt >= aacNoiseHcb {
+                    continue
+                }
+                let start = aacHcbSpecStart[bt - 1]
+                let width = off[sfb + 1] - off[sfb]
+                for w in 0..glen {
+                    let base = (win + w) * 128 + off[sfb]
+                    if !readCodewords(bt, start, base, width) {
+                        return false
+                    }
+                }
+            }
+            win += glen
+        }
+        if br.overrun {
+            error = "spectral data past the end"
+            return false
+        }
+        // Pulses are added to the quantised values (4.6.3.4).
+        if pulseCount > 0 {
+            stats[7] += 1
+            for i in 0..pulseCount {
+                let p = pulsePos[i]
+                var sfb = 0
+                while off[sfb + 1] <= p {
+                    sfb += 1
+                }
+                let bt = bandType[slot * 128 + sfb]
+                if bt != aacZeroHcb && bt < aacNoiseHcb {
+                    if quant[p] > 0 {
+                        quant[p] += pulseAmp[i]
+                    } else {
+                        quant[p] -= pulseAmp[i]
+                    }
+                }
+            }
+        }
+        // Dequantise: sign(q) |q|^(4/3) 2^((sf - 100)/4), and noise bands.
+        win = 0
+        for g in 0..ics[slot].numGroups {
+            let glen = ics[slot].groupLen[g]
+            for sfb in 0..maxSfb {
+                let idx = slot * 128 + g * maxSfb + sfb
+                let bt = bandType[idx]
+                let lo = off[sfb]
+                let hi = off[sfb + 1]
+                for w in 0..glen {
+                    let wb = (win + w) * 128
+                    if bt == aacZeroHcb || bt == aacIntensityHcb || bt == aacIntensityHcb2 {
+                        for k in lo..hi {
+                            coef[cbase + wb + k] = 0.0
+                        }
+                    } else if bt == aacNoiseHcb {
+                        // Noise with the band's energy (FFmpeg's generator).
+                        stats[6] += 1
+                        var energy = 0.0
+                        for k in lo..hi {
+                            randomState = (randomState * 1664525 + 1013904223) & 0xffffffff
+                            var v = randomState
+                            if v >= 0x80000000 {
+                                v -= 0x100000000
+                            }
+                            let f = Float(v)
+                            coef[cbase + wb + k] = f
+                            energy += f * f
+                        }
+                        let scale = aacPow2Sf[sfo[idx] + 200] / sqrt(energy)
+                        for k in lo..hi {
+                            coef[cbase + wb + k] *= scale
+                        }
+                    } else {
+                        let gain = aacPow2Sf[sfo[idx] - 100 + 200]
+                        for k in lo..hi {
+                            let q = quant[wb + k]
+                            if q == 0 {
+                                coef[cbase + wb + k] = 0.0
+                            } else if q > 0 {
+                                coef[cbase + wb + k] = aacPow43[min(q, 8191)] * gain
+                            } else {
+                                coef[cbase + wb + k] = -aacPow43[min(-q, 8191)] * gain
+                            }
+                        }
+                    }
+                }
+            }
+            win += glen
+        }
+        // Above max_sfb everything is zero.
+        let top = off[maxSfb]
+        let step = if short { 128 } else { 1024 }
+        for w in 0..ics[slot].numWindows {
+            for k in top..step {
+                coef[cbase + w * 128 + k] = 0.0
+            }
+        }
+        true
+    }
+
+    // The codewords of one band of one window (4.6.3.3): quads for books
+    // 1-4, pairs for 5-11; unsigned books have sign bits after the
+    // codeword and book 11 escape sequences for 16.
+    fn readCodewords(_ book: Int, _ start: Int, _ base: Int, _ width: Int) -> Bool {
+        var k = 0
+        if book <= 4 {
+            while k < width {
+                let idx = huff(aacHcbSpec, start, 8)
+                if idx < 0 {
+                    error = "bad spectral codeword"
+                    return false
+                }
+                var a = idx / 27
+                var b = (idx / 9) % 3
+                var c = (idx / 3) % 3
+                var d = idx % 3
+                if book <= 2 {
+                    a -= 1
+                    b -= 1
+                    c -= 1
+                    d -= 1
+                } else {
+                    if a != 0 && br.bit() == 1 { a = -a }
+                    if b != 0 && br.bit() == 1 { b = -b }
+                    if c != 0 && br.bit() == 1 { c = -c }
+                    if d != 0 && br.bit() == 1 { d = -d }
+                }
+                quant[base + k] = a
+                quant[base + k + 1] = b
+                quant[base + k + 2] = c
+                quant[base + k + 3] = d
+                k += 4
+            }
+            return true
+        }
+        let mod = if book <= 6 { 9 } else if book <= 8 { 8 } else if book <= 10 { 13 } else { 17 }
+        let signed = book <= 6
+        while k < width {
+            let idx = huff(aacHcbSpec, start, 8)
+            if idx < 0 {
+                error = "bad spectral codeword"
+                return false
+            }
+            var y = idx / mod
+            var z = idx % mod
+            if signed {
+                y -= 4
+                z -= 4
+            } else {
+                let sy = y != 0 && br.bit() == 1
+                let sz = z != 0 && br.bit() == 1
+                if book == 11 {
+                    if y == 16 {
+                        stats[8] += 1
+                        y = readEscape()
+                        if y < 0 {
+                            return false
+                        }
+                    }
+                    if z == 16 {
+                        z = readEscape()
+                        if z < 0 {
+                            return false
+                        }
+                    }
+                }
+                if sy { y = -y }
+                if sz { z = -z }
+            }
+            quant[base + k] = y
+            quant[base + k + 1] = z
+            k += 2
+        }
+        true
+    }
+
+    // escape_sequence: N ones, a zero, then an (N + 4)-bit word; the value
+    // is 2^(N + 4) + word.
+    fn readEscape() -> Int {
+        var n = 0
+        while br.bit() == 1 {
+            n += 1
+            if n > 8 {
+                error = "escape sequence too long"
+                return -1
+            }
+        }
+        (1 << (n + 4)) + br.bits(n + 4)
+    }
+
+    // --- channel_pair_element tools ---
+
+    // ms_mask from the bitstream (ms_mask_present 1) or all set (2).
+    fn readMsMask(_ slot: Int, present: Int) {
+        let n = ics[slot].numGroups * ics[slot].maxSfb
+        for i in 0..n {
+            msMask[i] = if present == 1 { br.bit() } else { 1 }
+        }
+    }
+
+    // M/S stereo (4.6.8.1): l = m + s, r = m - s in the bands marked.
+    fn applyMs(_ a: Int, _ b: Int) {
+        let short = ics[a].seq == aacEightShort
+        let off = if short { swbShort } else { swbLong }
+        let maxSfb = ics[a].maxSfb
+        var win = 0
+        for g in 0..ics[a].numGroups {
+            let glen = ics[a].groupLen[g]
+            for sfb in 0..maxSfb {
+                let idx = g * maxSfb + sfb
+                if msMask[idx] == 1 && bandType[a * 128 + idx] < aacNoiseHcb && bandType[b * 128 + idx] < aacNoiseHcb {
+                    stats[4] += 1
+                    for w in 0..glen {
+                        let base = (win + w) * 128
+                        for k in off[sfb]..off[sfb + 1] {
+                            let m = coef[a * 1024 + base + k]
+                            let s = coef[b * 1024 + base + k]
+                            coef[a * 1024 + base + k] = m + s
+                            coef[b * 1024 + base + k] = m - s
+                        }
+                    }
+                }
+            }
+            win += glen
+        }
+    }
+
+    // Intensity stereo (4.6.8.2): the right channel's intensity bands are
+    // the left channel scaled by 0.5^(position/4), with the sign of the
+    // codebook (15 in phase, 14 out of phase) flipped where ms_used.
+    fn applyIntensity(_ a: Int, _ b: Int, msPresent: Int) {
+        let short = ics[b].seq == aacEightShort
+        let off = if short { swbShort } else { swbLong }
+        let maxSfb = ics[b].maxSfb
+        var win = 0
+        for g in 0..ics[b].numGroups {
+            let glen = ics[b].groupLen[g]
+            for sfb in 0..maxSfb {
+                let idx = g * maxSfb + sfb
+                let bt = bandType[b * 128 + idx]
+                if bt == aacIntensityHcb || bt == aacIntensityHcb2 {
+                    stats[5] += 1
+                    var c = if bt == aacIntensityHcb { 1.0 } else { -1.0 }
+                    if msPresent != 0 && msMask[idx] == 1 {
+                        c = -c
+                    }
+                    let scale = c * aacPow2Sf[200 - sfo[b * 128 + idx]]
+                    for w in 0..glen {
+                        let base = (win + w) * 128
+                        for k in off[sfb]..off[sfb + 1] {
+                            coef[b * 1024 + base + k] = coef[a * 1024 + base + k] * scale
+                        }
+                    }
+                }
+            }
+            win += glen
+        }
+    }
+
+    // --- TNS filtering (4.6.9.3) ---
+
+    fn applyTns(_ slot: Int) {
+        let short = ics[slot].seq == aacEightShort
+        let off = if short { swbShort } else { swbLong }
+        let mmm = min(ics[slot].tnsMaxBands, ics[slot].maxSfb)
+        if mmm == 0 {
+            return
+        }
+        let numSwb = ics[slot].numSwb
+        let cbase = slot * 1024
+        for w in 0..ics[slot].numWindows {
+            var bottom = numSwb
+            for f in 0..tnsFilters[slot * 8 + w] {
+                let at = slot * 24 + w * 3 + f
+                let top = bottom
+                bottom = max(0, top - tnsLength[at])
+                let order = tnsOrder[at]
+                if order == 0 {
+                    continue
+                }
+                // Reflection coefficients to LPC coefficients a[1..order].
+                for m in 1..(order + 1) {
+                    let r = tnsCoef[at * 32 + m - 1]
+                    for i in 1..m {
+                        lpcTmp[i] = lpc[i] + r * lpc[m - i]
+                    }
+                    for i in 1..m {
+                        lpc[i] = lpcTmp[i]
+                    }
+                    lpc[m] = r
+                }
+                var start = off[min(bottom, mmm)]
+                let end = off[min(top, mmm)]
+                let size = end - start
+                if size <= 0 {
+                    continue
+                }
+                var inc = 1
+                if tnsDir[at] == 1 {
+                    inc = -1
+                    start = end - 1
+                }
+                var pos = cbase + w * 128 + start
+                // All-pole filter y[n] = x[n] - sum a[i] y[n - i].
+                for m in 0..size {
+                    var v = coef[pos]
+                    for i in 1..(min(m, order) + 1) {
+                        v -= coef[pos - i * inc] * lpc[i]
+                    }
+                    coef[pos] = v
+                    pos += inc
+                }
+            }
+        }
+    }
+
+    // --- Filterbank (4.6.11): IMDCT, windowing, overlap-add ---
+    //
+    // The window at each frame boundary is chosen the way FFmpeg does:
+    // a long overlap when the previous frame ended long (ONLY_LONG or
+    // LONG_STOP) and this one starts long (ONLY_LONG or LONG_START),
+    // otherwise the short overlap (448 samples kept, a 128-sample short
+    // window, 448 samples new). For the transitions the standard allows
+    // this is exactly 4.6.11.3; for the ones it doesn't, it is what
+    // FFmpeg (and so the reference here) does. So `saved` holds the
+    // second half of the last frame's IMDCT unwindowed (for long frames)
+    // or with the short windows applied except the last one's falling
+    // half (for eight short windows).
+
+    // Turns the slot's coefficients into 1024 samples in output[slot].
+    fn filterbank(_ slot: Int) {
+        let seq = ics[slot].seq
+        let prevSeq = ics[slot].prevSeq
+        let kbd = ics[slot].kbd
+        let prevKbd = ics[slot].prevKbd
+        let cbase = slot * 1024
+        let longOverlap = (prevSeq == aacOnlyLong || prevSeq == aacLongStop) && (seq == aacOnlyLong || seq == aacLongStart)
+        let ws = if kbd { aacKbdShort } else { aacSineShort }
+        let wps = if prevKbd { aacKbdShort } else { aacSineShort }
+        let wpl = if prevKbd { aacKbdLong } else { aacSineLong }
+        if seq == aacEightShort {
+            for i in 0..2048 {
+                win[i] = 0.0
+            }
+            for w in 0..8 {
+                for k in 0..128 {
+                    short.inp[k] = coef[cbase + w * 128 + k]
+                }
+                short.run()
+                let at = 448 + 128 * w
+                let rising = if w == 0 { wps } else { ws }
+                // 256 samples: y[n] = U(n + 64) / 128 with U from the DCT-IV.
+                for n in 0..256 {
+                    let j = n + 64
+                    var v = 0.0
+                    if j < 128 {
+                        v = short.out[j]
+                    } else if j < 256 {
+                        v = -short.out[255 - j]
+                    } else {
+                        v = -short.out[j - 256]
+                    }
+                    v = v / 128.0
+                    if n < 128 {
+                        win[at + n] += v * rising[n]
+                    } else if w < 7 {
+                        win[at + n] += v * ws[255 - n]
+                    } else {
+                        // The last window's falling half is windowed when
+                        // the next frame's overlap is known.
+                        win[at + n] += v
+                    }
+                }
+            }
+        } else {
+            for k in 0..1024 {
+                long.inp[k] = coef[cbase + k]
+            }
+            long.run()
+            for n in 0..2048 {
+                let j = n + 512
+                var v = 0.0
+                if j < 1024 {
+                    v = long.out[j]
+                } else if j < 2048 {
+                    v = -long.out[2047 - j]
+                } else {
+                    v = -long.out[j - 2048]
+                }
+                v = v / 1024.0
+                if n < 1024 {
+                    if longOverlap {
+                        v = v * wpl[n]
+                    } else if n < 448 {
+                        v = 0.0
+                    } else if n < 576 {
+                        v = v * wps[n - 448]
+                    }
+                }
+                win[n] = v
+            }
+        }
+        // Overlap with the last frame's second half.
+        if longOverlap {
+            for n in 0..1024 {
+                output[cbase + n] = saved[cbase + n] * wpl[1023 - n] + win[n]
+            }
+        } else {
+            for n in 0..448 {
+                output[cbase + n] = saved[cbase + n] + win[n]
+            }
+            for n in 448..576 {
+                output[cbase + n] = saved[cbase + n] * wps[575 - n] + win[n]
+            }
+            for n in 576..1024 {
+                output[cbase + n] = win[n]
+            }
+        }
+        for n in 0..1024 {
+            saved[cbase + n] = win[1024 + n]
+        }
+    }
+}
+
+fn aacNewCore() -> AacCore {
+    AacCore(br: core.bitReader(Data()), long: aacNewDct4(1024), short: aacNewDct4(128))
+}

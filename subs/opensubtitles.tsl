@@ -1,0 +1,958 @@
+// OpenSubtitles.com (REST API v1, https://api.opensubtitles.com/api/v1,
+// as its public documentation describes it): the movie hash, search by
+// hash or by name/season/episode/language, login, and download links.
+//
+// Every request is built by a pure function (…Call → HttpCall) and every
+// answer read by one (osRead… from the status and body text), so they can
+// be tested without the network; the opensubtitles… functions at the end
+// are thin wrappers that send them with Tessel's `request` (call them from
+// the app's thread, not from a background job).
+//
+// The API needs an API key (a "consumer" made on opensubtitles.com, sent
+// as the Api-Key header) for everything, and a login token (POST /login
+// with the user's name and password; the answer also names the server to
+// use from then on) for downloads. Searching works with the key alone.
+//
+// The movie hash is OpenSubtitles' own published one: the file size plus
+// the sums of the first and the last 64 KiB read as little-endian 64-bit
+// words, kept to 64 bits, as 16 hex digits.
+//
+// Answers are read with a small JSON reader of our own (OsJson) rather
+// than fromJson, because the API's fields come and go and are sometimes
+// null, and one odd field shouldn't lose the whole answer.
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+public let opensubtitlesApi = "https://api.opensubtitles.com/api/v1"
+
+// An HTTP request to send: what `request(url:method:headers:body:)` takes.
+public struct HttpCall {
+    method: String = "GET"
+    url: String
+    headers: [String: String] = [:]
+    body: String = ""
+}
+
+public struct OsUser {
+    userId: Int = 0
+    level: String = ""
+    vip: Bool = false
+    // Downloads allowed per day and left today (−1: not known).
+    allowedDownloads: Int = -1
+    remainingDownloads: Int = -1
+}
+
+// What the API needs to know about the app and the user.
+public struct OsClient {
+    apiKey: String
+    // Sent as User-Agent; the API wants "App v1.2"-like names.
+    userAgent: String = "Reel v1.0"
+    // From login; "" until then.
+    token: String = ""
+    // The server to use (login may move a user to another one).
+    baseUrl: String = "https://api.opensubtitles.com/api/v1"
+    user: OsUser = OsUser()
+}
+
+// A search. Give a movie hash (with the file size it came from, as the
+// API matches both) and/or a query (a title or file name); season and
+// episode for TV; languages as ISO 639-1 codes ("en", "pt-br").
+public struct OsQuery {
+    movieHash: String = ""
+    query: String = ""
+    languages: [String] = []
+    season: Int = 0
+    episode: Int = 0
+    imdbId: Int = 0
+    tmdbId: Int = 0
+    parentImdbId: Int = 0
+    year: Int = 0
+    // "movie", "episode" or "" (all).
+    type: String = ""
+    // "include", "exclude" or "only"; "" = the API's default.
+    hearingImpaired: String = ""
+    foreignPartsOnly: String = ""
+    aiTranslated: String = ""
+    machineTranslated: String = ""
+    // "download_count", "upload_date", "ratings" …; "" = the API's order.
+    orderBy: String = ""
+    page: Int = 0
+}
+
+public struct OsFile {
+    fileId: Int = 0
+    cdNumber: Int = 1
+    fileName: String = ""
+}
+
+// One subtitle the search found.
+public struct OsSubtitle {
+    id: String = ""
+    language: String = ""
+    release: String = ""
+    comments: String = ""
+    downloads: Int = 0
+    rating: Float = 0.0
+    votes: Int = 0
+    fps: Float = 0.0
+    hearingImpaired: Bool = false
+    foreignPartsOnly: Bool = false
+    hd: Bool = false
+    aiTranslated: Bool = false
+    machineTranslated: Bool = false
+    fromTrusted: Bool = false
+    // Found by the movie hash: made for exactly this file.
+    hashMatch: Bool = false
+    uploadDate: String = ""
+    uploader: String = ""
+    url: String = ""
+    // What it's for.
+    title: String = ""
+    year: Int = 0
+    season: Int = 0
+    episode: Int = 0
+    featureType: String = ""
+    imdbId: Int = 0
+    // The files to download (one per CD of old releases).
+    files: [OsFile] = []
+}
+
+public struct OsSearchResult {
+    subtitles: [OsSubtitle] = []
+    page: Int = 1
+    totalPages: Int = 1
+    totalCount: Int = 0
+}
+
+// The answer to a download request: where to fetch the file (the link
+// works for a few hours) and how many downloads are left today.
+public struct OsDownload {
+    link: String = ""
+    fileName: String = ""
+    requests: Int = 0
+    remaining: Int = -1
+    message: String = ""
+    resetTime: String = ""
+}
+
+// ---- the movie hash ----
+
+// The OpenSubtitles hash of a whole file's bytes; "" for files under
+// 64 KiB (the hash isn't defined for them).
+public fn movieHash(_ file: Data) -> String {
+    let n = file.count
+    if n < 65536 {
+        return ""
+    }
+    movieHashOf(size: n, head: file.slice(from: 0, to: 65536), tail: file.slice(from: n - 65536, to: n))
+}
+
+// The hash from the file size and its first and last 64 KiB (for files
+// read in pieces, e.g. over HTTP with ranges).
+public fn movieHashOf(size: Int, head: Data, tail: Data) -> String {
+    var h = size
+    var i = 0
+    while i + 8 <= head.count && i < 65536 {
+        h = h.wrappingAdd(head.int64(at: i))
+        i += 8
+    }
+    i = 0
+    while i + 8 <= tail.count && i < 65536 {
+        h = h.wrappingAdd(tail.int64(at: i))
+        i += 8
+    }
+    Data(bytes: h.bytes(count: 8, bigEndian: true)).hex
+}
+
+// ---- requests ----
+
+fn osHeaders(_ c: OsClient, auth: Bool) -> [String: String] {
+    var h: [String: String] = [
+        "Api-Key": c.apiKey,
+        "User-Agent": c.userAgent,
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    ]
+    if auth && !c.token.isEmpty {
+        h["Authorization"] = "Bearer {c.token}"
+    }
+    h
+}
+
+// A JSON string literal.
+fn osQuote(_ s: String) -> String {
+    var out = "\""
+    for ch in s.characters {
+        if ch == "\"" {
+            out += "\\\""
+        } else if ch == "\\" {
+            out += "\\\\"
+        } else if ch == "\n" {
+            out += "\\n"
+        } else if ch == "\r" {
+            out += "\\r"
+        } else if ch == "\t" {
+            out += "\\t"
+        } else if Data(text: ch)[0] < 0x20 {
+            out += "\\u00" + Data(bytes: [Data(text: ch)[0]]).hex
+        } else {
+            out += ch
+        }
+    }
+    out + "\""
+}
+
+// POST /login.
+public fn osLoginCall(_ c: OsClient, username: String, password: String) -> HttpCall {
+    HttpCall(method: "POST", url: c.baseUrl + "/login", headers: osHeaders(c, auth: false), body: "\{\"username\": {osQuote(username)}, \"password\": {osQuote(password)}}")
+}
+
+// DELETE /logout.
+public fn osLogoutCall(_ c: OsClient) -> HttpCall {
+    HttpCall(method: "DELETE", url: c.baseUrl + "/logout", headers: osHeaders(c, auth: true))
+}
+
+// GET /infos/user: the downloads left.
+public fn osUserCall(_ c: OsClient) -> HttpCall {
+    HttpCall(method: "GET", url: c.baseUrl + "/infos/user", headers: osHeaders(c, auth: true))
+}
+
+// GET /infos/languages.
+public fn osLanguagesCall(_ c: OsClient) -> HttpCall {
+    HttpCall(method: "GET", url: c.baseUrl + "/infos/languages", headers: osHeaders(c, auth: false))
+}
+
+// GET /subtitles. The parameters are written in alphabetical order and
+// lower case, as the API's documentation asks (other orders cost a
+// redirect).
+public fn osSearchCall(_ c: OsClient, _ q: OsQuery) -> HttpCall {
+    var params: [(String, String)] = []
+    if !q.aiTranslated.isEmpty { params.append(("ai_translated", q.aiTranslated)) }
+    if q.episode > 0 { params.append(("episode_number", "{q.episode}")) }
+    if !q.foreignPartsOnly.isEmpty { params.append(("foreign_parts_only", q.foreignPartsOnly)) }
+    if !q.hearingImpaired.isEmpty { params.append(("hearing_impaired", q.hearingImpaired)) }
+    if q.imdbId > 0 { params.append(("imdb_id", "{q.imdbId}")) }
+    if !q.languages.isEmpty {
+        var ls: [String] = []
+        for l in q.languages {
+            let t = l.trim().lowercase().replace("_", with: "-")
+            if !t.isEmpty && !ls.contains(t) {
+                ls.append(t)
+            }
+        }
+        params.append(("languages", ls.sorted(by: { a, b in a < b }).joined(separator: ",")))
+    }
+    if !q.machineTranslated.isEmpty { params.append(("machine_translated", q.machineTranslated)) }
+    if !q.movieHash.isEmpty { params.append(("moviehash", q.movieHash.lowercase())) }
+    if !q.orderBy.isEmpty { params.append(("order_by", q.orderBy)) }
+    if q.page > 1 { params.append(("page", "{q.page}")) }
+    if q.parentImdbId > 0 { params.append(("parent_imdb_id", "{q.parentImdbId}")) }
+    if !q.query.isEmpty { params.append(("query", q.query.trim().lowercase())) }
+    if q.season > 0 { params.append(("season_number", "{q.season}")) }
+    if q.tmdbId > 0 { params.append(("tmdb_id", "{q.tmdbId}")) }
+    if !q.type.isEmpty { params.append(("type", q.type)) }
+    if q.year > 0 { params.append(("year", "{q.year}")) }
+    var url = c.baseUrl + "/subtitles"
+    for (i, kv) in params.enumerated() {
+        url += (if i == 0 { "?" } else { "&" }) + kv.0 + "=" + osEncode(kv.1)
+    }
+    HttpCall(method: "GET", url: url, headers: osHeaders(c, auth: true))
+}
+
+// A query value made safe for a URL (commas of a language list kept).
+fn osEncode(_ v: String) -> String {
+    let parts = v.split(",")
+    var out: [String] = []
+    for p in parts {
+        out.append(p.urlEncoded)
+    }
+    out.joined(separator: ",")
+}
+
+// POST /download for a file of a search result (OsFile.fileId). `format`
+// asks the server to convert ("srt", "webvtt" …; "" = as uploaded).
+public fn osDownloadCall(_ c: OsClient, fileId: Int, format: String = "") -> HttpCall {
+    var body = "\{\"file_id\": {fileId}"
+    if !format.isEmpty {
+        body += ", \"sub_format\": {osQuote(format)}"
+    }
+    body += "}"
+    HttpCall(method: "POST", url: c.baseUrl + "/download", headers: osHeaders(c, auth: true), body: body)
+}
+
+// ---- answers ----
+
+// The reason an answer failed, from its status and the server's message.
+public fn osError(status: Int, text: String) -> Error {
+    var msg = ""
+    if let j = osParseJson(text).value() {
+        msg = j.string(j.get(0, "message"))
+        if msg.isEmpty {
+            let errs = j.get(0, "errors")
+            for e in j.children(errs) {
+                if !msg.isEmpty {
+                    msg += "; "
+                }
+                msg += j.string(e)
+            }
+        }
+    }
+    let why = match status {
+        0 -> "OpenSubtitles can't be reached" + (if text.isEmpty { "" } else { ": {text}" })
+        401 -> "OpenSubtitles didn't accept the API key or login"
+        403 -> "OpenSubtitles refused the request"
+        406 -> "OpenSubtitles: download limit reached"
+        429 -> "too many requests to OpenSubtitles; try again in a moment"
+        _ -> {
+            if status >= 500 { "OpenSubtitles is having problems (error {status})" } else { "OpenSubtitles answered {status}" }
+        }
+    }
+    if msg.isEmpty || status == 0 {
+        return Error(why)
+    }
+    Error("{why}: {msg}")
+}
+
+fn osOk(_ status: Int) -> Bool {
+    status >= 200 && status < 300
+}
+
+// The client after a login answer: token, server and the user's limits.
+public fn osReadLogin(_ c: OsClient, status: Int, text: String) -> Result<OsClient> {
+    if !osOk(status) {
+        return .failure(error: osError(status: status, text: text))
+    }
+    let j = try osParseJson(text)
+    var out = c
+    out.token = j.string(j.get(0, "token"))
+    if out.token.isEmpty {
+        return .failure(error: Error("OpenSubtitles' login answer has no token"))
+    }
+    let base = j.string(j.get(0, "base_url"))
+    if !base.isEmpty {
+        let host = if base.hasPrefix("http") { base } else { "https://" + base }
+        out.baseUrl = if host.hasSuffix("/api/v1") { host } else { host + "/api/v1" }
+    }
+    out.user = osReadUserNode(j, j.get(0, "user"))
+    Result.ok(value: out)
+}
+
+fn osReadUserNode(_ j: OsJson, _ u: Int) -> OsUser {
+    var user = OsUser()
+    if u < 0 {
+        return user
+    }
+    user.userId = j.int(j.get(u, "user_id"))
+    user.level = j.string(j.get(u, "level"))
+    user.vip = j.bool(j.get(u, "vip"))
+    if j.get(u, "allowed_downloads") >= 0 {
+        user.allowedDownloads = j.int(j.get(u, "allowed_downloads"))
+    }
+    if j.get(u, "remaining_downloads") >= 0 {
+        user.remainingDownloads = j.int(j.get(u, "remaining_downloads"))
+    }
+    user
+}
+
+// The user's limits from GET /infos/user.
+public fn osReadUser(status: Int, text: String) -> Result<OsUser> {
+    if !osOk(status) {
+        return .failure(error: osError(status: status, text: text))
+    }
+    let j = try osParseJson(text)
+    Result.ok(value: osReadUserNode(j, j.get(0, "data")))
+}
+
+// The languages the site has, as (code, name) pairs.
+public fn osReadLanguages(status: Int, text: String) -> Result<[(String, String)]> {
+    if !osOk(status) {
+        return .failure(error: osError(status: status, text: text))
+    }
+    let j = try osParseJson(text)
+    var out: [(String, String)] = []
+    for e in j.children(j.get(0, "data")) {
+        out.append((j.string(j.get(e, "language_code")), j.string(j.get(e, "language_name"))))
+    }
+    Result.ok(value: out)
+}
+
+// A search answer.
+public fn osReadSearch(status: Int, text: String) -> Result<OsSearchResult> {
+    if !osOk(status) {
+        return .failure(error: osError(status: status, text: text))
+    }
+    let j = try osParseJson(text)
+    var r = OsSearchResult()
+    r.page = max(1, j.int(j.get(0, "page")))
+    r.totalPages = max(1, j.int(j.get(0, "total_pages")))
+    r.totalCount = j.int(j.get(0, "total_count"))
+    for e in j.children(j.get(0, "data")) {
+        let a = j.get(e, "attributes")
+        if a < 0 {
+            continue
+        }
+        var s = OsSubtitle()
+        s.id = j.string(j.get(e, "id"))
+        if s.id.isEmpty {
+            s.id = j.string(j.get(a, "subtitle_id"))
+        }
+        s.language = j.string(j.get(a, "language"))
+        s.release = j.string(j.get(a, "release"))
+        s.comments = j.string(j.get(a, "comments"))
+        s.downloads = j.int(j.get(a, "download_count"))
+        s.rating = j.number(j.get(a, "ratings"))
+        s.votes = j.int(j.get(a, "votes"))
+        s.fps = j.number(j.get(a, "fps"))
+        s.hearingImpaired = j.bool(j.get(a, "hearing_impaired"))
+        s.foreignPartsOnly = j.bool(j.get(a, "foreign_parts_only"))
+        s.hd = j.bool(j.get(a, "hd"))
+        s.aiTranslated = j.bool(j.get(a, "ai_translated"))
+        s.machineTranslated = j.bool(j.get(a, "machine_translated"))
+        s.fromTrusted = j.bool(j.get(a, "from_trusted"))
+        s.hashMatch = j.bool(j.get(a, "moviehash_match"))
+        s.uploadDate = j.string(j.get(a, "upload_date"))
+        s.uploader = j.string(j.get(j.get(a, "uploader"), "name"))
+        s.url = j.string(j.get(a, "url"))
+        let fd = j.get(a, "feature_details")
+        if fd >= 0 {
+            s.title = j.string(j.get(fd, "title"))
+            if s.title.isEmpty {
+                s.title = j.string(j.get(fd, "movie_name"))
+            }
+            let parent = j.string(j.get(fd, "parent_title"))
+            if !parent.isEmpty && !s.title.contains(parent) {
+                s.title = parent + " – " + s.title
+            }
+            s.year = j.int(j.get(fd, "year"))
+            s.season = j.int(j.get(fd, "season_number"))
+            s.episode = j.int(j.get(fd, "episode_number"))
+            s.featureType = j.string(j.get(fd, "feature_type"))
+            s.imdbId = j.int(j.get(fd, "imdb_id"))
+        }
+        for f in j.children(j.get(a, "files")) {
+            let id = j.int(j.get(f, "file_id"))
+            if id > 0 {
+                s.files.append(OsFile(fileId: id, cdNumber: max(1, j.int(j.get(f, "cd_number"))), fileName: j.string(j.get(f, "file_name"))))
+            }
+        }
+        r.subtitles.append(s)
+    }
+    Result.ok(value: r)
+}
+
+// A download answer.
+public fn osReadDownload(status: Int, text: String) -> Result<OsDownload> {
+    if !osOk(status) {
+        return .failure(error: osError(status: status, text: text))
+    }
+    let j = try osParseJson(text)
+    var d = OsDownload()
+    d.link = j.string(j.get(0, "link"))
+    d.fileName = j.string(j.get(0, "file_name"))
+    d.requests = j.int(j.get(0, "requests"))
+    if j.get(0, "remaining") >= 0 {
+        d.remaining = j.int(j.get(0, "remaining"))
+    }
+    d.message = j.string(j.get(0, "message"))
+    d.resetTime = j.string(j.get(0, "reset_time_utc"))
+    if d.resetTime.isEmpty {
+        d.resetTime = j.string(j.get(0, "reset_time"))
+    }
+    if d.link.isEmpty {
+        return .failure(error: Error(if d.message.isEmpty { "OpenSubtitles gave no download link" } else { "OpenSubtitles: {d.message}" }))
+    }
+    Result.ok(value: d)
+}
+
+// Search results in the order to offer them: made for this file (hash
+// match) first, then by the preferred languages (first is best), then
+// human translations before machine ones, then trusted uploaders, then
+// by downloads.
+public fn osRank(_ subs: [OsSubtitle], languages: [String] = []) -> [OsSubtitle] {
+    var prefs: [String] = []
+    for l in languages {
+        prefs.append(l.lowercase())
+    }
+    subs.sorted(by: { a, b in osBefore(a, b, prefs) })
+}
+
+fn osLangRank(_ l: String, _ prefs: [String]) -> Int {
+    let t = l.lowercase()
+    for (i, p) in prefs.enumerated() {
+        if t == p || languageCode(t) == languageCode(p) {
+            return i
+        }
+    }
+    prefs.count
+}
+
+fn osBefore(_ a: OsSubtitle, _ b: OsSubtitle, _ prefs: [String]) -> Bool {
+    if a.hashMatch != b.hashMatch {
+        return a.hashMatch
+    }
+    let la = osLangRank(a.language, prefs)
+    let lb = osLangRank(b.language, prefs)
+    if la != lb {
+        return la < lb
+    }
+    let ma = a.machineTranslated || a.aiTranslated
+    let mb = b.machineTranslated || b.aiTranslated
+    if ma != mb {
+        return !ma
+    }
+    if a.fromTrusted != b.fromTrusted {
+        return a.fromTrusted
+    }
+    a.downloads > b.downloads
+}
+
+// Where to save a downloaded subtitle so siblingFiles finds it next time:
+// beside the video, "<video name>.<language>.<extension of the file>".
+public fn osSavePath(videoPath: String, _ sub: OsSubtitle, fileName: String = "") -> String {
+    let name = videoPath.fileName
+    let base = if let dot = name.findLast(".") { name.substring(from: 0, to: dot) } else { name }
+    var ext = fileName.fileExtension.lowercase()
+    if ext.isEmpty || !isSubtitleFile("x." + ext) {
+        ext = "srt"
+    }
+    let lang = if sub.language.isEmpty { "" } else { "." + sub.language.lowercase() }
+    joinPath(videoPath.folder, base + lang + "." + ext)
+}
+
+// A search from what the player knows: the hash of the file, and a
+// query (with season and episode) guessed from its name.
+public fn osQueryFor(videoPath: String, file: Data, languages: [String] = []) -> OsQuery {
+    var q = OsQuery(movieHash: movieHash(file), languages: languages)
+    let (title, season, episode) = osGuessTitle(videoPath.fileName)
+    q.query = title
+    q.season = season
+    q.episode = episode
+    if season > 0 || episode > 0 {
+        q.type = "episode"
+    }
+    q
+}
+
+// A title and season/episode from a file name like
+// "The.Show.S02E05.720p.WEB.mkv" or "Movie Name (2019) 1080p.mp4":
+// separators to spaces, cut at the first SxxEyy, year, resolution or
+// source word.
+public fn osGuessTitle(_ fileName: String) -> (String, Int, Int) {
+    let base = if let dot = fileName.findLast(".") { fileName.substring(from: 0, to: dot) } else { fileName }
+    let words = sibTokens(base)
+    var title: [String] = []
+    var season = 0
+    var episode = 0
+    let stops = ["720p", "1080p", "2160p", "480p", "4k", "uhd", "hdr", "bluray", "bdrip", "brrip", "webrip", "web", "webdl", "hdtv", "dvdrip", "x264", "x265", "h264", "hevc", "xvid", "proper", "repack", "extended", "remastered", "imax"]
+    for w in words {
+        let l = w.lowercase()
+        // S02E05
+        if l.count >= 4 && l.hasPrefix("s") && l.contains("e") {
+            let e = l.find("e") ?? 0
+            let sNum = Int(l.substring(from: 1, to: e)) ?? -1
+            let eNum = Int(l.substring(from: e + 1, to: l.count)) ?? -1
+            if sNum >= 0 && eNum >= 0 {
+                season = sNum
+                episode = eNum
+                break
+            }
+        }
+        // 2x05
+        if let x = l.find("x") {
+            let sNum = Int(l.substring(from: 0, to: x)) ?? -1
+            let eNum = Int(l.substring(from: x + 1, to: l.count)) ?? -1
+            if sNum > 0 && sNum < 100 && eNum >= 0 && x > 0 {
+                season = sNum
+                episode = eNum
+                break
+            }
+        }
+        if l.count == 4 && (l.hasPrefix("19") || l.hasPrefix("20")) && Int(l) != nil && !title.isEmpty {
+            break
+        }
+        if stops.contains(l) && !title.isEmpty {
+            break
+        }
+        title.append(w)
+    }
+    (title.joined(separator: " "), season, episode)
+}
+
+// ---- sending (thin wrappers around `request`) ----
+
+// Sends a call; `done` gets the status (0 when there was no answer) and
+// the body text (or the reason there was no answer).
+public fn osSend(_ call: HttpCall, done: fn(Int, String)) {
+    request(url: call.url, method: call.method, headers: call.headers, body: call.body) { r in
+        done(r.status, if r.status == 0 { r.error } else { r.text })
+    }
+}
+
+// Logs in; `done` gets the client with its token (keep it for downloads).
+public fn opensubtitlesLogin(_ c: OsClient, username: String, password: String, done: fn(Result<OsClient>)) {
+    osSend(osLoginCall(c, username: username, password: password)) { status, text in
+        done(osReadLogin(c, status: status, text: text))
+    }
+}
+
+// Searches; `done` gets the results ranked by osRank.
+public fn opensubtitlesSearch(_ c: OsClient, _ q: OsQuery, done: fn(Result<OsSearchResult>)) {
+    osSend(osSearchCall(c, q)) { status, text in
+        match osReadSearch(status: status, text: text) {
+            .ok(r) -> {
+                var ranked = r
+                ranked.subtitles = osRank(r.subtitles, languages: q.languages)
+                done(.ok(value: ranked))
+            }
+            .failure(e) -> done(.failure(error: e))
+        }
+    }
+}
+
+// Asks for a file's download link, then downloads it to `path`; `done`
+// gets the download answer (with the downloads left today).
+public fn opensubtitlesDownload(_ c: OsClient, fileId: Int, path: String, done: fn(Result<OsDownload>)) {
+    osSend(osDownloadCall(c, fileId: fileId)) { status, text in
+        match osReadDownload(status: status, text: text) {
+            .ok(d) -> {
+                download(url: d.link, to: path) { ok in
+                    if ok {
+                        done(.ok(value: d))
+                    } else {
+                        done(.failure(error: Error("the subtitle file couldn't be downloaded")))
+                    }
+                }
+            }
+            .failure(e) -> done(.failure(error: e))
+        }
+    }
+}
+
+// ---- a small JSON reader ----
+
+// A parsed JSON document as a flat tree: node 0 is the root; each node has
+// a kind, a value, its key (inside an object), its first child and next
+// sibling. Lookups of missing things give −1, and reading −1 gives empty
+// values, so chains like j.get(j.get(0, "a"), "b") never fail.
+public struct OsJson {
+    // 0 null, 1 false, 2 true, 3 number, 4 string, 5 array, 6 object.
+    kind: [Int] = []
+    num: [Float] = []
+    str: [String] = []
+    key: [String] = []
+    first: [Int] = []
+    next: [Int] = []
+
+    // The member of an object by key; −1 if there's none.
+    fn get(_ node: Int, _ k: String) -> Int {
+        if node < 0 || node >= kind.count || kind[node] != 6 {
+            return -1
+        }
+        var c = first[node]
+        while c >= 0 {
+            if key[c] == k {
+                return c
+            }
+            c = next[c]
+        }
+        -1
+    }
+
+    // The items of an array or members of an object.
+    fn children(_ node: Int) -> [Int] {
+        var out: [Int] = []
+        if node < 0 || node >= kind.count {
+            return out
+        }
+        var c = first[node]
+        while c >= 0 {
+            out.append(c)
+            c = next[c]
+        }
+        out
+    }
+
+    // A string, or a number/bool written as text; "" otherwise.
+    fn string(_ node: Int) -> String {
+        if node < 0 || node >= kind.count {
+            return ""
+        }
+        match kind[node] {
+            4 -> str[node]
+            3 -> {
+                let v = num[node]
+                if v == floor(v) && abs(v) < 1.0e15 { "{Int(v)}" } else { "{v}" }
+            }
+            2 -> "true"
+            1 -> "false"
+            _ -> ""
+        }
+    }
+
+    fn number(_ node: Int) -> Float {
+        if node < 0 || node >= kind.count {
+            return 0.0
+        }
+        match kind[node] {
+            3 -> num[node]
+            4 -> Float(str[node].trim()) ?? 0.0
+            2 -> 1.0
+            _ -> 0.0
+        }
+    }
+
+    fn int(_ node: Int) -> Int {
+        let v = number(node)
+        if abs(v) < 9.0e18 { Int(v) } else { 0 }
+    }
+
+    fn bool(_ node: Int) -> Bool {
+        if node < 0 || node >= kind.count {
+            return false
+        }
+        match kind[node] {
+            2 -> true
+            3 -> num[node] != 0.0
+            4 -> str[node] == "true" || str[node] == "1"
+            _ -> false
+        }
+    }
+}
+
+struct OsJsonParser {
+    d: Data
+    pos: Int = 0
+    j: OsJson = OsJson()
+    failed: String = ""
+
+    fn node(_ kind: Int, _ key: String) -> Int {
+        j.kind.append(kind)
+        j.num.append(0.0)
+        j.str.append("")
+        j.key.append(key)
+        j.first.append(-1)
+        j.next.append(-1)
+        j.kind.count - 1
+    }
+
+    fn space() {
+        while pos < d.count {
+            let b = d[pos]
+            if b == 0x20 || b == 0x09 || b == 0x0A || b == 0x0D {
+                pos += 1
+            } else {
+                break
+            }
+        }
+    }
+
+    fn fail(_ why: String) -> Int {
+        if failed.isEmpty {
+            failed = "{why} at byte {pos}"
+        }
+        pos = d.count
+        -1
+    }
+
+    // RFC 8259 §4–7: one value, its node index.
+    fn value(_ key: String, depth: Int) -> Int {
+        space()
+        if pos >= d.count {
+            return fail("unexpected end")
+        }
+        if depth > 200 {
+            return fail("nested too deep")
+        }
+        let b = d[pos]
+        if b == 0x7B {
+            pos += 1
+            let n = node(6, key)
+            var last = -1
+            space()
+            if pos < d.count && d[pos] == 0x7D {
+                pos += 1
+                return n
+            }
+            while pos < d.count {
+                space()
+                if pos >= d.count || d[pos] != 0x22 {
+                    return fail("expected a key")
+                }
+                let k = text()
+                space()
+                if pos >= d.count || d[pos] != 0x3A {
+                    return fail("expected ':'")
+                }
+                pos += 1
+                let c = value(k, depth: depth + 1)
+                if c < 0 {
+                    return -1
+                }
+                if last < 0 { j.first[n] = c } else { j.next[last] = c }
+                last = c
+                space()
+                if pos < d.count && d[pos] == 0x2C {
+                    pos += 1
+                    continue
+                }
+                if pos < d.count && d[pos] == 0x7D {
+                    pos += 1
+                    return n
+                }
+                return fail("expected ',' or '}'")
+            }
+            return fail("unclosed object")
+        }
+        if b == 0x5B {
+            pos += 1
+            let n = node(5, key)
+            var last = -1
+            space()
+            if pos < d.count && d[pos] == 0x5D {
+                pos += 1
+                return n
+            }
+            while pos < d.count {
+                let c = value("", depth: depth + 1)
+                if c < 0 {
+                    return -1
+                }
+                if last < 0 { j.first[n] = c } else { j.next[last] = c }
+                last = c
+                space()
+                if pos < d.count && d[pos] == 0x2C {
+                    pos += 1
+                    continue
+                }
+                if pos < d.count && d[pos] == 0x5D {
+                    pos += 1
+                    return n
+                }
+                return fail("expected ',' or ']'")
+            }
+            return fail("unclosed array")
+        }
+        if b == 0x22 {
+            let s = text()
+            let n = node(4, key)
+            j.str[n] = s
+            return n
+        }
+        if word("true") {
+            return node(2, key)
+        }
+        if word("false") {
+            return node(1, key)
+        }
+        if word("null") {
+            return node(0, key)
+        }
+        if b == 0x2D || (b >= 0x30 && b <= 0x39) {
+            let start = pos
+            pos += 1
+            while pos < d.count {
+                let c = d[pos]
+                if (c >= 0x30 && c <= 0x39) || c == 0x2E || c == 0x65 || c == 0x45 || c == 0x2B || c == 0x2D {
+                    pos += 1
+                } else {
+                    break
+                }
+            }
+            let t = d.slice(from: start, to: pos).text ?? ""
+            let n = node(3, key)
+            j.num[n] = Float(t) ?? 0.0
+            return n
+        }
+        fail("unexpected character")
+    }
+
+    fn word(_ w: String) -> Bool {
+        let wd = Data(text: w)
+        if pos + wd.count > d.count {
+            return false
+        }
+        for i in 0..wd.count {
+            if d[pos + i] != wd[i] {
+                return false
+            }
+        }
+        pos += wd.count
+        true
+    }
+
+    // A string at pos (which is its opening quote), with its escapes.
+    fn text() -> String {
+        pos += 1
+        var out = Data()
+        while pos < d.count {
+            let b = d[pos]
+            if b == 0x22 {
+                pos += 1
+                return out.text ?? out.latin1
+            }
+            if b == 0x5C && pos + 1 < d.count {
+                let e = d[pos + 1]
+                pos += 2
+                if e == 0x6E { out.append(byte: 0x0A) }
+                else if e == 0x74 { out.append(byte: 0x09) }
+                else if e == 0x72 { out.append(byte: 0x0D) }
+                else if e == 0x62 { out.append(byte: 0x08) }
+                else if e == 0x66 { out.append(byte: 0x0C) }
+                else if e == 0x75 {
+                    var cp = hex4()
+                    if cp >= 0xD800 && cp < 0xDC00 && pos + 1 < d.count && d[pos] == 0x5C && d[pos + 1] == 0x75 {
+                        pos += 2
+                        let lo = hex4()
+                        if lo >= 0xDC00 && lo < 0xE000 {
+                            cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00)
+                        } else {
+                            cp = 0xFFFD
+                        }
+                    }
+                    out.append(Data(text: charOf(cp)))
+                } else {
+                    out.append(byte: e)
+                }
+                continue
+            }
+            out.append(byte: b)
+            pos += 1
+        }
+        out.text ?? out.latin1
+    }
+
+    fn hex4() -> Int {
+        var v = 0
+        for _ in 0..4 {
+            if pos >= d.count {
+                return 0xFFFD
+            }
+            let b = d[pos]
+            var x = -1
+            if b >= 0x30 && b <= 0x39 { x = b - 0x30 }
+            else if b >= 0x61 && b <= 0x66 { x = b - 0x61 + 10 }
+            else if b >= 0x41 && b <= 0x46 { x = b - 0x41 + 10 }
+            if x < 0 {
+                return 0xFFFD
+            }
+            v = v * 16 + x
+            pos += 1
+        }
+        v
+    }
+}
+
+// Parses JSON text (RFC 8259).
+public fn osParseJson(_ text: String) -> Result<OsJson> {
+    var p = OsJsonParser(d: Data(text: text))
+    let root = p.value("", depth: 0)
+    p.space()
+    if root < 0 || !p.failed.isEmpty {
+        return .failure(error: Error("the answer isn't valid JSON: {p.failed}"))
+    }
+    if p.pos < p.d.count {
+        return .failure(error: Error("the answer isn't valid JSON: more after the end"))
+    }
+    Result.ok(value: p.j)
+}

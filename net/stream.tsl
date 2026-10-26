@@ -1,0 +1,534 @@
+// Segments to packets: a StreamBuffer collects downloaded HLS/DASH
+// segments (MPEG-TS, fragmented MP4 with its init segment, packed audio)
+// into one growing byte store plus a core.Media whose packets point into
+// it, on one continuous timeline. The player treats `file` and `media`
+// like a file it opened, and keeps adding segments as they arrive.
+//
+// Each segment is opened with demux.open (the same TS and MP4 parsers as
+// for files). Its packets' times are moved onto the presentation
+// timeline: segments of one timeline (an HLS discontinuity sequence, a
+// DASH period) keep their own timestamps, shifted by one offset fixed at
+// the timeline's first segment so that it starts at the playlist's time
+// for it. MPEG-TS timestamps that wrap at 2^33 (ISO/IEC 13818-1 §2.4.3.7)
+// are unwrapped. Packed audio segments (RFC 8216 §3.4) take their start
+// from the ID3 PRIV com.apple.streaming.transportStreamTimestamp frame.
+//
+// Old segments can be dropped to bound memory: the store is compacted and
+// packet offsets rebased; `rebase(index)` tells the player where its next
+// packet index went.
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+import "../core"
+import "../demux"
+
+public struct BufferedSegment {
+    // Bytes in StreamBuffer.file.
+    from: Int
+    to: Int
+    // Seconds on the presentation timeline.
+    start: Float
+    end: Float
+    // The caller's numbers: stream (0 main, 1 alternative audio, …),
+    // sequence (HLS media sequence / DASH segment number), timeline.
+    stream: Int = 0
+    sequence: Int = -1
+    timeline: Int = 0
+    // Its packets: media.packets[firstPacket ..< firstPacket+packetCount].
+    firstPacket: Int = 0
+    packetCount: Int = 0
+}
+
+// A track's codec setup changed (an ABR switch to a variant with other
+// parameter sets): decoders of that track must be made again from
+// `media.tracks[track]` before decoding packet `packet`.
+public struct TrackChange {
+    track: Int
+    packet: Int
+}
+
+public struct StreamBuffer {
+    file: Data = Data()
+    media: core.Media = core.Media(format: "stream")
+    segments: [BufferedSegment] = []
+    // Packets removed by drops so far, and the indexes (before the last
+    // drop) of the packets that drop removed, sorted.
+    droppedPackets: Int = 0
+    lastRemoved: [Int] = []
+    changes: [TrackChange] = []
+    // No more segments will come (VOD fully loaded, or a live stream that
+    // ended).
+    ended: Bool = false
+    // Timeline offsets (seconds added to a segment's own timestamps).
+    timelineIds: [Int] = []
+    timelineOffsets: [Float] = []
+    // For each track: "stream/kind/ordinal", to match tracks of later
+    // segments to it.
+    trackKeys: [String] = []
+    // Per track: the stream it belongs to.
+    trackStreams: [Int] = []
+    // MPEG-TS wrap handling: per timeline id, the wrap count in use.
+    wrapIds: [Int] = []
+    wraps: [Int] = []
+    warnings: [String] = []
+
+    // Bytes held.
+    size: Int { file.count }
+
+    // Adds one segment. `bytes` is the segment as downloaded (decrypted),
+    // `init` its initialisation section (fMP4 init segment or EXT-X-MAP)
+    // or empty; `start` and `duration` its place on the timeline (from
+    // the playlist / MPD); `timeline` the HLS discontinuity sequence or
+    // DASH period index; `stream` which of the caller's streams it belongs
+    // to (main variant 0, separate audio 1, …); `name` the URL (helps
+    // demux tell raw formats apart).
+    fn append(_ bytes: Data, init: Data = Data(), start: Float, duration: Float, timeline: Int = 0, stream: Int = 0, sequence: Int = -1, name: String = "") -> Error? {
+        if bytes.isEmpty {
+            return Error("an empty segment")
+        }
+        let initFixed = streamFixInit(init)
+        let seg0 = streamPadTs(bytes)
+        let whole = if initFixed.isEmpty { seg0 } else { initFixed + seg0 }
+        var seg = core.Media()
+        match demux.open(whole, name: name) {
+            .ok(m) -> {
+                seg = m
+            }
+            .failure(e) -> {
+                return Error("segment {sequence}: {e.message}")
+            }
+        }
+        if media.tracks.isEmpty {
+            media.format = seg.format
+            media.tags = seg.tags
+        }
+        for w in seg.warnings {
+            if warnings.count < 50 {
+                warnings.append(w)
+            }
+        }
+        // Map the segment's tracks onto ours.
+        var map: [Int] = []
+        var ordinals: [Int] = [0, 0, 0, 0]
+        for t in seg.tracks {
+            let k = streamKindIndex(t.kind)
+            let key = "{stream}/{k}/{ordinals[k]}"
+            ordinals[k] += 1
+            var found = -1
+            for (i, tk) in trackKeys.enumerated() {
+                if tk == key {
+                    found = i
+                    break
+                }
+            }
+            if found < 0 {
+                var nt = t
+                nt.index = media.tracks.count
+                found = media.tracks.count
+                media.tracks.append(nt)
+                trackKeys.append(key)
+                trackStreams.append(stream)
+            } else {
+                let old = media.tracks[found]
+                if old.codec != t.codec || old.extra != t.extra || old.width != t.width || old.height != t.height || old.sampleRate != t.sampleRate || old.channels != t.channels {
+                    var nt = t
+                    nt.index = found
+                    nt.timescale = old.timescale
+                    media.tracks[found] = nt
+                    changes.append(TrackChange(track: found, packet: media.packets.count))
+                }
+            }
+            map.append(found)
+        }
+        // Packed audio: the ID3 timestamp says where the segment starts.
+        var rawStart = -1
+        if seg.format != "ts" && seg.format != "mp4" {
+            rawStart = id3TransportTimestamp(seg0)
+        }
+        // The segment's earliest time (seconds, its own clock).
+        var first = 1e300
+        for p in seg.packets {
+            let t = seg.tracks[p.track]
+            if p.pts == core.noTime || (t.kind != core.TrackKind.video && t.kind != core.TrackKind.audio) {
+                continue
+            }
+            let s = core.seconds(p.pts, t.timescale)
+            if s < first {
+                first = s
+            }
+        }
+        if first > 1e299 {
+            first = 0.0
+        }
+        if rawStart >= 0 {
+            first += Float(rawStart) / 90000.0
+        }
+        // TS wrap: 2^33 ticks of 90 kHz.
+        let isTs = seg.format == "ts"
+        let wrapSecs = 8589934592.0 / 90000.0
+        var wrap = 0
+        var wi = -1
+        for (i, id) in wrapIds.enumerated() {
+            if id == timeline {
+                wi = i
+            }
+        }
+        if wi >= 0 {
+            wrap = wraps[wi]
+        }
+        // The timeline's offset.
+        var ti = -1
+        for (i, id) in timelineIds.enumerated() {
+            if id == timeline {
+                ti = i
+            }
+        }
+        if ti < 0 {
+            timelineIds.append(timeline)
+            timelineOffsets.append(start - first)
+            ti = timelineIds.count - 1
+        }
+        var offset = timelineOffsets[ti]
+        if isTs {
+            var mapped = first + Float(wrap) * wrapSecs + offset
+            while mapped < start - wrapSecs / 2.0 {
+                wrap += 1
+                mapped += wrapSecs
+            }
+            if wi < 0 {
+                wrapIds.append(timeline)
+                wraps.append(wrap)
+            } else {
+                wraps[wi] = wrap
+            }
+        }
+        let shiftSecs = offset + Float(wrap) * (if isTs { wrapSecs } else { 0.0 })
+        let landed = first + shiftSecs
+        // Timestamps far from where the playlist puts the segment, without
+        // a discontinuity: re-anchor this timeline.
+        let slack = max(10.0, 3.0 * duration)
+        if abs(landed - start) > slack {
+            warnings.append("segment {sequence}: timestamps {landed} s don't match the playlist's {start} s; re-anchored")
+            timelineOffsets[ti] = start - first - Float(wrap) * (if isTs { wrapSecs } else { 0.0 })
+            offset = timelineOffsets[ti]
+        }
+        let shift = offset + Float(wrap) * (if isTs { wrapSecs } else { 0.0 }) + (if rawStart >= 0 { Float(rawStart) / 90000.0 } else { 0.0 })
+        // Append the bytes (init excluded) and the packets.
+        let base = file.count - (whole.count - seg0.count)
+        file.append(seg0)
+        let firstPacket = media.packets.count
+        var count = 0
+        for p in seg.packets {
+            let ti2 = map[p.track]
+            let own = seg.tracks[p.track]
+            let dst = media.tracks[ti2]
+            if p.offset < whole.count - seg0.count {
+                continue
+            }
+            var q = p
+            q.track = ti2
+            q.offset = p.offset + base
+            if !p.parts.isEmpty {
+                var parts = p.parts
+                var k = 0
+                while k < parts.count {
+                    parts[k] += base
+                    k += 2
+                }
+                q.parts = parts
+            }
+            let add = Int(shift * Float(own.timescale) + (if shift >= 0.0 { 0.5 } else { -0.5 }))
+            if p.pts != core.noTime {
+                q.pts = streamRescale(p.pts + add, own.timescale, dst.timescale)
+            }
+            if p.dts != core.noTime {
+                q.dts = streamRescale(p.dts + add, own.timescale, dst.timescale)
+            }
+            q.duration = streamRescale(p.duration, own.timescale, dst.timescale)
+            media.packets.append(q)
+            count += 1
+        }
+        segments.append(BufferedSegment(from: base + (whole.count - seg0.count), to: file.count, start: start, end: start + duration, stream: stream, sequence: sequence, timeline: timeline, firstPacket: firstPacket, packetCount: count))
+        nil
+    }
+
+    // Where the buffered segments of a stream end (seconds), or -1.
+    fn bufferedEnd(stream: Int = 0) -> Float {
+        var e = -1.0
+        for s in segments {
+            if s.stream == stream && s.end > e {
+                e = s.end
+            }
+        }
+        e
+    }
+
+    // Seconds buffered ahead of `position`: the least over the streams
+    // that have segments.
+    fn bufferedSeconds(at: Float) -> Float {
+        var least = -1.0
+        var seen: [Int] = []
+        for s in segments {
+            if seen.contains(s.stream) {
+                continue
+            }
+            seen.append(s.stream)
+            let e = bufferedEnd(stream: s.stream) - at
+            if least < 0.0 || e < least {
+                least = e
+            }
+        }
+        max(0.0, least)
+    }
+
+    // The earliest buffered time, or -1.
+    bufferedStart: Float {
+        var b = -1.0
+        for s in segments {
+            if b < 0.0 || s.start < b {
+                b = s.start
+            }
+        }
+        b
+    }
+
+    // Whether a segment (stream + sequence) is held already.
+    fn has(stream: Int, sequence: Int) -> Bool {
+        segments.any(where: { s in s.stream == stream && s.sequence == sequence })
+    }
+
+    // Drops segments that end at or before `seconds` (keeping the store
+    // small for long and live streams). Gives the number of packets
+    // removed; afterwards `rebase(i)` maps old packet indexes to new.
+    fn dropBefore(_ seconds: Float) -> Int {
+        var keep: [Bool] = []
+        var any = false
+        for s in segments {
+            let k = s.end > seconds
+            keep.append(k)
+            if !k {
+                any = true
+            }
+        }
+        if !any {
+            lastRemoved = []
+            return 0
+        }
+        var newFile = Data()
+        var newSegs: [BufferedSegment] = []
+        var newPackets: [core.PacketRef] = []
+        var removed: [Int] = []
+        for (i, s) in segments.enumerated() {
+            if !keep[i] {
+                for k in s.firstPacket..s.firstPacket + s.packetCount {
+                    removed.append(k)
+                }
+                continue
+            }
+            let shift = newFile.count - s.from
+            newFile.append(file.slice(from: s.from, to: s.to))
+            var ns = s
+            ns.from = s.from + shift
+            ns.to = s.to + shift
+            ns.firstPacket = newPackets.count
+            for k in s.firstPacket..s.firstPacket + s.packetCount {
+                var p = media.packets[k]
+                p.offset += shift
+                if !p.parts.isEmpty {
+                    var parts = p.parts
+                    var j = 0
+                    while j < parts.count {
+                        parts[j] += shift
+                        j += 2
+                    }
+                    p.parts = parts
+                }
+                newPackets.append(p)
+            }
+            newSegs.append(ns)
+        }
+        // Track changes move with their packets.
+        var newChanges: [TrackChange] = []
+        removed = removed.sorted()
+        lastRemoved = removed
+        for c in changes {
+            let n = rebase(c.packet)
+            if n >= 0 {
+                newChanges.append(TrackChange(track: c.track, packet: n))
+            }
+        }
+        changes = newChanges
+        file = newFile
+        segments = newSegs
+        media.packets = newPackets
+        droppedPackets += removed.count
+        removed.count
+    }
+
+    // Where packet `index` (an index before the last dropBefore) is now;
+    // for a removed packet, the index of the next packet that stayed.
+    fn rebase(_ index: Int) -> Int {
+        // Count removed indexes below `index` (binary search).
+        var lo = 0
+        var hi = lastRemoved.count
+        while lo < hi {
+            let mid = (lo + hi) / 2
+            if lastRemoved[mid] < index {
+                lo = mid + 1
+            } else {
+                hi = mid
+            }
+        }
+        index - lo
+    }
+
+    // Empties the buffer (after a seek), keeping the tracks and timeline
+    // offsets so packets keep their meaning.
+    fn clear() {
+        let n = media.packets.count
+        lastRemoved = []
+        for i in 0..n {
+            lastRemoved.append(i)
+        }
+        droppedPackets += n
+        file = Data()
+        segments = []
+        media.packets = []
+        changes = []
+        ended = false
+    }
+
+    // The tracks of one of the caller's streams.
+    fn tracksOf(stream: Int) -> [Int] {
+        var out: [Int] = []
+        for (i, s) in trackStreams.enumerated() {
+            if s == stream {
+                out.append(i)
+            }
+        }
+        out
+    }
+}
+
+// Workaround (see build/NEEDED.md "net: mp4"): an fMP4 init segment's
+// edit list may give the media edit a segment_duration of 0, which in a
+// fragmented file means "to the end of the fragments" (ISO/IEC 14496-12
+// §8.6.6: the duration of the media isn't known when the init is
+// written); demux/mp4.tsl takes the edits' sum as the end and drops
+// every fragment sample after it. Such durations are made very long.
+fn streamFixInit(_ d: Data) -> Data {
+    if d.count < 16 {
+        return d
+    }
+    var out = Data()
+    var copied = 0
+    var i = 4
+    let n = d.count
+    while i + 12 <= n {
+        if d[i] == 0x65 && d[i + 1] == 0x6c && d[i + 2] == 0x73 && d[i + 3] == 0x74 {
+            let size = d.uint32(at: i - 4, bigEndian: true)
+            let version = d[i + 4]
+            let count = d.uint32(at: i + 8, bigEndian: true)
+            let entry = if version == 1 { 20 } else { 12 }
+            if size >= 16 && i - 4 + size <= n && 16 + count * entry <= size {
+                var p = i + 12
+                for _ in 0..count {
+                    let time = if version == 1 { d.int64(at: p + 8, bigEndian: true) } else { d.int32(at: p + 4, bigEndian: true) }
+                    let dur = if version == 1 { d.int64(at: p, bigEndian: true) } else { d.uint32(at: p, bigEndian: true) }
+                    if time != -1 && dur == 0 {
+                        out.append(d.slice(from: copied, to: p))
+                        if version == 1 {
+                            out.append(Data(bytes: [0, 0, 0, 0, 0x7f, 0xff, 0xff, 0xff]))
+                            copied = p + 8
+                        } else {
+                            out.append(Data(bytes: [0x7f, 0xff, 0xff, 0xff]))
+                            copied = p + 4
+                        }
+                    }
+                    p += entry
+                }
+                i = i - 4 + size
+                continue
+            }
+        }
+        i += 1
+    }
+    if copied == 0 {
+        return d
+    }
+    out.append(d.slice(from: copied, to: n))
+    out
+}
+
+// Workaround (see build/NEEDED.md "net: ts"): demux/ts.tsl needs five
+// packets to find the sync; a short last segment (an audio tail) gets
+// null packets (PID 0x1FFF, ISO/IEC 13818-1 §2.4.3.3) added.
+fn streamPadTs(_ d: Data) -> Data {
+    if d.count == 0 || d[0] != 0x47 || d.count % 188 != 0 || d.count >= 188 * 6 {
+        return d
+    }
+    var out = d
+    var nullPacket = Data(bytes: [0x47, 0x1f, 0xff, 0x10])
+    for _ in 0..184 {
+        nullPacket.append(byte: 0xff)
+    }
+    while out.count < 188 * 6 {
+        out.append(nullPacket)
+    }
+    out
+}
+
+fn streamKindIndex(_ k: core.TrackKind) -> Int {
+    match k {
+        .video -> 0
+        .audio -> 1
+        .subtitle -> 2
+        .other -> 3
+    }
+}
+
+fn streamRescale(_ t: Int, _ from: Int, _ to: Int) -> Int {
+    if from == to {
+        return t
+    }
+    if t < 0 {
+        return -core.rescale(-t, from: from, to: to)
+    }
+    core.rescale(t, from: from, to: to)
+}
+
+// The 33-bit MPEG-TS timestamp in an ID3v2 PRIV frame owned by
+// "com.apple.streaming.transportStreamTimestamp" at the start of a packed
+// audio segment (RFC 8216 §3.4), or -1.
+public fn id3TransportTimestamp(_ d: Data) -> Int {
+    if d.count < 10 || d[0] != 0x49 || d[1] != 0x44 || d[2] != 0x33 {
+        return -1
+    }
+    let major = d[3]
+    let size = (d[6] << 21) | (d[7] << 14) | (d[8] << 7) | d[9]
+    let end = min(d.count, 10 + size)
+    var p = 10
+    let owner = "com.apple.streaming.transportStreamTimestamp"
+    while p + 10 <= end {
+        let id = d.slice(from: p, to: p + 4).latin1
+        var fs = d.uint32(at: p + 4, bigEndian: true)
+        if major == 4 {
+            fs = (d[p + 4] << 21) | (d[p + 5] << 14) | (d[p + 6] << 7) | d[p + 7]
+        }
+        if fs <= 0 {
+            break
+        }
+        let body = p + 10
+        if id == "PRIV" && body + owner.count + 1 + 8 <= end {
+            if d.slice(from: body, to: body + owner.count).latin1 == owner {
+                let q = body + owner.count + 1
+                let hi = d.uint32(at: q, bigEndian: true) & 1
+                let lo = d.uint32(at: q + 4, bigEndian: true)
+                return hi * 4294967296 + lo
+            }
+        }
+        p = body + fs
+    }
+    -1
+}

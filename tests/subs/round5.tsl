@@ -1,0 +1,375 @@
+// Round-5 tests of the subs module: text encodings (detection and
+// decoding of tests/subs/fixtures/enc, made by
+// build/scratch/subs/gen/gen_enc_fixtures.py with Python's codecs as the
+// encoder, the UTF-8 copies as the reference), styling and the secondary
+// track (drawn into PNGs whose pixels are checked), the OpenSubtitles
+// client (movie hash against a Python computation of the published
+// algorithm, requests, and answers read from mock JSON in
+// tests/subs/fixtures/os shaped like the API's documented ones — no
+// network), find in dialogue and the transcript, and sibling files.
+//
+// Each group returns its checks as (passed, what) pairs for main.
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+import "../../subs"
+import "../../core"
+
+let encDir = "tests/subs/fixtures/enc"
+let osDir = "tests/subs/fixtures/os"
+
+fn r5Near(_ a: Float, _ b: Float) -> Bool {
+    abs(a - b) < 0.0005
+}
+
+fn encodingChecks() -> [(Bool, String)] {
+    var out: [(Bool, String)] = []
+    // Every fixture: detection decodes it to the reference text, and the
+    // named encoding does too.
+    var detected = 0
+    var explicit = 0
+    var total = 0
+    var worst = 1.0
+    var names: [String] = []
+    let t0 = now()
+    for f in (listFolder(encDir) ?? []).sorted(by: { a, b in a < b }) {
+        if f.contains(".utf8.") {
+            continue
+        }
+        let parts = f.split(".")
+        let want = parts[1]
+        let bytes = readData(joinPath(encDir, f)) ?? Data()
+        let ref = readFile(joinPath(encDir, parts[0] + ".utf8.srt")) ?? "?"
+        total += 1
+        let g = subs.detectEncoding(bytes)
+        if subs.decodeAs(bytes, encoding: g.name) == ref {
+            detected += 1
+            worst = min(worst, g.confidence)
+        } else {
+            print("  {f}: detected {g.name} ({g.language}, {Int(g.confidence * 100.0)}%)")
+        }
+        if subs.decodeAs(bytes, encoding: want) == ref {
+            explicit += 1
+        } else {
+            print("  {f}: decodeAs {want} differs from the reference")
+        }
+        if subs.decodeText(bytes) == ref {
+            names.append(g.name)
+        }
+    }
+    let ms = (now() - t0) * 1000.0
+    out.append((total == 23 && detected == total, "encodings: {detected} of {total} fixtures detected and decoded right"))
+    out.append((explicit == total, "encodings: {explicit} of {total} fixtures decoded right by name"))
+    out.append((names.count == total, "decodeText detects all {total} fixtures"))
+    print("time detect + decode an encoding fixture: {Int(ms / Float(max(1, total)) / 3.0)} ms")
+    print("encodings: worst confidence of a right guess {Int(worst * 100.0)}%")
+
+    let ja = subs.detectEncoding(readData(joinPath(encDir, "ja.shift_jis.srt")) ?? Data())
+    out.append((ja.name == "shift_jis" && ja.language == "ja" && ja.confidence > 0.8, "Shift_JIS detected with confidence ({Int(ja.confidence * 100.0)}%)"))
+    let koi = subs.detectEncoding(readData(joinPath(encDir, "ru.koi8-r.srt")) ?? Data())
+    out.append((koi.name == "koi8-r" && koi.language == "ru", "KOI8-R told from Windows-1251 ({koi.name})"))
+    let gb = subs.detectEncoding(readData(joinPath(encDir, "zh-hans.gbk.srt")) ?? Data())
+    let b5 = subs.detectEncoding(readData(joinPath(encDir, "zh-hant.big5.srt")) ?? Data())
+    out.append((gb.name == "gbk" && b5.name == "big5", "GBK and Big5 told apart ({gb.name}, {b5.name})"))
+    let kr = subs.detectEncoding(readData(joinPath(encDir, "ko.euc-kr.srt")) ?? Data())
+    out.append((kr.name == "euc-kr" && kr.language == "ko", "EUC-KR detected"))
+
+    // Short and tricky samples.
+    out.append((subs.detectEncoding(Data(bytes: [0x49, 0x20, 0x64, 0x6F, 0x6E, 0x92, 0x74, 0x20, 0x6B, 0x6E, 0x6F, 0x77, 0x2E])).name == "windows-1252", "one curly apostrophe: Windows-1252"))
+    let privet = Data(bytes: [0xCF, 0xF0, 0xE8, 0xE2, 0xE5, 0xF2, 0x2C, 0x20, 0xEC, 0xE8, 0xF0, 0x21])
+    out.append((subs.detectEncoding(privet).name == "windows-1251" && subs.decodeAs(privet, encoding: "auto") == "Привет, мир!", "a short Windows-1251 line"))
+    out.append((subs.detectEncoding(Data(text: "plain ascii")).name == "utf-8" && subs.detectEncoding(Data(text: "plain ascii")).confidence == 1.0, "ASCII is UTF-8"))
+    var broken = Data(text: "Ça va très bien, merci ! Où êtes-vous allés ? Déjà vu. ".repeated(3))
+    broken.append(byte: 0xE9)
+    broken.append(Data(text: " fin"))
+    let bg = subs.detectEncoding(broken)
+    out.append((bg.name == "utf-8" && subs.decodeAs(broken, encoding: bg.name).contains(subs.charOf(0xFFFD)), "UTF-8 with one bad byte stays UTF-8 (got {bg.name})"))
+    // A language hint breaks a tie: "é" is the same in 1250 and 1252.
+    let tie = Data(bytes: [0x63, 0x61, 0x66, 0xE9])
+    out.append((subs.detectEncoding(tie, language: "cs").name == "windows-1250" && subs.detectEncoding(tie).name == "windows-1252", "language hint chooses Windows-1250"))
+    out.append((subs.detectEncoding(Data(bytes: [0xEF, 0xBB, 0xBF, 0x41])).bom && subs.detectEncoding(Data(bytes: [0xFF, 0xFE, 0x41, 0])).name == "utf-16le", "byte order marks"))
+
+    // Decoder corners from the WHATWG algorithms.
+    let gb4 = Data(bytes: [162, 227, 149, 50, 130, 54, 129, 48, 132, 54, 214, 208])
+    out.append((subs.decodeAs(gb4, encoding: "gb18030") == "€𠀀¥中", "GB18030 four-byte sequences (ranges index)"))
+    out.append((subs.decodeAs(Data(bytes: [0x88, 0x62, 0x41]), encoding: "big5") == "Ê" + subs.charOf(0x304) + "A", "Big5 pointer 1133 is two code points"))
+    out.append((subs.decodeAs(Data(bytes: [0xB1, 0xF0, 0x40, 0x82, 0xA0]), encoding: "shift_jis") == subs.charOf(0xFF71) + subs.charOf(0xE000) + "あ", "Shift_JIS half-width katakana, EUDC, hiragana"))
+    out.append((subs.decodeAs(Data(bytes: [0x8F, 0xB0, 0xA1, 0x8E, 0xB1]), encoding: "euc-jp") == "丂" + subs.charOf(0xFF71), "EUC-JP JIS X 0212 and half-width katakana"))
+    out.append((subs.decodeAs(Data(bytes: [0x82, 0x41, 0x82]), encoding: "shift_jis") == subs.charOf(0xFFFD) + "A" + subs.charOf(0xFFFD), "bad Shift_JIS pair: the ASCII byte is kept"))
+    out.append((subs.decodeAs(Data(bytes: [0xC3, 0x28, 0xF0, 0x9F, 0x98, 0x80]), encoding: "utf-8") == subs.charOf(0xFFFD) + "(" + subs.charOf(0x1F600), "UTF-8 replacement per sequence"))
+    out.append((subs.decodeAs(Data(bytes: [0xA4]), encoding: "iso-8859-15") == "€" && subs.decodeAs(Data(bytes: [0xA4]), encoding: "latin1") == "¤", "ISO 8859-15 vs 8859-1"))
+
+    // Names.
+    out.append((subs.encodingName("CP1251") == "windows-1251" && subs.encodingName("Shift-JIS") == "shift_jis" && subs.encodingName("latin2") == "iso-8859-2" && subs.encodingName("GB2312") == "gbk" && subs.encodingName("ks_c_5601-1987") == "euc-kr" && subs.encodingName("ISO8859-7") == "iso-8859-7" && subs.encodingName("bogus") == "" && subs.encodingName("") == "auto", "encoding labels"))
+    var allTitled = true
+    for n in subs.encodingList {
+        if subs.encodingTitle(n) == n || subs.encodingName(n) != n {
+            allTitled = false
+            print("  encoding {n} has no title or doesn't name itself")
+        }
+    }
+    out.append((allTitled && subs.encodingList.count == 36, "every listed encoding has a title"))
+
+    // Files.
+    if let t = subs.loadFile(joinPath(encDir, "ru.koi8-r.srt")).value() {
+        out.append((t.encoding == "koi8-r" && t.cues.count == 7 && subs.plainText(t.cues[0]) == "Где ты был вчера вечером?", "loadFile detects KOI8-R"))
+    } else {
+        out.append((false, "loadFile KOI8-R"))
+    }
+    if let t = subs.loadFile(joinPath(encDir, "ja.shift_jis.srt"), encoding: "Shift_JIS").value() {
+        out.append((t.encoding == "shift_jis" && t.encodingConfidence == 1.0 && subs.plainText(t.cues[6]) == "わかった、じゃあ後でね。", "loadFile with a chosen encoding"))
+    } else {
+        out.append((false, "loadFile Shift_JIS"))
+    }
+    let wrong = subs.parseBytes(readData(joinPath(encDir, "ru.windows-1251.srt")) ?? Data(), format: "srt", encoding: "koi8-r")
+    out.append((wrong.isOk() && subs.plainText(wrong.valueOr(subs.SubTrack()).cues.first ?? subs.Cue(start: 0, end: 0)) != "Где ты был вчера вечером?", "a wrong manual encoding is used as asked"))
+    out.append((!subs.parseBytes(Data(text: "x"), format: "srt", encoding: "nope").isOk(), "unknown encoding name fails"))
+    out
+}
+
+fn styleChecks() -> [(Bool, String)] {
+    var out: [(Bool, String)] = []
+    let srt = subs.parseText("1\n00:00:01,000 --> 00:00:04,000\nplain <font color=\"#ff0000\">red</font>\n\n2\n00:00:01,000 --> 00:00:04,000\n\{\\an8}up here\n", format: "srt").valueOr(subs.SubTrack())
+    let style = subs.TextStyle(scale: 1.5, color: 0xFFFF00FF, outline: 2.0, outlineColor: 0x102030FF, shadow: 1.0, background: 0x000000FF, backgroundOpacity: 0.5, bold: true, marginV: 0.1)
+    let st = subs.styleTrack(srt, style)
+    let c0 = st.cues[0]
+    out.append((c0.spans[0].color == 0xFFFF00FF && c0.spans[1].color == 0xFF0000FF, "style colour; the cue's own colour kept"))
+    out.append((c0.spans[0].outline == 0x102030FF && r5Near(c0.spans[0].border, 2.0 * subs.defaultBorder) && c0.spans[0].bold && r5Near(c0.spans[0].shadowDepth, subs.defaultBorder), "style outline, shadow, bold"))
+    out.append((r5Near(c0.fontSize, subs.defaultFontSize * 1.5) && r5Near(c0.marginV, 0.1) && c0.boxColor == 0x00000080, "style size, margin, background box"))
+    out.append((st.cues[1].align == 8 && srt.cues[0].spans[0].color == subs.white, "\{\\an8} stays at the top; the original track is unchanged"))
+    let top = subs.styleTrack(srt, subs.secondaryStyle())
+    out.append((top.cues[0].align == 8 && top.cues[1].align == 8 && r5Near(top.cues[0].fontSize, subs.defaultFontSize * 0.85), "secondary style moves bottom cues to the top"))
+    // ASS keeps its styles unless overriding.
+    let ass = subs.parseText("[Script Info]\nPlayResX: 384\nPlayResY: 288\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, OutlineColour, Bold, Alignment, MarginV\nStyle: Default,Arial,30,&H0000FF00,&H00000000,0,2,10\n\n[Events]\nFormat: Layer, Start, End, Style, Text\nDialogue: 0,0:00:01.00,0:00:04.00,Default,green\nDialogue: 0,0:00:01.00,0:00:04.00,Default,\{\\pos(100,100)}placed\n", format: "ass").valueOr(subs.SubTrack())
+    let kept = subs.styleTrack(ass, style)
+    out.append((kept.cues[0].spans[0].color == ass.cues[0].spans[0].color && kept.cues[0].boxColor == 0, "ASS styles kept without override"))
+    var over = style
+    over.overrideAss = true
+    let ov = subs.styleTrack(ass, over)
+    out.append((ov.cues[0].spans[0].color == 0xFFFF00FF && r5Near(ov.cues[0].fontSize, subs.defaultFontSize * 1.5) && ov.cues[0].boxColor != 0, "ASS overridden"))
+    out.append((r5Near(ov.cues[1].x, ass.cues[1].x) && r5Near(ov.cues[1].marginV, ass.cues[1].marginV), "override keeps \\pos"))
+    // Drawing: a yellow secondary at the top, the white primary at the
+    // bottom, a box behind a styled line.
+    let w = 480
+    let h = 270
+    let primary = subs.parseText("1\n00:00:01,000 --> 00:00:04,000\nPrimary line\n", format: "srt").valueOr(subs.SubTrack())
+    let second = subs.styleTrack(subs.parseText("1\n00:00:01,000 --> 00:00:04,000\nSecond line\n", format: "srt").valueOr(subs.SubTrack()), subs.TextStyle(color: 0xFFFF00FF, position: "top"))
+    let path = "build/scratch/subs/r5_two_tracks.png"
+    let ok = renderImage(path: path, width: Float(w), height: Float(h)) { g in
+        g.fillRect(x: 0, y: 0, width: g.width, height: g.height, color: .rgb(100, 100, 100))
+        subs.drawTracks(g, primary: primary.cues, secondary: second.cues, at: 2.0, x: 0, y: 0, width: g.width, height: g.height, scale: 1.5)
+    }
+    var px: [Int] = []
+    if ok {
+        if let (_, _, p) = readImage(path) {
+            px = p
+        }
+    }
+    var whiteBottom = 0
+    var whiteTop = 0
+    var yellowTop = 0
+    var yellowBottom = 0
+    if px.count == w * h {
+        for y in 0..h {
+            for x in 0..w {
+                let p = px[y * w + x]
+                let r = p >> 24 & 255
+                let gg = p >> 16 & 255
+                let b = p >> 8 & 255
+                let isW = r > 220 && gg > 220 && b > 220
+                let isY = r > 220 && gg > 220 && b < 60
+                if y > h / 2 {
+                    if isW { whiteBottom += 1 }
+                    if isY { yellowBottom += 1 }
+                } else {
+                    if isW { whiteTop += 1 }
+                    if isY { yellowTop += 1 }
+                }
+            }
+        }
+    }
+    out.append((whiteBottom > 100 && yellowTop > 100 && whiteTop == 0 && yellowBottom == 0, "two tracks: primary at the bottom, secondary at the top ({whiteBottom}, {yellowTop})"))
+    let boxed = subs.styleTrack(primary, subs.TextStyle(background: 0x000000FF, backgroundOpacity: 1.0))
+    let path2 = "build/scratch/subs/r5_box.png"
+    var dark = 0
+    let ok2 = renderImage(path: path2, width: Float(w), height: Float(h)) { g in
+        g.fillRect(x: 0, y: 0, width: g.width, height: g.height, color: .rgb(100, 100, 100))
+        subs.draw(g, boxed.cues, at: 2.0, x: 0, y: 0, width: g.width, height: g.height, scale: 1.5)
+    }
+    if ok2 {
+        if let (_, _, p) = readImage(path2) {
+            for v in p {
+                if (v >> 24 & 255) < 10 && (v >> 16 & 255) < 10 {
+                    dark += 1
+                }
+            }
+        }
+    }
+    out.append((dark > 2000, "background box drawn ({dark} dark pixels)"))
+    out
+}
+
+fn r5Text(_ name: String) -> String {
+    readFile(joinPath(osDir, name)) ?? ""
+}
+
+fn openSubtitlesChecks() -> [(Bool, String)] {
+    var out: [(Bool, String)] = []
+    // The hash of 150001 bytes from a simple LCG, against Python's
+    // computation of the published algorithm.
+    var bytes: [Int] = []
+    var x = 1
+    for _ in 0..150001 {
+        x = (x * 1103515245 + 12345) & 0x7FFFFFFF
+        bytes.append(x >> 16 & 255)
+    }
+    let file = Data(bytes: bytes)
+    out.append((subs.movieHash(file) == "7db30ea69b2d5777", "movie hash = the published algorithm ({subs.movieHash(file)})"))
+    out.append((subs.movieHash(Data(text: "small")) == "" && subs.movieHashOf(size: 150001, head: file.slice(from: 0, to: 65536), tail: file.slice(from: 150001 - 65536, to: 150001)) == "7db30ea69b2d5777", "hash from head and tail; small files have none"))
+
+    var c = subs.OsClient(apiKey: "KEY123", userAgent: "Reel v0.5")
+    let q = subs.OsQuery(movieHash: "7DB30EA69B2D5777", query: "Some Movie", languages: ["fr", "en", "pt-BR"], season: 1, episode: 2)
+    let call = subs.osSearchCall(c, q)
+    out.append((call.method == "GET" && call.url == "https://api.opensubtitles.com/api/v1/subtitles?episode_number=2&languages=en,fr,pt-br&moviehash=7db30ea69b2d5777&query=some%20movie&season_number=1", "search URL: parameters sorted, lower case ({call.url})"))
+    out.append((call.headers["Api-Key"] == "KEY123" && call.headers["User-Agent"] == "Reel v0.5" && call.headers["Authorization"] == nil, "search headers"))
+    let login = subs.osLoginCall(c, username: "ada", password: "p\"w")
+    out.append((login.method == "POST" && login.url.hasSuffix("/login") && login.body == "\{\"username\": \"ada\", \"password\": \"p\\\"w\"}", "login body ({login.body})"))
+    if let lc = subs.osReadLogin(c, status: 200, text: r5Text("login.json")).value() {
+        c = lc
+        out.append((c.token == "eyJhbGciOiJIUzI1NiJ9.e30.abc" && c.baseUrl == "https://vip-api.opensubtitles.com/api/v1" && c.user.allowedDownloads == 100 && c.user.userId == 66, "login answer: token, server, limits"))
+    } else {
+        out.append((false, "login answer read"))
+    }
+    let dl = subs.osDownloadCall(c, fileId: 4470123, format: "srt")
+    out.append((dl.url == "https://vip-api.opensubtitles.com/api/v1/download" && dl.body == "\{\"file_id\": 4470123, \"sub_format\": \"srt\"}" && dl.headers["Authorization"] == "Bearer eyJhbGciOiJIUzI1NiJ9.e30.abc", "download request with the token and the new server"))
+    match subs.osReadSearch(status: 200, text: r5Text("search.json")) {
+        .ok(r) -> {
+            out.append((r.totalCount == 3 && r.subtitles.count == 3, "search answer: 3 subtitles"))
+            let a = r.subtitles[0]
+            out.append((a.id == "4022384" && a.language == "fr" && a.downloads == 1520 && r5Near(a.fps, 23.976) && r5Near(a.rating, 8.5) && a.fromTrusted && a.hd && a.title == "Some Movie" && a.year == 2019 && a.season == 0 && a.imdbId == 1234567 && a.uploader == "subber", "search answer fields (nulls are fine)"))
+            out.append((a.files.count == 1 && a.files[0].fileId == 4470123 && a.files[0].fileName.hasSuffix(".fr.srt") && a.comments.contains("\"exactly\" à la"), "files and escaped text"))
+            out.append((r.subtitles[2].files.count == 2 && r.subtitles[2].files[1].cdNumber == 2 && r.subtitles[2].year == 2019 && r.subtitles[2].machineTranslated, "multi-CD, a year as text"))
+            let ranked = subs.osRank(r.subtitles, languages: ["en"])
+            out.append((ranked[0].id == "5001001" && ranked[1].id == "5001002", "ranking: hash match first"))
+            let byLang = subs.osRank([r.subtitles[0], r.subtitles[2]], languages: ["en", "fr"])
+            out.append((byLang[0].id == "5001002", "ranking: preferred language before human translation"))
+            let human = subs.osRank([r.subtitles[2], r.subtitles[0]], languages: ["fr", "en"])
+            out.append((human[0].id == "4022384", "ranking: preferred language"))
+            out.append((subs.osSavePath(videoPath: "/m/Some.Movie.2019.mkv", a, fileName: a.files[0].fileName) == "/m/Some.Movie.2019.fr.srt", "save path beside the video"))
+        }
+        .failure(e) -> out.append((false, "search answer: {e.message}"))
+    }
+    if let d = subs.osReadDownload(status: 200, text: r5Text("download.json")).value() {
+        out.append((d.link.hasPrefix("https://www.opensubtitles.com/download/") && d.remaining == 97 && d.requests == 3 && d.resetTime == "2026-10-27T00:00:00.000Z", "download answer"))
+    } else {
+        out.append((false, "download answer read"))
+    }
+    let e401 = subs.osReadSearch(status: 401, text: r5Text("error401.json"))
+    out.append((e401.error()?.message == "OpenSubtitles didn't accept the API key or login: You cannot consume this service", "401 with the server's message"))
+    let e406 = subs.osReadDownload(status: 406, text: r5Text("error406.json"))
+    out.append(((e406.error()?.message ?? "").hasPrefix("OpenSubtitles: download limit reached: You have downloaded"), "406 download limit"))
+    out.append(((subs.osReadSearch(status: 0, text: "offline").error()?.message ?? "") == "OpenSubtitles can't be reached: offline" && (subs.osReadSearch(status: 503, text: "<html>").error()?.message ?? "") == "OpenSubtitles is having problems (error 503)", "no answer, server error"))
+    out.append((!subs.osReadSearch(status: 200, text: "\{\"data\": [").isOk(), "broken JSON fails with a reason"))
+    if let langs = subs.osReadLanguages(status: 200, text: r5Text("languages.json")).value() {
+        out.append((langs.count == 3 && langs[1].0 == "pt-BR" && langs[1].1 == "Portuguese (BR)", "languages answer"))
+    } else {
+        out.append((false, "languages answer"))
+    }
+    // JSON corners.
+    if let j = subs.osParseJson("\{\"a\": [1, -2.5e2, true, null, \"\\u00e9\\ud83d\\ude00\\n\"], \"b\": \{\}, \"c\": \"x\"}").value() {
+        let a = j.children(j.get(0, "a"))
+        out.append((a.count == 5 && j.int(a[0]) == 1 && r5Near(j.number(a[1]), -250.0) && j.bool(a[2]) && j.string(a[3]) == "" && j.string(a[4]) == "é" + subs.charOf(0x1F600) + "\n" && j.get(j.get(0, "b"), "x") == -1 && j.string(j.get(0, "c")) == "x", "JSON reader"))
+    } else {
+        out.append((false, "JSON reader"))
+    }
+    let (t1, s1, e1) = subs.osGuessTitle("The.Show.S02E05.720p.WEB.mkv")
+    let (t2, s2, e2) = subs.osGuessTitle("Movie Name (2019) 1080p.mp4")
+    let (t3, s3, e3) = subs.osGuessTitle("show_name_3x07.avi")
+    out.append((t1 == "the show" && s1 == 2 && e1 == 5 && t2 == "movie name" && s2 == 0 && e2 == 0 && t3 == "show name" && s3 == 3 && e3 == 7, "titles from file names ({t1}|{s1}|{e1}, {t2}, {t3}|{s3}|{e3})"))
+    let fq = subs.osQueryFor(videoPath: "/v/The.Show.S02E05.mkv", file: file, languages: ["en"])
+    out.append((fq.movieHash == "7db30ea69b2d5777" && fq.type == "episode" && fq.season == 2 && fq.query == "the show", "query for a file"))
+    out
+}
+
+fn searchChecks() -> [(Bool, String)] {
+    var out: [(Bool, String)] = []
+    let fr = subs.loadFile(joinPath(encDir, "fr.windows-1252.srt")).value() ?? subs.SubTrack()
+    let zh = subs.loadFile(joinPath(encDir, "zh-hans.gbk.srt")).value() ?? subs.SubTrack()
+    let en = subs.parseText("1\n00:00:01,000 --> 00:00:03,000\nWe're WALKING to the café.\n\n2\n00:00:04,000 --> 00:00:06,000\nThe sidewalk is wet.\n\n3\n00:00:07,000 --> 00:00:09,000\n<i>Don't</i> walk\nso fast!\n\n4\n00:00:20,000 --> 00:00:22,000\nThe end.\n", format: "srt").valueOr(subs.SubTrack())
+    var ix = subs.dialogueIndex([en, fr], names: ["English", "French"])
+    let zi = ix.add(zh, name: "Chinese")
+    out.append((ix.sources.count == 3 && zi == 2 && ix.lines.count == 4 + 7 + 7, "index of three sources ({ix.lines.count} lines)"))
+    let walk = ix.search("walk")
+    out.append((walk.count == 2 && walk[0].start == 1.0 && walk[1].start == 7.0, "word prefix: walk finds walking and walk, not sidewalk"))
+    out.append((walk.count == 2 && walk[0].text.substring(from: walk[0].matchFrom, to: walk[0].matchTo) == "WALK" && walk[1].text.substring(from: walk[1].matchFrom, to: walk[1].matchTo) == "walk", "match ranges ({walk[0].matchFrom}…{walk[0].matchTo})"))
+    out.append((walk.count == 2 && walk[1].before == "The sidewalk is wet." && walk[1].after == "The end." && walk[0].before == "", "context lines"))
+    out.append((ix.search("CAFE").count == 1 && ix.search("cafe", source: 1).isEmpty, "case and accents ignored; one source"))
+    out.append((ix.search("don't walk").count == 1 && ix.search("\"don't walk so\"").count == 1 && ix.search("\"walk don't\"").isEmpty, "apostrophes; phrases across line breaks"))
+    let deja = ix.search("etais inquiete")
+    out.append((deja.count == 1 && deja[0].source == 1 && deja[0].text == "Tu aurais dû m'appeler, j'étais inquiète.", "accent-free French search"))
+    let tel = ix.search("电话")
+    out.append((tel.count == 1 && tel[0].source == 2 && tel[0].text.substring(from: tel[0].matchFrom, to: tel[0].matchTo) == "电话", "Chinese search inside words"))
+    out.append((ix.search("").isEmpty && ix.search("zebra").isEmpty && ix.search("walk", limit: 1).count == 1, "empty, missing, limited"))
+    // Transcript.
+    out.append((ix.lineAt(source: 0, at: 0.5) == -1 && ix.lineAt(source: 0, at: 2.0) == 0 && ix.lineAt(source: 0, at: 3.5) == 0 && ix.lineAt(source: 0, at: 30.0) == 3, "lineAt"))
+    let tr = ix.transcript(source: 0, at: 4.5, before: 1, after: 1)
+    out.append((tr.lines.count == 3 && tr.current == 1 && tr.lines[1].showing && !tr.lines[0].showing && tr.lines[2].text == "Don't walk so fast!", "transcript around a time"))
+    let tr2 = ix.transcript(source: 1, at: 0.0, before: 2, after: 2)
+    out.append((tr2.current == -1 && tr2.lines.count == 3, "transcript before the first line"))
+    out.append((ix.sourceLines(2).count == 7 && ix.sourceLines(5).isEmpty, "sourceLines"))
+    // Repeated ASS layers merge.
+    let dup = subs.parseText("[Script Info]\nPlayResY: 288\n\n[Events]\nFormat: Layer, Start, End, Style, Text\nDialogue: 0,0:00:01.00,0:00:02.00,Default,Hello there\nDialogue: 1,0:00:01.00,0:00:02.00,Default,Hello there\nDialogue: 0,0:00:02.00,0:00:03.00,Default,Hello there\nDialogue: 0,0:00:05.00,0:00:06.00,Default,Bye\n", format: "ass").valueOr(subs.SubTrack())
+    var dx = subs.DialogueIndex()
+    let added = dx.add(dup, name: "ass")
+    out.append((added == 0 && dx.lines.count == 2 && r5Near(dx.lines[0].end, 3.0), "repeated lines merged"))
+    out
+}
+
+fn siblingChecks() -> [(Bool, String)] {
+    var out: [(Bool, String)] = []
+    let listing = ["Movie.Name.2019.1080p.mkv", "Movie.Name.2019.1080p.srt", "Movie.Name.2019.1080p.en.srt", "Movie.Name.2019.1080p.eng.forced.srt", "Movie.Name.2019.1080p.pt-BR.srt", "movie name 2019 1080p.fr.ass", "Movie.Name.2019.1080p.English.SDH.srt", "Movie.Name.2019.1080p.idx", "Movie.Name.2019.1080p.sub", "Movie.Name.2019.1080p.de.YIFY.srt", "notes.txt", "Subs/2_English.srt", "Subs/3_Spanish.srt"]
+    let s = subs.siblingFiles("/films/Movie.Name.2019.1080p.mkv", listing, languages: ["en", "pt"])
+    var names: [String] = []
+    for f in s {
+        names.append(f.name)
+    }
+    out.append((s.count == 10, "siblings: {s.count} files ({names.joined(separator: ", ")})"))
+    if s.count == 10 {
+        out.append((s[0].name == "Movie.Name.2019.1080p.idx" || s[0].name == "Movie.Name.2019.1080p.srt", "exact names first"))
+        out.append((s[0].score == 100 && s[1].score == 100 && s[0].path.hasPrefix("/films/"), "exact score and path"))
+        // Among the language-tagged ones, English full, then English SDH, English forced last of English, then Portuguese.
+        var tagged: [subs.SiblingFile] = []
+        for f in s {
+            if f.score == 90 {
+                tagged.append(f)
+            }
+        }
+        out.append((tagged.count == 4 && tagged[0].name == "Movie.Name.2019.1080p.en.srt" && tagged[0].language == "en" && tagged[1].hearingImpaired && tagged[1].language == "en" && tagged[2].forced && tagged[3].language == "pt-BR" && tagged[3].languageName == "Portuguese (Brazil)", "language order and flags"))
+        var yify = subs.SiblingFile(path: "", name: "", format: "")
+        var french = subs.SiblingFile(path: "", name: "", format: "")
+        var subsFolder: [subs.SiblingFile] = []
+        for f in s {
+            if f.name.contains("YIFY") { yify = f }
+            if f.name.hasPrefix("movie name") { french = f }
+            if f.path.contains("/Subs/") { subsFolder.append(f) }
+        }
+        out.append((yify.score == 80 && yify.language == "de" && yify.tags == ["yify"], "other words: lower score, kept as tags"))
+        out.append((french.score == 70 && french.language == "fr" && french.format == "ass", "loose name match"))
+        out.append((subsFolder.count == 2 && subsFolder[0].score == 50 && subsFolder[0].language == "en" && subsFolder[1].language == "es", "Subs folder beside the only video"))
+    }
+    // Two episodes: each gets its own, nothing loose.
+    let eps = ["Show.S01E01.mkv", "Show.S01E02.mkv", "Show.S01E01.srt", "Show.S01E02.fre.srt", "Subs/Show.S01E02/2_English.srt", "Subs/Show.S01E01/4_French.srt", "random.srt"]
+    let e2 = subs.siblingFiles("/tv/Show.S01E02.mkv", eps)
+    out.append((e2.count == 2 && e2[0].name == "Show.S01E02.fre.srt" && e2[0].language == "fr" && e2[1].name == "2_English.srt" && e2[1].score == 60, "episodes: only this episode's files ({e2.count})"))
+    out.append((subs.siblingFiles("/v/a.mp4", ["a.mp4", "b.srt"]).count == 1 && subs.siblingFiles("/v/a.mp4", ["a.mp4", "c.mkv", "b.srt"]).isEmpty, "a lone subtitle beside a lone video"))
+    out.append((subs.languageCode("eng") == "en" && subs.languageCode("Français") == "fr" && subs.languageCode("pt_BR") == "pt" && subs.languageCode("xx") == "" && subs.languageName("de") == "German" && subs.languageName("zh-Hant") == "Chinese (Traditional)", "language codes and names"))
+    let vob = subs.loadFile("tests/subs/fixtures/vobsub.idx").valueOr(subs.SubTrack())
+    out.append((vob.format == "dvdsub" && vob.cues.count == 43, "loadFile .idx reads the VobSub pair ({vob.cues.count} cues)"))
+    out.append((subs.subtitleFolders(["a.mkv", "Subs", "x"]) == ["Subs"] && subs.isSubtitleFile("A.SRT") && !subs.isSubtitleFile("a.txt"), "subtitle folders and files"))
+    out
+}
+
+fn round5Checks() -> [(Bool, String)] {
+    encodingChecks() + styleChecks() + openSubtitlesChecks() + searchChecks() + siblingChecks()
+}

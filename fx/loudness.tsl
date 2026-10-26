@@ -1,0 +1,667 @@
+// Loudness measurement: an ITU-R BS.1770-4 / EBU R 128 meter.
+//
+// - K-weighting (BS.1770-4 §2.1): the shelf and RLB high-pass of
+//   biquad.tsl on every channel, then mean square.
+// - Channel weights (BS.1770-4 Table 3): 1.0 for left, right, centre;
+//   1.41 for the surround channels (BL BR SL SR); the LFE is left out.
+//   Other channels count 1.0.
+// - Loudness = −0.691 + 10·log10(Σ G_i · z_i), in LUFS.
+// - The signal is summed in 10 ms sub-blocks. Momentary loudness is the
+//   last 400 ms (EBU Tech 3341 §2.2), short-term the last 3 s, both
+//   updated every 10 ms. The 400 ms blocks every 100 ms (75 % overlap)
+//   are kept for the integrated loudness, gated as BS.1770-4 §2.3 says:
+//   blocks under −70 LUFS are dropped, then those more than 10 LU below
+//   the loudness of the rest.
+// - Loudness range (EBU Tech 3342): the short-term values (3 s windows,
+//   10 per second), gated at −70 LUFS and then 20 LU under their mean
+//   power, LRA = 95th − 10th percentile (indices as in Tech 3342's
+//   reference code: round((n − 1)·p/100 + 1), 1-based).
+// - True peak (BS.1770-4 Annex 2): 4× oversampling by a polyphase
+//   windowed-sinc interpolator of Reel's own (32 taps per phase, Kaiser
+//   β = 8: flat to well past a quarter of the sample rate and still
+//   close at 0.45 of it, so wide-band sound isn't under-read), the
+//   largest magnitude of the original and interpolated samples. Blocks
+//   whose samples are too small to beat the peak found so far (even with
+//   the filter's largest possible gain) are skipped, which makes it cheap.
+//
+// ReplayGain tags (track/album gain and peak) are read from media tags:
+// "replaygain_track_gain" style keys (Vorbis comments, ID3 TXXX, MP4
+// freeform; any key ending that way), and Opus "r128_track_gain" /
+// "r128_album_gain" (Q7.8 dB towards −23 LUFS, RFC 7845 §5.2.1).
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+import "../core"
+
+// The reading for "no sound yet" / silence.
+public let silenceLufs = -120.0
+
+let tpTaps = 32
+let tpHalf = 16
+let tpBeta = 8.0
+// Largest Σ|h| of the interpolation phases (worked out in the design).
+let tpBlock = 32
+
+// The numbers a meter has found.
+public struct Loudness {
+    integrated: Float = -120.0
+    range: Float = 0.0
+    truePeak: Float = -120.0
+    samplePeak: Float = -120.0
+    maxMomentary: Float = -120.0
+    maxShortTerm: Float = -120.0
+    seconds: Float = 0.0
+}
+
+public struct Meter {
+    rate: Int = 0
+    channels: Int = 0
+    weights: [Float] = []
+    shelf: Biquad = Biquad()
+    hp: Biquad = Biquad()
+    // K-weighting filter state per channel.
+    sa: [Float] = []
+    sb: [Float] = []
+    ha: [Float] = []
+    hb: [Float] = []
+    // 10 ms sub-blocks: their energies (a ring of the last 3 s), and the
+    // running sums of the last 400 ms and 3 s.
+    subLen: Int = 480
+    subPos: Int = 0
+    subAcc: Float = 0.0
+    ring: [Float] = []
+    subCount: Int = 0
+    mSum: Float = 0.0
+    sSum: Float = 0.0
+    // Energies (mean weighted squares) of every 400 ms block and of every
+    // 3 s window, for the integrated loudness and the range.
+    blocks: [Float] = []
+    shorts: [Float] = []
+    momentary: Float = -120.0
+    shortTerm: Float = -120.0
+    maxMomentary: Float = -120.0
+    maxShortTerm: Float = -120.0
+    frames: Int = 0
+    // True peak: interpolator phases (3 × 12, phase-major), the filter's
+    // largest gain, the history (the last tpTaps − 1 samples per channel) and the
+    // peaks so far (linear).
+    tpCoef: [Float] = []
+    tpInter: [Float] = []
+    tpGain: Float = 2.0
+    tpHist: [Float] = []
+    tpBuf: [Float] = []
+    tpLin: Float = 0.0
+    peakLin: Float = 0.0
+    truePeakOn: Bool = true
+    // Integrated loudness cache.
+    intBlocks: Int = -1
+    intValue: Float = -120.0
+
+    // Seconds of sound measured.
+    seconds: Float {
+        if rate <= 0 { 0.0 } else { Float(frames) / Float(rate) }
+    }
+
+    // True peak in dBTP and sample peak in dBFS.
+    truePeak: Float {
+        toDb(max(tpLin, peakLin))
+    }
+    samplePeak: Float {
+        toDb(peakLin)
+    }
+
+    fn setup(_ r: Int, _ c: Int, _ layout: [String]) {
+        rate = r
+        channels = c
+        let lay = if layout.count == c { layout } else { core.defaultLayout(c) }
+        weights = []
+        for name in lay {
+            weights.append(match name {
+                "LFE" -> 0.0
+                "BL", "BR", "SL", "SR" -> 1.41
+                _ -> 1.0
+            })
+        }
+        shelf = kShelf(Float(r))
+        hp = kHighpass(Float(r))
+        subLen = max(1, Int(floor(Float(r) / 100.0 + 0.5)))
+        tpCoef = []
+        tpGain = 0.0
+        for p in 1..4 {
+            let t = Float(p) / 4.0
+            var row: [Float] = []
+            var sum = 0.0
+            for k in 0..tpTaps {
+                let d = Float(k - tpHalf + 1) - t
+                let sinc = sin(pi * d) / (pi * d)
+                let u = d / Float(tpHalf)
+                let w = if abs(u) >= 1.0 { 0.0 } else { meterI0(tpBeta * sqrt(1.0 - u * u)) / meterI0(tpBeta) }
+                row.append(sinc * w)
+                sum += sinc * w
+            }
+            var g = 0.0
+            for k in 0..tpTaps {
+                tpCoef.append(row[k] / sum)
+                g += abs(row[k] / sum)
+            }
+            tpGain = max(tpGain, g)
+        }
+        // The same, tap-major ([k·3 + phase]), for the inner loop.
+        tpInter = []
+        for k in 0..tpTaps {
+            for p in 0..3 {
+                tpInter.append(tpCoef[p * tpTaps + k])
+            }
+        }
+        reset()
+    }
+
+    // Forgets everything measured.
+    fn reset() {
+        let c = channels
+        sa = []
+        sb = []
+        ha = []
+        hb = []
+        for _ in 0..c {
+            sa.append(0.0)
+            sb.append(0.0)
+            ha.append(0.0)
+            hb.append(0.0)
+        }
+        tpHist = []
+        for _ in 0..((tpTaps - 1) * c) {
+            tpHist.append(0.0)
+        }
+        subPos = 0
+        subAcc = 0.0
+        ring = []
+        for _ in 0..300 {
+            ring.append(0.0)
+        }
+        subCount = 0
+        mSum = 0.0
+        sSum = 0.0
+        blocks = []
+        shorts = []
+        momentary = silenceLufs
+        shortTerm = silenceLufs
+        maxMomentary = silenceLufs
+        maxShortTerm = silenceLufs
+        frames = 0
+        tpLin = 0.0
+        peakLin = 0.0
+        intBlocks = -1
+        intValue = silenceLufs
+    }
+
+    // Clears only the filter state (after a seek: the measurement so far
+    // stays, the next sound isn't joined to the old).
+    fn clearFilters() {
+        for i in 0..sa.count {
+            sa[i] = 0.0
+            sb[i] = 0.0
+            ha[i] = 0.0
+            hb[i] = 0.0
+        }
+        for i in 0..tpHist.count {
+            tpHist[i] = 0.0
+        }
+    }
+
+    // Measures a block of sound (set up for its rate and channels first;
+    // a different setup starts the measurement again).
+    fn add(_ s: core.Samples) {
+        if s.channels <= 0 || s.rate <= 0 {
+            return
+        }
+        if s.rate != rate || s.channels != channels {
+            setup(s.rate, s.channels, s.layout)
+        }
+        addData(s.data)
+    }
+
+    fn addData(_ d: [Float]) {
+        let c = channels
+        let n = d.count / c
+        var f = 0
+        while f < n {
+            let e = min(n, f + (subLen - subPos))
+            subAcc += weighted(d, f, e)
+            subPos += e - f
+            f = e
+            if subPos >= subLen {
+                endSub()
+            }
+        }
+        frames += n
+        if truePeakOn {
+            peaks(d)
+        } else {
+            samplePeaks(d)
+        }
+    }
+
+    // Σ G_ch · Σ y² over frames [f0, f1) after K-weighting.
+    fn weighted(_ d: [Float], _ f0: Int, _ f1: Int) -> Float {
+        let c = channels
+        let s0 = shelf.b0
+        let s1 = shelf.b1
+        let s2 = shelf.b2
+        let r1 = shelf.a1
+        let r2 = shelf.a2
+        let h0 = hp.b0
+        let h1 = hp.b1
+        let h2 = hp.b2
+        let q1 = hp.a1
+        let q2 = hp.a2
+        var total = 0.0
+        if c == 2 {
+            var a0 = sa[0]
+            var b0 = sb[0]
+            var c0 = ha[0]
+            var e0 = hb[0]
+            var a1 = sa[1]
+            var b1 = sb[1]
+            var c1 = ha[1]
+            var e1 = hb[1]
+            var accL = 0.0
+            var accR = 0.0
+            var i = f0 * 2
+            let end = f1 * 2
+            while i < end {
+                let x = d[i]
+                let u = d[i + 1]
+                let y = s0 * x + a0
+                let v = s0 * u + a1
+                a0 = s1 * x - r1 * y + b0
+                a1 = s1 * u - r1 * v + b1
+                b0 = s2 * x - r2 * y
+                b1 = s2 * u - r2 * v
+                let z = h0 * y + c0
+                let w = h0 * v + c1
+                c0 = h1 * y - q1 * z + e0
+                c1 = h1 * v - q1 * w + e1
+                e0 = h2 * y - q2 * z
+                e1 = h2 * v - q2 * w
+                accL += z * z
+                accR += w * w
+                i += 2
+            }
+            sa[0] = a0
+            sb[0] = b0
+            ha[0] = c0
+            hb[0] = e0
+            sa[1] = a1
+            sb[1] = b1
+            ha[1] = c1
+            hb[1] = e1
+            return weights[0] * accL + weights[1] * accR
+        }
+        for ch in 0..c {
+            let g = weights[ch]
+            if g == 0.0 {
+                continue
+            }
+            var a0 = sa[ch]
+            var b0 = sb[ch]
+            var c0 = ha[ch]
+            var e0 = hb[ch]
+            var acc = 0.0
+            var i = f0 * c + ch
+            let end = f1 * c
+            while i < end {
+                let x = d[i]
+                let y = s0 * x + a0
+                a0 = s1 * x - r1 * y + b0
+                b0 = s2 * x - r2 * y
+                let z = h0 * y + c0
+                c0 = h1 * y - q1 * z + e0
+                e0 = h2 * y - q2 * z
+                acc += z * z
+                i += c
+            }
+            sa[ch] = a0
+            sb[ch] = b0
+            ha[ch] = c0
+            hb[ch] = e0
+            total += g * acc
+        }
+        total
+    }
+
+    // A 10 ms sub-block is complete. Momentary and short-term loudness
+    // are updated every 10 ms (so their maxima are found within 0.1 LU,
+    // EBU Tech 3341 cases 11 and 14); the 400 ms gating blocks and the
+    // short-term values for the range are kept every 100 ms.
+    fn endSub() {
+        let e = subAcc / Float(subLen)
+        let slot = subCount % 300
+        let old3 = ring[slot]
+        let old04 = ring[(subCount + 300 - 40) % 300]
+        ring[slot] = e
+        subCount += 1
+        subAcc = 0.0
+        subPos = 0
+        if subCount % 300 == 0 {
+            // Add up again now and then so the running sums can't drift.
+            var s3 = 0.0
+            for k in 0..300 {
+                s3 += ring[k]
+            }
+            sSum = s3
+            var s04 = 0.0
+            for k in 0..40 {
+                s04 += ring[(subCount - 1 - k) % 300]
+            }
+            mSum = s04
+        } else {
+            sSum += e - old3
+            mSum += e - (if subCount > 40 { old04 } else { 0.0 })
+        }
+        if subCount >= 40 {
+            let em = max(0.0, mSum) / 40.0
+            momentary = lufs(em)
+            maxMomentary = max(maxMomentary, momentary)
+            if subCount % 10 == 0 {
+                blocks.append(em)
+            }
+        }
+        if subCount >= 300 {
+            let es = max(0.0, sSum) / 300.0
+            shortTerm = lufs(es)
+            maxShortTerm = max(maxShortTerm, shortTerm)
+            if subCount % 10 == 0 {
+                shorts.append(es)
+            }
+        }
+    }
+
+    // The gated integrated loudness so far (BS.1770-4 §2.3), LUFS.
+    fn integrated() -> Float {
+        if intBlocks == blocks.count {
+            return intValue
+        }
+        intBlocks = blocks.count
+        intValue = gatedLoudness(blocks, -10.0)
+        intValue
+    }
+
+    // The loudness range so far (EBU Tech 3342), LU.
+    fn loudnessRange() -> Float {
+        let absE = energyOf(-70.0)
+        var kept: [Float] = []
+        var sum = 0.0
+        for e in shorts {
+            if e > absE {
+                kept.append(e)
+                sum += e
+            }
+        }
+        if kept.isEmpty {
+            return 0.0
+        }
+        let relE = energyOf(lufs(sum / Float(kept.count)) - 20.0)
+        var levels: [Float] = []
+        for e in kept {
+            if e >= relE {
+                levels.append(lufs(e))
+            }
+        }
+        if levels.isEmpty {
+            return 0.0
+        }
+        let sorted = levels.sorted()
+        let n = sorted.count
+        let lo = Int(round(Float(n - 1) * 0.10 + 1.0)) - 1
+        let hi = Int(round(Float(n - 1) * 0.95 + 1.0)) - 1
+        sorted[min(hi, n - 1)] - sorted[max(lo, 0)]
+    }
+
+    // Everything at once.
+    fn report() -> Loudness {
+        Loudness(integrated: integrated(), range: loudnessRange(), truePeak: truePeak, samplePeak: samplePeak, maxMomentary: maxMomentary, maxShortTerm: maxShortTerm, seconds: seconds)
+    }
+
+    // Peaks without oversampling.
+    fn samplePeaks(_ d: [Float]) {
+        var p = peakLin
+        for x in d {
+            let a = abs(x)
+            if a > p {
+                p = a
+            }
+        }
+        peakLin = p
+    }
+
+    // Sample and true peaks of the block, channel by channel.
+    fn peaks(_ d: [Float]) {
+        let c = channels
+        let n = d.count / c
+        let h = tpTaps - 1
+        samplePeaks(d)
+        for ch in 0..c {
+            // The channel's last tpTaps − 1 samples, then this block's.
+            var buf = tpBuf
+            tpBuf = []
+            let len = h + n
+            // (One spare zero at the end: the inner loop reads one ahead.)
+            if buf.count != len + 1 {
+                buf = []
+                for _ in 0..(len + 1) {
+                    buf.append(0.0)
+                }
+            }
+            for k in 0..h {
+                buf[k] = tpHist[k * c + ch]
+            }
+            var i = ch
+            var j = h
+            while j < len {
+                buf[j] = d[i]
+                i += c
+                j += 1
+            }
+            tpLin = max(tpLin, interpolatedPeak(buf, len))
+            for k in 0..h {
+                tpHist[k * c + ch] = buf[len - h + k]
+            }
+            tpBuf = buf
+        }
+    }
+
+    // The largest interpolated magnitude between buf[m] and buf[m+1] for
+    // m from tpHalf − 1 to len − tpHalf − 1 (the filter reaches
+    // tpHalf − 1 back and tpHalf ahead).
+    fn interpolatedPeak(_ buf: [Float], _ len: Int) -> Float {
+        let cf = tpInter
+        var best = tpLin
+        let g = tpGain
+        var m0 = tpHalf - 1
+        let last = len - tpHalf - 1
+        while m0 <= last {
+            let m1 = min(last, m0 + tpBlock - 1)
+            // Can anything in this stretch beat the best so far?
+            var big = 0.0
+            for k in (m0 - tpHalf + 1)..(m1 + tpHalf + 1) {
+                let a = abs(buf[k])
+                if a > big {
+                    big = a
+                }
+            }
+            if big * g > best {
+                // Two positions at a time, all three phases at once: six
+                // independent sums keep the multiply-adds flowing.
+                var m = m0
+                while m <= m1 {
+                    let base = m - tpHalf + 1
+                    var a0 = 0.0
+                    var a1 = 0.0
+                    var a2 = 0.0
+                    var e0 = 0.0
+                    var e1 = 0.0
+                    var e2 = 0.0
+                    var x = buf[base]
+                    var ci = 0
+                    for k in 0..tpTaps {
+                        let nx = buf[base + k + 1]
+                        let h0 = cf[ci]
+                        let h1 = cf[ci + 1]
+                        let h2 = cf[ci + 2]
+                        a0 += h0 * x
+                        a1 += h1 * x
+                        a2 += h2 * x
+                        e0 += h0 * nx
+                        e1 += h1 * nx
+                        e2 += h2 * nx
+                        x = nx
+                        ci += 3
+                    }
+                    best = max(best, max(max(abs(a0), abs(a1)), abs(a2)))
+                    if m + 1 <= m1 {
+                        best = max(best, max(max(abs(e0), abs(e1)), abs(e2)))
+                    }
+                    m += 2
+                }
+            }
+            m0 = m1 + 1
+        }
+        best
+    }
+}
+
+public fn newMeter(rate: Int, channels: Int, layout: [String] = []) -> Meter {
+    var m = Meter()
+    m.setup(max(1, rate), max(1, channels), layout)
+    m
+}
+
+// Measures a whole piece of sound at once (a pre-scan).
+public fn measure(_ s: core.Samples) -> Loudness {
+    var m = newMeter(rate: s.rate, channels: s.channels, layout: s.layout)
+    m.add(s)
+    m.report()
+}
+
+// −0.691 + 10·log10(energy).
+public fn lufs(_ e: Float) -> Float {
+    if e <= 0.0 {
+        return silenceLufs
+    }
+    max(silenceLufs, -0.691 + 10.0 * log10(e))
+}
+
+fn energyOf(_ l: Float) -> Float {
+    pow(10.0, (l + 0.691) / 10.0)
+}
+
+public fn toDb(_ lin: Float) -> Float {
+    if lin <= 0.0 {
+        return silenceLufs
+    }
+    max(silenceLufs, 20.0 * log10(lin))
+}
+
+public fn fromDb(_ db: Float) -> Float {
+    pow(10.0, db / 20.0)
+}
+
+// The two-stage gating of BS.1770-4 over block energies: absolute −70
+// LUFS, then `relative` LU under the absolute-gated loudness.
+public fn gatedLoudness(_ blocks: [Float], _ relative: Float) -> Float {
+    let absE = energyOf(-70.0)
+    var sum = 0.0
+    var count = 0
+    for e in blocks {
+        if e > absE {
+            sum += e
+            count += 1
+        }
+    }
+    if count == 0 {
+        return silenceLufs
+    }
+    let relE = energyOf(lufs(sum / Float(count)) + relative)
+    var s2 = 0.0
+    var c2 = 0
+    for e in blocks {
+        if e > absE && e > relE {
+            s2 += e
+            c2 += 1
+        }
+    }
+    if c2 == 0 {
+        return silenceLufs
+    }
+    lufs(s2 / Float(c2))
+}
+
+fn meterI0(_ x: Float) -> Float {
+    var sum = 1.0
+    var term = 1.0
+    let q = x * x / 4.0
+    var k = 1.0
+    while k < 60.0 {
+        term = term * q / (k * k)
+        sum += term
+        if term < sum * 1e-17 {
+            break
+        }
+        k += 1.0
+    }
+    sum
+}
+
+// ReplayGain values found in tags (dB and linear peaks); nil when absent.
+public struct ReplayGain {
+    trackGain: Float? = nil
+    trackPeak: Float? = nil
+    albumGain: Float? = nil
+    albumPeak: Float? = nil
+}
+
+// Reads ReplayGain (and Opus R128) tags. Gains are relative to the
+// ReplayGain 2 reference of −18 LUFS.
+public fn replayGain(_ tags: [String: String]) -> ReplayGain {
+    var rg = ReplayGain()
+    for (key, value) in tags {
+        let k = key.lowercase()
+        if k.hasSuffix("replaygain_track_gain") {
+            rg.trackGain = rgNumber(value)
+        } else if k.hasSuffix("replaygain_track_peak") {
+            rg.trackPeak = rgNumber(value)
+        } else if k.hasSuffix("replaygain_album_gain") {
+            rg.albumGain = rgNumber(value)
+        } else if k.hasSuffix("replaygain_album_peak") {
+            rg.albumPeak = rgNumber(value)
+        }
+    }
+    // Opus: Q7.8 gain towards −23 LUFS, which is 5 dB under −18.
+    for (key, value) in tags {
+        let k = key.lowercase()
+        if k == "r128_track_gain" && rg.trackGain == nil {
+            if let q = Int(value.trim()) {
+                rg.trackGain = Float(q) / 256.0 + 5.0
+            }
+        } else if k == "r128_album_gain" && rg.albumGain == nil {
+            if let q = Int(value.trim()) {
+                rg.albumGain = Float(q) / 256.0 + 5.0
+            }
+        }
+    }
+    rg
+}
+
+// "-6.48 dB", "+1.2dB", "0.98765" → the number.
+fn rgNumber(_ text: String) -> Float? {
+    var t = text.trim().lowercase()
+    if t.hasSuffix("db") {
+        t = t.substring(from: 0, to: t.count - 2).trim()
+    }
+    if t.hasPrefix("+") {
+        t = t.substring(from: 1, to: t.count)
+    }
+    Float(t)
+}

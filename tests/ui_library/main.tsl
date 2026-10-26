@@ -1,0 +1,328 @@
+// Tests for the library views' pure helpers (ui/lib_*.tsl): times,
+// sizes, "time left" and "days ago" texts, episode codes, grid maths,
+// keyboard selection moves, the seek preview's place and time, scenes and
+// chapters, playlist reordering; and LibraryModel / loadHomeData read
+// against a library in memory (":memory:", never the user's Reel data).
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+import "../../ui"
+import "../../library"
+import "../../core"
+
+struct Checker {
+    passed: Int = 0
+    total: Int = 0
+
+    fn check(_ ok: Bool, _ what: String) {
+        total += 1
+        if ok {
+            passed += 1
+        } else {
+            print("FAIL: {what}")
+        }
+    }
+
+    fn same(_ got: String, _ want: String, _ what: String) {
+        check(got == want, "{what}: got \"{got}\", want \"{want}\"")
+    }
+
+    fn sameInt(_ got: Int, _ want: Int, _ what: String) {
+        check(got == want, "{what}: got {got}, want {want}")
+    }
+
+    fn near(_ got: Float, _ want: Float, _ what: String, tol: Float = 0.001) {
+        check(abs(got - want) <= tol, "{what}: got {got}, want {want}")
+    }
+}
+
+fn testText(_ k: bind Checker) {
+    k.same(ui.libDurationText(-1.0), "", "duration unknown")
+    k.same(ui.libDurationText(65.0), "1:05", "duration 65 s")
+    k.same(ui.libDurationText(3725.0), "1:02:05", "duration 3725 s")
+    k.same(ui.libTimeLeftText(position: 0.0, duration: 30.0), "Less than a minute left", "left < 1 min")
+    k.same(ui.libTimeLeftText(position: 0.0, duration: 600.0), "10 min left", "left 10 min")
+    k.same(ui.libTimeLeftText(position: 100.0, duration: 3900.0), "1 h 3 min left", "left 1 h 3 min")
+    k.same(ui.libTimeLeftText(position: 0.0, duration: 7200.0), "2 h left", "left 2 h")
+    k.same(ui.libTimeLeftText(position: 0.0, duration: -1.0), "", "left unknown")
+    k.near(ui.libProgress(position: 50.0, duration: 200.0), 0.25, "progress quarter")
+    k.near(ui.libProgress(position: 300.0, duration: 200.0), 1.0, "progress clamped")
+    k.near(ui.libProgress(position: 10.0, duration: -1.0), 0.0, "progress unknown")
+    k.same(ui.libEpisodeCode(season: 1, episode: 2), "S01E02", "episode code")
+    k.same(ui.libEpisodeCode(season: 12, episode: 104), "S12E104", "long episode code")
+    k.same(ui.libEpisodeCode(season: 3, episode: -1), "S03", "season only")
+    k.same(ui.libEpisodeCode(season: -1, episode: -1), "", "not an episode")
+    k.same(ui.libEpisodeCode(season: -1, episode: -1, date: "2026-10-01"), "2026-10-01", "dated episode")
+    k.same(ui.libSeasonTitle(0), "Specials", "season 0")
+    k.same(ui.libSeasonTitle(3), "Season 3", "season 3")
+    k.same(ui.libSeasonTitle(-1), "Episodes", "no season")
+    k.same(ui.libSizeText(999), "999 bytes", "size bytes")
+    k.same(ui.libSizeText(1500), "1.5 KB", "size KB")
+    k.same(ui.libSizeText(9960), "10 KB", "size rounds to 10 KB")
+    k.same(ui.libSizeText(740_000), "740 KB", "size 740 KB")
+    k.same(ui.libSizeText(12_500_000), "12.5 MB", "size MB")
+    k.same(ui.libSizeText(1_234_000_000), "1.2 GB", "size GB")
+    k.same(ui.libSizeText(3_000_000_000_000), "3 TB", "size TB")
+    k.same(ui.libSizeText(250_400_000), "250 MB", "size 250 MB")
+    let t0 = date(year: 2026, month: 10, day: 26, hour: 15)
+    k.same(ui.libAgoText(t0 - 3600.0, now: t0), "Today", "ago today")
+    k.same(ui.libAgoText(t0 - 86400.0, now: t0), "Yesterday", "ago yesterday")
+    k.same(ui.libAgoText(t0 - 3.0 * 86400.0, now: t0), "3 days ago", "ago 3 days")
+    k.same(ui.libAgoText(date(year: 2026, month: 3, day: 12, hour: 9), now: t0), "12 Mar 2026", "ago date")
+    k.same(ui.libAgoText(0.0, now: t0), "", "ago never")
+    k.same(ui.libStem("/a/Movie (2001).mkv"), "Movie (2001)", "stem")
+    k.same(ui.libStem(".hidden"), ".hidden", "stem of dot file")
+    k.same(ui.libChapterTitle(core.Chapter(start: 0.0), index: 2), "Chapter 3", "untitled chapter")
+    k.same(ui.libChapterTitle(core.Chapter(start: 0.0, title: " Intro "), index: 0), "Intro", "chapter title")
+    k.same(ui.libShowSubtitle(library.ShowSummary(name: "X", key: "x", seasons: [1, 2], episodes: 10, unwatched: 3)), "2 seasons · 10 episodes · 3 unwatched", "show subtitle")
+    k.same(ui.libShowSubtitle(library.ShowSummary(name: "X", key: "x", seasons: [1], episodes: 1, unwatched: 0)), "1 episode · all watched", "show subtitle watched")
+    k.same(ui.libAlbumSubtitle(library.AlbumSummary(album: "A", artist: "B", year: 1997, tracks: 4, duration: 1242.0)), "1997 · 4 tracks · 20:42", "album subtitle")
+    let movie = library.MediaItem(id: 1, path: "/m/Heat (1995).mkv", name: "Heat (1995).mkv", size: 1_500_000_000, kind: "video", duration: 6693.0, year: 1995, group: "movies")
+    k.same(ui.libItemSubtitle(movie, level: "items"), "1995 · 1:51:33 · 1.5 GB", "movie subtitle")
+    let ep = library.MediaItem(id: 2, path: "/t/x.mkv", name: "x.mkv", kind: "video", duration: 2700.0, series: "The Expanse", season: 1, episode: 3, group: "tv", lastPlayed: t0 - 86400.0, playCount: 2)
+    k.same(ui.libItemSubtitle(ep, level: "items"), "The Expanse S01E03 · 45:00", "episode subtitle in search")
+    k.same(ui.libItemSubtitle(ep, level: "history", now: t0), "The Expanse S01E03 · played yesterday · 2 times", "history subtitle")
+    let song = library.MediaItem(id: 3, path: "/s.flac", name: "s.flac", kind: "audio", duration: 240.0, artist: "Björk", album: "Post", group: "music")
+    k.same(ui.libItemSubtitle(song, level: "items"), "Björk · Post · 4:00", "song subtitle")
+    k.same(ui.libItemSubtitle(song, level: "tracks"), "Björk · 4:00", "track subtitle")
+}
+
+fn testLayout(_ k: bind Checker) {
+    k.sameInt(ui.libGridColumns(width: 766.0, cell: 160.0, spacing: 14.0), 4, "columns in 766")
+    k.sameInt(ui.libGridColumns(width: 100.0, cell: 160.0, spacing: 14.0), 1, "at least one column")
+    k.sameInt(ui.libGridColumns(width: 334.0, cell: 160.0, spacing: 14.0), 2, "exactly two columns")
+    k.sameInt(ui.libGridRows(count: 0, columns: 4), 0, "rows of nothing")
+    k.sameInt(ui.libGridRows(count: 9, columns: 4), 3, "rows of 9 in 4")
+    k.sameInt(ui.libGridRows(count: 8, columns: 4), 2, "rows of 8 in 4")
+    let r = ui.libGridRowRange(row: 2, columns: 4, count: 9)
+    k.check(r.0 == 8 && r.1 == 9, "last row range: {r.0}..{r.1}")
+    let r2 = ui.libGridRowRange(row: 3, columns: 4, count: 9)
+    k.check(r2.0 == 9 && r2.1 == 9, "row past the end is empty: {r2.0}..{r2.1}")
+    k.near(ui.libCellWidth(width: 766.0, columns: 4, spacing: 14.0), 181.0, "cell width")
+    // Keyboard moves in a grid of 4 with 10 items.
+    k.sameInt(ui.libMoveSelection(-1, key: "right", count: 10, columns: 4), 0, "first move selects the first")
+    k.sameInt(ui.libMoveSelection(-1, key: "end", count: 10, columns: 4), 9, "end from nothing")
+    k.sameInt(ui.libMoveSelection(5, key: "down", count: 10, columns: 4), 9, "down")
+    k.sameInt(ui.libMoveSelection(6, key: "down", count: 10, columns: 4), 9, "down to the shorter last row")
+    k.sameInt(ui.libMoveSelection(9, key: "down", count: 10, columns: 4), 9, "down on the last row stays")
+    k.sameInt(ui.libMoveSelection(2, key: "up", count: 10, columns: 4), 2, "up on the first row stays")
+    k.sameInt(ui.libMoveSelection(5, key: "up", count: 10, columns: 4), 1, "up")
+    k.sameInt(ui.libMoveSelection(0, key: "left", count: 10, columns: 4), 0, "left at the start")
+    k.sameInt(ui.libMoveSelection(9, key: "right", count: 10, columns: 4), 9, "right at the end")
+    k.sameInt(ui.libMoveSelection(3, key: "pagedown", count: 100), 13, "page down in a list")
+    k.sameInt(ui.libMoveSelection(3, key: "home", count: 100), 0, "home")
+    k.sameInt(ui.libMoveSelection(3, key: "x", count: 0), -1, "empty list")
+    // Seek preview.
+    k.near(ui.libPreviewLeft(x: 300.0, barWidth: 980.0, box: 168.0), 216.0, "preview centred")
+    k.near(ui.libPreviewLeft(x: 20.0, barWidth: 980.0, box: 168.0), 0.0, "preview at the left edge")
+    k.near(ui.libPreviewLeft(x: 975.0, barWidth: 980.0, box: 168.0), 812.0, "preview at the right edge")
+    k.near(ui.libTimeAtX(10.0, width: 220.0, duration: 600.0), 0.0, "time at the track start")
+    k.near(ui.libTimeAtX(110.0, width: 220.0, duration: 600.0), 300.0, "time at the middle")
+    k.near(ui.libTimeAtX(500.0, width: 220.0, duration: 600.0), 600.0, "time past the end")
+}
+
+fn testScenes(_ k: bind Checker) {
+    let starts = [0.0, 10.0, 25.0, 60.0]
+    k.sameInt(ui.libCurrentIndex(starts, at: -1.0), -1, "before the first")
+    k.sameInt(ui.libCurrentIndex(starts, at: 0.0), 0, "at the first")
+    k.sameInt(ui.libCurrentIndex(starts, at: 24.9), 1, "in the second")
+    k.sameInt(ui.libCurrentIndex(starts, at: 25.0), 2, "at the third")
+    k.sameInt(ui.libCurrentIndex(starts, at: 1000.0), 3, "after the last")
+    let scenes = [ui.SceneThumb(time: 0.0), ui.SceneThumb(time: 30.0), ui.SceneThumb(time: 90.0)]
+    k.sameInt(ui.libSceneIndex(scenes, at: 45.0), 1, "scene playing")
+    let ch = [core.Chapter(start: 0.0), core.Chapter(start: 600.0), core.Chapter(start: 1800.0)]
+    k.sameInt(ui.libChapterIndex(ch, at: 700.0), 1, "chapter playing")
+    k.near(ui.libChapterStep(ch, at: 700.0, forward: true), 1800.0, "next chapter")
+    k.near(ui.libChapterStep(ch, at: 1900.0, forward: true), -1.0, "no next chapter")
+    k.near(ui.libChapterStep(ch, at: 700.0, forward: false), 600.0, "back to this chapter's start")
+    k.near(ui.libChapterStep(ch, at: 601.0, forward: false), 0.0, "back to the previous chapter")
+    k.near(ui.libChapterStep([], at: 5.0, forward: false), -1.0, "no chapters")
+    let a = ui.LibThumb(width: 2, height: 1, pixels: [1, 2])
+    let b = ui.LibThumb(width: 2, height: 1, pixels: [1, 3])
+    k.check(ui.libThumbKey(a) != ui.libThumbKey(b), "thumb keys differ")
+    k.check(ui.LibThumb().isEmpty && !a.isEmpty && ui.LibThumb(width: 3, height: 1, pixels: [1]).isEmpty, "thumb emptiness")
+}
+
+fn testReorder(_ k: bind Checker) {
+    let l = ["a", "b", "c", "d", "e"]
+    k.same(ui.libMoved(l, from: 3, to: 0).joined(separator: ""), "dabce", "move up to the top")
+    k.same(ui.libMoved(l, from: 0, to: 5).joined(separator: ""), "bcdea", "move to the end")
+    k.same(ui.libMoved(l, from: 1, to: 3).joined(separator: ""), "acbde", "move down one slot")
+    k.same(ui.libMoved(l, from: 1, to: 2).joined(separator: ""), "abcde", "drop just after itself")
+    k.same(ui.libMoved(l, from: 9, to: 0).joined(separator: ""), "abcde", "bad index")
+    // The playing item follows the move; others shift around it.
+    for from in 0..5 {
+        for to in 0..6 {
+            let moved = ui.libMoved(l, from: from, to: to)
+            for i in 0..5 {
+                let j = ui.libMovedIndex(i, from: from, to: to, count: 5)
+                k.check(j >= 0 && j < 5 && moved[j] == l[i], "index {i} after moving {from} to {to}: {j}")
+            }
+        }
+    }
+    k.sameInt(ui.libMovedIndex(-1, from: 0, to: 3, count: 5), -1, "nothing playing stays")
+    k.sameInt(ui.libIndexAfterRemove(3, removed: 1), 2, "after removing above")
+    k.sameInt(ui.libIndexAfterRemove(1, removed: 3), 1, "after removing below")
+    k.sameInt(ui.libIndexAfterRemove(2, removed: 2), -1, "removing the playing one")
+    let (total, unknown) = ui.libTotalDuration([60.0, -1.0, 30.5])
+    k.check(abs(total - 90.5) < 0.001 && unknown == 1, "total duration {total} {unknown}")
+}
+
+// A small library in memory: two movies (and `extra` more), a show with
+// two seasons, an album, and some history.
+fn sampleLibrary(extra: Int = 0) -> library.Library? {
+    match library.openLibrary(":memory:") {
+        .ok(l) -> {
+            var lib = l
+            var found: [library.FoundFile] = []
+            var reports: [library.MediaReport] = []
+            found.append(library.FoundFile(path: "/m/Heat (1995).mkv", root: "/m", size: 1000, modified: 1.0))
+            reports.append(library.MediaReport(path: "/m/Heat (1995).mkv", duration: 6693.0, hasVideo: true, hasAudio: true))
+            found.append(library.FoundFile(path: "/m/Alien (1979).mkv", root: "/m", size: 1001, modified: 1.0))
+            reports.append(library.MediaReport(path: "/m/Alien (1979).mkv", duration: 7000.0, hasVideo: true, hasAudio: true))
+            for k in 0..extra {
+                found.append(library.FoundFile(path: "/m/more/Film {k} (2000).mp4", root: "/m", size: 5000 + k, modified: 1.0))
+            }
+            for s in 1..3 {
+                for e in 1..4 {
+                    let p = "/t/Show/Season {s}/Show.S0{s}E0{e}.mkv"
+                    found.append(library.FoundFile(path: p, root: "/t", size: 2000 + s * 10 + e, modified: 1.0))
+                    reports.append(library.MediaReport(path: p, duration: 1800.0, hasVideo: true, hasAudio: true))
+                }
+            }
+            for (n, title) in ["One", "Two", "Three"].enumerated() {
+                let p = "/a/Artist/Album/0{n + 1} {title}.flac"
+                found.append(library.FoundFile(path: p, root: "/a", size: 3000 + n, modified: 1.0))
+                reports.append(library.MediaReport(path: p, duration: 200.0, title: title, artist: "Artist", album: "Album", albumArtist: "Artist", year: 2001, track: n + 1, hasAudio: true))
+            }
+            lib.applyScan(found)
+            for r in reports {
+                lib.applyReport(r, details: 2)
+            }
+            lib.startedPlaying("/m/Heat (1995).mkv", size: 1000)
+            lib.savePosition("/m/Heat (1995).mkv", size: 1000, position: 900.0, duration: 6693.0)
+            lib.startedPlaying("/t/Show/Season 1/Show.S01E01.mkv", size: 2011)
+            lib.setFinished("/t/Show/Season 1/Show.S01E01.mkv", size: 2011, true)
+            return lib
+        }
+        .failure(e) -> {
+            print("FAIL: can't open a library in memory: {e.message}")
+            return nil
+        }
+    }
+}
+
+fn testModel(_ k: bind Checker) {
+    if let lib = sampleLibrary() {
+        var m = ui.LibraryModel()
+        k.same(m.level(), "items", "movies level")
+        m.reload(lib)
+        k.sameInt(m.items.count, 2, "movies")
+        k.same(m.items[0].displayTitle, "Alien (1979)", "sorted by title")
+        k.sameInt(m.counts["tv"] ?? 0, 6, "tv count")
+        k.sameInt(m.historyCount, 2, "history count")
+        m.descending = true
+        m.reload(lib)
+        k.same(m.items[0].displayTitle, "Heat (1995)", "descending")
+        m.query = "heat"
+        m.reload(lib)
+        k.check(m.items.count == 1 && m.title() == "Movies: “heat”", "search: {m.items.count} {m.title()}")
+        m.choose("tv")
+        k.check(m.query == "heat", "choosing a group keeps the search text")
+        m.query = ""
+        k.same(m.level(), "shows", "tv level")
+        m.reload(lib)
+        k.sameInt(m.shows.count, 1, "shows")
+        k.check(m.showFirst[m.shows[0].key] != nil, "show poster item")
+        m.selected = m.shows[0].key
+        k.sameInt(m.selectedIndex(), 0, "selected show")
+        m.openShow(m.shows[0])
+        k.same(m.level(), "episodes", "episodes level")
+        k.check(m.canGoBack, "can go back from a show")
+        m.reload(lib)
+        k.sameInt(m.items.count, 6, "all episodes")
+        k.check(m.seasons.count == 2 && m.seasons[0] == 1, "seasons")
+        k.same(m.nextEpisodePath, "/t/Show/Season 1/Show.S01E02.mkv", "next episode")
+        k.check(m.items[0].finished, "watched mark read")
+        m.season = 2
+        m.reload(lib)
+        k.check(m.items.count == 3 && m.items[0].season == 2, "season 2")
+        k.check(m.nextEpisode?.path == m.nextEpisodePath, "next episode kept with a season shown")
+        m.back()
+        k.check(m.level() == "shows" && m.selected == m.shows[0].key, "back selects the show")
+        m.choose("music")
+        m.reload(lib)
+        k.same(m.level(), "artists", "artists level")
+        k.check(m.artists == ["Artist"], "artists")
+        k.sameInt(m.shownCount(), 2, "artists plus All Albums")
+        m.openArtist("Artist")
+        m.reload(lib)
+        k.check(m.albums.count == 1 && m.albumFirst["Album|Artist"]?.track == 1, "albums and first track")
+        m.openAlbum(m.albums[0])
+        m.reload(lib)
+        k.check(m.level() == "tracks" && m.items.count == 3 && m.items[2].title == "Three", "tracks")
+        m.back()
+        k.check(m.level() == "albums" && m.selected == "Album|Artist", "back to albums")
+        m.back()
+        k.same(m.level(), "artists", "back to artists")
+        m.choose("history")
+        m.reload(lib)
+        k.check(m.items.count == 2 && m.items[0].lastPlayed >= m.items[1].lastPlayed, "history newest first")
+        let heat = m.items.first(where: { i in i.path == "/m/Heat (1995).mkv" })
+        k.check(heat?.position == 900.0 && heat?.group == "movies", "history item from the library")
+        m.query = "show"
+        m.reload(lib)
+        k.check(m.items.count == 1, "history search: {m.items.count}")
+        m.choose("playlists")
+        k.same(m.level(), "playlists", "playlists level")
+        k.check(m.queryKey().hasPrefix("playlists|show|title|true|"), "query key: {m.queryKey()}")
+        // Home.
+        let h = ui.loadHomeData(lib, existing: false)
+        k.check(h.continueWatching.count == 1 && h.continueWatching[0].path == "/m/Heat (1995).mkv", "continue watching")
+        k.near(h.continueWatching[0].position, 900.0, "continue position")
+        k.check(h.nextEpisodes.count == 1 && h.nextEpisodes[0].path == "/t/Show/Season 1/Show.S01E02.mkv", "next episode on Home")
+        k.same(h.nextEpisodes[0].subtitle, "Show · S01E02", "next episode subtitle")
+        k.check(h.recentlyAdded.count > 0 && !h.recentlyAdded.any(where: { e in e.path == "/m/Heat (1995).mkv" }), "recently added leaves out the others")
+        let none = ui.loadHomeData(lib, existing: true)
+        k.check(none.continueWatching.isEmpty, "missing files left out of Continue watching")
+    }
+    // Speed: 5,000 movies.
+    if let big = sampleLibrary(extra: 5000) {
+        var m = ui.LibraryModel()
+        let t0 = now()
+        m.reload(big)
+        let t1 = now()
+        m.sort = "title"
+        m.descending = true
+        m.update(big)
+        k.same(m.items[0].displayTitle, "Heat (1995)", "sorted 5,000 by title, descending")
+        let t2 = now()
+        m.query = "film"
+        m.update(big)
+        let t3 = now()
+        m.query = "film 4"
+        m.update(big)
+        let t4 = now()
+        k.check(m.items.count > 1000, "search in 5,000: {m.items.count}")
+        let sql = big.search("film 4", group: "movies")
+        k.sameInt(sql.count, m.items.count, "same results as the library's search")
+        m.query = "amelie"
+        m.update(big)
+        k.sameInt(m.items.count, 0, "no match")
+        print("time reload 5000 items: {Int((t1 - t0) * 1000.0)} ms")
+        print("time sort 5000 items: {Int((t2 - t1) * 1000.0)} ms")
+        print("time first search 5000 items: {Int((t3 - t2) * 1000.0)} ms")
+        print("time next search 5000 items: {Int((t4 - t3) * 1000.0)} ms")
+    }
+}
+
+fn main() {
+    var c = Checker()
+    testText(c)
+    testLayout(c)
+    testScenes(c)
+    testReorder(c)
+    testModel(c)
+    print("ui_library: {c.passed} of {c.total} passed")
+}

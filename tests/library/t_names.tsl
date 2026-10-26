@@ -1,0 +1,178 @@
+// Library tests: episode names, next episode, keymap and preferences.
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+import "../../library"
+
+// name, series, season, episode, kind, title (or date for date shows)
+let episodeCases: [(String, String, Int, Int, String, String)] = [
+    ("/tv/The.Office.US.S02E05.Halloween.720p.WEB-DL.x264.mkv", "The Office US", 2, 5, "sxe", "Halloween"),
+    ("/tv/Breaking Bad - s1e7 - A No-Rough-Stuff-Type Deal.mp4", "Breaking Bad", 1, 7, "sxe", "A No-Rough-Stuff-Type Deal"),
+    ("/tv/Doctor.Who.2005.S01E01.Rose.avi", "Doctor Who", 1, 1, "sxe", "Rose"),
+    ("/tv/Show S03 E10.mkv", "Show", 3, 10, "sxe", ""),
+    ("/tv/Friends - 1x02 - The One with the Sonogram.mkv", "Friends", 1, 2, "x", "The One with the Sonogram"),
+    ("/tv/Lost Season 4 Episode 12.mkv", "Lost", 4, 12, "season", ""),
+    ("/tv/Planet Earth - Episode 2 - Mountains.mp4", "Planet Earth", -1, 2, "episode", "Mountains"),
+    ("/tv/Cosmos Ep.03.mkv", "Cosmos", -1, 3, "episode", ""),
+    ("/tv/Nature E07 Wolves.mkv", "Nature", -1, 7, "episode", "Wolves"),
+    ("/anime/[SubsPlease] Frieren - 07 (1080p) [ABCD1234].mkv", "Frieren", -1, 7, "anime", ""),
+    ("/anime/[Group] Mushishi - 12v2 [720p].mkv", "Mushishi", -1, 12, "anime", ""),
+    ("/anime/[HorribleSubs] One Piece 1000 [1080p].mkv", "One Piece", -1, 1000, "anime", ""),
+    ("/tv/The Daily Show 2026-10-26 Guest Name.mkv", "The Daily Show", -1, -1, "date", "2026-10-26"),
+    ("/tv/Show/Season 2/05 - Title Here.mkv", "Show", 2, 5, "folder", "Title Here"),
+]
+
+fn testEpisodes(_ c: bind Checker) {
+    for (path, series, season, episode, kind, title) in episodeCases {
+        let e = library.parseEpisode(path)
+        let what = path.fileName
+        c.check(e.isEpisode, "{what} is an episode")
+        c.same(e.series, series, "{what} series")
+        c.sameInt(e.season, season, "{what} season")
+        c.sameInt(e.episode, episode, "{what} episode")
+        c.same(e.kind, kind, "{what} kind")
+        if kind == "date" {
+            c.same(e.date, title, "{what} date")
+        } else {
+            c.same(e.title, title, "{what} title")
+        }
+    }
+    let dbl = library.parseEpisode("/tv/Show.S01E01E02.mkv")
+    c.sameInt(dbl.episodeEnd, 2, "double episode S01E01E02")
+    let dbl2 = library.parseEpisode("/tv/Show S01E03-E04.mkv")
+    c.sameInt(dbl2.episodeEnd, 4, "double episode S01E03-E04")
+    c.same(library.episodeLabel(dbl2), "S01E03–E04", "label of a double episode")
+    c.sameInt(library.parseEpisode("/tv/Doctor.Who.2005.S01E01.Rose.avi").year, 2005, "year in a show name")
+    // Things that aren't episodes.
+    let movie = library.parseEpisode("/films/Blade.Runner.2049.2017.2160p.UHD.mkv")
+    c.check(!movie.isEpisode, "a movie isn't an episode")
+    c.same(movie.title, "Blade Runner 2049", "movie title stops at the year")
+    c.sameInt(movie.year, 2017, "movie year")
+    let am = library.parseEpisode("/films/Amélie (2001).mkv")
+    c.check(!am.isEpisode && am.year == 2001 && am.title == "Amélie", "Amélie (2001): title and year")
+    c.check(!library.parseEpisode("/films/Video 1920x1080 test.mp4").isEpisode, "1920x1080 isn't 19x20")
+    c.check(!library.parseEpisode("/music/01 - Song.mp3").isEpisode, "a numbered track in a plain folder isn't an episode")
+    // Series keys.
+    c.same(library.seriesKey("Law & Order: SVU"), "law and order svu", "series key with &")
+    c.same(library.seriesKey("Doctor Who (2005)"), library.seriesKey("doctor.who"), "series key drops a trailing year")
+    c.same(library.parseEpisode("/a/Mr.Robot.S01E01.mkv").key, library.parseEpisode("/b/mr robot - 1x02.mkv").key, "keys match across styles")
+    c.sameInt(library.seasonOfFolder("Season 03"), 3, "Season 03 folder")
+    c.sameInt(library.seasonOfFolder("S2"), 2, "S2 folder")
+    c.sameInt(library.seasonOfFolder("Specials"), -1, "Specials isn't a season")
+
+    // Next episode.
+    let files = ["/tv/Show/Show S01E10.mkv", "/tv/Show/Show S01E02.mkv", "/tv/Show/Show S02E01.mkv", "/tv/Show/Show S01E01.mkv", "/tv/Show/Other S01E03.mkv", "/tv/Show/notes.txt"]
+    c.same(library.nextEpisode("/tv/Show/Show S01E01.mkv", candidates: files), "/tv/Show/Show S01E02.mkv", "next episode")
+    c.same(library.nextEpisode("/tv/Show/Show S01E02.mkv", candidates: files), "/tv/Show/Show S01E10.mkv", "next skips to E10 (not by text)")
+    c.same(library.nextEpisode("/tv/Show/Show S01E10.mkv", candidates: files), "/tv/Show/Show S02E01.mkv", "next goes to the next season")
+    c.same(library.nextEpisode("/tv/Show/Show S02E01.mkv", candidates: files), "", "no next after the last")
+    c.same(library.previousEpisode("/tv/Show/Show S02E01.mkv", candidates: files), "/tv/Show/Show S01E10.mkv", "previous episode")
+    let anime = ["/a/[G] Show - 01 [x].mkv", "/a/[G] Show - 02 [x].mkv", "/a/[G] Show - 10 [x].mkv"]
+    c.same(library.nextEpisode(anime[1], candidates: anime), anime[2], "next anime episode")
+    let plain = ["/v/Ep 10.mp4", "/v/Ep 2.mp4", "/v/Ep 1.mp4", "/w/Ep 3.mp4"]
+    c.same(library.nextEpisode("/v/Ep 2.mp4", candidates: plain), "/v/Ep 10.mp4", "next by natural order in the folder")
+    let dates = ["/d/News 2026-10-25.mkv", "/d/News 2026-10-27.mkv", "/d/News 2026-10-26.mkv"]
+    c.same(library.nextEpisode(dates[0], candidates: dates), dates[2], "next date-based episode")
+    c.same(library.sortEpisodes(files.filter { f in f.hasSuffix(".mkv") }).joined(separator: "|"), "/tv/Show/Other S01E03.mkv|/tv/Show/Show S01E01.mkv|/tv/Show/Show S01E02.mkv|/tv/Show/Show S01E10.mkv|/tv/Show/Show S02E01.mkv", "sortEpisodes")
+}
+
+fn testKeymap(_ c: bind Checker) {
+    let m = library.defaultKeymap()
+    // Reel's keys from main.tsl.
+    c.same(m.actionFor(key: "space"), "play-pause", "space")
+    c.same(m.actionFor(key: " "), "play-pause", "' ' is space")
+    c.same(m.actionFor(key: "left"), "jump-back", "left")
+    c.same(m.actionFor(key: "left", shift: true), "jump-back-short", "shift+left")
+    c.same(m.actionFor(key: "right", alt: true), "jump-forward-long", "alt+right")
+    c.same(m.actionFor(key: "right", command: true), "jump-forward", "cmd+right")
+    c.same(m.actionFor(key: "up"), "volume-up", "up")
+    c.same(m.actionFor(key: "f"), "fullscreen", "f")
+    c.same(m.actionFor(key: "escape"), "exit-fullscreen", "escape")
+    c.same(m.actionFor(key: "m"), "mute", "m")
+    c.same(m.actionFor(key: "e"), "frame-step", "e")
+    c.same(m.actionFor(key: "]"), "faster", "]")
+    c.same(m.actionFor(key: "["), "slower", "[")
+    c.same(m.actionFor(key: "="), "normal-speed", "=")
+    c.same(m.actionFor(key: "n"), "next", "n")
+    c.same(m.actionFor(key: "p"), "previous", "p")
+    c.same(m.actionFor(key: "v"), "cycle-subtitle", "v")
+    c.same(m.actionFor(key: "b"), "cycle-audio", "b")
+    c.same(m.actionFor(key: "i"), "media-info", "i")
+    c.same(m.actionFor(key: "S", command: true, shift: true), "snapshot", "cmd+shift+s")
+    c.same(m.actionFor(key: "q"), "", "an unbound key")
+    c.same(library.keyAction(m, KeyEvent(key: "left", text: "", shift: true, alt: false, command: false, control: false, repeated: false, up: false)), "jump-back-short", "keyAction from a KeyEvent")
+    c.same(m.menuShortcut("open-file"), "cmd+o", "menu shortcut open")
+    c.same(m.menuShortcut("open-folder"), "cmd+shift+o", "menu shortcut open folder")
+    c.same(m.menuShortcut("mute"), "", "no menu shortcut without cmd")
+    c.sameInt(m.conflicts().count, 0, "the defaults have no conflicts")
+    for a in library.keyActions {
+        c.check(!m.combos(a.id).isEmpty || a.id == "", "{a.id} has a default")
+    }
+    // Parsing and display.
+    c.same(library.canonicalCombo("Ctrl+Shift+S"), "ctrl+shift+s", "parse Ctrl+Shift+S")
+    c.same(library.canonicalCombo("Shift + Cmd + S"), "cmd+shift+s", "modifier order is canonical")
+    c.same(library.canonicalCombo("⇧⌘S"), "cmd+shift+s", "parse mac symbols")
+    c.same(library.canonicalCombo("Option+Left"), "alt+left", "option is alt")
+    c.same(library.canonicalCombo("cmd++"), "cmd++", "the plus key")
+    c.same(library.canonicalCombo("Esc"), "escape", "Esc")
+    c.same(library.canonicalCombo("hyper+x"), "", "unknown modifier")
+    c.same(library.canonicalCombo("cmd+banana"), "", "unknown key")
+    c.same(library.displayCombo("cmd+shift+s", os: "macos"), "⇧⌘S", "display mac")
+    c.same(library.displayCombo("ctrl+alt+left", os: "macos"), "⌃⌥←", "display mac arrows")
+    c.same(library.displayCombo("cmd+shift+s", os: "windows"), "Ctrl+Shift+S", "display windows")
+    c.same(library.displayCombo("pagedown", os: "windows"), "Page Down", "display key name")
+    // Changes, conflicts, overrides.
+    var u = library.defaultKeymap()
+    u.set("mute", combos: ["space"])
+    let cs = u.conflicts()
+    c.check(cs.count == 1 && cs[0].combo == "space" && cs[0].actions.contains("mute") && cs[0].actions.contains("play-pause"), "conflict found")
+    u.assign("mute", combo: "space")
+    c.sameInt(u.conflicts().count, 0, "assign takes the key away")
+    c.check(u.combos("play-pause").isEmpty, "play-pause lost space")
+    u.set("snapshot", combos: ["cmd+q"])
+    c.check(u.conflicts().any(where: { k in k.reserved && k.combo == "cmd+q" }), "reserved combination flagged")
+    let o = u.overrides()
+    c.check(o["mute"] == ["space"] && o["play-pause"] == [] && o["next"] == nil, "overrides hold only changes")
+    let back = library.keymapWith(overrides: o)
+    c.same(back.actionFor(key: "space"), "mute", "keymap from overrides")
+    c.same(back.actionFor(key: "n"), "next", "untouched defaults stay")
+    c.same(library.actionTitle("snapshot"), "Snapshot", "action title")
+}
+
+fn testPrefs(_ c: bind Checker, _ root: String) {
+    let path = library.preferencesPath(root)
+    c.check(!fileExists(path), "no preferences yet")
+    let d = library.loadPreferences(path)
+    c.same(d.resume, "ask", "default resume")
+    c.near(d.networkCacheSeconds, 10.0, "default network cache")
+    var p = d
+    p.libraryFolders = ["/Movies", "/Music"]
+    p.audioLanguages = ["jpn", "eng"]
+    p.subtitleStyle.fontScale = 1.5
+    p.openSubtitlesApiKey = "KEY"
+    p.keyOverrides = ["mute": ["space"]]
+    p.theme = "dark"
+    c.check(library.savePreferences(p, path: path) == nil, "save preferences")
+    let q = library.loadPreferences(path)
+    c.check(q == p, "preferences round trip")
+    // An older file with only some fields: the rest are defaults.
+    writeFile(path: path, text: "\{\"volume\": 0.5, \"theme\": \"light\", \"subtitleStyle\": \{\"bold\": true}}")
+    let old = library.loadPreferences(path)
+    c.near(old.volume, 0.5, "old file value kept")
+    c.same(old.theme, "light", "old file theme")
+    c.check(old.subtitleStyle.bold && old.subtitleStyle.fontScale == 1.0, "nested defaults filled")
+    c.same(old.deinterlace, "auto", "missing field defaults")
+    // Out of range values.
+    writeFile(path: path, text: "\{\"volume\": 7.0, \"theme\": \"pink\", \"loopMode\": 9, \"equalizerBands\": [20.0, -30.0]}")
+    let v = library.loadPreferences(path)
+    c.check(v.volume == 1.0 && v.theme == "system" && v.loopMode == 2, "values clamped")
+    c.check(v.equalizerBands.count == 10 && v.equalizerBands[0] == 12.0 && v.equalizerBands[1] == -12.0, "bands clamped and filled")
+    // A damaged file is set aside.
+    writeFile(path: path, text: "\{\"volume\": \"loud\"")
+    let bad = library.loadPreferences(path)
+    c.near(bad.volume, 1.0, "damaged file gives defaults")
+    c.check(fileExists(joinPath(root, "preferences.bad.json")) && !fileExists(path), "damaged file kept aside")
+    let km = library.keymapWith(overrides: q.keyOverrides)
+    c.same(km.actionFor(key: "space"), "mute", "keymap from preferences")
+}

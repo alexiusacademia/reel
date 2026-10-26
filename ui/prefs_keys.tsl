@@ -1,0 +1,164 @@
+// The Shortcuts page of the Preferences window: every action of
+// library.keyActions by group, with its key combinations as the system
+// writes them (⇧⌘S, Ctrl+Shift+S). "Add" records the next key pressed
+// (with .onKeyEvent, Escape cancels); each combination can be removed;
+// clashes with other actions or keys the system keeps are said inline,
+// with a button to give the key to this action only; a changed action can
+// be reset, and so can all of them. Every change also updates the
+// preferences' key overrides (`overrides`, normally prefs.keyOverrides).
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+import "../library"
+
+// One action's row.
+view PrefsKeyRow(action: library.KeyAction, keymap: bind library.Keymap, overrides: bind [String: [String]], recording: bind String, conflicts: [library.KeyConflict], os: String) {
+    let combos = keymap.combos(action.id)
+    let mine = prefsConflictsOf(conflicts, action: action.id)
+    let isRecording = recording == action.id
+
+    fn changed() {
+        overrides = keymap.overrides()
+    }
+
+    fn record(_ e: KeyEvent) {
+        if e.key == "escape" && !e.command && !e.control && !e.alt && !e.shift {
+            recording = ""
+            return
+        }
+        let c = prefsComboFromKey(key: e.key, command: e.command, control: e.control, alt: e.alt, shift: e.shift)
+        if c.isEmpty {
+            return
+        }
+        let have = keymap.combos(action.id)
+        if !have.contains(c) {
+            keymap.set(action.id, combos: have + [c])
+            changed()
+        }
+        recording = ""
+    }
+
+    VStack(spacing: 3, alignment: .leading) {
+        HStack(spacing: 6) {
+            Text(action.title).frame(width: 190, alignment: .leading)
+            if combos.isEmpty && !isRecording {
+                Text("None").color(.secondary)
+            }
+            for c in combos {
+                let clash = mine.any(where: { k in k.combo == c })
+                HStack(spacing: 2) {
+                    Text(library.displayCombo(c, os: os))
+                        .font(size: 12)
+                    Button("×") {
+                        keymap.set(action.id, combos: combos.filter { x in x != c })
+                        changed()
+                    }
+                    .font(size: 11)
+                    .background(.clear)
+                    .accessibilityLabel("Remove {library.displayCombo(c, os: os)} from {action.title}")
+                }
+                .padding(horizontal: 6, vertical: 2)
+                .background(if clash { .rgba(242, 140, 26, 0.35) } else { .lightGray }, radius: 4)
+            }
+            if isRecording {
+                Text("Press the new shortcut…")
+                    .font(size: 12)
+                    .padding(horizontal: 8, vertical: 3)
+                    .border(prefsAccent, width: 1.5, radius: 4)
+                    .onKeyEvent { e in record(e) }
+                Button("Cancel") { recording = "" }
+                    .accessibilityLabel("Stop recording a shortcut for {action.title}")
+            } else {
+                Button("Add") { recording = action.id }
+                    .accessibilityLabel("Add a shortcut for {action.title}")
+            }
+            Spacer()
+            if prefsKeyChanged(keymap, action: action.id) {
+                Button("Reset") {
+                    keymap.set(action.id, combos: library.defaultKeymap().combos(action.id))
+                    changed()
+                }
+                .accessibilityLabel("Reset {action.title} to its default keys")
+            }
+        }
+        for k in mine {
+            HStack(spacing: 6) {
+                Text("⚠ " + prefsConflictText(k, action: action.id, os: os))
+                    .font(size: 11)
+                    .color(if k.reserved && k.actions.count == 1 { .secondary } else { prefsAccent })
+                if k.actions.count > 1 {
+                    Button("Use Only Here") {
+                        keymap.assign(action.id, combo: k.combo)
+                        changed()
+                    }
+                    .font(size: 11)
+                    .accessibilityLabel("Use {library.displayCombo(k.combo, os: os)} only for {action.title}")
+                }
+            }
+            .padding(leading: 196)
+        }
+    }
+    .padding(horizontal: 8, vertical: 3)
+    .background(if isRecording { .highlight } else { .clear }, radius: 4)
+}
+
+// Shortcuts: all actions, search, recording, conflicts, reset.
+public view ShortcutPrefs(keymap: bind library.Keymap, overrides: bind [String: [String]], os: String = "") {
+    state recording = ""
+    state query = ""
+    state confirmReset = false
+    let conflicts = keymap.conflicts()
+    let groups = prefsKeyGroups()
+
+    VStack(spacing: 8, alignment: .leading) {
+        HStack(spacing: 8) {
+            SearchField("Search actions or keys", text: query)
+                .frame(width: 260)
+            Spacer()
+            let clashes = conflicts.count(where: { k in k.actions.count > 1 })
+            if clashes > 0 {
+                Text(if clashes == 1 { "1 key runs two actions" } else { "{clashes} keys run two actions" })
+                    .font(size: 12)
+                    .color(prefsAccent)
+            }
+            if confirmReset {
+                Text("Reset every shortcut?").font(size: 12)
+                Button("Reset All") {
+                    keymap = library.defaultKeymap()
+                    overrides = [:]
+                    recording = ""
+                    confirmReset = false
+                }
+                .color(.red)
+                Button("Cancel") { confirmReset = false }
+                    .accessibilityLabel("Keep the shortcuts")
+            } else {
+                Button("Reset All…") { confirmReset = true }
+                    .disabled(overrides.isEmpty && keymap.overrides().isEmpty)
+            }
+        }
+        .padding(top: 14, leading: 16, trailing: 16)
+        Scroll {
+            VStack(spacing: 2, alignment: .leading) {
+                for g in groups {
+                    let shown = library.keyActions.filter { a in a.group == g && prefsKeyMatches(a, keymap, query: query, os: os) }
+                    if !shown.isEmpty {
+                        Text(g)
+                            .font(size: 13, weight: .semibold)
+                            .padding(top: 10, leading: 8, bottom: 2)
+                        for a in shown {
+                            PrefsKeyRow(action: a, keymap: keymap, overrides: overrides, recording: recording, conflicts: conflicts, os: os)
+                                .id(a.id)
+                        }
+                    }
+                }
+                if !library.keyActions.any(where: { a in prefsKeyMatches(a, keymap, query: query, os: os) }) {
+                    Text("No action or key matches “{query}”.").color(.secondary).padding(8)
+                }
+            }
+            .padding(horizontal: 12, vertical: 8)
+            .frame(maxWidth: .infinity, alignment: .topLeading)
+        }
+    }
+}

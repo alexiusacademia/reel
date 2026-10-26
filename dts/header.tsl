@@ -1,0 +1,361 @@
+// DTS frame headers and stream forms: the core frame header (ETSI TS
+// 102 114 5.3.1), the four ways a core stream can be stored, and
+// `frameInfo` / `streamInfo` for the demuxer and the media info window.
+//
+// Stream forms. The core sync word is 0x7FFE8001 in the normal 16-bit
+// big-endian form. Streams written as 16-bit little-endian words (as in
+// WAV files) start FE 7F 01 80. "14-bit" streams (DTS CDs and WAV files,
+// made so that a player that doesn't know DTS plays near-silence) keep 14
+// bits in each 16-bit word: 1F FF E8 00 (big-endian) or FF 1F 00 E8
+// (little-endian). We turn the other forms into the big-endian 16-bit one
+// before decoding (FFmpeg's avpriv_dca_convert_bitstream).
+//
+// A DTS-HD stream follows each core frame (padded to 4 bytes) with an
+// extension substream (sync 0x64582025, exss.tsl) that carries XLL, XBR,
+// XXCH or X96 data; DTS-HD streams without a core are a substream alone.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../core"
+
+// What a core frame header says (5.3.1).
+public struct DtsCoreHeader {
+    ok: Bool = false
+    problem: String = ""
+    // Bits the header takes.
+    headerBits: Int = 0
+    normalFrame: Bool = true
+    crcPresent: Bool = false
+    npcmblocks: Int = 0
+    // Bytes in the frame (16-bit form).
+    frameSize: Int = 0
+    audioMode: Int = 0
+    srCode: Int = 0
+    brCode: Int = 0
+    drcPresent: Bool = false
+    tsPresent: Bool = false
+    auxPresent: Bool = false
+    extAudioType: Int = 0
+    extAudioPresent: Bool = false
+    syncSsf: Bool = false
+    lfePresent: Int = 0
+    predictorHistory: Bool = false
+    filterPerfect: Bool = false
+    pcmrCode: Int = 0
+    sumdiffFront: Bool = false
+    sumdiffSurround: Bool = false
+}
+
+// Reads a core frame header from a copy of `r` (big-endian 16-bit form).
+public fn dtsReadCoreHeader(_ r: core.BitReader) -> DtsCoreHeader {
+    var br = r
+    var h = DtsCoreHeader()
+    let start = br.position
+    if br.long(32) != 0x7FFE8001 {
+        h.problem = "no core sync word"
+        return h
+    }
+    h.normalFrame = br.flag()
+    let deficit = br.bits(5) + 1
+    h.crcPresent = br.flag()
+    h.npcmblocks = br.bits(7) + 1
+    h.frameSize = br.bits(14) + 1
+    h.audioMode = br.bits(6)
+    h.srCode = br.bits(4)
+    h.brCode = br.bits(5)
+    let reserved = br.flag()
+    h.drcPresent = br.flag()
+    h.tsPresent = br.flag()
+    h.auxPresent = br.flag()
+    br.bits(1)
+    h.extAudioType = br.bits(3)
+    h.extAudioPresent = br.flag()
+    h.syncSsf = br.flag()
+    h.lfePresent = br.bits(2)
+    h.predictorHistory = br.flag()
+    if h.crcPresent {
+        br.skip(16)
+    }
+    h.filterPerfect = br.flag()
+    br.bits(4)
+    br.bits(2)
+    h.pcmrCode = br.bits(3)
+    h.sumdiffFront = br.flag()
+    h.sumdiffSurround = br.flag()
+    br.bits(4)
+    h.headerBits = br.position - start
+    if deficit != 32 {
+        h.problem = "deficit samples are not supported"
+    } else if (h.npcmblocks & 7) != 0 {
+        h.problem = "unsupported number of PCM blocks ({h.npcmblocks})"
+    } else if h.frameSize < 96 {
+        h.problem = "invalid core frame size ({h.frameSize})"
+    } else if h.audioMode >= 10 {
+        h.problem = "unsupported channel arrangement ({h.audioMode})"
+    } else if dtsSampleRates[h.srCode] == 0 {
+        h.problem = "invalid core sampling frequency"
+    } else if reserved {
+        h.problem = "reserved bit set"
+    } else if h.lfePresent == 3 {
+        h.problem = "invalid LFE flag"
+    } else if dtsBitsPerSample[h.pcmrCode] == 0 {
+        h.problem = "invalid source PCM resolution"
+    } else if br.overrun {
+        h.problem = "core header cut off"
+    } else {
+        h.ok = true
+    }
+    h
+}
+
+// Stream forms.
+let dtsFormBE16 = 0
+let dtsFormLE16 = 1
+let dtsFormBE14 = 2
+let dtsFormLE14 = 3
+let dtsFormSubstream = 4
+
+// The form of a sync word at data[at…], or −1.
+public fn dtsSyncForm(_ data: Data, at: Int) -> Int {
+    if at < 0 || at + 4 > data.count {
+        return -1
+    }
+    let a = data[at]
+    let b = data[at + 1]
+    let c = data[at + 2]
+    let d = data[at + 3]
+    if a == 0x7f && b == 0xfe && c == 0x80 && d == 0x01 {
+        return dtsFormBE16
+    }
+    if a == 0xfe && b == 0x7f && c == 0x01 && d == 0x80 {
+        return dtsFormLE16
+    }
+    if a == 0x1f && b == 0xff && c == 0xe8 && d == 0x00 && at + 6 <= data.count && data[at + 4] == 0x07 && (data[at + 5] & 0xf0) == 0xf0 {
+        return dtsFormBE14
+    }
+    if a == 0xff && b == 0x1f && c == 0x00 && d == 0xe8 && at + 6 <= data.count && (data[at + 4] & 0xf0) == 0xf0 && data[at + 5] == 0x07 {
+        return dtsFormLE14
+    }
+    if a == 0x64 && b == 0x58 && c == 0x20 && d == 0x25 {
+        return dtsFormSubstream
+    }
+    -1
+}
+
+// data[from…to] turned into the big-endian 16-bit form (FFmpeg's
+// avpriv_dca_convert_bitstream).
+public fn dtsToBigEndian(_ data: Data, from: Int, to: Int, form: Int) -> Data {
+    let end = min(to, data.count)
+    if form == dtsFormBE16 || form == dtsFormSubstream {
+        return data.slice(from: from, to: end)
+    }
+    var out = Data()
+    if form == dtsFormLE16 {
+        var i = from
+        while i + 1 < end {
+            out.append(byte: data[i + 1])
+            out.append(byte: data[i])
+            i += 2
+        }
+        if i < end {
+            out.append(byte: 0)
+        }
+        return out
+    }
+    // 14 bits of each 16-bit word, packed one after the other.
+    var acc = 0
+    var bits = 0
+    var i = from
+    while i + 1 < end {
+        let w = if form == dtsFormBE14 { (data[i] << 8) | data[i + 1] } else { (data[i + 1] << 8) | data[i] }
+        acc = (acc << 14) | (w & 0x3fff)
+        bits += 14
+        while bits >= 8 {
+            bits -= 8
+            out.append(byte: (acc >> bits) & 0xff)
+        }
+        acc = acc & ((1 << bits) - 1)
+        i += 2
+    }
+    if bits > 0 {
+        out.append(byte: (acc << (8 - bits)) & 0xff)
+    }
+    out
+}
+
+// What a frame says, for demuxers and the media info window.
+public struct FrameInfo {
+    ok: Bool = false
+    // 0 16-bit big-endian, 1 16-bit little-endian, 2 14-bit big-endian,
+    // 3 14-bit little-endian, 4 extension substream only (no core).
+    form: Int = 0
+    // Bytes of the core frame in the stream's own form (for the 14-bit
+    // forms an estimate: the next sync word marks the real end), and of
+    // the extension substream after it (0 when there is none).
+    coreSize: Int = 0
+    exssSize: Int = 0
+    // coreSize (padded to 4 bytes when a substream follows) + exssSize.
+    size: Int = 0
+    // Core: rate, channels (with LFE), samples per frame.
+    rate: Int = 0
+    channels: Int = 0
+    lfe: Bool = false
+    samples: Int = 0
+    audioMode: Int = 0
+    bitrate: Int = 0
+    // Core extensions announced in the header: "XCh", "X96", "XXCH" or "".
+    coreExtension: String = ""
+    // DTS-HD: what the substream carries.
+    xll: Bool = false
+    xbr: Bool = false
+    lbr: Bool = false
+    hdRate: Int = 0
+    hdChannels: Int = 0
+    hdBits: Int = 0
+    hdSamples: Int = 0
+}
+
+// The frame at data[at…]: the core header (when there is a core) and the
+// extension substream that follows it.
+// `end` limits the bytes looked at (−1: to the end of data).
+public fn frameInfo(_ data: Data, at: Int, end: Int = -1) -> FrameInfo {
+    var info = FrameInfo()
+    let limit = if end < 0 || end > data.count { data.count } else { end }
+    let form = dtsSyncForm(data, at: at)
+    if form < 0 || at + 16 > limit {
+        return FrameInfo()
+    }
+    info.form = form
+    var exssAt = at
+    if form != dtsFormSubstream {
+        // The header in big-endian 16-bit form.
+        var h = DtsCoreHeader()
+        if form == dtsFormBE16 {
+            h = dtsReadCoreHeader(core.bitReaderRange(data, from: at, to: min(limit, at + 18)))
+        } else {
+            let head = dtsToBigEndian(data, from: at, to: min(limit, at + 22), form: form)
+            h = dtsReadCoreHeader(core.bitReader(head))
+        }
+        if !h.ok {
+            return info
+        }
+        info.rate = dtsSampleRates[h.srCode]
+        info.lfe = h.lfePresent != 0
+        info.channels = dtsChannelsForMode[h.audioMode] + (if info.lfe { 1 } else { 0 })
+        info.samples = h.npcmblocks * 32
+        info.audioMode = h.audioMode
+        let br = dtsBitRates[h.brCode]
+        info.bitrate = if br > 3 { br } else { 0 }
+        if h.extAudioPresent {
+            info.coreExtension = if h.extAudioType == 0 { "XCh" } else if h.extAudioType == 2 { "X96" } else if h.extAudioType == 6 { "XXCH" } else { "" }
+        }
+        info.coreSize = if form >= 2 { ((h.frameSize * 8 + 13) / 14) * 2 } else { h.frameSize }
+        info.size = info.coreSize
+        info.ok = true
+        if form >= 2 {
+            return info
+        }
+        exssAt = at + ((h.frameSize + 3) & ~3)
+    }
+    if exssAt + 16 <= limit && dtsSyncForm(data, at: exssAt) == dtsFormSubstream {
+        let x = dtsParseExss(data, at: exssAt, end: limit)
+        if x.ok {
+            info.exssSize = x.size
+            info.size = (exssAt - at) + x.size
+            info.ok = true
+            let a = x.asset
+            info.xll = (a.extensionMask & dtsExssXll) != 0
+            info.xbr = (a.extensionMask & dtsExssXbr) != 0
+            info.lbr = (a.extensionMask & dtsExssLbr) != 0
+            info.hdRate = a.maxSampleRate
+            info.hdChannels = a.nchannelsTotal
+            info.hdBits = a.pcmBitRes
+            if info.xll {
+                let xs = dtsXllFrameSamples(data, at: exssAt + a.xllOffset, end: exssAt + a.xllOffset + a.xllSize)
+                info.hdSamples = if a.maxSampleRate > 96000 { 2 * xs } else { xs }
+            }
+            if form == dtsFormSubstream {
+                info.rate = a.maxSampleRate
+                info.channels = a.nchannelsTotal
+                info.samples = info.hdSamples
+            }
+        }
+    }
+    info
+}
+
+// The position of the next frame (core or substream) at or after `from`
+// (and before `to`, −1 for the end) whose header reads as valid, or −1.
+public fn findSync(_ data: Data, from: Int, to: Int = -1) -> Int {
+    let limit = if to < 0 || to > data.count { data.count } else { to }
+    var i = max(from, 0)
+    while i + 4 <= limit {
+        let b = data[i]
+        if (b == 0x7f || b == 0xfe || b == 0x1f || b == 0xff || b == 0x64) && dtsSyncForm(data, at: i) >= 0 && frameInfo(data, at: i, end: limit).ok {
+            return i
+        }
+        i += 1
+    }
+    -1
+}
+
+// "DTS-HD MA 7.1, 48 kHz, 24-bit" for a DTS track (from its first packet
+// when the demuxer put one in `extra`, else from what the track says).
+public fn streamInfo(_ track: core.Track) -> String {
+    var kind = "DTS"
+    var rate = track.sampleRate
+    var channels = track.channels
+    var bits = track.bitsPerSample
+    var lfe = channels == 6 || channels == 8
+    if track.tag.hasPrefix("DTS") {
+        kind = track.tag
+    }
+    if !track.extra.isEmpty {
+        let info = frameInfo(track.extra, at: 0)
+        if info.ok {
+            lfe = info.lfe
+            if info.xll {
+                kind = "DTS-HD MA"
+            } else if info.lbr {
+                kind = "DTS Express"
+            } else if info.exssSize > 0 {
+                kind = "DTS-HD HRA"
+            } else if info.coreExtension == "XCh" || info.coreExtension == "XXCH" {
+                kind = "DTS-ES"
+            } else if info.coreExtension == "X96" {
+                kind = "DTS 96/24"
+            }
+            if info.hdRate > 0 {
+                rate = info.hdRate
+                channels = info.hdChannels
+                bits = info.hdBits
+            } else if rate == 0 {
+                rate = info.rate
+                channels = info.channels
+            }
+        }
+    }
+    var layout = "{channels} ch"
+    if channels == 1 {
+        layout = "mono"
+    } else if channels == 2 {
+        layout = "stereo"
+    } else if lfe && channels >= 3 {
+        layout = "{channels - 1}.1"
+    } else if channels > 2 {
+        layout = "{channels}.0"
+    }
+    var text = "{kind} {layout}"
+    if rate > 0 {
+        if rate % 1000 == 0 {
+            text += ", {rate / 1000} kHz"
+        } else {
+            text += ", {rate / 1000}.{(rate % 1000) / 100} kHz"
+        }
+    }
+    if bits > 0 {
+        text += ", {bits}-bit"
+    }
+    text
+}

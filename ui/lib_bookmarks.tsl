@@ -1,0 +1,142 @@
+// The bookmarks panel (`BookmarksPanel`): the open file's named times
+// (library.Bookmark, in time order), the one just passed marked; click
+// one to go there; rename it in place (the pencil, or a double click) or
+// delete it; a name field and "Add at 12:34" make one at the playing
+// time. Changes go to the app through callbacks (it keeps them in the
+// file's library.FileSettings with library.addBookmark, renameBookmark
+// and removeBookmark). Dark, like the player.
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+import "../library"
+
+public view BookmarksPanel(bookmarks: [library.Bookmark], current: Float, onJump: fn(Float), onAdd: fn(String), onRename: fn(Int, String), onDelete: fn(Int)) {
+    state draft = ""
+    state editing = -1
+    state editText = ""
+    state lastTap = -1
+    state lastTapTime = -100.0
+
+    VStack(spacing: 0, alignment: .leading) {
+        HStack(spacing: 4) {
+            Text("Bookmarks").font(size: 13, weight: .bold).color(.white)
+            Text("{bookmarks.count}").font(size: 11).color(libDarkDim)
+            Spacer()
+        }
+        .padding(horizontal: 10, vertical: 8)
+        HStack(spacing: 6) {
+            TextField("Name (optional)", text: draft)
+                .onSubmit { bmAdd() }
+                .font(size: 12)
+            HStack(spacing: 4) {
+                Svg(svgLibBookmarkPlus()).color(libAccent).frame(width: 13, height: 13)
+                Text("Add at {libDurationText(current)}").font(size: 12).color(libDarkText)
+            }
+            .padding(horizontal: 8, vertical: 4)
+            .background(libDarkCard, radius: 6)
+            .hoverBackground(.rgb(58, 58, 58), radius: 6)
+            .onTap { bmAdd() }
+            .tooltip("Bookmark the playing time")
+            .accessibilityLabel("Add bookmark at {libDurationText(current)}")
+        }
+        .padding(horizontal: 8, bottom: 8)
+        if bookmarks.isEmpty {
+            VStack(spacing: 6) {
+                Spacer()
+                Svg(svgLibBookmark()).color(libDarkDim).frame(width: 28, height: 28)
+                Text("No bookmarks in this file.").font(size: 12).color(libDarkDim)
+                Spacer()
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else {
+            Scroll {
+                VStack(spacing: 0, alignment: .leading) {
+                    for (i, b) in bookmarks.enumerated() {
+                        bmRow(i, b)
+                    }
+                }
+            }
+        }
+    }
+    .frame(maxHeight: .infinity)
+    .background(libDarkPanel)
+
+    fn bmCurrent() -> Int {
+        var starts: [Float] = []
+        for b in bookmarks {
+            starts.append(b.time)
+        }
+        libCurrentIndex(starts, at: current)
+    }
+
+    fn bmRow(_ i: Int, _ b: library.Bookmark) -> View {
+        let on = i == bmCurrent()
+        HStack(spacing: 8) {
+            Text(libDurationText(b.time))
+                .font(size: 12, weight: .semibold, family: "monospaced")
+                .color(if on { libAccent } else { libDarkDim })
+                .frame(width: 58, alignment: .leading)
+            if editing == i {
+                TextField("Bookmark name", text: editText)
+                    .autofocus()
+                    .onSubmit { bmRename(i) }
+                    .font(size: 12)
+            } else {
+                Text(if b.name.isEmpty { libDurationText(b.time) } else { b.name })
+                    .font(size: 12, weight: if on { .semibold } else { .regular })
+                    .color(if on { libAccent } else { libDarkText })
+                    .lineLimit(1)
+                Spacer()
+                LibDarkButton(svg: svgLibPencil(), tip: "Rename “{b.name}”", size: 12) { bmStartRename(i, b) }
+            }
+            LibDarkButton(svg: svgLibTrash(), tip: "Delete “{b.name}”", size: 12) { bmDelete(i) }
+        }
+        .padding(horizontal: 8, vertical: 3)
+        .background(if on { libAccentSoft } else { .clear }, radius: 4)
+        .hoverBackground(libDarkHover, radius: 4)
+        .padding(horizontal: 4)
+        .onTap { bmTapped(i, b) }
+        .accessibilityLabel("{b.name} at {libDurationText(b.time)}")
+        .id("libbm{i}")
+    }
+
+    fn bmAdd() {
+        onAdd(draft.trim())
+        draft = ""
+    }
+
+    fn bmTapped(_ i: Int, _ b: library.Bookmark) {
+        if editing == i {
+            return
+        }
+        let t = now()
+        if lastTap == i && t - lastTapTime < 0.45 {
+            lastTap = -1
+            bmStartRename(i, b)
+            return
+        }
+        lastTap = i
+        lastTapTime = t
+        onJump(b.time)
+    }
+
+    fn bmStartRename(_ i: Int, _ b: library.Bookmark) {
+        editing = i
+        editText = b.name
+    }
+
+    fn bmRename(_ i: Int) {
+        let name = editText.trim()
+        editing = -1
+        if i >= 0 && i < bookmarks.count && name != bookmarks[i].name {
+            onRename(i, name)
+        }
+    }
+
+    fn bmDelete(_ i: Int) {
+        editing = -1
+        lastTap = -1
+        onDelete(i)
+    }
+}

@@ -1,0 +1,250 @@
+// The render test's checks of render.View: picture adjustments, crop,
+// zoom and pan, aspect override, flips and rotation, against ffmpeg's eq,
+// hue, crop, hflip, vflip and transpose filters (make_view_refs.sh) and
+// against plain expectations; and the speed of adjusted conversion.
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+import "../../render"
+import "../../core"
+
+struct ViewCase {
+    name: String
+    look: render.View
+    width: Int
+    height: Int
+    maxErr: Int
+    meanErr: Float
+    // Converted at exactly width×height with `render` (flips as given)
+    // rather than fitted into a box with `frame`.
+    exact: Bool = false
+}
+
+fn viewTests(_ t: bind Tally, _ full: core.Picture) {
+    var base = cropOf(full)
+    base.matrix = .bt601
+    var cases: [ViewCase] = []
+    var eq = render.View()
+    eq.brightness = 0.08
+    eq.contrast = 1.3
+    eq.saturation = 1.4
+    eq.gamma = 1.2
+    cases.append(ViewCase(name: "v_eq", look: eq, width: 160, height: 120, maxErr: 4, meanErr: 0.6))
+    var eqs = render.View()
+    eqs.contrast = 0.7
+    eqs.gamma = 0.8
+    eqs.brightness = -0.05
+    // ffmpeg rounds eq's output to whole code values before scaling; the
+    // renderer keeps the fraction, so the scaled case is allowed more.
+    cases.append(ViewCase(name: "v_eq_scaled", look: eqs, width: 107, height: 80, maxErr: 45, meanErr: 1.2))
+    var hue = render.View()
+    hue.hue = 40.0
+    hue.saturation = 0.8
+    cases.append(ViewCase(name: "v_hue", look: hue, width: 160, height: 120, maxErr: 3, meanErr: 0.6))
+    var hue2 = render.View()
+    hue2.hue = -120.0
+    hue2.saturation = 1.6
+    cases.append(ViewCase(name: "v_hue2", look: hue2, width: 160, height: 120, maxErr: 3, meanErr: 0.6))
+    var crop = render.View()
+    crop.cropLeft = 20
+    crop.cropTop = 10
+    crop.cropRight = 40
+    crop.cropBottom = 30
+    cases.append(ViewCase(name: "v_crop", look: crop, width: 100, height: 80, maxErr: 2, meanErr: 0.1))
+    // (ffmpeg flips and turns its RGB result, see make_view_refs.sh.)
+    var hf = render.View()
+    hf.flipH = true
+    cases.append(ViewCase(name: "v_hflip", look: hf, width: 160, height: 120, maxErr: 2, meanErr: 0.1))
+    var vf = render.View()
+    vf.flipV = true
+    cases.append(ViewCase(name: "v_vflip", look: vf, width: 160, height: 120, maxErr: 2, meanErr: 0.1))
+    var hv = render.View()
+    hv.flipH = true
+    hv.flipV = true
+    cases.append(ViewCase(name: "v_hvflip_scaled", look: hv, width: 256, height: 192, maxErr: 2, meanErr: 0.1, exact: true))
+    var r90 = render.View()
+    r90.rotation = 90
+    cases.append(ViewCase(name: "v_transpose1", look: r90, width: 120, height: 160, maxErr: 2, meanErr: 0.1))
+    var r270 = render.View()
+    r270.rotation = -90
+    cases.append(ViewCase(name: "v_transpose2", look: r270, width: 120, height: 160, maxErr: 2, meanErr: 0.1))
+    // Hue and saturation, flipped then turned a quarter clockwise by
+    // ffmpeg (in screen space: turned, then flipped vertically). (ffmpeg's
+    // "eq=saturation=…,hue=…" chain gives different colours from either
+    // filter alone, so the one-filter form is the reference.)
+    var mixed = render.View()
+    mixed.saturation = 1.5
+    mixed.hue = 25.0
+    mixed.rotation = 90
+    mixed.flipV = true
+    cases.append(ViewCase(name: "v_hue_hflip_rot", look: mixed, width: 120, height: 160, maxErr: 2, meanErr: 0.1))
+    var renderer = render.newRenderer()
+    for c in cases {
+        // A box of the reference's size: the frame comes out that size.
+        var f = render.Frame()
+        if c.exact {
+            f = render.Frame(width: c.width, height: c.height, pixels: renderer.render(base, settings: c.look, width: c.width, height: c.height))
+        } else {
+            f = renderer.frame(base, settings: c.look, boxW: c.width, boxH: c.height)
+        }
+        let ref = loadRgb(c.name)
+        let (worst, mean) = compareRgb(f.pixels, ref)
+        print("view {c.name} vs ffmpeg: max {worst}, mean {f2(mean)}, PSNR {f2(if f.pixels.count * 3 == ref.count { psnrRgb(f.pixels, ref) } else { 0.0 })} dB")
+        t.check(f.width == c.width && f.height == c.height, "{c.name}: frame is {f.width}×{f.height}, want {c.width}×{c.height}")
+        t.check(worst <= c.maxErr && mean <= c.meanErr, "{c.name}: max {worst} (≤ {c.maxErr}), mean {f2(mean)} (≤ {f2(c.meanErr)}) vs ffmpeg")
+    }
+
+    // Plain view = toRgba; the same Renderer goes back to plain colours.
+    let plain = renderer.toRgba(base, width: 160, height: 120)
+    t.check(renderer.frame(base, settings: render.View(), boxW: 160, boxH: 120).pixels == plain, "a plain view converts like toRgba")
+    t.check(render.toRgba(base, width: 160, height: 120) == plain, "toRgba after an adjusted frame is plain again")
+    // Flips are exact mirrors (vertical flip on the same-size path; both
+    // on the scaled path).
+    let vflip = renderer.frame(base, settings: vf, boxW: 160, boxH: 120).pixels
+    var vOk = vflip.count == plain.count
+    for y in 0..120 {
+        for x in 0..160 {
+            if vOk && vflip[y * 160 + x] != plain[(119 - y) * 160 + x] {
+                vOk = false
+            }
+        }
+    }
+    t.check(vOk, "vertical flip mirrors the rows exactly")
+    let scaledPlain = renderer.toRgba(base, width: 256, height: 192)
+    let scaledHv = renderer.render(base, settings: hv, width: 256, height: 192)
+    var hvOk = scaledHv.count == scaledPlain.count
+    for y in 0..192 {
+        for x in 0..256 {
+            if hvOk && scaledHv[y * 256 + x] != scaledPlain[(191 - y) * 256 + 255 - x] {
+                hvOk = false
+            }
+        }
+    }
+    t.check(hvOk, "both flips on the scaled path turn the picture 180°")
+    // Screen-space flips under a track rotation: hflip after a quarter turn.
+    var hf90 = hf
+    hf90.rotation = 0
+    let turned = renderer.frame(base, settings: render.View(), boxW: 0, boxH: 0, trackRotation: 90)
+    let turnedFlip = renderer.frame(base, settings: hf90, boxW: 0, boxH: 0, trackRotation: 90)
+    var sfOk = turned.width == 120 && turned.height == 160 && turnedFlip.pixels.count == turned.pixels.count
+    for y in 0..turned.height {
+        for x in 0..turned.width {
+            if sfOk && turnedFlip.pixels[y * 120 + x] != turned.pixels[y * 120 + 119 - x] {
+                sfOk = false
+            }
+        }
+    }
+    t.check(sfOk, "flips are in screen space after the track rotation")
+
+    // Identity adjustments are exact; brightness up makes everything
+    // brighter; saturation 0 makes gray.
+    var bright = render.View()
+    bright.brightness = 0.2
+    let bpx = renderer.render(base, settings: bright, width: 160, height: 120)
+    var brighter = true
+    for i in 0..bpx.count {
+        if ((bpx[i] >> 16) & 255) < ((plain[i] >> 16) & 255) {
+            brighter = false
+        }
+    }
+    t.check(brighter, "brightness raises every pixel")
+    var gray = render.View()
+    gray.saturation = 0.0
+    let gpx = renderer.render(base, settings: gray, width: 160, height: 120)
+    t.check(gpx.all(where: { v in abs(((v >> 24) & 255) - ((v >> 16) & 255)) <= 1 && abs(((v >> 8) & 255) - ((v >> 16) & 255)) <= 1 }), "saturation 0 is gray")
+    t.check(abs(render.adjustedLuma(100.0, render.View(), depth: 8) - 100.0) < 0.0001, "plain luma is unchanged")
+    var g2 = render.View()
+    g2.gamma = 2.0
+    t.check(abs(render.adjustedLuma(64.0, g2, depth: 8) - 255.0 * sqrt(64.0 / 255.0)) < 0.001, "gamma 2 is a square root on 0…1")
+    // 10-bit adjusted pictures stay sane (flat picture stays flat).
+    var flat10 = core.blankPicture(width: 32, height: 16, depth: 10)
+    flat10.y = core.filled(32 * 16, 500)
+    flat10.u = core.filled(16 * 8, 600)
+    flat10.v = core.filled(16 * 8, 400)
+    let f10 = renderer.render(flat10, settings: eq, width: 32, height: 16)
+    t.check(f10.all(where: { v in v == f10[0] }), "10-bit adjusted flat picture stays flat")
+
+    // Geometry: crop windows, zoom/pan, aspect.
+    let (wx, wy, ww, wh) = render.viewWindow(base, crop)
+    t.check(wx == 20 && wy == 10 && ww == 100 && wh == 80, "crop window")
+    var odd = crop
+    odd.cropLeft = 21
+    odd.cropTop = 11
+    let (ox, oy, ow, oh) = render.viewWindow(base, odd)
+    t.check(ox == 20 && oy == 10 && ow == 100 && oh == 80, "odd crop edges round to even for 4:2:0 ({ox},{oy} {ow}×{oh})")
+    var zoom = render.View()
+    zoom.zoom = 2.0
+    let (zx, zy, zw, zh) = render.viewWindow(base, zoom)
+    t.check(zx == 40 && zy == 30 && zw == 80 && zh == 60, "zoom 2 shows the middle half")
+    zoom.panX = 1.0
+    zoom.panY = -1.0
+    let (px, py, _, _) = render.viewWindow(base, zoom)
+    t.check(px == 80 && py == 0, "pan to the top right")
+    var zoomed = render.View()
+    zoomed.zoom = 2.0
+    let zf = renderer.frame(base, settings: zoomed, boxW: 1000, boxH: 1000)
+    t.check(zf.width == 80 && zf.height == 60, "a zoomed frame is the window's own size")
+    var wide = render.View()
+    wide.aspect = render.parseAspect("16:9")
+    let ws = render.frameSize(base, wide, boxW: 1000, boxH: 1000)
+    t.check(ws.0 == 213 && ws.1 == 120, "aspect 16:9 override ({ws.0}×{ws.1})")
+    t.check(abs(render.parseAspect("2.35:1") - 2.35) < 0.0001 && render.parseAspect("Default") == 0.0 && abs(render.parseAspect("1.85") - 1.85) < 0.0001 && render.parseAspect("x") == 0.0, "parseAspect")
+    var square = render.View()
+    square.aspect = 1.0
+    let sq = render.frameSize(base, square, boxW: 500, boxH: 500)
+    // Never more rows than the picture has: 1:1 of 160×120 is 120×120.
+    t.check(sq.0 == 120 && sq.1 == 120, "aspect 1:1 ({sq.0}×{sq.1})")
+    let rs = render.frameSize(base, r90, boxW: 1000, boxH: 1000)
+    t.check(rs.0 == 120 && rs.1 == 160, "frame size turns with the rotation")
+    let fitBox = render.frameSize(base, render.View(), boxW: 80, boxH: 200)
+    t.check(fitBox.0 == 80 && fitBox.1 == 60, "frame fits the box")
+}
+
+fn viewSpeedTests(_ t: bind Tally, _ full: core.Picture) {
+    let hd = bigPicture(full, 1920, 1080)
+    var v = render.View()
+    v.brightness = 0.05
+    v.contrast = 1.2
+    v.saturation = 1.3
+    v.hue = 10.0
+    v.gamma = 1.1
+    var r = render.newRenderer()
+    var best1 = 1e9
+    var best2 = 1e9
+    var best3 = 1e9
+    var best4 = 1e9
+    var keep = render.Frame()
+    for _ in 0..8 {
+        var t0 = now()
+        keep = r.frame(hd, settings: v, boxW: 1920, boxH: 1080)
+        best1 = min(best1, ms(t0))
+    }
+    var r2 = render.newRenderer()
+    for _ in 0..8 {
+        let t0 = now()
+        keep = r2.frame(hd, settings: v, boxW: 1280, boxH: 720)
+        best2 = min(best2, ms(t0))
+    }
+    var fl = render.View()
+    fl.flipH = true
+    var r3 = render.newRenderer()
+    for _ in 0..8 {
+        let t0 = now()
+        keep = r3.frame(hd, settings: fl, boxW: 1920, boxH: 1080)
+        best3 = min(best3, ms(t0))
+    }
+    var cz = render.View()
+    cz.cropTop = 140
+    cz.cropBottom = 140
+    cz.zoom = 1.5
+    var r4 = render.newRenderer()
+    for _ in 0..8 {
+        let t0 = now()
+        keep = r4.frame(hd, settings: cz, boxW: 1920, boxH: 1080)
+        best4 = min(best4, ms(t0))
+    }
+    print("time frame 1080p adjusted (b/c/s/h/gamma) → 1080p: {f2(best1)} ms, → 720p: {f2(best2)} ms")
+    print("time frame 1080p flipped horizontally: {f2(best3)} ms; cropped + zoom 1.5: {f2(best4)} ms")
+    t.check(keep.pixels.count == keep.width * keep.height && keep.width > 0, "big view frames convert")
+}

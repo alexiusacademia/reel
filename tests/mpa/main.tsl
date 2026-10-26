@@ -1,0 +1,385 @@
+// Tests for the mpa module (MPEG audio layers I, II and III) against
+// ffmpeg's decoded samples:
+//   - the shared raw fixtures (mp3_cbr, mp3_vbr_mono, mp2, cover.mp3),
+//     framed by mpa.findFrames and checked against ffprobe's packet list;
+//   - mp3 tracks inside MKV and AVI (packets from testkit.mediaFromRef);
+//   - extra clips in tests/mpa/fixtures (tests/mpa/make_fixtures.sh): lame
+//     short blocks, LSF and MPEG-2.5 rates, CRC, forced M/S, dual, simple
+//     stereo, 320 kbps, no reservoir; ffmpeg mp2 mono/LSF; generated
+//     layer I and joint-stereo layer II streams (gen_layer12.py);
+//   - the ISO 11172-4 compliance streams, when they've been downloaded
+//     into build/conformance/audio_a/iso (each with ffmpeg's decoding,
+//     F.f32, and the reference decoder's 16-bit output, F.pcm).
+// Layers I/II must match bit for bit (SNR 150: ffmpeg decodes them in
+// fixed point, as we do); layer III at 90 dB or more.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../../mpa"
+import "../../core"
+import "../../testkit"
+
+struct Run {
+    data: [Float] = []
+    channels: Int = 0
+    rate: Int = 0
+    delay: Int = 0
+    padding: Int = 0
+    warnings: [String] = []
+    seconds: Float = 0.0
+    frames: Int = 0
+    layer: Int = 0
+}
+
+fn newMpa() -> mpa.Decoder {
+    mpa.newDecoder(core.Track(index: 0, kind: .audio, codec: "mp3")).value() ?? mpa.Decoder()
+}
+
+// Decodes a raw stream frame by frame (one frame per packet, as a demuxer
+// would hand them over).
+fn decodeRaw(_ file: Data) -> Run {
+    var run = Run()
+    var d = newMpa()
+    let fr = mpa.findFrames(file)
+    let start = now()
+    var i = 0
+    while i < fr.count {
+        run.data += d.decode(file.slice(from: fr[i], to: fr[i] + fr[i + 1]), pts: 0).data
+        i += 2
+    }
+    run.seconds = now() - start
+    run.channels = d.channels
+    run.rate = d.rate
+    run.delay = d.delay
+    run.padding = d.padding
+    run.warnings = d.warnings
+    run.frames = d.frames
+    run.layer = d.layer
+    run
+}
+
+fn decodeMedia(_ file: Data, _ media: core.Media, _ track: Int) -> Run {
+    var run = Run()
+    var d = mpa.newDecoder(media.tracks[track]).value() ?? newMpa()
+    let start = now()
+    for p in media.packets {
+        if p.track == track {
+            run.data += d.decode(core.packetBytes(file, media, p), pts: p.pts).data
+        }
+    }
+    run.seconds = now() - start
+    run.channels = d.channels
+    run.rate = d.rate
+    run.delay = d.delay
+    run.warnings = d.warnings
+    run.frames = d.frames
+    run.layer = d.layer
+    run
+}
+
+// SNR of got (from frame `offset` on) against want.
+fn snrAt(_ got: [Float], _ want: [Float], _ ch: Int, _ offset: Int) -> Float {
+    if offset >= 0 {
+        return testkit.snr(got.slice(from: offset * ch, to: got.count), want)
+    }
+    testkit.snr(got, want, offset: -offset * ch)
+}
+
+// The alignment within ±range frames that matches best (on a 2048-frame
+// window), and its full SNR.
+fn bestAlignment(_ got: [Float], _ want: [Float], _ ch: Int, _ range: Int) -> (Int, Float) {
+    let w0 = min(4096, want.count / ch / 4)
+    let wn = 2048
+    let window = want.slice(from: w0 * ch, to: (w0 + wn) * ch)
+    var best = -1000.0
+    var bestOff = 0
+    var off = -range
+    while off <= range {
+        let from = (w0 + off) * ch
+        if from >= 0 && from + wn * ch <= got.count {
+            let s = testkit.snr(got.slice(from: from, to: from + wn * ch), window)
+            if s > best {
+                best = s
+                bestOff = off
+            }
+        }
+        off += 1
+    }
+    (bestOff, snrAt(got, want, ch, bestOff))
+}
+
+fn main() {
+    var passed = 0
+    var total = 0
+    fn check(_ ok: Bool, _ what: String) {
+        total += 1
+        if ok { passed += 1 } else { print("FAIL: {what}") }
+    }
+    var l3Seconds = 0.0
+    var l3Audio = 0.0
+    var l12Seconds = 0.0
+    var l12Audio = 0.0
+    var worstL3 = 1000.0
+    fn account(_ r: Run) {
+        let audio = Float(r.data.count / max(r.channels, 1)) / Float(max(r.rate, 1))
+        if r.layer == 3 {
+            l3Seconds += r.seconds
+            l3Audio += audio
+        } else {
+            l12Seconds += r.seconds
+            l12Audio += audio
+        }
+    }
+
+    // ---- Shared raw fixtures ----
+    for name in ["mp3_cbr.mp3", "mp3_vbr_mono.mp3", "mp2.mp2", "cover.mp3"] {
+        let file = testkit.fixture(name)
+        let ref = testkit.loadRef(name)
+        let audioPackets = ref.packets.filter { p in p.track == 0 }
+        // Our framing = ffprobe's packets, plus the Xing/Info frame it hides.
+        let fr = mpa.findFrames(file)
+        var offs: [Int] = []
+        var i = 0
+        while i < fr.count {
+            if !mpa.isTagFrame(file.slice(from: fr[i], to: fr[i] + fr[i + 1])) {
+                offs.append(fr[i])
+            }
+            i += 2
+        }
+        var same = offs.count == audioPackets.count
+        if same {
+            for k in 0..offs.count {
+                if offs[k] != audioPackets[k].pos || fr.count < 2 {
+                    same = false
+                }
+            }
+        }
+        check(same, "{name}: findFrames gives {offs.count} audio frames, ffprobe {audioPackets.count}")
+        let run = decodeRaw(file)
+        account(run)
+        let want = testkit.referenceSamples(name)
+        let ch = run.channels
+        let isL3 = run.layer == 3
+        let snr = snrAt(run.data, want, ch, run.delay)
+        let trimmed = run.data.count / ch - run.delay - run.padding
+        check(trimmed == want.count / ch, "{name}: {trimmed} frames after trimming delay {run.delay} and padding {run.padding}, ffmpeg has {want.count / ch}")
+        check(snr >= (if isL3 { 90.0 } else { 150.0 }), "{name}: SNR {snr.formatted(decimals: 1)} dB at the decoder's delay {run.delay}")
+        check(run.warnings.isEmpty, "{name}: warnings {run.warnings.joined(separator: "; ")}")
+        check(run.rate == ref.tracks[0].sampleRate && ch == ref.tracks[0].channels, "{name}: {run.rate} Hz {ch} ch")
+        print("{name}: SNR {snr.formatted(decimals: 1)} dB, aligned at {run.delay}")
+        if isL3 {
+            worstL3 = min(worstL3, snr)
+        }
+    }
+
+    // The LAME tag of mp3_cbr.mp3: delay 576, padding 756.
+    let cbr = testkit.fixture("mp3_cbr.mp3")
+    let first = mpa.findFrames(cbr)
+    if let tag = mpa.parseTag(cbr.slice(from: first[0], to: first[0] + first[1])) {
+        check(tag.kind == "Info" && tag.encoderDelay == 576 && tag.encoderPadding == 756 && tag.frames == 116, "LAME tag: {tag.kind} {tag.encoderDelay} {tag.encoderPadding} {tag.frames}")
+    } else {
+        check(false, "mp3_cbr.mp3 has an Info frame")
+    }
+
+    // ---- MP3 inside MKV and AVI ----
+    for (name, track) in [("h264_high.mkv", 1), ("mpeg4.avi", 1)] {
+        let file = testkit.fixture(name)
+        var media = testkit.mediaFromRef(file, testkit.loadRef(name))
+        if media.format == "matroska" || name.hasSuffix(".mkv") {
+            // ffprobe's pos for Matroska is the Block's start: track
+            // number (1 byte here), timecode and flags come first.
+            for p in media.packets {
+                if p.track == track {
+                    p.offset += 4
+                }
+            }
+        }
+        let run = decodeMedia(file, media, track)
+        account(run)
+        let want = testkit.referenceSamples(name)
+        let (off, snr) = bestAlignment(run.data, want, run.channels, 4096)
+        check(snr >= 90.0, "{name}: SNR {snr.formatted(decimals: 1)} dB at offset {off}")
+        check(run.warnings.isEmpty, "{name}: warnings {run.warnings.joined(separator: "; ")}")
+        print("{name} mp3 track: SNR {snr.formatted(decimals: 1)} dB, best alignment {off} frames")
+        worstL3 = min(worstL3, snr)
+    }
+
+    // ---- Extra clips ----
+    let extras = [
+        "mp3_short.mp3", "mp3_lsf24.mp3", "mp3_lsf16.mp3", "mp3_m25_8k.mp3", "mp3_m25_11k.mp3",
+        "mp3_m25_12k.mp3", "mp3_crc.mp3", "mp3_ms.mp3", "mp3_dual.mp3", "mp3_simple.mp3",
+        "mp3_320.mp3", "mp3_nores.mp3", "mp2_mono32.mp2", "mp2_lsf22.mp2", "mp2_lsf16.mp2",
+        "mp1_stereo.mp1", "mp1_joint4.mp1", "mp1_joint16.mp1", "mp1_mono.mp1", "mp1_dual.mp1",
+        "mp1_lsf.mp1", "mp2_joint8.mp2", "mp2_joint16.mp2", "mp2_dual.mp2", "mp2_lsfjoint.mp2",
+        "mp2_lowrate.mp2",
+    ]
+    for name in extras {
+        let refName = "../mpa/fixtures/{name}"
+        let file = testkit.fixture(refName)
+        if file.isEmpty {
+            check(false, "{name}: missing (run tests/mpa/make_fixtures.sh)")
+            continue
+        }
+        let run = decodeRaw(file)
+        account(run)
+        let want = testkit.referenceSamples(refName)
+        let ch = max(run.channels, 1)
+        let isL3 = run.layer == 3
+        var snr = snrAt(run.data, want, ch, run.delay)
+        var off = run.delay
+        if snr < 90.0 {
+            let (o, s) = bestAlignment(run.data, want, ch, 4096)
+            off = o
+            snr = s
+        }
+        let trimmed = run.data.count / ch - run.delay - run.padding
+        check(trimmed == want.count / ch, "{name}: {trimmed} frames, ffmpeg {want.count / ch}")
+        check(off == run.delay, "{name}: aligned at {off}, the decoder's delay is {run.delay}")
+        check(snr >= (if isL3 { 90.0 } else { 150.0 }), "{name}: SNR {snr.formatted(decimals: 1)} dB")
+        check(run.warnings.isEmpty, "{name}: warnings {run.warnings.joined(separator: "; ")}")
+        if isL3 {
+            worstL3 = min(worstL3, snr)
+        }
+        print("{name}: layer {run.layer}, {run.rate} Hz {ch} ch, SNR {snr.formatted(decimals: 1)} dB")
+    }
+
+    // ---- ISO 11172-4 compliance streams (optional download) ----
+    let iso = "build/conformance/audio_a/iso"
+    let vectors = [
+        "l1-fl1", "l1-fl2", "l1-fl3", "l1-fl4", "l1-fl5", "l1-fl6", "l1-fl7", "l1-fl8",
+        "l2-fl10", "l2-fl11", "l2-fl12", "l2-fl13", "l2-fl14", "l2-fl15", "l2-fl16", "l2-test32",
+        "l3-compl", "l3-he_32khz", "l3-he_44khz", "l3-he_48khz", "l3-he_mode", "l3-hecommon",
+        "l3-si", "l3-si_block", "l3-si_huff", "l3-sin1k0db", "l3-test45", "l3-test46",
+        "M2L3_compl24", "M2L3_noise", "M2L3_bitrate_22_all",
+    ]
+    var isoRan = 0
+    for v in vectors {
+        let file = readData(joinPath(iso, v + ".bit")) ?? Data()
+        let f32 = readData(joinPath(iso, v + ".f32")) ?? Data()
+        if file.isEmpty || f32.isEmpty {
+            continue
+        }
+        isoRan += 1
+        var want: [Float] = []
+        var i = 0
+        while i + 4 <= f32.count {
+            want.append(f32.float32(at: i))
+            i += 4
+        }
+        // The 16-bit output of the reference decoder.
+        let pcm = readData(joinPath(iso, v + ".pcm")) ?? Data()
+        var ref16: [Float] = []
+        var q = 0
+        while q + 2 <= pcm.count {
+            ref16.append(Float(pcm.int16(at: q)) / 32768.0)
+            q += 2
+        }
+        if v == "l3-he_mode" {
+            // The channel mode changes mid-stream (stereo, joint, dual,
+            // mono); ffmpeg's command line mixes it to one layout, so this
+            // one is compared with the reference decoder, which writes
+            // each frame with its own channel count, as we do.
+            let run = decodeRaw(file)
+            let s16 = testkit.snr(run.data, ref16)
+            check(run.data.count == ref16.count && s16 >= 70.0, "ISO {v}: {s16.formatted(decimals: 1)} dB vs the 16-bit reference, {run.data.count} of {ref16.count} samples")
+            print("ISO {v}: layer 3, mode changes mid-stream: {s16.formatted(decimals: 1)} dB vs the 16-bit reference")
+            continue
+        }
+        let run = decodeRaw(file)
+        account(run)
+        let ch = max(run.channels, 1)
+        let isL3 = run.layer == 3
+        var snr = snrAt(run.data, want, ch, 0)
+        var off = 0
+        if snr < 90.0 {
+            // ffmpeg's demuxer drops the first frame of some of these.
+            let (o, s) = bestAlignment(run.data, want, ch, 2304)
+            off = o
+            snr = s
+        }
+        let snr16 = testkit.snr(run.data, ref16)
+        // On a few CRC-protected layer I/II streams ffmpeg's own output is
+        // far from the ISO reference (it loses the first frame and more);
+        // there the reference decoder is the judge.
+        let ffmpegVsIso = testkit.snr(want, ref16, offset: off * ch)
+        if snr < 90.0 && ffmpegVsIso < 60.0 {
+            check(snr16 >= 70.0, "ISO {v}: {snr16.formatted(decimals: 1)} dB vs the 16-bit reference")
+            print("ISO {v}: layer {run.layer}: ffmpeg is {ffmpegVsIso.formatted(decimals: 1)} dB from the ISO reference here; we are {snr16.formatted(decimals: 1)} dB from it")
+            continue
+        }
+        check(run.data.count / ch - off == want.count / ch, "ISO {v}: {run.data.count / ch} frames from offset {off}, ffmpeg {want.count / ch}")
+        check(snr >= (if isL3 { 90.0 } else { 150.0 }), "ISO {v}: SNR {snr.formatted(decimals: 1)} dB vs ffmpeg (offset {off})")
+        if isL3 {
+            worstL3 = min(worstL3, snr)
+        }
+        print("ISO {v}: layer {run.layer} {run.rate} Hz {ch} ch: {snr.formatted(decimals: 1)} dB vs ffmpeg (offset {off}), {snr16.formatted(decimals: 1)} dB vs the 16-bit reference")
+    }
+    if isoRan == 0 {
+        print("ISO compliance streams not downloaded: skipped")
+    }
+
+    // ---- Damage, reset, odd packets ----
+    let mp2 = testkit.fixture("mp2.mp2")
+    let mf = mpa.findFrames(mp2)
+    var d = newMpa()
+    // Two frames in one packet, then a junk-prefixed frame.
+    let two = d.decode(mp2.slice(from: mf[0], to: mf[2] + mf[3]), pts: 0)
+    check(two.frames == 2304 && two.channels == 2, "two frames in one packet: {two.frames}")
+    let junk = Data(bytes: [1, 2, 3, 0xff, 0x00, 9]) + mp2.slice(from: mf[4], to: mf[4] + mf[5])
+    let j = d.decode(junk, pts: 0)
+    check(j.frames == 1152 && !d.warnings.isEmpty, "junk before a frame is skipped with a warning")
+    let none = d.decode(Data(bytes: [9, 9, 9, 9, 9, 9, 9, 9]), pts: 0)
+    check(none.frames == 0, "a packet with no frame gives nothing")
+    // Garbage inside layer III frames: decoding goes on, no crash.
+    var m3 = newMpa()
+    let cf = mpa.findFrames(cbr)
+    var outFrames = 0
+    var k = 0
+    while k < cf.count {
+        var bytes = cbr.slice(from: cf[k], to: cf[k] + cf[k + 1]).bytes
+        if k / 2 % 3 == 2 {
+            for b in 6..bytes.count {
+                bytes[b] = (bytes[b] * 31 + b) & 255
+            }
+        }
+        outFrames += m3.decode(Data(bytes: bytes), pts: 0).frames
+        k += 2
+    }
+    check(outFrames == (cf.count / 2 - 1) * 1152, "damaged MP3 frames still give a frame of samples each ({outFrames})")
+    // A cut frame.
+    let cut = m3.decode(cbr.slice(from: cf[10], to: cf[10] + 100), pts: 0)
+    check(cut.frames == 1152, "a cut frame decodes (padded)")
+    // reset() clears history: decoding the same frames again after reset
+    // gives the same samples as a fresh decoder.
+    var fresh = newMpa()
+    var again = newMpa()
+    var a1: [Float] = []
+    var a2: [Float] = []
+    for n in 20..30 {
+        let fr = cbr.slice(from: cf[n * 2], to: cf[n * 2] + cf[n * 2 + 1])
+        a1 += fresh.decode(fr, pts: 0).data
+    }
+    for n in 0..10 {
+        again.decode(cbr.slice(from: cf[n * 2], to: cf[n * 2] + cf[n * 2 + 1]), pts: 0)
+    }
+    again.reset()
+    for n in 20..30 {
+        let fr = cbr.slice(from: cf[n * 2], to: cf[n * 2] + cf[n * 2 + 1])
+        a2 += again.decode(fr, pts: 0).data
+    }
+    check(a1 == a2, "reset() forgets the reservoir, overlap and filter state")
+    check(!mpa.newDecoder(core.Track(index: 0, kind: .audio, codec: "aac")).isOk(), "aac isn't MPEG audio")
+    // Header parsing.
+    if let h = mpa.parseHeader(0xfffb9064) {
+        check(h.layer == 3 && h.rate == 44100 && h.bitrate == 128000 && h.frameSize == 417 && h.channels == 2 && h.mode == 1, "header 0xfffb9064")
+    } else {
+        check(false, "header 0xfffb9064")
+    }
+    check(mpa.parseHeader(0xfffb0064) == nil, "free format is refused")
+
+    print("time mp3 decode: {Int(l3Seconds * 1000.0)} ms for {l3Audio.formatted(decimals: 1)} s of audio ({Int(l3Audio / max(l3Seconds, 0.000001))}x real time)")
+    print("time mp1/mp2 decode: {Int(l12Seconds * 1000.0)} ms for {l12Audio.formatted(decimals: 1)} s of audio ({Int(l12Audio / max(l12Seconds, 0.000001))}x real time)")
+    print("worst layer III SNR: {worstL3.formatted(decimals: 1)} dB")
+    print("mpa: {passed} of {total} passed")
+}

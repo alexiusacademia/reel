@@ -1,0 +1,73 @@
+// Development timing helpers for the interpolation and CABAC engine,
+// called by benchmarks under build/scratch/h264 (not used by Reel).
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+// Development timing of the interpolation (used by a scratch benchmark).
+public fn benchMc() {
+    var mc = Mc()
+    mc.setup()
+    var ref: [Int] = []
+    for i in 0..(1280 * 720) {
+        ref.append((i * 7) & 255)
+    }
+    for fx in 0..4 {
+        for fy in 0..4 {
+            let t = now()
+            for k in 0..20000 {
+                mc.luma(ref, off: 0, stride: 1280, pw: 1280, ph: 720, px: 100 + (k & 511), py0: 100 + (k & 255), fx: fx, fy: fy, w: 16, h: 16, list: 0, bx: 0, by: 0)
+            }
+            print("time mc {fx},{fy}: {Int((now() - t) * 1000000000.0 / 20000.0)} ns per 16x16")
+        }
+    }
+}
+
+// Development timing of the CABAC engine (used by a scratch benchmark).
+public fn benchCabac() {
+    var bytes: [Int] = []
+    var x = 12345
+    for _ in 0..2000000 {
+        x = (x * 1103515245 + 12345) & 0x7fffffff
+        bytes.append((x >> 16) & 255)
+    }
+    var c = Cabac()
+    c.start(Data(bytes: bytes), at: 0, end: 2000000)
+    c.initContexts(sliceQp: 26, isIntra: true, initIdc: 0)
+    let t = now()
+    var s = 0
+    for i in 0..10000000 {
+        s += c.decision(i & 255)
+    }
+    print("time 10M decisions: {Int((now() - t) * 1000.0)} ms {s}")
+}
+
+// Development timing of the interpolation into a picture plane.
+public fn benchQpel() {
+    var ref: [Int] = []
+    for i in 0..(1920 * 1088) {
+        ref.append((i * 7) & 255)
+    }
+    var dst = h264Zeros(1920 * 1088)
+    var tmp = h264Zeros(21 * 21)
+    for fx in 0..4 {
+        var line = ""
+        for fy in 0..4 {
+            let t = now()
+            for k in 0..20000 {
+                let px = 100 + (k & 511)
+                let py = 100 + (k & 255)
+                h264Qpel(dst, py * 1920 + px, 1920, tmp, ref, py * 1920 + px, 1920, fx, fy, 16, 16, false)
+            }
+            line += " {fx},{fy}: {Int((now() - t) * 1000000000.0 / 20000.0)}"
+        }
+        print("ns per 16x16:{line}")
+    }
+    let t = now()
+    for k in 0..20000 {
+        let px = 100 + (k & 511)
+        let py = 100 + (k & 255)
+        h264McChroma(dst, py * 1920 + px, 1920, tmp, ref, 0, 1920, 1920, 1088, px, py, 3, 5, 8, 8, false)
+    }
+    print("ns per chroma 8x8: {Int((now() - t) * 1000000000.0 / 20000.0)}")
+}

@@ -1,0 +1,873 @@
+// AVI files (RIFF AVI, with the OpenDML extensions for files over 1 GB).
+//
+// An AVI file is a RIFF tree (Microsoft "AVI RIFF File Reference"):
+//
+//   RIFF 'AVI '
+//     LIST 'hdrl'                header list
+//       avih                     main header (MainAVIHeader)
+//       LIST 'strl'              one per stream, in stream number order
+//         strh                   stream header (AVIStreamHeader)
+//         strf                   format: BITMAPINFOHEADER or WAVEFORMATEX
+//         strn                   stream name (optional)
+//         indx                   OpenDML super index (optional)
+//       LIST 'odml' / dmlh       OpenDML total frame count (optional)
+//     LIST 'INFO'                tags (INAM, IART, ...)
+//     LIST 'movi'                the data chunks: '00dc' '01wb' ... and
+//                                OpenDML 'ix00' standard index chunks
+//     idx1                       AVI 1.0 index (AVIOLDINDEX)
+//   RIFF 'AVIX'                  OpenDML: more RIFFs, each with LIST 'movi'
+//
+// Data chunks are named by a two-digit stream number and a type: 'dc'
+// (compressed video), 'db' (uncompressed video), 'wb' (audio), 'tx'
+// (text), 'pc' (palette change, skipped).
+//
+// Packets come from the OpenDML indexes when there are any, else from
+// idx1, else from scanning every movi list. Times follow the stream
+// header: one video chunk is one frame of dwScale/dwRate seconds; audio
+// counts bytes (dwSampleSize > 0, CBR) or blocks of nBlockAlign (VBR, as
+// MP3 with nBlockAlign = 1152), the way ffmpeg's avidec does.
+//
+// AVI stores frames in decode order and doesn't say when B-frames are
+// shown, so a video packet's pts is its frame number (pts = dts); the
+// video decoder reorders. DivX "packed bitstream" files (two VOPs in one
+// chunk) are left as they are, with a warning (the mpeg4 decoder unpacks).
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../core"
+
+// One stream as the headers describe it.
+struct AviStream {
+    kind: core.TrackKind = core.TrackKind.other
+    fccType: String = ""
+    handler: String = ""
+    // AVIStreamHeader: time unit is dwScale/dwRate seconds.
+    scale: Int = 1
+    rate: Int = 1
+    start: Int = 0
+    length: Int = 0
+    sampleSize: Int = 0
+    // BITMAPINFOHEADER.
+    width: Int = 0
+    height: Int = 0
+    compression: String = ""
+    bitCount: Int = 0
+    // WAVEFORMATEX.
+    formatTag: Int = 0
+    channels: Int = 0
+    sampleRate: Int = 0
+    avgBytes: Int = 0
+    blockAlign: Int = 0
+    bits: Int = 0
+    extra: Data = Data()
+    name: String = ""
+    // OpenDML super index: offset, size pairs of the 'ix##' chunks.
+    superIndex: [Int] = []
+    // An 'indx' that is itself a standard index (index of chunks).
+    directIndexAt: Int = -1
+    directIndexSize: Int = 0
+}
+
+// One data chunk found in an index or a scan.
+struct AviEntry {
+    stream: Int
+    // Where the chunk's data starts (after its 8-byte header).
+    offset: Int
+    size: Int
+    key: Bool
+}
+
+struct AviReader {
+    file: Data
+    streams: [AviStream] = []
+    tags: [String: String] = [:]
+    warnings: [String] = []
+    // Positions of each movi list's 'movi' fourcc and the end of its data.
+    moviStarts: [Int] = []
+    moviEnds: [Int] = []
+    idx1At: Int = -1
+    idx1Size: Int = 0
+    totalFrames: Int = 0
+    riffCount: Int = 0
+
+    fn u32(_ at: Int) -> Int {
+        if at + 4 > file.count {
+            return 0
+        }
+        file.uint32(at: at)
+    }
+
+    fn u16(_ at: Int) -> Int {
+        if at + 2 > file.count {
+            return 0
+        }
+        file.uint16(at: at)
+    }
+
+    fn cc(_ at: Int) -> String {
+        if at + 4 > file.count {
+            return ""
+        }
+        aviFourcc(file, at)
+    }
+
+    // Walks the top-level RIFFs: 'AVI ' first, then any 'AVIX'.
+    fn readTop() {
+        var at = 0
+        let n = file.count
+        while at + 12 <= n {
+            let id = cc(at)
+            let size = u32(at + 4)
+            if id != "RIFF" {
+                if at > 0 {
+                    // Trailing junk after the last RIFF.
+                    break
+                }
+                warnings.append("AVI: not a RIFF file")
+                break
+            }
+            var end = at + 8 + size
+            if end > n || size == 0 {
+                if end > n {
+                    warnings.append("AVI: the file is cut short (RIFF says {size} bytes)")
+                }
+                end = n
+            }
+            riffCount += 1
+            readList(at + 12, end, top: true)
+            at = end + (end & 1)
+        }
+    }
+
+    // Reads the chunks of a RIFF or LIST body [from, to).
+    fn readList(_ from: Int, _ to: Int, top: Bool) {
+        var at = from
+        while at + 8 <= to {
+            let id = cc(at)
+            let size = u32(at + 4)
+            var end = at + 8 + size
+            if end > to {
+                end = to
+            }
+            if id == "LIST" {
+                let kind = cc(at + 8)
+                if kind == "hdrl" {
+                    readList(at + 12, end, top: false)
+                } else if kind == "strl" {
+                    streams.append(AviStream())
+                    readList(at + 12, end, top: false)
+                } else if kind == "odml" {
+                    readList(at + 12, end, top: false)
+                } else if kind == "INFO" {
+                    readInfo(at + 12, end)
+                } else if kind == "movi" {
+                    moviStarts.append(at + 8)
+                    moviEnds.append(end)
+                }
+            } else if id == "avih" {
+                // MainAVIHeader: dwTotalFrames at 16 (first RIFF only).
+                if totalFrames == 0 {
+                    totalFrames = u32(at + 8 + 16)
+                }
+            } else if id == "dmlh" {
+                // ODMLExtendedAVIHeader: dwTotalFrames of the whole file.
+                totalFrames = u32(at + 8)
+            } else if id == "strh" && !streams.isEmpty {
+                readStrh(at + 8, size)
+            } else if id == "strf" && !streams.isEmpty {
+                readStrf(at + 8, min(size, end - at - 8))
+            } else if id == "strn" && !streams.isEmpty {
+                streams[streams.count - 1].name = aviText(file.slice(from: at + 8, to: end))
+            } else if id == "indx" && !streams.isEmpty {
+                readIndx(at + 8, end)
+            } else if id == "idx1" && top {
+                idx1At = at + 8
+                idx1Size = end - at - 8
+            }
+            at = end + (end & 1)
+        }
+    }
+
+    // AVIStreamHeader: fccType, fccHandler, dwFlags, wPriority, wLanguage,
+    // dwInitialFrames, dwScale, dwRate, dwStart, dwLength,
+    // dwSuggestedBufferSize, dwQuality, dwSampleSize, rcFrame.
+    fn readStrh(_ at: Int, _ size: Int) {
+        let i = streams.count - 1
+        let t = cc(at)
+        streams[i].fccType = t
+        streams[i].handler = cc(at + 4)
+        streams[i].kind = match t {
+            "vids" -> core.TrackKind.video
+            "auds" -> core.TrackKind.audio
+            "txts" -> core.TrackKind.subtitle
+            _ -> core.TrackKind.other
+        }
+        let scale = u32(at + 20)
+        let rate = u32(at + 24)
+        streams[i].scale = if scale > 0 { scale } else { 1 }
+        streams[i].rate = if rate > 0 { rate } else { 1 }
+        streams[i].start = u32(at + 28)
+        streams[i].length = u32(at + 32)
+        if size >= 48 {
+            streams[i].sampleSize = u32(at + 44)
+        }
+    }
+
+    fn readStrf(_ at: Int, _ size: Int) {
+        let i = streams.count - 1
+        if streams[i].kind == core.TrackKind.video {
+            // BITMAPINFOHEADER: biSize, biWidth, biHeight, biPlanes,
+            // biBitCount, biCompression, biSizeImage, ... (40 bytes), then
+            // codec setup bytes up to the chunk's end.
+            if size < 40 {
+                warnings.append("AVI: stream {i} has a short BITMAPINFOHEADER")
+                return
+            }
+            streams[i].width = file.int32(at: at + 4)
+            let h = file.int32(at: at + 8)
+            streams[i].height = if h < 0 { -h } else { h }
+            streams[i].bitCount = u16(at + 14)
+            let comp = u32(at + 16)
+            streams[i].compression = if comp < 256 { "{comp}" } else { cc(at + 16) }
+            if size > 40 {
+                streams[i].extra = file.slice(from: at + 40, to: at + size)
+            }
+        } else if streams[i].kind == core.TrackKind.audio {
+            // WAVEFORMATEX: wFormatTag, nChannels, nSamplesPerSec,
+            // nAvgBytesPerSec, nBlockAlign, wBitsPerSample, cbSize, extra.
+            if size < 14 {
+                warnings.append("AVI: stream {i} has a short WAVEFORMATEX")
+                return
+            }
+            var tag = u16(at)
+            streams[i].channels = u16(at + 2)
+            streams[i].sampleRate = u32(at + 4)
+            streams[i].avgBytes = u32(at + 8)
+            streams[i].blockAlign = u16(at + 12)
+            if size >= 16 {
+                streams[i].bits = u16(at + 14)
+            }
+            if size >= 18 {
+                let cb = min(u16(at + 16), size - 18)
+                if cb > 0 {
+                    streams[i].extra = file.slice(from: at + 18, to: at + 18 + cb)
+                }
+                // WAVEFORMATEXTENSIBLE: wValidBitsPerSample, dwChannelMask,
+                // then the SubFormat GUID whose first two bytes are the tag.
+                if tag == 0xFFFE && cb >= 22 {
+                    tag = u16(at + 18 + 6)
+                    streams[i].extra = Data()
+                }
+            }
+            streams[i].formatTag = tag
+        } else {
+            if size > 0 {
+                streams[i].extra = file.slice(from: at, to: at + size)
+            }
+        }
+    }
+
+    // OpenDML 'indx' (AVISUPERINDEX): wLongsPerEntry, bIndexSubType,
+    // bIndexType, nEntriesInUse, dwChunkId, 3 reserved dwords, then the
+    // entries. bIndexType 0 (AVI_INDEX_OF_INDEXES): each entry is qwOffset,
+    // dwSize, dwDuration of an 'ix##' chunk. bIndexType 1: the entries are
+    // the chunks themselves, as in a standard index.
+    fn readIndx(_ at: Int, _ end: Int) {
+        let i = streams.count - 1
+        if at + 24 > end {
+            return
+        }
+        let longs = u16(at)
+        let indexType = file[at + 3]
+        let count = u32(at + 4)
+        if indexType == 1 {
+            streams[i].directIndexAt = at - 8
+            streams[i].directIndexSize = end - at
+            return
+        }
+        if indexType != 0 || longs < 4 {
+            return
+        }
+        var e = at + 24
+        var k = 0
+        while k < count && e + 16 <= end {
+            let off = file.int64(at: e)
+            let size = u32(e + 8)
+            if off > 0 && size > 0 {
+                streams[i].superIndex.append(off)
+                streams[i].superIndex.append(size)
+            }
+            e += longs * 4
+            k += 1
+        }
+    }
+
+    // LIST 'INFO' strings.
+    fn readInfo(_ from: Int, _ to: Int) {
+        var at = from
+        while at + 8 <= to {
+            let id = cc(at)
+            let size = u32(at + 4)
+            let end = min(at + 8 + size, to)
+            let value = aviText(file.slice(from: at + 8, to: end))
+            let key = match id {
+                "INAM" -> "title"
+                "IART" -> "artist"
+                "ICMT" -> "comment"
+                "ICRD" -> "date"
+                "IGNR" -> "genre"
+                "ICOP" -> "copyright"
+                "ISFT" -> "encoder"
+                "IPRD" -> "album"
+                "IPRT" -> "track"
+                "ITRK" -> "track"
+                "ICMS" -> "composer"
+                _ -> ""
+            }
+            if !key.isEmpty && !value.isEmpty {
+                tags[key] = value
+            }
+            at = end + (end & 1)
+        }
+    }
+
+    // Entries of an OpenDML standard index chunk ('ix##', AVISTDINDEX)
+    // whose header starts at `at`: after the 8-byte chunk header come
+    // wLongsPerEntry, bIndexSubType, bIndexType, nEntriesInUse, dwChunkId,
+    // qwBaseOffset, dwReserved, then entries of dwOffset (from
+    // qwBaseOffset to the chunk's data) and dwSize (bit 31 set: not a
+    // keyframe).
+    fn readStdIndex(_ stream: Int, _ at: Int, _ out: bind [AviEntry]) -> Bool {
+        if at + 32 > file.count {
+            return false
+        }
+        let id = cc(at)
+        if !id.hasPrefix("ix") && id != "indx" {
+            return false
+        }
+        let body = at + 8
+        let size = u32(at + 4)
+        let end = min(body + size, file.count)
+        let longs = max(u16(body), 2)
+        let count = u32(body + 4)
+        let base = file.int64(at: body + 12)
+        var e = body + 24
+        var k = 0
+        while k < count && e + 8 <= end {
+            let off = u32(e)
+            let raw = u32(e + 4)
+            let sz = raw & 0x7fffffff
+            out.append(AviEntry(stream: stream, offset: base + off, size: sz, key: (raw & 0x80000000) == 0))
+            e += longs * 4
+            k += 1
+        }
+        true
+    }
+
+    // Every data chunk, from the OpenDML indexes.
+    fn openDmlEntries() -> [AviEntry] {
+        var out: [AviEntry] = []
+        for (s, st) in streams.enumerated() {
+            if st.directIndexAt >= 0 {
+                readStdIndex(s, st.directIndexAt, out)
+            }
+            var k = 0
+            while k + 1 < st.superIndex.count {
+                if !readStdIndex(s, st.superIndex[k], out) {
+                    warnings.append("AVI: stream {s} has a broken OpenDML index entry")
+                }
+                k += 2
+            }
+        }
+        // Each stream's index is in file order; merge the streams.
+        out.sorted(by: { a, b in a.offset < b.offset })
+    }
+
+    // Every data chunk, from idx1. Its offsets point at chunk headers,
+    // counted from the 'movi' fourcc (usual) or from the file's start
+    // (some old muxers); the first entry tells which.
+    fn idx1Entries() -> [AviEntry] {
+        var out: [AviEntry] = []
+        let count = idx1Size / 16
+        if count == 0 || moviStarts.isEmpty {
+            return out
+        }
+        let movi = moviStarts[0]
+        var base = movi
+        for k in 0..count {
+            let e = idx1At + k * 16
+            let id = cc(e)
+            if aviStreamNumber(id) < 0 {
+                continue
+            }
+            let off = u32(e + 8)
+            if cc(movi + off) == id {
+                base = movi
+            } else if cc(off) == id {
+                base = 0
+            } else {
+                warnings.append("AVI: idx1 offsets don't point at chunks")
+            }
+            break
+        }
+        for k in 0..count {
+            let e = idx1At + k * 16
+            let id = cc(e)
+            let s = aviStreamNumber(id)
+            if s < 0 || s >= streams.count {
+                continue
+            }
+            if aviIsDataChunk(id) == false {
+                continue
+            }
+            let flags = u32(e + 4)
+            let off = base + u32(e + 8) + 8
+            let size = u32(e + 12)
+            if off + size > file.count {
+                warnings.append("AVI: idx1 entry past the end of the file")
+                continue
+            }
+            out.append(AviEntry(stream: s, offset: off, size: size, key: (flags & 0x10) != 0))
+        }
+        out
+    }
+
+    // Every data chunk, found by walking the movi lists (no index).
+    fn scanEntries() -> [AviEntry] {
+        var out: [AviEntry] = []
+        for (k, m) in moviStarts.enumerated() {
+            scanList(m + 4, moviEnds[k], out)
+        }
+        out
+    }
+
+    fn scanList(_ from: Int, _ to: Int, _ out: bind [AviEntry]) {
+        var at = from
+        while at + 8 <= to {
+            let id = cc(at)
+            let size = u32(at + 4)
+            var end = at + 8 + size
+            if end > to {
+                warnings.append("AVI: chunk {id} at {at} runs past its list")
+                end = to
+            }
+            if id == "LIST" {
+                // 'rec ' lists group chunks to be read together.
+                scanList(at + 12, end, out)
+            } else {
+                let s = aviStreamNumber(id)
+                if s >= 0 && s < streams.count && aviIsDataChunk(id) {
+                    out.append(AviEntry(stream: s, offset: at + 8, size: end - at - 8, key: false))
+                } else if s < 0 && id != "JUNK" && !id.hasPrefix("ix") && aviFourccIsText(id) == false {
+                    warnings.append("AVI: lost sync in movi at {at}")
+                    return
+                }
+            }
+            at = end + (end & 1)
+        }
+    }
+}
+
+// Opens an AVI file.
+public fn aviOpen(_ file: Data) -> Result<core.Media> {
+    var r = AviReader(file: file)
+    r.readTop()
+    if r.streams.isEmpty {
+        return Result.failure(error: Error("this AVI file has no streams"))
+    }
+    var media = core.Media(format: "avi")
+    media.tags = r.tags
+
+    // Tracks.
+    for (i, st) in r.streams.enumerated() {
+        media.tracks.append(aviTrack(st, i))
+    }
+
+    // Packets: OpenDML indexes, else idx1, else a scan.
+    var entries: [AviEntry] = []
+    var fromScan = false
+    if r.streams.any(where: { s in !s.superIndex.isEmpty || s.directIndexAt >= 0 }) {
+        entries = r.openDmlEntries()
+    }
+    if entries.isEmpty && r.idx1At >= 0 {
+        entries = r.idx1Entries()
+    }
+    if entries.isEmpty {
+        if r.idx1At >= 0 || r.riffCount > 1 {
+            r.warnings.append("AVI: the index is empty or broken; scanned the file instead")
+        }
+        entries = r.scanEntries()
+        fromScan = true
+    }
+
+    // Timing per stream (AVI 1.0 spec, AVIStreamHeader; ffmpeg avidec's
+    // get_duration for audio).
+    let ns = r.streams.count
+    var units = core.filled(ns, 0)
+    var lastOffset = core.filled(ns, -1)
+    for i in 0..ns {
+        units[i] = r.streams[i].start
+    }
+    var packets: [core.PacketRef] = []
+    for e in entries {
+        let s = e.stream
+        let st = r.streams[s]
+        let track = media.tracks[s]
+        if e.offset == lastOffset[s] {
+            // Some broken indexes list a chunk twice.
+            continue
+        }
+        lastOffset[s] = e.offset
+        var n = 1
+        if st.kind == core.TrackKind.audio {
+            if st.sampleSize > 0 {
+                n = e.size / st.sampleSize
+            } else if st.blockAlign > 0 {
+                n = (e.size + st.blockAlign - 1) / st.blockAlign
+            } else if e.size == 0 {
+                n = 0
+            }
+        }
+        if e.size > 0 && e.offset + e.size <= file.count {
+            let t = aviTicks(st, track, units[s])
+            let d = aviTicks(st, track, units[s] + n) - t
+            var key = e.key
+            if st.kind != core.TrackKind.video {
+                key = true
+            } else if fromScan {
+                key = aviGuessKey(file, track.codec, e.offset, e.size, units[s] == st.start)
+            }
+            packets.append(core.PacketRef(track: s, pts: t, dts: t, duration: d, key: key, offset: e.offset, size: e.size))
+        }
+        units[s] += n
+    }
+
+    // Durations: what the index or scan found, or the stream header's
+    // length (or OpenDML's total frames) when that is longer but
+    // plausible (it also counts empty chunks).
+    var longest = 0.0
+    for i in 0..ns {
+        let st = r.streams[i]
+        let found = units[i]
+        var len = found
+        if st.length > 0 && st.start + st.length > found && st.length < 2 * (found - st.start) + 16 {
+            len = st.start + st.length
+        }
+        if st.kind == core.TrackKind.video && r.totalFrames > len - st.start && r.totalFrames < 2 * (found - st.start) + 16 {
+            len = st.start + r.totalFrames
+        }
+        media.tracks[i].duration = aviTicks(st, media.tracks[i], len)
+        let secs = core.seconds(media.tracks[i].duration, media.tracks[i].timescale)
+        if secs > longest {
+            longest = secs
+        }
+        if media.tracks[i].bitrate == 0 && secs > 0.0 {
+            var bytes = 0
+            for p in packets {
+                if p.track == i {
+                    bytes += p.size
+                }
+            }
+            media.tracks[i].bitrate = Int(Float(bytes) * 8.0 / secs)
+        }
+    }
+    media.duration = longest
+    media.packets = packets
+
+    // DivX 5 "packed bitstream": the encoder's user data ends in 'p'.
+    for t in media.tracks {
+        if t.codec == "mpeg4" {
+            if aviIsPacked(file, t.extra, packets, t.index) {
+                r.warnings.append("AVI: DivX packed bitstream (B-frames packed with the previous frame); left as is for the mpeg4 decoder")
+            }
+        }
+    }
+    media.warnings = r.warnings
+    Result.ok(value: media)
+}
+
+// A track from a stream's headers.
+fn aviTrack(_ st: AviStream, _ i: Int) -> core.Track {
+    var t = core.Track(index: i, id: i, kind: st.kind, codec: "unknown:{st.fccType}")
+    t.title = st.name
+    t.extra = st.extra
+    if st.kind == core.TrackKind.video {
+        t.codec = aviVideoCodec(st.compression, st.handler)
+        if t.codec == "mjpeg" {
+            // JFIF: full-range BT.601 (MJPEG in AVI carries no other).
+            t.matrix = core.ColorMatrix.bt601
+            t.fullRange = true
+        }
+        t.width = st.width
+        t.height = st.height
+        t.timescale = st.rate
+        let g = aviGcd(st.rate, st.scale)
+        t.fpsNum = st.rate / g
+        t.fpsDen = st.scale / g
+        if t.codec == "h264" && !t.extra.isEmpty && t.extra[0] != 1 {
+            // Annex B parameter sets: the stream repeats them (core's h264
+            // extra is an avcC or empty).
+            t.extra = Data()
+        }
+    } else if st.kind == core.TrackKind.audio {
+        t.sampleRate = st.sampleRate
+        t.channels = st.channels
+        t.bitsPerSample = st.bits
+        t.timescale = if st.sampleRate > 0 { st.sampleRate } else { st.rate }
+        t.bitrate = st.avgBytes * 8
+        t.blockAlign = st.blockAlign
+        t.codec = match st.formatTag {
+            0x0001 -> "pcm"
+            0x0003 -> "pcm"
+            0x0006 -> "alaw"
+            0x0007 -> "ulaw"
+            0x0050 -> "mp2"
+            0x0055 -> "mp3"
+            0x00FF -> "aac"
+            0x1610 -> "aac"
+            0x706D -> "aac"
+            0x4143 -> "aac"
+            0x2000 -> "ac3"
+            0x2001 -> "dts"
+            0xF1AC -> "flac"
+            0x0160 -> "wmav1"
+            0x0161 -> "wmav2"
+            0x0162 -> "wmapro"
+            0x0163 -> "wmalossless"
+            _ -> "unknown:0x{aviHex(st.formatTag)}"
+        }
+        if st.formatTag == 1 {
+            t.pcm = core.PcmFormat(bits: st.bits, float: false, bigEndian: false, signed: st.bits > 8)
+        } else if st.formatTag == 3 {
+            t.pcm = core.PcmFormat(bits: st.bits, float: true, bigEndian: false, signed: true)
+        }
+        if t.codec == "pcm" || t.codec == "alaw" || t.codec == "ulaw" {
+            t.extra = Data()
+        }
+        if t.codec == "aac" && (st.formatTag == 0x1610 || st.extra.isEmpty) {
+            // ADTS-framed AAC ("MPEG_HEAAC" 0x1610, or 0xFF without an
+            // AudioSpecificConfig).
+            t.adts = true
+            t.extra = Data()
+        }
+    } else if st.kind == core.TrackKind.subtitle {
+        t.codec = "unknown:txts"
+    }
+    t
+}
+
+// Video codec from BITMAPINFOHEADER.biCompression (or the stream
+// header's fccHandler when that is empty).
+fn aviVideoCodec(_ compression: String, _ handler: String) -> String {
+    var c = compression.uppercase()
+    if c == "0" || c.isEmpty {
+        let h = handler.uppercase()
+        if h.isEmpty || h == "DIB " || h == "RAW " || h.contains("?") {
+            return "rawvideo"
+        }
+        c = h
+    }
+    match c {
+        "H264" -> "h264"
+        "AVC1" -> "h264"
+        "X264" -> "h264"
+        "DAVC" -> "h264"
+        "VSSH" -> "h264"
+        "HEVC" -> "hevc"
+        "H265" -> "hevc"
+        "HVC1" -> "hevc"
+        "XVID" -> "mpeg4"
+        "DIVX" -> "mpeg4"
+        "DX50" -> "mpeg4"
+        "FMP4" -> "mpeg4"
+        "MP4V" -> "mpeg4"
+        "3IV2" -> "mpeg4"
+        "DIV5" -> "mpeg4"
+        "M4S2" -> "mpeg4"
+        "MJPG" -> "mjpeg"
+        "AVRN" -> "mjpeg"
+        "JPGL" -> "mjpeg"
+        "AVDJ" -> "mjpeg"
+        "MPG2" -> "mpeg2"
+        "MPEG" -> "mpeg2"
+        "MPG1" -> "mpeg1"
+        "VP80" -> "vp8"
+        "VP90" -> "vp9"
+        "AV01" -> "av1"
+        "WVC1" -> "vc1"
+        "WMVA" -> "vc1"
+        "WMV3" -> "wmv3"
+        "WMV2" -> "wmv2"
+        "WMV1" -> "wmv1"
+        "MP43" -> "msmpeg4v3"
+        "DIV3" -> "msmpeg4v3"
+        "DIV4" -> "msmpeg4v3"
+        "MP42" -> "msmpeg4v2"
+        "MPG4" -> "msmpeg4v1"
+        "AVDN" -> "dnxhd"
+        "AVDH" -> "dnxhd"
+        "DIB " -> "rawvideo"
+        "RGB " -> "rawvideo"
+        "I420" -> "rawvideo"
+        "YV12" -> "rawvideo"
+        "YUY2" -> "rawvideo"
+        _ -> "unknown:{compression.trim()}"
+    }
+}
+
+// Units of a stream's dwScale/dwRate clock in the track's ticks.
+fn aviTicks(_ st: AviStream, _ t: core.Track, _ units: Int) -> Int {
+    if st.kind == core.TrackKind.video {
+        return units * st.scale
+    }
+    core.rescale(units * st.scale, from: st.rate, to: t.timescale)
+}
+
+// Without an index: is this video chunk a keyframe? Judged from the
+// payload's start where the codec makes that easy.
+fn aviGuessKey(_ file: Data, _ codec: String, _ at: Int, _ size: Int, _ first: Bool) -> Bool {
+    if codec == "mjpeg" || codec == "rawvideo" {
+        return true
+    }
+    let end = min(min(at + size, at + 4096), file.count)
+    if codec == "mpeg4" {
+        // VOP start code 00 00 01 B6, then vop_coding_type (2 bits): 0 = I.
+        var i = at
+        while i + 4 < end {
+            if file[i] == 0 && file[i + 1] == 0 && file[i + 2] == 1 && file[i + 3] == 0xB6 {
+                return (file[i + 4] >> 6) == 0
+            }
+            i += 1
+        }
+        return first
+    }
+    if codec == "h264" {
+        return tsH264KeyRange(file, at, min(at + size, file.count)) == 1 || first
+    }
+    if codec == "mpeg1" || codec == "mpeg2" {
+        return tsMpegVideoKeyRange(file, at, min(at + size, file.count)) == 1 || first
+    }
+    first
+}
+
+// Whether an mpeg4 stream is DivX packed bitstream: user data (00 00 01
+// B2) "DivX<version>b<build>p" in the setup bytes or the first frame.
+fn aviIsPacked(_ file: Data, _ extra: Data, _ packets: [core.PacketRef], _ track: Int) -> Bool {
+    if aviPackedIn(extra, 0, extra.count) {
+        return true
+    }
+    if let p = packets.first(where: { q in q.track == track }) {
+        return aviPackedIn(file, p.offset, min(p.offset + p.size, p.offset + 512))
+    }
+    false
+}
+
+fn aviPackedIn(_ d: Data, _ from: Int, _ to: Int) -> Bool {
+    var i = from
+    while i + 4 <= to {
+        if d[i] == 0x44 && d[i + 1] == 0x69 && d[i + 2] == 0x76 && d[i + 3] == 0x58 {
+            // "DivX": the build string runs to the next unprintable byte.
+            var j = i + 4
+            while j < to && d[j] >= 0x20 && d[j] < 0x7f {
+                j += 1
+            }
+            return d[j - 1] == 0x70
+        }
+        i += 1
+    }
+    false
+}
+
+// Text from a chunk: UTF-8 (or Latin-1) up to the first zero byte.
+fn aviText(_ d: Data) -> String {
+    var n = 0
+    while n < d.count && d[n] != 0 {
+        n += 1
+    }
+    let s = d.slice(from: 0, to: n)
+    (s.text ?? s.latin1).trim()
+}
+
+fn aviFourcc(_ file: Data, _ at: Int) -> String {
+    var s = ""
+    for k in 0..4 {
+        s += aviChar(file[at + k])
+    }
+    s
+}
+
+fn aviChar(_ b: Int) -> String {
+    let codes = " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz\{|}~"
+    if b >= 32 && b < 127 {
+        return codes.substring(from: b - 32, to: b - 31)
+    }
+    "?"
+}
+
+// The stream number of a chunk id like '01wb' or 'ix01', or -1.
+fn aviStreamNumber(_ id: String) -> Int {
+    if id.count != 4 {
+        return -1
+    }
+    let digits = "0123456789"
+    var a = -1
+    var b = -1
+    var c0 = 0
+    var c1 = 1
+    if id.hasPrefix("ix") {
+        c0 = 2
+        c1 = 3
+    }
+    if let x = digits.find(id.substring(from: c0, to: c0 + 1)) {
+        a = x
+    }
+    if let y = digits.find(id.substring(from: c1, to: c1 + 1)) {
+        b = y
+    }
+    if a < 0 || b < 0 {
+        return -1
+    }
+    a * 10 + b
+}
+
+// '##dc' '##db' '##wb' '##tx' (and anything but palette changes and
+// indexes) carry a stream's data.
+fn aviIsDataChunk(_ id: String) -> Bool {
+    if id.hasPrefix("ix") {
+        return false
+    }
+    let t = id.substring(from: 2, to: 4)
+    t != "pc"
+}
+
+fn aviFourccIsText(_ id: String) -> Bool {
+    for ch in id.characters {
+        if ch == "?" {
+            return false
+        }
+    }
+    true
+}
+
+fn aviGcd(_ a: Int, _ b: Int) -> Int {
+    var x = a
+    var y = b
+    while y != 0 {
+        let t = x % y
+        x = y
+        y = t
+    }
+    if x == 0 { 1 } else { x }
+}
+
+fn aviHex(_ v: Int) -> String {
+    let digits = "0123456789ABCDEF"
+    var s = ""
+    var n = v
+    for _ in 0..4 {
+        s = digits.substring(from: n & 15, to: (n & 15) + 1) + s
+        n = n >> 4
+    }
+    s
+}

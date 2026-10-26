@@ -1,0 +1,81 @@
+{
+ "format": "wav",
+ "duration": 0.25,
+ "tags": {
+  "encoder": "Lavf62.12.102"
+ },
+ "tracks": [
+  {
+   "index": 0,
+   "kind": "audio",
+   "codec": "ulaw",
+   "ffCodec": "pcm_mulaw",
+   "profile": "",
+   "timescale": 8000,
+   "duration": 2000,
+   "extraHex": "",
+   "width": 0,
+   "height": 0,
+   "sarNum": 1,
+   "sarDen": 1,
+   "fpsNum": 0,
+   "fpsDen": 0,
+   "rotation": 0,
+   "pixFmt": "",
+   "sampleRate": 8000,
+   "channels": 2,
+   "channelLayout": "",
+   "bitsPerSample": 8,
+   "pcm": {
+    "bits": 16,
+    "float": false,
+    "bigEndian": false,
+    "signed": true
+   },
+   "language": "",
+   "title": "",
+   "isDefault": false,
+   "isCover": false,
+   "frames": -1
+  }
+ ],
+ "packets": [
+  {
+   "track": 0,
+   "pts": 0,
+   "dts": 0,
+   "duration": 512,
+   "key": true,
+   "pos": 92,
+   "size": 1024
+  },
+  {
+   "track": 0,
+   "pts": 512,
+   "dts": 512,
+   "duration": 512,
+   "key": true,
+   "pos": 1116,
+   "size": 1024
+  },
+  {
+   "track": 0,
+   "pts": 1024,
+   "dts": 1024,
+   "duration": 512,
+   "key": true,
+   "pos": 2140,
+   "size": 1024
+  },
+  {
+   "track": 0,
+   "pts": 1536,
+   "dts": 1536,
+   "duration": 464,
+   "key": true,
+   "pos": 3164,
+   "size": 928
+  }
+ ],
+ "chapters": []
+}

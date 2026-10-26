@@ -1,0 +1,252 @@
+// Tests the Windows Media video decoders (module wmv) against ffmpeg:
+// every picture's md5 must equal ffmpeg's framemd5 (made with -flags
+// +bitexact) for
+//   - clips ffmpeg's encoders made (msmpeg4v2, msmpeg4 = v3, wmv1, wmv2,
+//     in AVI and MKV, odd sizes too: tests/wmv/fixtures, made by
+//     build/scratch/wmv/tools/make_fixtures.sh), and
+//   - cuts of public samples (FATE suite, samples.ffmpeg.org) of every
+//     codec, remuxed by ffmpeg -c copy into MKV/AVI/TS
+//     (build/conformance/wmv, made by build/scratch/wmv/tools/
+//     make_conformance.sh; cases whose file is missing are skipped).
+// The case lists are in ms_cases.tsl (MS-MPEG4/WMV1/WMV2) and
+// vc_cases.tsl (WMV9/VC-1), with the extra checks of each decoder (seek,
+// skipping B pictures, damaged packets, speed).
+//
+// WMV_ONLY=<text> runs only the cases whose name contains the text, and
+// WMV_SKIP_EXTRA=1 leaves out the extra checks.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../../wmv"
+import "../../core"
+import "../../testkit"
+import "../../demux"
+
+// One clip to decode and compare.
+struct WmvCase {
+    name: String
+    path: String
+    // How many pictures to compare from the start; 0 = all of the
+    // reference.
+    limit: Int = 0
+    // Print the decoding time per picture.
+    timing: Bool = false
+}
+
+struct Tally {
+    passed: Int = 0
+    total: Int = 0
+
+    fn check(_ ok: Bool, _ what: String) {
+        total += 1
+        if ok {
+            passed += 1
+        } else {
+            print("FAIL: {what}")
+        }
+    }
+}
+
+// What decoding a clip gave.
+struct WmvRun {
+    ok: Bool = false
+    error: String = ""
+    md5s: [String] = []
+    pts: [Int] = []
+    keys: Int = 0
+    warnings: [String] = []
+    ms: Float = 0.0
+    width: Int = 0
+    height: Int = 0
+    track: core.Track = core.Track(index: 0, kind: .video, codec: "")
+}
+
+// The md5s of ffmpeg's framemd5 file.
+fn wmvRefMd5s(_ path: String) -> [String] {
+    let text = readFile(path) ?? ""
+    var out: [String] = []
+    for line in text.lines() {
+        if line.hasPrefix("#") || line.trim().isEmpty {
+            continue
+        }
+        let parts = line.split(",")
+        if parts.count >= 6 {
+            out.append(parts[5].trim())
+        }
+    }
+    out
+}
+
+// The file's first video track and its packets (in decode order).
+struct WmvClip {
+    ok: Bool = false
+    error: String = ""
+    track: core.Track = core.Track(index: 0, kind: .video, codec: "")
+    packets: [Data] = []
+    pts: [Int] = []
+    dts: [Int] = []
+    keys: [Bool] = []
+}
+
+fn wmvOpenClip(_ path: String) -> WmvClip {
+    var c = WmvClip()
+    let file = readData(path) ?? Data()
+    if file.isEmpty {
+        c.error = "missing"
+        return c
+    }
+    let opened = demux.open(file, name: path)
+    if let err = opened.error() {
+        c.error = "demux: {err.message}"
+        return c
+    }
+    let media = opened.valueOr(core.Media())
+    var vi = -1
+    for t in media.tracks {
+        if t.kind == .video && vi < 0 {
+            vi = t.index
+        }
+    }
+    if vi < 0 {
+        c.error = "no video track"
+        return c
+    }
+    c.track = media.tracks[vi]
+    for p in media.packets {
+        if p.track == vi {
+            c.packets.append(core.packetBytes(file, media, p))
+            c.pts.append(p.pts)
+            c.dts.append(p.dts)
+            c.keys.append(p.key)
+        }
+    }
+    c.ok = true
+    c
+}
+
+// Decodes a clip's packets with a fresh decoder; stops after `limit`
+// pictures (0 = all).
+fn wmvDecodeClip(_ c: WmvClip, limit: Int, skipNonReference: Bool = false) -> WmvRun {
+    var r = WmvRun()
+    r.track = c.track
+    let made = wmv.newDecoder(c.track)
+    if let err = made.error() {
+        r.error = "newDecoder: {err.message}"
+        return r
+    }
+    var d = made.valueOr(wmv.Decoder())
+    d.skipNonReference = skipNonReference
+    var spent = 0.0
+    var i = 0
+    while i < c.packets.count && (limit == 0 || r.md5s.count < limit) {
+        let t0 = now()
+        let got = d.decode(c.packets[i], pts: c.pts[i], dts: c.dts[i], key: c.keys[i])
+        spent += now() - t0
+        for p in got {
+            wmvTake(r, p)
+        }
+        i += 1
+    }
+    if limit == 0 || r.md5s.count < limit {
+        let t1 = now()
+        let rest = d.flush()
+        spent += now() - t1
+        for p in rest {
+            wmvTake(r, p)
+        }
+    }
+    r.ms = spent * 1000.0
+    r.warnings = d.warnings
+    r.ok = true
+    r
+}
+
+fn wmvTake(_ r: bind WmvRun, _ p: core.Picture) {
+    r.md5s.append(testkit.pictureMd5(p))
+    r.pts.append(p.pts)
+    if p.key {
+        r.keys += 1
+    }
+    r.width = p.width
+    r.height = p.height
+}
+
+// Runs one case: one check (all compared pictures bit-exact and as many
+// as ffmpeg's), plus a line saying how many matched.
+fn wmvRunCase(_ t: bind Tally, _ cs: WmvCase) {
+    let refPath = cs.path + ".framemd5"
+    if !fileExists(cs.path) || !fileExists(refPath) {
+        print("skip {cs.name}: {cs.path} not there")
+        return
+    }
+    var want = wmvRefMd5s(refPath)
+    if cs.limit > 0 && want.count > cs.limit {
+        want = want.slice(from: 0, to: cs.limit)
+    }
+    let clip = wmvOpenClip(cs.path)
+    if !clip.ok {
+        t.check(false, "{cs.name}: {clip.error}")
+        return
+    }
+    let r = wmvDecodeClip(clip, limit: want.count)
+    if !r.ok {
+        t.check(false, "{cs.name}: {r.error}")
+        return
+    }
+    var same = 0
+    var first = -1
+    for i in 0..min(want.count, r.md5s.count) {
+        if want[i] == r.md5s[i] {
+            same += 1
+        } else if first < 0 {
+            first = i
+        }
+    }
+    var line = "{cs.name} ({clip.track.codec} {r.width}x{r.height}): {same} of {want.count} pictures bit-exact"
+    if r.md5s.count != want.count {
+        line += ", decoded {r.md5s.count}"
+    }
+    if first >= 0 {
+        line += ", first mismatch at {first}"
+    }
+    if !r.warnings.isEmpty {
+        line += ", {r.warnings.count} warnings (first: {r.warnings[0]})"
+    }
+    print(line)
+    t.check(same == want.count && r.md5s.count == want.count, "{cs.name}: {same} of {want.count} bit-exact, {r.md5s.count} decoded")
+    if cs.timing && r.md5s.count > 0 {
+        let per = Int(r.ms / Float(r.md5s.count) * 10.0)
+        print("time wmv {cs.name} {r.width}x{r.height}: {per / 10}.{per % 10} ms per picture")
+    }
+}
+
+fn main() {
+    let only = environment("WMV_ONLY") ?? ""
+    let skipExtra = (environment("WMV_SKIP_EXTRA") ?? "") == "1"
+    var t = Tally()
+    var cases = msCases()
+    cases += vcCases()
+    for cs in cases {
+        if !only.isEmpty && !cs.name.contains(only) {
+            continue
+        }
+        wmvRunCase(t, cs)
+    }
+    if !skipExtra {
+        msExtraChecks(t, only)
+        vcExtraChecks(t, only)
+    }
+    // The public API without a decoder behind it.
+    if only.isEmpty {
+        let bad = wmv.newDecoder(core.Track(index: 0, kind: .video, codec: "h264"))
+        t.check(bad.error() != nil, "newDecoder refuses h264")
+        var tr = core.Track(index: 0, kind: .video, codec: "wmv3")
+        tr.width = 640
+        tr.height = 480
+        tr.extra = Data(bytes: [0x4E, 0xF1, 0x0A, 0x01])
+        let info = wmv.streamInfo(tr)
+        t.check(info == "WMV9 Main, 640×480", "streamInfo wmv3: {info}")
+    }
+    print("wmv: {t.passed} of {t.total} passed")
+}

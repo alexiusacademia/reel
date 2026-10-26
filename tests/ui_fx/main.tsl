@@ -1,0 +1,283 @@
+// Tests for the "Effects and Filters" views' pure helpers (ui/fx_*.tsl):
+// number text and parsing, the equalizer's response curve (against fx's
+// own filter designs), preset matching, the compressor's transfer curve
+// (against the Giannoulis–Massberg–Reiss soft-knee formulas), the names
+// of the choices and their round trips, and the meter readout of a real
+// fx.Chain. The views themselves are checked headless with the demo app
+// in build/scratch/ui-fx/demo.
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+import "../../ui"
+import "../../fx"
+import "../../render"
+import "../../vfx"
+import "../../core"
+
+struct Tally {
+    passed: Int = 0
+    total: Int = 0
+
+    fn check(_ ok: Bool, _ what: String) {
+        total += 1
+        if ok {
+            passed += 1
+        } else {
+            print("FAIL: {what}")
+        }
+    }
+
+    fn same(_ got: String, _ want: String, _ what: String) {
+        check(got == want, "{what}: got \"{got}\", want \"{want}\"")
+    }
+
+    fn near(_ got: Float, _ want: Float, _ tol: Float, _ what: String) {
+        check(abs(got - want) <= tol, "{what}: got {got.formatted(decimals: 4)}, want {want.formatted(decimals: 4)} ± {tol}")
+    }
+
+    fn ms(_ text: String, _ want: Int?, _ what: String) {
+        let got = ui.fxParseMs(text)
+        check(got == want, "{what}: fxParseMs(\"{text}\") = {got ?? -999999}, want {want ?? -999999}")
+    }
+
+    fn speed(_ text: String, _ want: Float?, _ what: String) {
+        let got = ui.fxParseSpeed(text)
+        var ok = false
+        if let g = got {
+            if let w = want {
+                ok = abs(g - w) < 0.000001
+            }
+        } else {
+            ok = want == nil
+        }
+        check(ok, "{what}: fxParseSpeed(\"{text}\") = {got ?? -1.0}, want {want ?? -1.0}")
+    }
+}
+
+fn main() {
+    var t = Tally()
+    textTests(t)
+    parseTests(t)
+    eqTests(t)
+    compressorTests(t)
+    nameTests(t)
+    meterTests(t)
+    print("ui_fx: {t.passed} of {t.total} passed")
+}
+
+fn textTests(_ t: bind Tally) {
+    t.same(ui.fxSigned(3.5), "+3.5", "fxSigned positive")
+    t.same(ui.fxSigned(-3.5), "−3.5", "fxSigned negative uses the minus sign")
+    t.same(ui.fxSigned(0.04), "0.0", "fxSigned rounds to an unsigned zero")
+    t.same(ui.fxSigned(-0.04), "0.0", "fxSigned negative zero")
+    t.same(ui.fxSigned(-12.0, decimals: 0), "−12", "fxSigned no decimals")
+    t.same(ui.fxDb(6.0), "+6.0 dB", "fxDb")
+    let labels = fx.eqFrequencies.map { f in ui.fxFreqLabel(f) }
+    t.same(labels.joined(separator: " "), "31 63 125 250 500 1k 2k 4k 8k 16k", "band labels")
+    t.same(ui.fxFreqLabel(1500.0), "1.5k", "fractional kHz label")
+    t.same(ui.fxLufs(-120.0), "—", "silence shows a dash")
+    t.same(ui.fxLufs(-23.0), "−23.0 LUFS", "fxLufs")
+    t.same(ui.fxLufs(-1.25, unit: "dBTP"), "−1.2 dBTP", "fxLufs with a unit")
+    t.same(ui.fxMs(120), "+120 ms", "fxMs positive")
+    t.same(ui.fxMs(-80), "−80 ms", "fxMs negative")
+    t.same(ui.fxMs(0), "0 ms", "fxMs zero")
+    t.same(ui.fxSpeed(1.0), "1×", "fxSpeed 1")
+    t.same(ui.fxSpeed(1.25), "1.25×", "fxSpeed 1.25")
+    t.same(ui.fxSpeed(0.5), "0.5×", "fxSpeed 0.5")
+    t.same(ui.fxSpeed(2.0), "2×", "fxSpeed 2")
+    t.same(ui.fxPlain(1.50), "1.5", "fxPlain trims zeros")
+    t.same(ui.fxPlain(-0.001), "0", "fxPlain negative zero")
+    t.same(ui.fxPlain(-2.25), "−2.25", "fxPlain negative")
+    t.same(ui.fxWidthText(0.0), "Mono", "width 0")
+    t.same(ui.fxWidthText(1.0), "As recorded", "width 1")
+    t.same(ui.fxWidthText(1.5), "150 %", "width 1.5")
+    t.same(ui.fxBalanceText(0.0), "Centre", "balance centre")
+    t.same(ui.fxBalanceText(-0.3), "L 30 %", "balance left")
+    t.same(ui.fxBalanceText(1.0), "R 100 %", "balance right")
+    var v = render.View()
+    t.same(ui.fxCropText(v), "none", "no crop")
+    v.cropTop = 140
+    v.cropBottom = 138
+    t.same(ui.fxCropText(v), "left 0, top 140, right 0, bottom 138", "crop text")
+}
+
+fn parseTests(_ t: bind Tally) {
+    t.ms("120", 120, "plain ms")
+    t.ms("-80", -80, "negative ms")
+    t.ms("−40", -40, "typographic minus")
+    t.ms("+250 ms", 250, "plus and unit")
+    t.ms("1.5 s", 1500, "seconds")
+    t.ms("-0.2s", -200, "negative seconds")
+    t.ms(" 33.4 ", 33, "rounds to whole ms")
+    t.ms("abc", nil, "text")
+    t.ms("", nil, "empty")
+    t.ms("ms", nil, "unit only")
+    t.ms("700000", nil, "beyond ten minutes")
+    t.speed("1.5", 1.5, "plain speed")
+    t.speed("1.5x", 1.5, "speed with x")
+    t.speed("1.5×", 1.5, "speed with ×")
+    t.speed("150%", 1.5, "speed in percent")
+    t.speed("0.25", 0.25, "slowest")
+    t.speed("4", 4.0, "fastest")
+    t.speed("0.1", nil, "too slow")
+    t.speed("5", nil, "too fast")
+    t.speed("x", nil, "no number")
+    t.near(ui.fxSnap(0.37, from: 0.0, to: 1.0, step: 0.05), 0.35, 0.000001, "snap down")
+    t.near(ui.fxSnap(5.0, from: 0.0, to: 1.0, step: 0.05), 1.0, 0.000001, "snap clamps")
+    t.near(ui.fxSnap(0.37, from: 0.0, to: 1.0, step: 0.0), 0.37, 0.000001, "no step")
+}
+
+fn eqTests(_ t: bind Tally) {
+    let f3 = ui.fxLogFrequencies(3)
+    t.check(f3.count == 3, "three log frequencies")
+    t.near(f3[0], 20.0, 0.0001, "log axis starts at 20 Hz")
+    t.near(f3[1], sqrt(20.0 * 20000.0), 0.001, "log axis middle is the geometric mean")
+    t.near(f3[2], 20000.0, 0.01, "log axis ends at 20 kHz")
+    t.near(ui.fxLogPosition(20.0), 0.0, 0.000001, "20 Hz at the left")
+    t.near(ui.fxLogPosition(20000.0), 1.0, 0.000001, "20 kHz at the right")
+    t.near(ui.fxLogPosition(sqrt(20.0 * 20000.0)), 0.5, 0.000001, "geometric mean in the middle")
+
+    let freqs = ui.fxLogFrequencies(64)
+    let flat = ui.fxEqResponse(gains: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], preamp: 0.0, freqs: freqs)
+    t.check(flat.count == 64 && (flat.map { d in abs(d) }.max() ?? 1.0) < 0.000001, "flat response is 0 dB")
+    let pre = ui.fxEqResponse(gains: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], preamp: -4.0, freqs: freqs)
+    t.check((pre.map { d in abs(d + 4.0) }.max() ?? 1.0) < 0.000001, "preamp shifts the whole curve")
+    // One band: its peak gain at its centre, as the Cookbook designs it.
+    let one = ui.fxEqResponse(gains: [0.0, 0.0, 0.0, 0.0, 0.0, 6.0, 0.0, 0.0, 0.0, 0.0], preamp: 0.0, freqs: [1000.0, 30.0, 16000.0])
+    t.near(one[0], 6.0, 0.001, "1 kHz band +6 dB at its centre")
+    t.near(one[1], 0.0, 0.05, "1 kHz band leaves 30 Hz alone")
+    t.near(one[2], 0.0, 0.05, "1 kHz band leaves 16 kHz alone")
+    // A preset: the sum of fx's own filters.
+    let rock = fx.preset(named: "Rock") ?? fx.Preset(name: "", preamp: 0.0, gains: [])
+    let probe = [31.25, 100.0, 440.0, 3000.0, 12000.0]
+    let got = ui.fxEqResponse(gains: rock.gains, preamp: rock.preamp, freqs: probe)
+    var worst = 0.0
+    for (k, f) in probe.enumerated() {
+        var want = rock.preamp
+        for (i, g) in rock.gains.enumerated() {
+            want += fx.peaking(f0: fx.eqFrequencies[i], gain: g, bw: fx.eqBandwidth, rate: 48000.0).db(f, 48000.0)
+        }
+        worst = max(worst, abs(got[k] - want))
+    }
+    t.near(worst, 0.0, 0.000001, "Rock curve equals the sum of fx's filters")
+    // Beyond Nyquist only the preamp counts.
+    let high = ui.fxEqResponse(gains: rock.gains, preamp: -2.0, freqs: [30000.0], rate: 48000.0)
+    t.near(high[0], -2.0, 0.000001, "above Nyquist: preamp only")
+
+    t.same(ui.fxPresetName(fx.Settings()), "Flat", "default settings are Flat")
+    var s = fx.withPreset(fx.Settings(), "Rock")
+    t.same(ui.fxPresetName(s), "Rock", "a preset is recognised")
+    s.eqGains[3] = s.eqGains[3] + 0.5
+    t.same(ui.fxPresetName(s), "Custom", "an edited preset is Custom")
+    s = fx.withPreset(fx.Settings(), "Vocal")
+    s.eqPreamp = s.eqPreamp - 1.0
+    t.same(ui.fxPresetName(s), "Custom", "a changed preamp is Custom")
+    var all = true
+    for p in fx.presets() {
+        if p.name != "Flat" && ui.fxPresetName(fx.withPreset(fx.Settings(), p.name)) != p.name {
+            all = false
+        }
+    }
+    t.check(all, "every preset is recognised by name")
+}
+
+fn compressorTests(_ t: bind Tally) {
+    // Below the knee: unchanged.
+    t.near(ui.fxCompressorOutput(-40.0, threshold: -20.0, ratio: 4.0, knee: 6.0), -40.0, 0.000001, "below the knee")
+    // Above: T + (x − T)/R.
+    t.near(ui.fxCompressorOutput(-4.0, threshold: -20.0, ratio: 4.0, knee: 6.0), -16.0, 0.000001, "above the knee")
+    // At the threshold, inside the knee: x + (1/R − 1)(W/2)²/(2W).
+    t.near(ui.fxCompressorOutput(-20.0, threshold: -20.0, ratio: 4.0, knee: 6.0), -20.0 + (0.25 - 1.0) * 9.0 / 12.0, 0.000001, "in the knee")
+    // The knee joins both lines.
+    t.near(ui.fxCompressorOutput(-17.0, threshold: -20.0, ratio: 4.0, knee: 6.0), -20.0 + 3.0 / 4.0, 0.000001, "knee meets the upper line")
+    t.near(ui.fxCompressorOutput(-23.0, threshold: -20.0, ratio: 4.0, knee: 6.0), -23.0, 0.000001, "knee meets the lower line")
+    // Hard knee, makeup, ratio 1.
+    t.near(ui.fxCompressorOutput(-10.0, threshold: -20.0, ratio: 2.0, knee: 0.0), -15.0, 0.000001, "hard knee")
+    t.near(ui.fxCompressorOutput(-10.0, threshold: -20.0, ratio: 2.0, knee: 0.0, makeup: 3.0), -12.0, 0.000001, "makeup adds")
+    t.near(ui.fxCompressorOutput(-5.0, threshold: -20.0, ratio: 1.0, knee: 6.0), -5.0, 0.000001, "ratio 1 changes nothing")
+    // Never rises faster than 1:1.
+    var mono = true
+    var last = -1000.0
+    for i in 0..121 {
+        let y = ui.fxCompressorOutput(-60.0 + Float(i) * 0.5, threshold: -30.0, ratio: 8.0, knee: 12.0)
+        if y < last - 0.000001 {
+            mono = false
+        }
+        last = y
+    }
+    t.check(mono, "transfer curve never falls")
+}
+
+fn nameTests(_ t: bind Tally) {
+    var ok = true
+    for n in ui.fxStereoModeNames {
+        if ui.fxStereoModeName(ui.fxStereoMode(named: n)) != n {
+            ok = false
+        }
+    }
+    t.check(ok && ui.fxStereoModeNames.count == 5, "stereo modes round trip")
+    ok = true
+    for n in ui.fxNormalizeNames {
+        if ui.fxNormalizeName(ui.fxNormalizeMode(named: n)) != n {
+            ok = false
+        }
+    }
+    t.check(ok && ui.fxNormalizeNames.count == 5, "normalisation modes round trip")
+    ok = true
+    for n in ui.fxDeinterlaceNames {
+        let stored = ui.fxDeinterlaceValue(n)
+        if ui.fxDeinterlaceName(stored) != n {
+            ok = false
+        }
+    }
+    t.check(ok, "deinterlace names round trip through vfx.Settings' strings")
+    t.same(ui.fxDeinterlaceName("weave"), "Off", "weave is Off")
+    t.same(ui.fxDeinterlaceName(vfx.Settings().deinterlace), "Adaptive", "default deinterlace")
+    t.same(ui.fxAspectName(0.0), "Default", "aspect default")
+    t.same(ui.fxAspectName(16.0 / 9.0), "16:9", "aspect 16:9")
+    t.same(ui.fxAspectName(1.66), "Custom", "aspect custom")
+    t.same(ui.fxAspectText(1.66), "1.66", "custom aspect text")
+    t.same(ui.fxAspectText(0.0), "Default", "default aspect text")
+    // Each preset is named back from its value; its text reads back as
+    // the same value, except "21:9", which is the trade name of 64:27.
+    var bad: [String] = []
+    for (name, v) in render.aspectPresets {
+        let back = render.parseAspect(ui.fxAspectText(v))
+        if ui.fxAspectName(v) != name || (name != "21:9" && abs(back - v) > 0.0001) {
+            bad.append(name)
+        }
+    }
+    t.check(bad.isEmpty, "aspect presets round trip through their text: {bad.joined(separator: ", ")}")
+    t.same(ui.fxRotationName(90), "90°", "rotation 90")
+    t.same(ui.fxRotationName(450), "90°", "rotation 450")
+    t.same(ui.fxRotationName(-90), "270°", "rotation −90")
+    t.check(ui.fxRotation(named: "180°") == 180, "rotation from its name")
+    t.check(ui.fxTabs.count == 5 && ui.fxTabs[0].0 == "equalizer" && ui.fxTabs[4].0 == "sync", "five tabs")
+    t.check(ui.fxSpeedChoices.contains(1.0), "speed choices include 1×")
+}
+
+fn meterTests(_ t: bind Tally) {
+    var chain = fx.newChain(fx.Settings())
+    let idle = ui.meterReadout(chain)
+    t.check(!idle.active, "a fresh chain's readout is inactive")
+    // Two seconds of a −20 dBFS 1 kHz sine, stereo.
+    let rate = 48000
+    var data: [Float] = []
+    let a = pow(10.0, -20.0 / 20.0)
+    for i in 0..(rate * 2) {
+        let x = a * sin(2.0 * pi * 1000.0 * Float(i) / Float(rate))
+        data.append(x)
+        data.append(x)
+    }
+    let out = chain.process(core.Samples(rate: rate, channels: 2, data: data, layout: ["FL", "FR"]))
+    let m = ui.meterReadout(chain)
+    t.check(out.frames > 0, "the chain gives sound back")
+    t.check(m.active, "readout active after sound")
+    // A 1 kHz sine at −20 dBFS in both channels reads −20 LUFS (EBU Tech
+    // 3341's first test signal is the same at −23).
+    t.near(m.integrated, -20.0, 0.2, "integrated loudness of a −20 dBFS sine")
+    t.near(m.momentary, m.integrated, 0.3, "momentary of a steady tone")
+    t.near(m.truePeak, -20.0, 0.3, "true peak of a −20 dBFS sine")
+    t.check(m.compressorReduction == 0.0 && m.limiterReduction < 0.01, "no gain reduction on a quiet tone")
+}

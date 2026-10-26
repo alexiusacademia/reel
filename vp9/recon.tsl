@@ -1,0 +1,866 @@
+// The second stage of the VP9 decoder: turns ParsedFrames into pictures.
+// It keeps the eight reference frames (8.10), runs prediction and the
+// residual for every block (8.5, 8.6, 8.7), builds the loop filter masks
+// (FFmpeg's mask_edges) and filters each superblock row once the row below
+// it has been reconstructed (so intra prediction still sees unfiltered
+// samples, as 8.8 requires), and hands out core.Pictures.
+//
+// Planes are Int lists sized to whole superblocks (64 samples) so blocks
+// that overhang the picture need no special cases.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../core"
+
+// A decoded frame: its planes and their geometry.
+struct Vp9Buf {
+    id: Int = 0
+    y: [Int] = []
+    u: [Int] = []
+    v: [Int] = []
+    w: Int = 0
+    h: Int = 0
+    yStride: Int = 0
+    cStride: Int = 0
+    yRows: Int = 0
+    cRows: Int = 0
+    bitDepth: Int = 8
+    ssH: Int = 1
+    ssV: Int = 1
+    colorSpace: Int = 0
+    fullRange: Bool = false
+}
+
+public struct Reconstructor {
+    warnings: [String] = []
+    px: Vp9Px = Vp9Px()
+    ready: Bool = false
+    slots: [Vp9Buf] = []
+    slotOk: [Int] = [0, 0, 0, 0, 0, 0, 0, 0]
+    pool: [Vp9Buf] = []
+    nextId: Int = 1
+    hasLast: Bool = false
+    // From the container: pixel shape, and the colour matrix to use when
+    // the stream's color_space is unknown.
+    sarNum: Int = 1
+    sarDen: Int = 1
+    trackMatrix: core.ColorMatrix = .unknown
+    lastPic: core.Picture = core.Picture(width: 0, height: 0)
+    // Time spent (seconds) reconstructing blocks and loop filtering, for
+    // benchmarks.
+    tBlocks: Float = 0.0
+    tFilter: Float = 0.0
+
+    // The frame being reconstructed.
+    cur: Vp9Buf = Vp9Buf()
+    hdr: FrameHeader = FrameHeader()
+    cols: Int = 0
+    rows: Int = 0
+    sbCols: Int = 0
+    sbRows: Int = 0
+    ssH: Int = 1
+    ssV: Int = 1
+    // Loop filter masks per superblock (128: [plane 2][dir 2][row 8][kind 4])
+    // and levels per superblock (64).
+    lfMask: [Int] = []
+    lfLevel: [Int] = []
+    // Reference scale factors (x, y in 1/16384) and steps, per active ref.
+    scaleX: [Int] = [0, 0, 0]
+    scaleY: [Int] = [0, 0, 0]
+    stepX: [Int] = [0, 0, 0]
+    stepY: [Int] = [0, 0, 0]
+    tBwh8: [Int] = []
+    tBwh4: [Int] = []
+    tTxType: [Int] = []
+    // The block being reconstructed.
+    blk: [Int] = []
+    coefs: [Int] = []
+
+    fn setup() {
+        if ready {
+            return
+        }
+        ready = true
+        px.setup()
+        for _ in 0..8 {
+            slots.append(Vp9Buf())
+        }
+        tBwh8 = vp9Bwh8
+        tBwh4 = vp9Bwh4
+        tTxType = vp9IntraTxType
+    }
+
+    fn warn(_ s: String) {
+        if warnings.count < 200 {
+            warnings.append(s)
+        }
+    }
+
+    fn reset() {
+        setup()
+        slotOk = [0, 0, 0, 0, 0, 0, 0, 0]
+        hasLast = false
+    }
+
+    fn picture(_ b: Vp9Buf, _ pts: Int, _ key: Bool) -> core.Picture {
+        var p = core.Picture(width: b.w, height: b.h)
+        p.chroma = if b.ssH == 1 && b.ssV == 1 { core.Chroma.yuv420 } else if b.ssH == 1 { core.Chroma.yuv422 } else { core.Chroma.yuv444 }
+        p.depth = b.bitDepth
+        p.y = b.y
+        p.u = b.u
+        p.v = b.v
+        p.yStride = b.yStride
+        p.cStride = b.cStride
+        if b.ssH == 0 && b.ssV == 1 {
+            // 4:4:0 has no core.Chroma: show it as 4:4:4 with each chroma
+            // row twice.
+            p.u = vp9DoubleRows(b.u, b.cStride, b.h)
+            p.v = vp9DoubleRows(b.v, b.cStride, b.h)
+        }
+        p.pts = pts
+        p.key = key
+        p.fullRange = b.fullRange
+        let cs = b.colorSpace
+        if cs == 1 || cs == 3 {
+            p.matrix = .bt601
+        } else if cs == 2 || cs == 4 {
+            p.matrix = .bt709
+        } else if cs == 5 {
+            p.matrix = .bt2020
+        } else if trackMatrix != .unknown {
+            p.matrix = trackMatrix
+        } else {
+            p.matrix = core.guessMatrix(width: b.w, height: b.h)
+        }
+        p.sarNum = sarNum
+        p.sarDen = sarDen
+        p
+    }
+
+    fn reconstruct(_ pf: ParsedFrame) -> [core.Picture] {
+        setup()
+        var out: [core.Picture] = []
+        if pf.kind == 1 {
+            let i = pf.hdr.existingIdx
+            if slotOk[i] == 1 {
+                let p = picture(slots[i], pf.pts, false)
+                lastPic = p
+                hasLast = true
+                out.append(p)
+            }
+            return out
+        }
+        if pf.kind == 2 {
+            warn("vp9: damaged frame concealed")
+            if hasLast && pf.hdr.show {
+                var p = lastPic
+                p.pts = pf.pts
+                p.key = false
+                out.append(p)
+            }
+            return out
+        }
+        if pf.kind == 3 {
+            return out
+        }
+        decodeFrame(pf)
+        let h = pf.hdr
+        // The new frame goes into the slots refresh_frame_flags names.
+        for i in 0..8 {
+            if (h.refreshMask >> i) & 1 == 1 {
+                let old = slots[i]
+                slots[i] = cur
+                if slotOk[i] == 1 {
+                    release(old)
+                }
+                slotOk[i] = 1
+            }
+        }
+        if h.show {
+            let p = picture(cur, pf.pts, h.keyframe)
+            lastPic = p
+            hasLast = true
+            out.append(p)
+        } else if h.refreshMask == 0 {
+            release(cur)
+        }
+        cur = Vp9Buf()
+        out
+    }
+
+    // A buffer no slot holds any more goes back to the pool.
+    fn release(_ b: Vp9Buf) {
+        for i in 0..8 {
+            if slotOk[i] == 1 && slots[i].id == b.id {
+                return
+            }
+        }
+        if pool.count < 3 {
+            pool.append(b)
+        }
+    }
+
+    fn newBuf(_ h: FrameHeader, _ sbc: Int, _ sbr: Int) -> Vp9Buf {
+        let ys = sbc * 64
+        let yr = sbr * 64
+        let cs = ys >> h.ssH
+        let cr = yr >> h.ssV
+        var found = -1
+        // Reuse a pooled buffer of the same geometry, oldest first, keeping
+        // one back so a picture just handed out isn't written at once.
+        if pool.count >= 2 {
+            for i in 0..pool.count {
+                let b = pool[i]
+                if b.yStride == ys && b.yRows == yr && b.cStride == cs && b.cRows == cr {
+                    found = i
+                    break
+                }
+            }
+        }
+        var b = Vp9Buf()
+        if found >= 0 {
+            b = pool[found]
+            pool.remove(at: found)
+        } else {
+            b.y = vp9Zeros(ys * yr)
+            b.u = vp9Zeros(cs * cr)
+            b.v = vp9Zeros(cs * cr)
+        }
+        b.id = nextId
+        nextId += 1
+        b.w = h.width
+        b.h = h.height
+        b.yStride = ys
+        b.cStride = cs
+        b.yRows = yr
+        b.cRows = cr
+        b.bitDepth = h.bitDepth
+        b.ssH = h.ssH
+        b.ssV = h.ssV
+        b.colorSpace = h.colorSpace
+        b.fullRange = h.fullRange
+        b
+    }
+
+    // ---- one frame --------------------------------------------------------
+
+    fn decodeFrame(_ pf: ParsedFrame) {
+        let h = pf.hdr
+        hdr = h
+        cols = pf.cols
+        rows = pf.rows
+        sbCols = pf.sbCols
+        sbRows = pf.sbRows
+        ssH = h.ssH
+        ssV = h.ssV
+        px.setDepth(h.bitDepth)
+        px.setSharpness(h.sharpness)
+        var b = newBuf(h, sbCols, sbRows)
+        px.sY = b.y
+        px.sU = b.u
+        px.sV = b.v
+        b.y = []
+        b.u = []
+        b.v = []
+        px.active = -1
+        cur = b
+        let nsb = sbCols * sbRows
+        if lfMask.count != nsb * 128 {
+            lfMask = vp9Zeros(nsb * 128)
+            lfLevel = vp9Zeros(nsb * 64)
+        } else {
+            vp9Fill(lfMask, 0)
+        }
+        // Reference scaling (8.5.2.3).
+        if !h.keyframe && !h.intraOnly {
+            for i in 0..3 {
+                let r = slots[h.refIdx[i]]
+                if r.w == h.width && r.h == h.height {
+                    scaleX[i] = 0
+                    scaleY[i] = 0
+                } else {
+                    scaleX[i] = (r.w << 14) / h.width
+                    scaleY[i] = (r.h << 14) / h.height
+                    stepX[i] = (16 * scaleX[i]) >> 14
+                    stepY[i] = (16 * scaleY[i]) >> 14
+                }
+            }
+        }
+        blk = pf.blocks
+        coefs = pf.coefs
+        var sbRowDone = -1
+        let t0 = now()
+        for bi in 0..pf.nBlocks {
+            let rb = bi * blockSize
+            let sr = blk[rb] >> 3
+            if sr != sbRowDone {
+                // A new superblock row: the row two above is now final.
+                if sr >= 2 {
+                    filterRow(sr - 2)
+                }
+                sbRowDone = sr
+            }
+            block(rb)
+        }
+        let t1 = now()
+        if sbRowDone >= 1 {
+            filterRow(sbRowDone - 1)
+        }
+        if sbRowDone >= 0 {
+            filterRow(sbRowDone)
+        }
+        tFilter += now() - t1
+        tBlocks += t1 - t0
+        px.settle()
+        cur.y = px.sY
+        cur.u = px.sU
+        cur.v = px.sV
+        px.sY = []
+        px.sU = []
+        px.sV = []
+        blk = []
+        coefs = []
+    }
+
+    // Makes plane p (0 y, 1 u, 2 v) the pixel engine's working plane.
+    fn take(_ p: Int) {
+        px.use(p)
+    }
+
+    fn give(_ p: Int) {
+    }
+
+    fn block(_ rb: Int) {
+        let row = blk[rb]
+        let col = blk[rb + 1]
+        let bs = blk[rb + 2]
+        let intra = blk[rb + 6] == 1
+        if intra {
+            intraBlock(rb)
+        } else {
+            interBlock(rb)
+        }
+        // Loop filter level and edges.
+        let lvl = blk[rb + 16]
+        if hdr.filterLevel > 0 && lvl > 0 {
+            let w8 = tBwh8[bs * 2]
+            let h8 = tBwh8[bs * 2 + 1]
+            let xEnd = min(cols - col, w8)
+            let yEnd = min(rows - row, h8)
+            let skipInter = !intra && blk[rb + 5] == 1
+            let row7 = row & 7
+            let col7 = col & 7
+            let sb = (row >> 3) * sbCols + (col >> 3)
+            let lb = sb * 64
+            for y in 0..h8 {
+                for x in 0..w8 {
+                    lfLevel[lb + (row7 + y) * 8 + col7 + x] = lvl
+                }
+            }
+            let mb = sb * 128
+            maskEdges(mb, 0, 0, row7, col7, xEnd, yEnd, 0, 0, blk[rb + 3], skipInter)
+            if ssH == 1 || ssV == 1 {
+                let ce = if (cols & 1) == 1 && col + w8 >= cols { cols & 7 } else { 0 }
+                let re = if (rows & 1) == 1 && row + h8 >= rows { rows & 7 } else { 0 }
+                maskEdges(mb + 64, ssH, ssV, row7, col7, xEnd, yEnd, ce, re, blk[rb + 4], skipInter)
+            }
+        }
+    }
+
+    fn orMask(_ at: Int, _ v: Int) {
+        lfMask[at] = lfMask[at] | v
+    }
+
+    // FFmpeg's mask_edges: which 8x8 (and 4x4) edges of the block to
+    // filter and with which filter width. base: [dir 2][row 8][kind 4].
+    fn maskEdges(_ base: Int, _ sh: Int, _ sv: Int, _ row7: Int, _ col7: Int, _ w0: Int, _ h0: Int,
+                 _ colEnd: Int, _ rowEnd: Int, _ tx: Int, _ skipInter: Bool) {
+        var w = w0
+        var h = h0
+        let wideCol = if sh == 1 { 0x01 } else { 0x11 }
+        let wideRow = if sv == 1 { 0x07 } else { 0x03 }
+        if tx == 0 && (sv == 1 || sh == 1) {
+            if h == sv {
+                if (row7 & 1) == 1 {
+                    return
+                }
+                if rowEnd == 0 {
+                    h += 1
+                }
+            }
+            if w == sh {
+                if (col7 & 1) == 1 {
+                    return
+                }
+                if colEnd == 0 {
+                    w += 1
+                }
+            }
+        }
+        let c0 = base
+        let r0 = base + 32
+        if tx == 0 && !skipInter {
+            let t = 1 << col7
+            let mCol = (t << w) - t
+            let mRow8 = mCol & wideCol
+            let mRow4 = mCol - mRow8
+            for y in row7..(h + row7) {
+                let cid = if (y & wideRow) != 0 { 2 } else { 1 }
+                orMask(c0 + y * 4 + 1, mRow8)
+                orMask(c0 + y * 4 + 2, mRow4)
+                if sh == 1 && sv == 1 && (colEnd & 1) == 1 && (y & 1) == 1 {
+                    orMask(r0 + y * 4 + cid, (t << (w - 1)) - t)
+                } else {
+                    orMask(r0 + y * 4 + cid, mCol)
+                }
+                if sh == 0 {
+                    orMask(c0 + y * 4 + 3, mCol)
+                }
+                if sv == 0 {
+                    if sh == 1 && (colEnd & 1) == 1 {
+                        orMask(r0 + y * 4 + 3, (t << (w - 1)) - t)
+                    } else {
+                        orMask(r0 + y * 4 + 3, mCol)
+                    }
+                }
+            }
+            return
+        }
+        let t = 1 << col7
+        let mCol = (t << w) - t
+        if !skipInter {
+            let maskId = if tx == 1 { 1 } else { 0 }
+            var l2 = tx + sh - 1
+            let mRow = mCol & vp9LfMasks(l2)
+            if sh == 1 && tx > 1 && (w & 1) == 1 {
+                let mRow16 = ((t << (w - 1)) - t) & vp9LfMasks(l2)
+                let mRow8 = mRow - mRow16
+                for y in row7..(h + row7) {
+                    orMask(c0 + y * 4, mRow16)
+                    orMask(c0 + y * 4 + 1, mRow8)
+                }
+            } else {
+                for y in row7..(h + row7) {
+                    orMask(c0 + y * 4 + maskId, mRow)
+                }
+            }
+            l2 = tx + sv - 1
+            let step1d = 1 << l2
+            if sv == 1 && tx > 1 && (h & 1) == 1 {
+                var y = row7
+                while y < h + row7 - 1 {
+                    orMask(r0 + y * 4, mCol)
+                    y += step1d
+                }
+                if y - row7 == h - 1 {
+                    orMask(r0 + y * 4 + 1, mCol)
+                }
+            } else {
+                var y = row7
+                while y < h + row7 {
+                    orMask(r0 + y * 4 + maskId, mCol)
+                    y += step1d
+                }
+            }
+        } else if tx != 0 {
+            let mid1 = if tx == 1 || h == sv { 1 } else { 0 }
+            orMask(r0 + row7 * 4 + mid1, mCol)
+            let mid0 = if tx == 1 || w == sh { 1 } else { 0 }
+            for y in row7..(h + row7) {
+                orMask(c0 + y * 4 + mid0, t)
+            }
+        } else {
+            let t8 = t & wideCol
+            let t4 = t - t8
+            for y in row7..(h + row7) {
+                orMask(c0 + y * 4 + 2, t4)
+                orMask(c0 + y * 4 + 1, t8)
+            }
+            let k = if (row7 & wideRow) != 0 { 2 } else { 1 }
+            orMask(r0 + row7 * 4 + k, mCol)
+        }
+    }
+
+    // Loop filters one superblock row (8.8.2), plane by plane.
+    fn filterRow(_ sr: Int) {
+        if hdr.filterLevel == 0 {
+            return
+        }
+        let t = now()
+        let mask = lfMask
+        let lv = lfLevel
+        for p in 0..3 {
+            take(p)
+            let ls = if p == 0 { cur.yStride } else { cur.cStride }
+            let sh = if p == 0 { 0 } else { ssH }
+            let sv = if p == 0 { 0 } else { ssV }
+            // 4:4:4 chroma uses the luma masks (FFmpeg's mask[ss_h | ss_v]).
+            let mp = if p == 0 || (ssH == 0 && ssV == 0) { 0 } else { 64 }
+            let row = sr * 8
+            var c = 0
+            while c < cols {
+                let sb = sr * sbCols + (c >> 3)
+                let at = ((row * 8) >> sv) * ls + ((c * 8) >> sh)
+                px.planeCols(mask, sb * 128 + mp, lv, sb * 64, c, sh, sv, at, ls)
+                px.planeRows(mask, sb * 128 + mp + 32, lv, sb * 64, row, sh, sv, at, ls)
+                c += 8
+            }
+            give(p)
+        }
+        tFilter += now() - t
+    }
+
+    // ---- intra blocks (FFmpeg's intra_recon) ----------------------------------
+
+    fn intraBlock(_ rb: Int) {
+        let row = blk[rb]
+        let col = blk[rb + 1]
+        let bs = blk[rb + 2]
+        let tx = blk[rb + 3]
+        let uvtx = blk[rb + 4]
+        let skip = blk[rb + 5] == 1
+        let tileStart = blk[rb + 18]
+        var ci = blk[rb + 17]
+        let lossless = hdr.lossless
+        var w4 = tBwh8[bs * 2] * 2
+        let h4 = tBwh8[bs * 2 + 1] * 2
+        var endX = min(2 * (cols - col), w4)
+        var endY = min(2 * (rows - row), h4)
+        let step = 1 << tx
+        // Luma.
+        take(0)
+        let ys = cur.yStride
+        let co = coefs
+        var y = 0
+        while y < endY {
+            var x = 0
+            while x < endX {
+                let mi = if bs > bs8x8 && tx == 0 { y * 2 + x } else { 0 }
+                let mode = blk[rb + 10 + mi]
+                let txType = tTxType[mode]
+                let at = (row * 8 + y * 4) * ys + col * 8 + x * 4
+                let m = px.edges(mode, at, ys, tx, row > 0 || y > 0, col > tileStart || x > 0, x < w4 - 1,
+                                 ((cols - col) * 2 - x) * 4, ((rows - row) * 2 - y) * 4)
+                px.predict(m, at, ys, tx)
+                if !skip {
+                    let n = co[ci]
+                    if n > 0 {
+                        px.itxAdd(co, ci, n, at, ys, tx, if lossless { 4 } else { txType })
+                    }
+                    ci += 1 + n
+                }
+                x += step
+            }
+            y += step
+        }
+        give(0)
+        // Chroma.
+        w4 = w4 >> ssH
+        endX = endX >> ssH
+        endY = endY >> ssV
+        let ustep = 1 << uvtx
+        let uvMode = blk[rb + 14]
+        let cs = cur.cStride
+        for p in 1..3 {
+            take(p)
+            var yy = 0
+            while yy < endY {
+                var xx = 0
+                while xx < endX {
+                    let at = (((row * 8) >> ssV) + yy * 4) * cs + ((col * 8) >> ssH) + xx * 4
+                    let m = px.edges(uvMode, at, cs, uvtx, row > 0 || yy > 0, col > tileStart || xx > 0, xx < w4 - 1,
+                                     (((cols - col) << (1 - ssH)) - xx) * 4, (((rows - row) << (1 - ssV)) - yy) * 4)
+                    px.predict(m, at, cs, uvtx)
+                    if !skip {
+                        let n = co[ci]
+                        if n > 0 {
+                            px.itxAdd(co, ci, n, at, cs, uvtx, if lossless { 4 } else { 0 })
+                        }
+                        ci += 1 + n
+                    }
+                    xx += ustep
+                }
+                yy += ustep
+            }
+            give(p)
+        }
+    }
+
+    // ---- inter blocks (FFmpeg's inter_recon / inter_pred) ---------------------
+
+    fn interBlock(_ rb: Int) {
+        let row = blk[rb]
+        let col = blk[rb + 1]
+        let bs = blk[rb + 2]
+        let comp = blk[rb + 7] == 1
+        let scaled = scaleX[blk[rb + 8]] != 0 || (comp && scaleX[blk[rb + 9]] != 0)
+        for z in 0..(if comp { 2 } else { 1 }) {
+            let ri = blk[rb + 8 + z]
+            let r = slots[hdr.refIdx[ri]]
+            predict(rb, z, r, ri, scaled)
+        }
+        if blk[rb + 5] == 1 {
+            return
+        }
+        // Residual (DCT only for inter blocks; WHT when lossless).
+        let tx = blk[rb + 3]
+        let uvtx = blk[rb + 4]
+        let lossless = hdr.lossless
+        var w4 = tBwh8[bs * 2] * 2
+        var h4 = tBwh8[bs * 2 + 1] * 2
+        var endX = min(2 * (cols - col), w4)
+        var endY = min(2 * (rows - row), h4)
+        var ci = blk[rb + 17]
+        let co = coefs
+        let step = 1 << tx
+        take(0)
+        let ys = cur.yStride
+        var y = 0
+        while y < endY {
+            var x = 0
+            while x < endX {
+                let n = co[ci]
+                if n > 0 {
+                    let at = (row * 8 + y * 4) * ys + col * 8 + x * 4
+                    px.itxAdd(co, ci, n, at, ys, tx, if lossless { 4 } else { 0 })
+                }
+                ci += 1 + n
+                x += step
+            }
+            y += step
+        }
+        give(0)
+        w4 = w4 >> ssH
+        h4 = h4 >> ssV
+        endX = endX >> ssH
+        endY = endY >> ssV
+        let ustep = 1 << uvtx
+        let cs = cur.cStride
+        for p in 1..3 {
+            take(p)
+            var yy = 0
+            while yy < endY {
+                var xx = 0
+                while xx < endX {
+                    let n = co[ci]
+                    if n > 0 {
+                        let at = (((row * 8) >> ssV) + yy * 4) * cs + ((col * 8) >> ssH) + xx * 4
+                        px.itxAdd(co, ci, n, at, cs, uvtx, if lossless { 4 } else { 0 })
+                    }
+                    ci += 1 + n
+                    xx += ustep
+                }
+                yy += ustep
+            }
+            give(p)
+        }
+    }
+
+    // The prediction of block rb from reference z (0 first, 1 second).
+    fn predict(_ rb: Int, _ z: Int, _ r: Vp9Buf, _ ri: Int, _ scaled: Bool) {
+        let row = blk[rb]
+        let col = blk[rb + 1]
+        let bs = blk[rb + 2]
+        let filt = blk[rb + 15]
+        let avg = z == 1
+        let ys = cur.yStride
+        let cs = cur.cStride
+        let mv0 = blk[rb + 19 + z]
+        let mv1 = blk[rb + 21 + z]
+        let mv2 = blk[rb + 23 + z]
+        let mv3 = blk[rb + 25 + z]
+        let ly = row * 8
+        let lx = col * 8
+        let cw = (r.w + ssH) >> ssH
+        let ch = (r.h + ssV) >> ssV
+        let cy = (row * 8) >> ssV
+        let cx = (col * 8) >> ssH
+        if bs > bs8x8 {
+            if scaled || bs == bs4x4 {
+                // Four 4x4 luma predictions.
+                take(0)
+                lumaPred(r, ri, scaled, ly, lx, mv0, 0, 0, 8, 8, 4, 4, ly * ys + lx, filt, avg)
+                lumaPred(r, ri, scaled, ly, lx + 4, mv1, 4, 0, 8, 8, 4, 4, ly * ys + lx + 4, filt, avg)
+                lumaPred(r, ri, scaled, ly + 4, lx, mv2, 0, 4, 8, 8, 4, 4, (ly + 4) * ys + lx, filt, avg)
+                lumaPred(r, ri, scaled, ly + 4, lx + 4, mv3, 4, 4, 8, 8, 4, 4, (ly + 4) * ys + lx + 4, filt, avg)
+                give(0)
+                for p in 1..3 {
+                    take(p)
+                    let rp = if p == 1 { r.u } else { r.v }
+                    if ssV == 1 {
+                        if ssH == 1 {
+                            let uv = vp9MvAvg4(mv0, mv1, mv2, mv3)
+                            chromaPred(rp, r, ri, scaled, cy, cx, uv, 0, 0, 4, 4, 4, 4, cy * cs + cx, cw, ch, filt, avg)
+                        } else {
+                            let uva = vp9MvAvg2(mv0, mv2)
+                            chromaPred(rp, r, ri, scaled, cy, lx, uva, 0, 0, 8, 4, 4, 4, cy * cs + lx, cw, ch, filt, avg)
+                            let uvb = vp9MvAvg2(mv1, mv3)
+                            chromaPred(rp, r, ri, scaled, cy, lx + 4, uvb, 4, 0, 8, 4, 4, 4, cy * cs + lx + 4, cw, ch, filt, avg)
+                        }
+                    } else {
+                        if ssH == 1 {
+                            let uva = vp9MvAvg2(mv0, mv1)
+                            chromaPred(rp, r, ri, scaled, ly, cx, uva, 0, 0, 4, 8, 4, 4, ly * cs + cx, cw, ch, filt, avg)
+                            // libvpx uses the wrong block (1 and 2) for the bottom half.
+                            let uvb = vp9MvAvg2(mv1, mv2)
+                            chromaPred(rp, r, ri, scaled, ly + 4, cx, uvb, 0, 4, 4, 8, 4, 4, (ly + 4) * cs + cx, cw, ch, filt, avg)
+                        } else {
+                            chromaPred(rp, r, ri, scaled, ly, lx, mv0, 0, 0, 8, 8, 4, 4, ly * cs + lx, cw, ch, filt, avg)
+                            chromaPred(rp, r, ri, scaled, ly, lx + 4, mv1, 4, 0, 8, 8, 4, 4, ly * cs + lx + 4, cw, ch, filt, avg)
+                            chromaPred(rp, r, ri, scaled, ly + 4, lx, mv2, 0, 4, 8, 8, 4, 4, (ly + 4) * cs + lx, cw, ch, filt, avg)
+                            chromaPred(rp, r, ri, scaled, ly + 4, lx + 4, mv3, 4, 4, 8, 8, 4, 4, (ly + 4) * cs + lx + 4, cw, ch, filt, avg)
+                        }
+                    }
+                    give(p)
+                }
+                return
+            }
+            if bs == bs8x4 {
+                take(0)
+                lumaPred(r, ri, false, ly, lx, mv0, 0, 0, 8, 4, 8, 4, ly * ys + lx, filt, avg)
+                lumaPred(r, ri, false, ly + 4, lx, mv2, 0, 0, 8, 4, 8, 4, (ly + 4) * ys + lx, filt, avg)
+                give(0)
+                for p in 1..3 {
+                    take(p)
+                    let rp = if p == 1 { r.u } else { r.v }
+                    if ssV == 1 {
+                        let uv = vp9MvAvg2(mv0, mv2)
+                        chromaPred(rp, r, ri, false, row * 4, cx, uv, 0, 0, 8 >> ssH, 4, 8 >> ssH, 4, row * 4 * cs + cx, cw, ch, filt, avg)
+                    } else {
+                        chromaPred(rp, r, ri, false, ly, cx, mv0, 0, 0, 8 >> ssH, 4, 8 >> ssH, 4, ly * cs + cx, cw, ch, filt, avg)
+                        let uvb = if ssH == 0 { mv2 } else { vp9MvAvg2(mv0, mv2) }
+                        chromaPred(rp, r, ri, false, ly + 4, cx, uvb, 0, 0, 8 >> ssH, 4, 8 >> ssH, 4, (ly + 4) * cs + cx, cw, ch, filt, avg)
+                    }
+                    give(p)
+                }
+                return
+            }
+            // 4x8
+            take(0)
+            lumaPred(r, ri, false, ly, lx, mv0, 0, 0, 4, 8, 4, 8, ly * ys + lx, filt, avg)
+            lumaPred(r, ri, false, ly, lx + 4, mv1, 0, 0, 4, 8, 4, 8, ly * ys + lx + 4, filt, avg)
+            give(0)
+            for p in 1..3 {
+                take(p)
+                let rp = if p == 1 { r.u } else { r.v }
+                if ssH == 1 {
+                    let uv = vp9MvAvg2(mv0, mv1)
+                    chromaPred(rp, r, ri, false, cy, col * 4, uv, 0, 0, 4, 8 >> ssV, 4, 8 >> ssV, cy * cs + col * 4, cw, ch, filt, avg)
+                } else {
+                    chromaPred(rp, r, ri, false, cy, lx, mv0, 0, 0, 4, 8 >> ssV, 4, 8 >> ssV, cy * cs + lx, cw, ch, filt, avg)
+                    chromaPred(rp, r, ri, false, cy, lx + 4, mv1, 0, 0, 4, 8 >> ssV, 4, 8 >> ssV, cy * cs + lx + 4, cw, ch, filt, avg)
+                }
+                give(p)
+            }
+            return
+        }
+        let bw = tBwh4[bs * 2] * 4
+        let bh = tBwh4[bs * 2 + 1] * 4
+        let uvbw = (if ssH == 1 { tBwh8[bs * 2] } else { tBwh4[bs * 2] }) * 4
+        let uvbh = (if ssV == 1 { tBwh8[bs * 2 + 1] } else { tBwh4[bs * 2 + 1] }) * 4
+        take(0)
+        lumaPred(r, ri, scaled, ly, lx, mv0, 0, 0, bw, bh, bw, bh, ly * ys + lx, filt, avg)
+        give(0)
+        for p in 1..3 {
+            take(p)
+            let rp = if p == 1 { r.u } else { r.v }
+            chromaPred(rp, r, ri, scaled, cy, cx, mv0, 0, 0, uvbw, uvbh, uvbw, uvbh, cy * cs + cx, cw, ch, filt, avg)
+            give(p)
+        }
+    }
+
+    // mc_luma_unscaled / mc_luma_scaled: (y, x) the block position in
+    // samples, (px, py) the sub-block's offset in its 8x8 and (pw, ph) the
+    // whole block size (for the scaled motion vector clamp).
+    fn lumaPred(_ r: Vp9Buf, _ ri: Int, _ scaled: Bool, _ y: Int, _ x: Int, _ mv: Int, _ px0: Int, _ py0: Int,
+                _ pw: Int, _ ph: Int, _ bw: Int, _ bh: Int, _ dOff: Int, _ filt: Int, _ avg: Bool) {
+        let mvx = vp9MvX(mv)
+        let mvy = vp9MvY(mv)
+        if !scaled || scaleX[ri] == 0 {
+            let sx = x + (mvx >> 3)
+            let sy = y + (mvy >> 3)
+            px.mc(r.y, r.yStride, r.w, r.h, sx, sy, (mvx & 7) << 1, (mvy & 7) << 1, dOff, cur.yStride, bw, bh, filt, avg)
+            return
+        }
+        let mx0 = vp9Clip(mvx, -(x + pw - px0 + 4) * 8, (cols * 8 - x + px0 + 3) * 8)
+        let my0 = vp9Clip(mvy, -(y + ph - py0 + 4) * 8, (rows * 8 - y + py0 + 3) * 8)
+        let sxs = scaleX[ri]
+        let sys = scaleY[ri]
+        let mx = ((mx0 * 2 * sxs) >> 14) + ((x * 16 * sxs) >> 14)
+        let my = ((my0 * 2 * sys) >> 14) + ((y * 16 * sys) >> 14)
+        px.mcScaled(r.y, r.yStride, r.w, r.h, mx >> 4, my >> 4, mx & 15, my & 15, stepX[ri], stepY[ri], dOff, cur.yStride, bw, bh, filt, avg)
+    }
+
+    fn chromaPred(_ rp: [Int], _ r: Vp9Buf, _ ri: Int, _ scaled: Bool, _ y: Int, _ x: Int, _ mv: Int, _ px0: Int, _ py0: Int,
+                  _ pw: Int, _ ph: Int, _ bw: Int, _ bh: Int, _ dOff: Int, _ cw: Int, _ ch: Int, _ filt: Int, _ avg: Bool) {
+        let mvx = vp9MvX(mv)
+        let mvy = vp9MvY(mv)
+        if !scaled || scaleX[ri] == 0 {
+            let mx = mvx * (1 << (1 - ssH))
+            let my = mvy * (1 << (1 - ssV))
+            px.mc(rp, r.cStride, cw, ch, x + (mx >> 4), y + (my >> 4), mx & 15, my & 15, dOff, cur.cStride, bw, bh, filt, avg)
+            return
+        }
+        let sxs = scaleX[ri]
+        let sys = scaleY[ri]
+        var mx = 0
+        var my = 0
+        if ssH == 1 {
+            let m = vp9Clip(mvx, -(x + pw - px0 + 4) * 16, (cols * 4 - x + px0 + 3) * 16)
+            mx = ((m * sxs) >> 14) + (((x * 16 * sxs) >> 14) & ~15) + (((x * 32 * sxs) >> 14) & 15)
+        } else {
+            let m = vp9Clip(mvx, -(x + pw - px0 + 4) * 8, (cols * 8 - x + px0 + 3) * 8)
+            mx = ((m * 2 * sxs) >> 14) + ((x * 16 * sxs) >> 14)
+        }
+        if ssV == 1 {
+            let m = vp9Clip(mvy, -(y + ph - py0 + 4) * 16, (rows * 4 - y + py0 + 3) * 16)
+            my = ((m * sys) >> 14) + (((y * 16 * sys) >> 14) & ~15) + (((y * 32 * sys) >> 14) & 15)
+        } else {
+            let m = vp9Clip(mvy, -(y + ph - py0 + 4) * 8, (rows * 8 - y + py0 + 3) * 8)
+            my = ((m * 2 * sys) >> 14) + ((y * 16 * sys) >> 14)
+        }
+        px.mcScaled(rp, r.cStride, cw, ch, mx >> 4, my >> 4, mx & 15, my & 15, stepX[ri], stepY[ri], dOff, cur.cStride, bw, bh, filt, avg)
+    }
+}
+
+fn vp9DoubleRows(_ src: [Int], _ stride: Int, _ h: Int) -> [Int] {
+    var out: [Int] = []
+    for y in 0..h {
+        let r = (y >> 1) * stride
+        for x in 0..stride {
+            out.append(src[r + x])
+        }
+    }
+    out
+}
+
+fn vp9LfMasks(_ l2: Int) -> Int {
+    if l2 == 0 {
+        return 0xff
+    }
+    if l2 == 1 {
+        return 0x55
+    }
+    if l2 == 2 {
+        return 0x11
+    }
+    0x01
+}
+
+// FFmpeg's ROUNDED_DIV for motion vector averages.
+fn vp9RoundDiv(_ a: Int, _ b: Int) -> Int {
+    if a >= 0 {
+        return (a + (b >> 1)) / b
+    }
+    (a - (b >> 1)) / b
+}
+
+fn vp9MvAvg2(_ a: Int, _ b: Int) -> Int {
+    vp9Mv(vp9RoundDiv(vp9MvX(a) + vp9MvX(b), 2), vp9RoundDiv(vp9MvY(a) + vp9MvY(b), 2))
+}
+
+fn vp9MvAvg4(_ a: Int, _ b: Int, _ c: Int, _ d: Int) -> Int {
+    vp9Mv(vp9RoundDiv(vp9MvX(a) + vp9MvX(b) + vp9MvX(c) + vp9MvX(d), 4),
+          vp9RoundDiv(vp9MvY(a) + vp9MvY(b) + vp9MvY(c) + vp9MvY(d), 4))
+}

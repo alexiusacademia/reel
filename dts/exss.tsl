@@ -1,0 +1,334 @@
+// The DTS-HD extension substream (ETSI TS 102 114 Clause 7, "EXSS"):
+// header, the audio asset descriptor, and where each coding component
+// (core, XBR, XXCH, X96, LBR, XLL) sits inside the asset's data. Follows
+// FFmpeg's dca_exss.c: one audio presentation with one asset, which is
+// what Blu-ray and other DTS-HD streams carry.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../core"
+
+public struct DtsExss {
+    ok: Bool = false
+    problem: String = ""
+    // Bytes of the whole substream and of its header.
+    size: Int = 0
+    headerSize: Int = 0
+    index: Int = 0
+    asset: DtsAsset = DtsAsset()
+}
+
+fn dtsCountChsForMask(_ mask: Int) -> Int {
+    dtsPopcount((mask & 0xffff) | ((mask & 0xae66) << 16))
+}
+
+// Parses the substream at data[at…end]. Offsets in the asset are from
+// `at`.
+public fn dtsParseExss(_ data: Data, at: Int, end: Int) -> DtsExss {
+    var x = DtsExss()
+    var br = core.bitReaderRange(data, from: at, to: min(end, data.count))
+    let base = at * 8
+    if br.long(32) != 0x64582025 {
+        x.problem = "no substream sync word"
+        return x
+    }
+    br.skip(8)
+    x.index = br.bits(2)
+    let wide = br.flag()
+    x.headerSize = br.bits(if wide { 12 } else { 8 }) + 1
+    let sizeBits = if wide { 20 } else { 16 }
+    x.size = br.bits(sizeBits) + 1
+    if x.size > end - at {
+        x.problem = "packet too short for the extension substream"
+        return x
+    }
+    var nmixConfigs = 0
+    var nmixChs: [Int] = [0, 0, 0, 0]
+    var mixMetadata = false
+    let staticFields = br.flag()
+    if staticFields {
+        br.skip(2)
+        br.skip(3)
+        if br.flag() {
+            br.skip(36)
+        }
+        let npresents = br.bits(3) + 1
+        if npresents > 1 {
+            x.problem = "{npresents} audio presentations"
+            return x
+        }
+        let nassets = br.bits(3) + 1
+        if nassets > 1 {
+            x.problem = "{nassets} audio assets"
+            return x
+        }
+        let active = br.bits(x.index + 1)
+        br.skip(dtsPopcount(active) * 8)
+        mixMetadata = br.flag()
+        if mixMetadata {
+            br.skip(2)
+            let maskBits = (br.bits(2) + 1) << 2
+            nmixConfigs = br.bits(2) + 1
+            for i in 0..nmixConfigs {
+                nmixChs[i] = dtsCountChsForMask(br.bits(maskBits))
+            }
+        }
+    }
+    var a = DtsAsset()
+    let assetOffset = x.headerSize
+    let assetSize = br.bits(sizeBits) + 1
+    if assetOffset + assetSize > x.size {
+        x.problem = "asset out of bounds"
+        return x
+    }
+
+    // Audio asset descriptor.
+    let descrPos = br.position - base
+    let descrSize = br.bits(9) + 1
+    br.skip(3)
+    var embeddedStereo = false
+    var embedded6 = false
+    if staticFields {
+        if br.flag() {
+            br.skip(4)
+        }
+        if br.flag() {
+            br.skip(24)
+        }
+        if br.flag() {
+            let textSize = br.bits(10) + 1
+            br.skip(textSize * 8)
+        }
+        a.pcmBitRes = br.bits(5) + 1
+        a.maxSampleRate = dtsSamplingFreqs[br.bits(4)]
+        a.nchannelsTotal = br.bits(8) + 1
+        a.oneToOneMap = br.flag()
+        if a.oneToOneMap {
+            var maskBits = 0
+            embeddedStereo = a.nchannelsTotal > 2 && br.flag()
+            embedded6 = a.nchannelsTotal > 6 && br.flag()
+            if br.flag() {
+                maskBits = (br.bits(2) + 1) << 2
+                a.spkrMask = br.bits(maskBits)
+            }
+            let remapSets = br.bits(3)
+            if remapSets != 0 && maskBits == 0 {
+                x.problem = "speaker remapping without a speaker mask"
+                return x
+            }
+            var nspeakers: [Int] = []
+            for _ in 0..remapSets {
+                nspeakers.append(dtsCountChsForMask(br.bits(maskBits)))
+            }
+            for i in 0..remapSets {
+                let nch = br.bits(5) + 1
+                for _ in 0..nspeakers[i] {
+                    let m = br.long(nch)
+                    br.skip(dtsPopcount(m) * 5)
+                }
+            }
+        } else {
+            a.representationType = br.bits(3)
+        }
+    }
+    let drc = br.flag()
+    if drc {
+        br.skip(8)
+    }
+    if br.flag() {
+        br.skip(5)
+    }
+    if drc && embeddedStereo {
+        br.skip(8)
+    }
+    if mixMetadata && br.flag() {
+        br.skip(1)
+        br.skip(6)
+        if br.bits(2) == 3 {
+            br.skip(8)
+        } else {
+            br.skip(3)
+        }
+        if br.flag() {
+            for i in 0..nmixConfigs {
+                br.skip(6 * nmixChs[i])
+            }
+        } else {
+            br.skip(6 * nmixConfigs)
+        }
+        var ndmix = a.nchannelsTotal
+        if embedded6 {
+            ndmix += 6
+        }
+        if embeddedStereo {
+            ndmix += 2
+        }
+        for i in 0..nmixConfigs {
+            if nmixChs[i] == 0 {
+                x.problem = "invalid mixing configuration"
+                return x
+            }
+            for _ in 0..ndmix {
+                let m = br.bits(nmixChs[i])
+                br.skip(dtsPopcount(m) * 6)
+            }
+        }
+    }
+    let codingMode = br.bits(2)
+    if codingMode == 0 {
+        a.extensionMask = br.bits(12)
+        if (a.extensionMask & dtsExssCore) != 0 {
+            a.coreSize = br.bits(14) + 1
+            if br.flag() {
+                br.skip(2)
+            }
+        }
+        if (a.extensionMask & dtsExssXbr) != 0 {
+            a.xbrSize = br.bits(14) + 1
+        }
+        if (a.extensionMask & dtsExssXxch) != 0 {
+            a.xxchSize = br.bits(14) + 1
+        }
+        if (a.extensionMask & dtsExssX96) != 0 {
+            a.x96Size = br.bits(12) + 1
+        }
+        if (a.extensionMask & dtsExssLbr) != 0 {
+            dtsLbrParameters(br, a)
+        }
+        if (a.extensionMask & dtsExssXll) != 0 {
+            dtsXllParameters(br, a, sizeBits)
+        }
+        if (a.extensionMask & 0x400) != 0 {
+            br.skip(16)
+        }
+        if (a.extensionMask & 0x800) != 0 {
+            br.skip(16)
+        }
+    } else if codingMode == 1 {
+        a.extensionMask = dtsExssXll
+        dtsXllParameters(br, a, sizeBits)
+    } else if codingMode == 2 {
+        a.extensionMask = dtsExssLbr
+        dtsLbrParameters(br, a)
+    } else {
+        a.extensionMask = 0
+        br.skip(14)
+        br.skip(8)
+        if br.flag() {
+            br.skip(3)
+        }
+    }
+    if (a.extensionMask & dtsExssXll) != 0 {
+        a.hdStreamId = br.bits(3)
+    }
+    if br.position - base > descrPos + descrSize * 8 || br.overrun {
+        x.problem = "read past the end of the asset descriptor"
+        return x
+    }
+
+    // Where the components are (set_exss_offsets).
+    var offs = assetOffset
+    var size = assetSize
+    if (a.extensionMask & dtsExssCore) != 0 {
+        a.coreOffset = offs
+        if a.coreSize > size {
+            x.problem = "invalid core size in the asset"
+            return x
+        }
+        offs += a.coreSize
+        size -= a.coreSize
+    }
+    if (a.extensionMask & dtsExssXbr) != 0 {
+        a.xbrOffset = offs
+        if a.xbrSize > size {
+            x.problem = "invalid XBR size in the asset"
+            return x
+        }
+        offs += a.xbrSize
+        size -= a.xbrSize
+    }
+    if (a.extensionMask & dtsExssXxch) != 0 {
+        a.xxchOffset = offs
+        if a.xxchSize > size {
+            x.problem = "invalid XXCH size in the asset"
+            return x
+        }
+        offs += a.xxchSize
+        size -= a.xxchSize
+    }
+    if (a.extensionMask & dtsExssX96) != 0 {
+        a.x96Offset = offs
+        if a.x96Size > size {
+            x.problem = "invalid X96 size in the asset"
+            return x
+        }
+        offs += a.x96Size
+        size -= a.x96Size
+    }
+    if (a.extensionMask & dtsExssLbr) != 0 {
+        a.lbrOffset = offs
+        if a.lbrSize > size {
+            x.problem = "invalid LBR size in the asset"
+            return x
+        }
+        offs += a.lbrSize
+        size -= a.lbrSize
+    }
+    if (a.extensionMask & dtsExssXll) != 0 {
+        a.xllOffset = offs
+        if a.xllSize > size {
+            x.problem = "invalid XLL size in the asset"
+            return x
+        }
+    }
+    a.ok = true
+    x.asset = a
+    x.ok = true
+    x
+}
+
+fn dtsXllParameters(_ br: bind core.BitReader, _ a: bind DtsAsset, _ sizeBits: Int) {
+    a.xllSize = br.bits(sizeBits) + 1
+    a.xllSyncPresent = br.flag()
+    if a.xllSyncPresent {
+        br.skip(4)
+        let delayBits = br.bits(5) + 1
+        a.xllDelayFrames = br.long(delayBits)
+        a.xllSyncOffset = br.bits(sizeBits)
+    } else {
+        a.xllDelayFrames = 0
+        a.xllSyncOffset = 0
+    }
+}
+
+fn dtsLbrParameters(_ br: bind core.BitReader, _ a: bind DtsAsset) {
+    a.lbrSize = br.bits(14) + 1
+    if br.flag() {
+        br.skip(2)
+    }
+}
+
+// Samples per channel of the XLL frame at data[at…end] (one frequency
+// band), from its common header; 0 when there is none.
+public fn dtsXllFrameSamples(_ data: Data, at: Int, end: Int) -> Int {
+    if at < 0 || at + 16 > min(end, data.count) {
+        return 0
+    }
+    var br = core.bitReaderRange(data, from: at, to: min(end, data.count))
+    if br.long(32) != 0x41A29547 {
+        return 0
+    }
+    if br.bits(4) != 0 {
+        return 0
+    }
+    br.skip(8)
+    br.skip(br.bits(5) + 1)
+    br.skip(4)
+    let segs = br.bits(4)
+    let segSamples = br.bits(4)
+    if segs + segSamples > 24 {
+        return 0
+    }
+    1 << (segs + segSamples)
+}

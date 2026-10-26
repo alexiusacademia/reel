@@ -1,0 +1,1368 @@
+// The AV1 post filters: the frame-level steps 1 to 5 of
+// decode_frame_wrapup (AV1 spec 7.4) run on a fully reconstructed frame:
+//
+//   1. the loop filter (7.14): deblocking of transform / block edges,
+//      first every vertical edge of a plane, then every horizontal one
+//   2. CDEF (7.15): the directional deringing filter on 8x8 blocks, from
+//      CurrFrame into a separate CdefFrame
+//   3./4. the upscaling process (7.16, superres) of CdefFrame and of
+//      CurrFrame
+//   5. loop restoration (7.17): Wiener and self-guided filters per
+//      restoration unit, processed in 64-row stripes whose outside rows
+//      come from the deblocked (pre-CDEF) frame
+//
+// The reconstructor swaps the frame's planes into y/u/v, calls
+// filterFrame, and takes the result (LrFrame) back out of y/u/v. Scratch
+// planes (the CDEF output, stripe buffers) live in fields and are reused
+// from frame to frame.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+public struct Av1Post {
+    // The frame (swapped in and out by the reconstructor).
+    y: [Int] = []
+    u: [Int] = []
+    v: [Int] = []
+    yStride: Int = 0
+    cStride: Int = 0
+    rows: Int = 0
+    cRows: Int = 0
+
+    // Time spent (seconds) in each stage, for benchmarks.
+    tLf: Float = 0.0
+    tCdef: Float = 0.0
+    tSr: Float = 0.0
+    tLr: Float = 0.0
+
+    ready: Bool = false
+    // Working planes: the source being filtered and the destination.
+    pl: [Int] = []
+    dst: [Int] = []
+    // CdefFrame.
+    cdY: [Int] = []
+    cdU: [Int] = []
+    cdV: [Int] = []
+
+    bitDepth: Int = 8
+    maxV: Int = 255
+
+    // Tables (copies of the module tables, which are slow to read).
+    tSub: [Int] = []
+    tN4W: [Int] = []
+    tN4H: [Int] = []
+    tTxW: [Int] = []
+    tTxH: [Int] = []
+    tCdefDir: [Int] = []
+    tUvDir: [Int] = []
+    tDivTab: [Int] = []
+    tUpscale: [Int] = []
+    tSgr: [Int] = []
+
+    // Loop filter state of the frame.
+    lfLv: [Int] = [0, 0, 0, 0]
+    lfRefDeltas: [Int] = [0, 0, 0, 0, 0, 0, 0, 0]
+    lfModeDeltas: [Int] = [0, 0]
+    lfDeltaEn: Bool = false
+    segEn: Bool = false
+    featEn: [Int] = []
+    featData: [Int] = []
+    // Per level 0..63: limit, blimit, thresh.
+    limTab: [Int] = []
+    blimTab: [Int] = []
+    thrTab: [Int] = []
+    // lvl for DeltaLF 0: [i 4][segment 8][ref 8][modeType 2].
+    lvlTab: [Int] = []
+    // The wide filter's samples, s[k] at ws[k + 7] for k = -7 … 6.
+    ws: [Int] = []
+
+    // CDEF: per 8x8 block, its direction and variance (-1: not filtered).
+    cdDir: [Int] = []
+    cdVar: [Int] = []
+    part: [Int] = []
+    // constrain() tables (cdefTable) and their offsets by key.
+    ctab: [Int] = []
+    ctKey: [Int] = []
+    ctBits: Int = 0
+    cost: [Int] = []
+
+    // Upscaling: one row of the source.
+    rowTmp: [Int] = []
+
+    // Loop restoration scratch: the stripe's source samples (3 rows and
+    // columns of margin), the Wiener intermediate rows, box sums, A/B,
+    // the two self-guided outputs, and the a2 lookup.
+    sbuf: [Int] = []
+    wTmp: [Int] = []
+    vsum: [Int] = []
+    vsq: [Int] = []
+    aBuf: [Int] = []
+    bBuf: [Int] = []
+    flt0: [Int] = []
+    flt1: [Int] = []
+    a2Tab: [Int] = []
+
+    fn setup() {
+        if ready {
+            return
+        }
+        ready = true
+        tSub = av1SubsampledSize
+        tN4W = av1Num4x4BlocksWide
+        tN4H = av1Num4x4BlocksHigh
+        tTxW = av1TxWidth
+        tTxH = av1TxHeight
+        tCdefDir = av1CdefDirections
+        tUvDir = av1CdefUvDir
+        tDivTab = av1DivTable
+        tUpscale = av1UpscaleFilter
+        tSgr = av1SgrParams
+        limTab = pfZeros(64)
+        blimTab = pfZeros(64)
+        thrTab = pfZeros(64)
+        lvlTab = pfZeros(512)
+        ws = pfZeros(14)
+        part = pfZeros(120)
+        cost = pfZeros(8)
+        a2Tab = pfZeros(256)
+        for z in 0..256 {
+            if z >= 255 {
+                a2Tab[z] = 256
+            } else if z == 0 {
+                a2Tab[z] = 1
+            } else {
+                a2Tab[z] = ((z << 8) + (z / 2)) / (z + 1)
+            }
+        }
+    }
+
+    // Moves plane p (0 y, 1 u, 2 v) into `pl`, or back.
+    fn swapPl(_ p: Int) {
+        if p == 0 {
+            let t = y
+            y = pl
+            pl = t
+        } else if p == 1 {
+            let t = u
+            u = pl
+            pl = t
+        } else {
+            let t = v
+            v = pl
+            pl = t
+        }
+    }
+
+    // Moves CDEF plane p into `pl`, or back.
+    fn swapCdPl(_ p: Int) {
+        if p == 0 {
+            let t = cdY
+            cdY = pl
+            pl = t
+        } else if p == 1 {
+            let t = cdU
+            cdU = pl
+            pl = t
+        } else {
+            let t = cdV
+            cdV = pl
+            pl = t
+        }
+    }
+
+    // Moves CDEF plane p into `dst`, or back.
+    fn swapDst(_ p: Int) {
+        if p == 0 {
+            let t = cdY
+            cdY = dst
+            dst = t
+        } else if p == 1 {
+            let t = cdU
+            cdU = dst
+            dst = t
+        } else {
+            let t = cdV
+            cdV = dst
+            dst = t
+        }
+    }
+
+    // decode_frame_wrapup steps 1 to 5 (7.4).
+    fn filterFrame(_ pf: ParsedFrame) {
+        setup()
+        let h = pf.hdr
+        bitDepth = h.bitDepth
+        maxV = (1 << h.bitDepth) - 1
+        var t0 = now()
+        if h.loopFilterLevel[0] != 0 || h.loopFilterLevel[1] != 0 {
+            loopFilter(pf)
+        }
+        var t1 = now()
+        tLf += t1 - t0
+        let cdefDone = cdefFrame(pf)
+        t0 = now()
+        tCdef += t0 - t1
+        if h.useSuperres && h.upscaledWidth != h.frameWidth {
+            for p in 0..h.numPlanes {
+                swapPl(p)
+                upscalePlane(h, p)
+                swapPl(p)
+                if cdefDone {
+                    swapCdPl(p)
+                    upscalePlane(h, p)
+                    swapCdPl(p)
+                }
+            }
+        }
+        t1 = now()
+        tSr += t1 - t0
+        var lrDone = false
+        if h.usesLr {
+            if !cdefDone {
+                // LrFrame starts as a copy of UpscaledCdefFrame, which is
+                // CurrFrame here; it is written in place, so copy.
+                cdY = y
+                cdU = u
+                cdV = v
+            }
+            restoreFrame(pf)
+            lrDone = true
+        }
+        t0 = now()
+        tLr += t0 - t1
+        if cdefDone || lrDone {
+            // The result is in cd*: hand it out, keep the old planes as
+            // scratch for the next frame.
+            var t = y
+            y = cdY
+            cdY = t
+            t = u
+            u = cdU
+            cdU = t
+            t = v
+            v = cdV
+            cdV = t
+        }
+    }
+
+    // ---- loop filter (7.14) ------------------------------------------
+
+    fn loopFilter(_ pf: ParsedFrame) {
+        let h = pf.hdr
+        for i in 0..4 {
+            lfLv[i] = h.loopFilterLevel[i]
+        }
+        for i in 0..8 {
+            lfRefDeltas[i] = h.loopFilterRefDeltas[i]
+        }
+        lfModeDeltas[0] = h.loopFilterModeDeltas[0]
+        lfModeDeltas[1] = h.loopFilterModeDeltas[1]
+        lfDeltaEn = h.loopFilterDeltaEnabled
+        segEn = h.segmentationEnabled && h.featureEnabled.count >= 64 && h.featureData.count >= 64
+        featEn = h.featureEnabled
+        featData = h.featureData
+        // Limits by level (7.14.4).
+        let sharp = h.loopFilterSharpness
+        let shift = if sharp > 4 { 2 } else if sharp > 0 { 1 } else { 0 }
+        for lvl in 0..64 {
+            var limit = 0
+            if sharp > 0 {
+                limit = pfClip(1, 9 - sharp, lvl >> shift)
+            } else {
+                limit = max(1, lvl >> shift)
+            }
+            limTab[lvl] = limit
+            blimTab[lvl] = 2 * (lvl + 2) + limit
+            thrTab[lvl] = lvl >> 4
+        }
+        for i in 0..4 {
+            for seg in 0..8 {
+                for ref in 0..8 {
+                    for mt in 0..2 {
+                        lvlTab[((i * 8 + seg) * 8 + ref) * 2 + mt] = lfCalc(i, seg, ref, mt, 0)
+                    }
+                }
+            }
+        }
+        for plane in 0..h.numPlanes {
+            if plane > 0 && h.loopFilterLevel[1 + plane] == 0 {
+                continue
+            }
+            swapPl(plane)
+            lfPass(pf, plane, 0)
+            lfPass(pf, plane, 1)
+            swapPl(plane)
+        }
+    }
+
+    // The adaptive filter strength selection process (7.14.5).
+    fn lfCalc(_ i: Int, _ seg: Int, _ ref: Int, _ modeType: Int, _ dlf: Int) -> Int {
+        var lvlSeg = pfClip(0, 63, dlf + lfLv[i])
+        if segEn {
+            let f = seg * 8 + 1 + i
+            if featEn[f] != 0 {
+                lvlSeg = pfClip(0, 63, featData[f] + lvlSeg)
+            }
+        }
+        if lfDeltaEn {
+            let nShift = lvlSeg >> 5
+            if ref <= 0 {
+                lvlSeg += lfRefDeltas[0] << nShift
+            } else {
+                lvlSeg += (lfRefDeltas[ref] << nShift) + (lfModeDeltas[modeType] << nShift)
+            }
+            lvlSeg = pfClip(0, 63, lvlSeg)
+        }
+        lvlSeg
+    }
+
+    // lvl of the block whose packed mode info is g at (row, col).
+    fn lfLevelOf(_ g: Int, _ i: Int, _ dl: [Int], _ at: Int, _ multi: Bool) -> Int {
+        let seg = (g >> 20) & 7
+        var ref = ((g >> 5) & 15) - 1
+        if ref < 0 {
+            ref = 0
+        }
+        let mode = (g >> 13) & 31
+        let modeType = if mode >= 14 && mode != 16 && mode != 24 { 1 } else { 0 }
+        if dl.isEmpty {
+            return lvlTab[((i * 8 + seg) * 8 + ref) * 2 + modeType]
+        }
+        let k = if multi { i } else { 0 }
+        let dlf = ((dl[at] >> (7 * k)) & 127) - 64
+        lfCalc(i, seg, ref, modeType, dlf)
+    }
+
+    // Every edge of one plane in one direction (7.14.1, 7.14.2).
+    fn lfPass(_ pf: ParsedFrame, _ plane: Int, _ pass: Int) {
+        let h = pf.hdr
+        let gi = pf.gInfo
+        let gt = pf.gTxUV
+        let dl = pf.gDeltaLF
+        let ms = pf.miStride
+        let miRows = h.miRows
+        let miCols = h.miCols
+        let fw = h.frameWidth
+        let fh = h.frameHeight
+        let subX = if plane == 0 { 0 } else { h.subX }
+        let subY = if plane == 0 { 0 } else { h.subY }
+        let stride = if plane == 0 { yStride } else { cStride }
+        let rowStep = 1 << subY
+        let colStep = 1 << subX
+        let dx = if pass == 0 { 1 } else { 0 }
+        let dy = 1 - dx
+        let i = if plane == 0 { pass } else { plane + 1 }
+        let multi = h.deltaLfMulti
+        let sub = tSub
+        let n4w = tN4W
+        let n4h = tN4H
+        let txw = tTxW
+        let txh = tTxH
+        let lt = limTab
+        let bt = blimTab
+        let tt = thrTab
+        // Step along the edge (4 samples) and across it.
+        let along = if pass == 0 { stride } else { 1 }
+        let across = if pass == 0 { 1 } else { stride }
+        let sh = bitDepth - 8
+        var row = 0
+        while row < miRows {
+            let yl = row * 4
+            if yl >= fh {
+                break
+            }
+            if pass == 1 && yl == 0 {
+                row += rowStep
+                continue
+            }
+            let r = row | subY
+            let yP = yl >> subY
+            let prevR = r - (dy << subY)
+            var col = 0
+            while col < miCols {
+                let xl = col * 4
+                if xl >= fw {
+                    break
+                }
+                if pass == 0 && xl == 0 {
+                    col += colStep
+                    continue
+                }
+                let c = col | subX
+                let xP = xl >> subX
+                let at = r * ms + c
+                let g = gi[at]
+                var txSz = 0
+                var prevTx = 0
+                let prevC = c - (dx << subX)
+                let pat = prevR * ms + prevC
+                let gp = gi[pat]
+                if plane == 0 {
+                    txSz = (g >> 27) & 31
+                    prevTx = (gp >> 27) & 31
+                } else {
+                    txSz = gt[(r >> subY) * ms + (c >> subX)]
+                    prevTx = gt[(prevR >> subY) * ms + (prevC >> subX)]
+                }
+                var ps = sub[((g & 31) * 2 + subX) * 2 + subY]
+                if ps >= 22 {
+                    ps = 0
+                }
+                var isTxEdge = false
+                var isBlockEdge = false
+                var baseSize = 0
+                if pass == 0 {
+                    isTxEdge = xP % txw[txSz] == 0
+                    isBlockEdge = xP % (n4w[ps] * 4) == 0
+                    baseSize = min(txw[prevTx], txw[txSz])
+                } else {
+                    isTxEdge = yP % txh[txSz] == 0
+                    isBlockEdge = yP % (n4h[ps] * 4) == 0
+                    baseSize = min(txh[prevTx], txh[txSz])
+                }
+                if isTxEdge {
+                    let skip = (g >> 18) & 1
+                    let isIntra = ((g >> 5) & 15) <= 1
+                    if isBlockEdge || skip == 0 || isIntra {
+                        let filterSize = if plane == 0 { min(16, baseSize) } else { min(8, baseSize) }
+                        var lvl = lfLevelOf(g, i, dl, at, multi)
+                        if lvl == 0 {
+                            lvl = lfLevelOf(gp, i, dl, pat, multi)
+                        }
+                        if lvl > 0 {
+                            let d0 = yP * stride + xP
+                            lfEdge4(d0, along, across, filterSize, plane, lt[lvl] << sh, bt[lvl] << sh, tt[lvl] << sh)
+                        }
+                    }
+                }
+                col += colStep
+            }
+            row += rowStep
+        }
+    }
+
+    // The sample filtering process (7.14.6) for the 4 samples of one edge
+    // segment starting at plane offset d0: `along` steps along the edge,
+    // `across` across it (the spec's dx/dy direction).
+    fn lfEdge4(_ d0: Int, _ along: Int, _ across: Int, _ filterSize: Int, _ plane: Int,
+               _ limitBd: Int, _ blimitBd: Int, _ threshBd: Int) {
+        let filterLen = if filterSize == 4 { 4 } else if plane != 0 { 6 } else if filterSize == 8 { 8 } else { 16 }
+        let flatTh = 1 << (bitDepth - 8)
+        let lo = -(1 << (bitDepth - 1))
+        let hi = (1 << (bitDepth - 1)) - 1
+        let off = 0x80 << (bitDepth - 8)
+        let s = across
+        var d = d0
+        for _ in 0..4 {
+            let q0 = pl[d]
+            let q1 = pl[d + s]
+            let p0 = pl[d - s]
+            let p1 = pl[d - 2 * s]
+            // filterMask (7.14.6.2).
+            var bad = abs(p1 - p0) > limitBd || abs(q1 - q0) > limitBd || abs(p0 - q0) * 2 + abs(p1 - q1) / 2 > blimitBd
+            var p2 = 0
+            var q2 = 0
+            var p3 = 0
+            var q3 = 0
+            if !bad && filterLen >= 6 {
+                p2 = pl[d - 3 * s]
+                q2 = pl[d + 2 * s]
+                bad = abs(p2 - p1) > limitBd || abs(q2 - q1) > limitBd
+                if !bad && filterLen >= 8 {
+                    p3 = pl[d - 4 * s]
+                    q3 = pl[d + 3 * s]
+                    bad = abs(p3 - p2) > limitBd || abs(q3 - q2) > limitBd
+                }
+            }
+            if !bad {
+                var flat = false
+                if filterSize >= 8 {
+                    flat = abs(p1 - p0) <= flatTh && abs(q1 - q0) <= flatTh && abs(p2 - p0) <= flatTh && abs(q2 - q0) <= flatTh
+                    if flat && filterLen >= 8 {
+                        flat = abs(p3 - p0) <= flatTh && abs(q3 - q0) <= flatTh
+                    }
+                }
+                if filterSize == 4 || !flat {
+                    // Narrow filter (7.14.6.3).
+                    let hev = abs(p1 - p0) > threshBd || abs(q1 - q0) > threshBd
+                    let ps1 = p1 - off
+                    let ps0 = p0 - off
+                    let qs0 = q0 - off
+                    let qs1 = q1 - off
+                    var f = 0
+                    if hev {
+                        f = pfClip(lo, hi, ps1 - qs1)
+                    }
+                    f = pfClip(lo, hi, f + 3 * (qs0 - ps0))
+                    let f1 = pfClip(lo, hi, f + 4) >> 3
+                    let f2 = pfClip(lo, hi, f + 3) >> 3
+                    pl[d] = pfClip(lo, hi, qs0 - f1) + off
+                    pl[d - s] = pfClip(lo, hi, ps0 + f2) + off
+                    if !hev {
+                        let f3 = (f1 + 1) >> 1
+                        pl[d + s] = pfClip(lo, hi, qs1 - f3) + off
+                        pl[d - 2 * s] = pfClip(lo, hi, ps1 + f3) + off
+                    }
+                } else {
+                    var flat2 = false
+                    if filterSize >= 16 {
+                        let p4 = pl[d - 5 * s]
+                        let p5 = pl[d - 6 * s]
+                        let p6 = pl[d - 7 * s]
+                        let q4 = pl[d + 4 * s]
+                        let q5 = pl[d + 5 * s]
+                        let q6 = pl[d + 6 * s]
+                        flat2 = abs(p6 - p0) <= flatTh && abs(q6 - q0) <= flatTh && abs(p5 - p0) <= flatTh &&
+                            abs(q5 - q0) <= flatTh && abs(p4 - p0) <= flatTh && abs(q4 - q0) <= flatTh
+                    }
+                    if filterSize == 8 || !flat2 {
+                        lfWide(d, s, 3, plane)
+                    } else {
+                        lfWide(d, s, 4, plane)
+                    }
+                }
+            }
+            d += along
+        }
+    }
+
+    // The wide filter process (7.14.6.4) at plane offset d, step s.
+    fn lfWide(_ d: Int, _ s: Int, _ log2Size: Int, _ plane: Int) {
+        let n = if log2Size == 4 { 6 } else if plane == 0 { 3 } else { 2 }
+        let n2 = if log2Size == 3 && plane == 0 { 0 } else { 1 }
+        // ws[k + 7] = sample at offset k, k = -(n + 1) … n.
+        var k = -(n + 1)
+        while k <= n {
+            ws[k + 7] = pl[d + k * s]
+            k += 1
+        }
+        let lo = -(n + 1)
+        // S = sum over j = -n … n of s[clip(i + j)], for i = -n.
+        var sum = 0
+        var j = -n
+        while j <= n {
+            sum += ws[max(lo, -n + j) + 7]
+            j += 1
+        }
+        let rnd = 1 << (log2Size - 1)
+        var i = -n
+        while i < n {
+            var t = sum
+            if n2 == 1 {
+                t += ws[i - 1 + 7] + ws[i + 7] + ws[i + 1 + 7]
+            } else {
+                t += ws[i + 7]
+            }
+            pl[d + i * s] = (t + rnd) >> log2Size
+            // Slide: drop s[clip(i - n)], add s[clip(i + 1 + n)].
+            sum += ws[min(n, i + 1 + n) + 7] - ws[max(lo, i - n) + 7]
+            i += 1
+        }
+    }
+
+    // ---- CDEF (7.15) ------------------------------------------------
+
+    // Runs CDEF into cd*; false when nothing was filtered (CdefFrame is
+    // then CurrFrame itself).
+    fn cdefFrame(_ pf: ParsedFrame) -> Bool {
+        let h = pf.hdr
+        let ci = pf.cdefIdx
+        if !h.enableCdef || ci.isEmpty || h.codedLossless || h.allowIntrabc {
+            return false
+        }
+        let cs = pf.cdefStride
+        let miRows = h.miRows
+        let miCols = h.miCols
+        // Anything to do?
+        var any = false
+        for k in 0..ci.count {
+            let idx = ci[k]
+            if idx >= 0 && idx < 8 {
+                if h.cdefYPriStrength[idx] != 0 || h.cdefYSecStrength[idx] != 0 ||
+                    (h.numPlanes > 1 && (h.cdefUVPriStrength[idx] != 0 || h.cdefUVSecStrength[idx] != 0)) {
+                    any = true
+                    break
+                }
+            }
+        }
+        if !any {
+            return false
+        }
+        // CdefFrame starts as a copy of CurrFrame (copy-on-write: the first
+        // write below copies each plane once).
+        cdY = y
+        cdU = u
+        cdV = v
+        let gi = pf.gInfo
+        let ms = pf.miStride
+        let w8 = miCols >> 1
+        let h8 = miRows >> 1
+        if cdDir.count < w8 * h8 {
+            cdDir = pfZeros(w8 * h8)
+            cdVar = pfZeros(w8 * h8)
+        }
+        let coeffShift = bitDepth - 8
+        // Directions (luma), per 8x8 block that is filtered.
+        swapPl(0)
+        for r8 in 0..h8 {
+            for c8 in 0..w8 {
+                let r = r8 * 2
+                let c = c8 * 2
+                let idx = ci[(r >> 4) * cs + (c >> 4)]
+                var dirOut = -1
+                var varOut = 0
+                if idx >= 0 {
+                    let a = r * ms + c
+                    let sk = ((gi[a] >> 18) & 1) & ((gi[a + 1] >> 18) & 1) & ((gi[a + ms] >> 18) & 1) & ((gi[a + ms + 1] >> 18) & 1)
+                    if sk == 0 {
+                        dirOut = 0
+                        if h.cdefYPriStrength[idx] != 0 || (h.numPlanes > 1 && h.cdefUVPriStrength[idx] != 0) {
+                            let dv = cdefDirection(r * 4 * yStride + c * 4, yStride)
+                            dirOut = dv >> 32
+                            varOut = dv & 0xffffffff
+                        }
+                    }
+                }
+                cdDir[r8 * w8 + c8] = dirOut
+                cdVar[r8 * w8 + c8] = varOut
+            }
+        }
+        swapPl(0)
+        for plane in 0..h.numPlanes {
+            let subX = if plane == 0 { 0 } else { h.subX }
+            let subY = if plane == 0 { 0 } else { h.subY }
+            let stride = if plane == 0 { yStride } else { cStride }
+            let pw = (miCols * 4) >> subX
+            let ph = (miRows * 4) >> subY
+            swapPl(plane)
+            swapDst(plane)
+            for r8 in 0..h8 {
+                for c8 in 0..w8 {
+                    let yDir = cdDir[r8 * w8 + c8]
+                    if yDir < 0 {
+                        continue
+                    }
+                    let idx = ci[((r8 * 2) >> 4) * cs + ((c8 * 2) >> 4)]
+                    var priStr = 0
+                    var secStr = 0
+                    var dir = 0
+                    var damping = 0
+                    if plane == 0 {
+                        priStr = h.cdefYPriStrength[idx] << coeffShift
+                        secStr = h.cdefYSecStrength[idx] << coeffShift
+                        dir = if priStr == 0 { 0 } else { yDir }
+                        let vr = cdVar[r8 * w8 + c8]
+                        let varStr = if (vr >> 6) != 0 { min(pfFloorLog2(vr >> 6), 12) } else { 0 }
+                        priStr = if vr != 0 { (priStr * (4 + varStr) + 8) >> 4 } else { 0 }
+                        damping = h.cdefDamping + coeffShift
+                    } else {
+                        priStr = h.cdefUVPriStrength[idx] << coeffShift
+                        secStr = h.cdefUVSecStrength[idx] << coeffShift
+                        dir = if priStr == 0 { 0 } else { tUvDir[(subX * 2 + subY) * 8 + yDir] }
+                        damping = h.cdefDamping + coeffShift - 1
+                    }
+                    if priStr == 0 && secStr == 0 {
+                        continue
+                    }
+                    let x0 = (c8 * 8) >> subX
+                    let y0 = (r8 * 8) >> subY
+                    cdefFilter(x0, y0, 8 >> subX, 8 >> subY, stride, pw, ph, priStr, secStr, damping, dir, coeffShift)
+                }
+            }
+            swapDst(plane)
+            swapPl(plane)
+        }
+        true
+    }
+
+    // The CDEF direction process (7.15.2) on the luma 8x8 block at `at`:
+    // returns yDir << 32 | var.
+    fn cdefDirection(_ at: Int, _ stride: Int) -> Int {
+        // partial[d][k] at part[d * 15 + k].
+        for k in 0..120 {
+            part[k] = 0
+        }
+        let sh = bitDepth - 8
+        for i in 0..8 {
+            let rowAt = at + i * stride
+            for j in 0..8 {
+                let x = (pl[rowAt + j] >> sh) - 128
+                part[i + j] += x
+                part[15 + i + j / 2] += x
+                part[30 + i] += x
+                part[45 + 3 + i - j / 2] += x
+                part[60 + 7 + i - j] += x
+                part[75 + 3 - i / 2 + j] += x
+                part[90 + j] += x
+                part[105 + i / 2 + j] += x
+            }
+        }
+        let dt = tDivTab
+        var c2 = 0
+        var c6 = 0
+        for i in 0..8 {
+            c2 += part[30 + i] * part[30 + i]
+            c6 += part[90 + i] * part[90 + i]
+        }
+        cost[2] = c2 * dt[8]
+        cost[6] = c6 * dt[8]
+        var c0 = 0
+        var c4 = 0
+        for i in 0..7 {
+            c0 += (part[i] * part[i] + part[14 - i] * part[14 - i]) * dt[i + 1]
+            c4 += (part[60 + i] * part[60 + i] + part[74 - i] * part[74 - i]) * dt[i + 1]
+        }
+        c0 += part[7] * part[7] * dt[8]
+        c4 += part[67] * part[67] * dt[8]
+        cost[0] = c0
+        cost[4] = c4
+        var d = 1
+        while d < 8 {
+            let b = d * 15
+            var c = 0
+            for j in 0..5 {
+                c += part[b + 3 + j] * part[b + 3 + j]
+            }
+            c *= dt[8]
+            for j in 0..3 {
+                c += (part[b + j] * part[b + j] + part[b + 10 - j] * part[b + 10 - j]) * dt[2 * j + 2]
+            }
+            cost[d] = c
+            d += 2
+        }
+        var bestCost = 0
+        var yDir = 0
+        for i in 0..8 {
+            if cost[i] > bestCost {
+                bestCost = cost[i]
+                yDir = i
+            }
+        }
+        let vr = (bestCost - cost[(yDir + 4) & 7]) >> 10
+        (yDir << 32) | vr
+    }
+
+    // Offset in ctab of the constrain() table for (threshold, damping):
+    // ctab[off + maxV + diff] = constrain(diff, threshold, damping).
+    fn cdefTable(_ threshold: Int, _ damping: Int) -> Int {
+        let adj = max(0, damping - pfFloorLog2(threshold))
+        let key = threshold * 32 + min(adj, 31)
+        if ctKey.count <= key {
+            while ctKey.count <= key {
+                ctKey.append(-1)
+            }
+        }
+        let k = ctKey[key]
+        if k >= 0 {
+            return k
+        }
+        let off = ctab.count
+        let mv = maxV
+        var d = -mv
+        while d <= mv {
+            ctab.append(pfConstrain(d, threshold, adj))
+            d += 1
+        }
+        ctKey[key] = off
+        off
+    }
+
+    // The CDEF filter process (7.15.3) for one block of plane `pl` into
+    // `dst`. pw/ph: the plane's filter region (MiCols/MiRows) in samples.
+    // When only the primary or only the secondary taps are on, the
+    // result x + sum/16 can't leave [min, max] of the taps used (their
+    // weights add up to 12/16), so the clipping is left out.
+    fn cdefFilter(_ x0: Int, _ y0: Int, _ w: Int, _ h: Int, _ stride: Int, _ pw: Int, _ ph: Int,
+                  _ priStr: Int, _ secStr: Int, _ damping: Int, _ dir: Int, _ coeffShift: Int) {
+        if ctBits != bitDepth {
+            ctBits = bitDepth
+            ctab = []
+            ctKey = []
+        }
+        let cd = tCdefDir
+        let priTap0 = if ((priStr >> coeffShift) & 1) == 0 { 4 } else { 3 }
+        let priTap1 = if ((priStr >> coeffShift) & 1) == 0 { 2 } else { 3 }
+        let d2 = (dir + 2) & 7
+        let d6 = (dir + 6) & 7
+        let pr0 = cd[dir * 4]
+        let pc0 = cd[dir * 4 + 1]
+        let pr1 = cd[dir * 4 + 2]
+        let pc1 = cd[dir * 4 + 3]
+        let ar0 = cd[d2 * 4]
+        let ac0 = cd[d2 * 4 + 1]
+        let ar1 = cd[d2 * 4 + 2]
+        let ac1 = cd[d2 * 4 + 3]
+        let br0 = cd[d6 * 4]
+        let bc0 = cd[d6 * 4 + 1]
+        let br1 = cd[d6 * 4 + 2]
+        let bc1 = cd[d6 * 4 + 3]
+        let po0 = pr0 * stride + pc0
+        let po1 = pr1 * stride + pc1
+        let ao0 = ar0 * stride + ac0
+        let ao1 = ar1 * stride + ac1
+        let bo0 = br0 * stride + bc0
+        let bo1 = br1 * stride + bc1
+        let mv = maxV
+        let pt = if priStr != 0 { cdefTable(priStr, damping) + mv } else { 0 }
+        let st = if secStr != 0 { cdefTable(secStr, damping) + mv } else { 0 }
+        let ct = ctab
+        let inner = x0 >= 2 && y0 >= 2 && x0 + w + 2 <= pw && y0 + h + 2 <= ph
+        if inner && secStr == 0 {
+            for i in 0..h {
+                let rowAt = (y0 + i) * stride + x0
+                for j in 0..w {
+                    let at = rowAt + j
+                    let x = pl[at]
+                    let b = pt - x
+                    let sum = priTap0 * (ct[b + pl[at + po0]] + ct[b + pl[at - po0]]) + priTap1 * (ct[b + pl[at + po1]] + ct[b + pl[at - po1]])
+                    let neg = if sum < 0 { 1 } else { 0 }
+                    dst[at] = x + ((8 + sum - neg) >> 4)
+                }
+            }
+            return
+        }
+        if inner && priStr == 0 {
+            for i in 0..h {
+                let rowAt = (y0 + i) * stride + x0
+                for j in 0..w {
+                    let at = rowAt + j
+                    let x = pl[at]
+                    let b = st - x
+                    let sum = 2 * (ct[b + pl[at + ao0]] + ct[b + pl[at - ao0]] + ct[b + pl[at + bo0]] + ct[b + pl[at - bo0]]) +
+                        ct[b + pl[at + ao1]] + ct[b + pl[at - ao1]] + ct[b + pl[at + bo1]] + ct[b + pl[at - bo1]]
+                    let neg = if sum < 0 { 1 } else { 0 }
+                    dst[at] = x + ((8 + sum - neg) >> 4)
+                }
+            }
+            return
+        }
+        if inner {
+            for i in 0..h {
+                let rowAt = (y0 + i) * stride + x0
+                for j in 0..w {
+                    let at = rowAt + j
+                    let x = pl[at]
+                    let pa = pl[at + po0]
+                    let pb = pl[at - po0]
+                    let pc = pl[at + po1]
+                    let pd = pl[at - po1]
+                    let sa = pl[at + ao0]
+                    let sb = pl[at - ao0]
+                    let sc = pl[at + bo0]
+                    let sd = pl[at - bo0]
+                    let se = pl[at + ao1]
+                    let sf = pl[at - ao1]
+                    let sg = pl[at + bo1]
+                    let sh = pl[at - bo1]
+                    let bp = pt - x
+                    let bs = st - x
+                    let sum = priTap0 * (ct[bp + pa] + ct[bp + pb]) + priTap1 * (ct[bp + pc] + ct[bp + pd]) +
+                        2 * (ct[bs + sa] + ct[bs + sb] + ct[bs + sc] + ct[bs + sd]) +
+                        ct[bs + se] + ct[bs + sf] + ct[bs + sg] + ct[bs + sh]
+                    let mx = max(max(max(x, pa), max(pb, pc)), max(max(pd, sa), max(sb, sc)), max(max(sd, se), max(sf, max(sg, sh))))
+                    let mn = min(min(min(x, pa), min(pb, pc)), min(min(pd, sa), min(sb, sc)), min(min(sd, se), min(sf, min(sg, sh))))
+                    let neg = if sum < 0 { 1 } else { 0 }
+                    dst[at] = pfClip(mn, mx, x + ((8 + sum - neg) >> 4))
+                }
+            }
+            return
+        }
+        // Near the frame edges: the spec's cdef_get_at with availability.
+        for i in 0..h {
+            let rowAt = (y0 + i) * stride + x0
+            for j in 0..w {
+                let at = rowAt + j
+                let x = pl[at]
+                var sum = 0
+                var mx = x
+                var mn = x
+                let yy = y0 + i
+                let xx = x0 + j
+                for k in 0..2 {
+                    let tap = if k == 0 { priTap0 } else { priTap1 }
+                    let stap = if k == 0 { 2 } else { 1 }
+                    let rp = if k == 0 { pr0 } else { pr1 }
+                    let cp = if k == 0 { pc0 } else { pc1 }
+                    let ra = if k == 0 { ar0 } else { ar1 }
+                    let ca = if k == 0 { ac0 } else { ac1 }
+                    let rb = if k == 0 { br0 } else { br1 }
+                    let cb = if k == 0 { bc0 } else { bc1 }
+                    var sign = -1
+                    while sign <= 1 {
+                        var ty = yy + sign * rp
+                        var tx = xx + sign * cp
+                        if ty >= 0 && ty < ph && tx >= 0 && tx < pw {
+                            let p = pl[ty * stride + tx]
+                            if priStr != 0 {
+                                sum += tap * ct[pt + p - x]
+                            }
+                            mx = max(mx, p)
+                            mn = min(mn, p)
+                        }
+                        ty = yy + sign * ra
+                        tx = xx + sign * ca
+                        if ty >= 0 && ty < ph && tx >= 0 && tx < pw {
+                            let s = pl[ty * stride + tx]
+                            if secStr != 0 {
+                                sum += stap * ct[st + s - x]
+                            }
+                            mx = max(mx, s)
+                            mn = min(mn, s)
+                        }
+                        ty = yy + sign * rb
+                        tx = xx + sign * cb
+                        if ty >= 0 && ty < ph && tx >= 0 && tx < pw {
+                            let s = pl[ty * stride + tx]
+                            if secStr != 0 {
+                                sum += stap * ct[st + s - x]
+                            }
+                            mx = max(mx, s)
+                            mn = min(mn, s)
+                        }
+                        sign += 2
+                    }
+                }
+                let neg = if sum < 0 { 1 } else { 0 }
+                dst[at] = pfClip(mn, mx, x + ((8 + sum - neg) >> 4))
+            }
+        }
+    }
+
+    // ---- upscaling (7.16) -------------------------------------------
+
+    // Upscales plane p (held in `pl`) in place, row by row.
+    fn upscalePlane(_ h: Av1Hdr, _ plane: Int) {
+        let subX = if plane == 0 { 0 } else { h.subX }
+        let subY = if plane == 0 { 0 } else { h.subY }
+        let stride = if plane == 0 { yStride } else { cStride }
+        let downW = (h.frameWidth + subX) >> subX
+        let upW = (h.upscaledWidth + subX) >> subX
+        let planeH = (h.frameHeight + subY) >> subY
+        if upW <= downW {
+            return
+        }
+        let stepX = ((downW << 14) + (upW / 2)) / upW
+        let err = (upW * stepX) - (downW << 14)
+        var initialSubpelX = (-((upW - downW) << 13) + upW / 2) / upW + (1 << 7) - err / 2
+        initialSubpelX = initialSubpelX & 16383
+        let miW = h.miCols >> subX
+        let maxX = miW * 4 - 1
+        if rowTmp.count < stride {
+            rowTmp = pfZeros(stride)
+        }
+        let f = tUpscale
+        for yy in 0..planeH {
+            let rowAt = yy * stride
+            for x in 0..(maxX + 1) {
+                rowTmp[x] = pl[rowAt + x]
+            }
+            for x in 0..upW {
+                let srcX = -(1 << 14) + initialSubpelX + x * stepX
+                let srcXPx = srcX >> 14
+                let fo = ((srcX & 16383) >> 8) * 8
+                var sum = 0
+                if srcXPx - 3 >= 0 && srcXPx + 4 <= maxX {
+                    let b = srcXPx - 3
+                    sum = rowTmp[b] * f[fo] + rowTmp[b + 1] * f[fo + 1] + rowTmp[b + 2] * f[fo + 2] + rowTmp[b + 3] * f[fo + 3] +
+                        rowTmp[b + 4] * f[fo + 4] + rowTmp[b + 5] * f[fo + 5] + rowTmp[b + 6] * f[fo + 6] + rowTmp[b + 7] * f[fo + 7]
+                } else {
+                    for k in 0..8 {
+                        let sx = pfClip(0, maxX, srcXPx + (k - 3))
+                        sum += rowTmp[sx] * f[fo + k]
+                    }
+                }
+                pl[rowAt + x] = pfClip(0, maxV, (sum + 64) >> 7)
+            }
+        }
+    }
+
+    // ---- loop restoration (7.17) ------------------------------------
+
+    // LrFrame in cd* (which holds UpscaledCdefFrame), reading
+    // UpscaledCurrFrame from y/u/v.
+    fn restoreFrame(_ pf: ParsedFrame) {
+        let h = pf.hdr
+        for plane in 0..h.numPlanes {
+            if h.frameRestorationType[plane] == 0 {
+                continue
+            }
+            if pf.lrRows[plane] <= 0 || pf.lrCols[plane] <= 0 {
+                continue
+            }
+            swapPl(plane)
+            swapDst(plane)
+            restorePlane(pf, plane)
+            swapDst(plane)
+            swapPl(plane)
+        }
+    }
+
+    fn restorePlane(_ pf: ParsedFrame, _ plane: Int) {
+        let h = pf.hdr
+        let subX = if plane == 0 { 0 } else { h.subX }
+        let subY = if plane == 0 { 0 } else { h.subY }
+        let stride = if plane == 0 { yStride } else { cStride }
+        let planeW = (h.upscaledWidth + subX) >> subX
+        let planeH = (h.frameHeight + subY) >> subY
+        let unitSize = h.loopRestorationSize[plane]
+        let unitRows = pf.lrRows[plane]
+        let unitCols = pf.lrCols[plane]
+        let base = pf.lrOff[plane]
+        let lr = pf.lrData
+        let bw = planeW + 6
+        var stripe = 0
+        while true {
+            let sStart = (-8 + stripe * 64) >> subY
+            let sEnd = sStart + (64 >> subY) - 1
+            let y0 = max(0, sStart)
+            let y1 = min(planeH - 1, sEnd)
+            if y0 > planeH - 1 {
+                break
+            }
+            stripe += 1
+            if y1 < y0 {
+                continue
+            }
+            let lumaY = ((y0 << subY) >> 2) << 2
+            let unitRow = min(unitRows - 1, ((lumaY + 8) >> subY) / unitSize)
+            // Which units of this stripe need filtering?
+            var need = false
+            for uc in 0..unitCols {
+                if lr[base + (unitRow * unitCols + uc) * 10] != 0 {
+                    need = true
+                }
+            }
+            if !need {
+                continue
+            }
+            let nb = y1 - y0 + 7
+            lrFillStripe(y0, y1, sStart, sEnd, planeW, planeH, stride, bw)
+            for uc in 0..unitCols {
+                let u0 = base + (unitRow * unitCols + uc) * 10
+                let rType = lr[u0]
+                if rType == 0 {
+                    continue
+                }
+                let ux0 = uc * unitSize
+                let ux1 = if uc == unitCols - 1 { planeW } else { min(planeW, (uc + 1) * unitSize) }
+                if ux0 >= ux1 {
+                    continue
+                }
+                if rType == 1 {
+                    lrWiener(lr, u0, y0, y1, ux0, ux1, stride, bw, nb)
+                } else if rType == 2 {
+                    lrSgr(lr, u0, y0, y1, ux0, ux1, stride, bw, nb)
+                }
+            }
+        }
+    }
+
+    // Fills sbuf with the get source sample process (7.17.6) for rows
+    // y0 - 3 … y1 + 3 and columns -3 … planeW + 2 of the stripe.
+    fn lrFillStripe(_ y0: Int, _ y1: Int, _ sStart: Int, _ sEnd: Int, _ planeW: Int, _ planeH: Int,
+                    _ stride: Int, _ bw: Int) {
+        let nb = y1 - y0 + 7
+        if sbuf.count < nb * bw {
+            sbuf = pfZeros(nb * bw)
+        }
+        let endX = planeW - 1
+        let endY = planeH - 1
+        for r in 0..nb {
+            var yy = pfClip(0, endY, y0 - 3 + r)
+            var fromCur = false
+            if yy < sStart {
+                yy = max(sStart - 2, yy)
+                fromCur = true
+            } else if yy > sEnd {
+                yy = min(sEnd + 2, yy)
+                fromCur = true
+            }
+            let src = yy * stride
+            let o = r * bw + 3
+            if fromCur {
+                for x in 0..planeW {
+                    sbuf[o + x] = pl[src + x]
+                }
+            } else {
+                for x in 0..planeW {
+                    sbuf[o + x] = dst[src + x]
+                }
+            }
+            let first = sbuf[o]
+            let last = sbuf[o + endX]
+            sbuf[o - 3] = first
+            sbuf[o - 2] = first
+            sbuf[o - 1] = first
+            sbuf[o + planeW] = last
+            sbuf[o + planeW + 1] = last
+            sbuf[o + planeW + 2] = last
+        }
+    }
+
+    // The Wiener filter process (7.17.4) for rows y0 … y1, columns
+    // ux0 ..< ux1, from sbuf into dst.
+    fn lrWiener(_ lr: [Int], _ u0: Int, _ y0: Int, _ y1: Int, _ ux0: Int, _ ux1: Int, _ stride: Int, _ bw: Int, _ nb: Int) {
+        let round0 = if bitDepth == 12 { 5 } else { 3 }
+        let round1 = if bitDepth == 12 { 9 } else { 11 }
+        // vfilter from pass 0, hfilter from pass 1 (7.17.5).
+        let v0 = lr[u0 + 4]
+        let v1 = lr[u0 + 5]
+        let v2 = lr[u0 + 6]
+        let v3 = 128 - 2 * (v0 + v1 + v2)
+        let h0 = lr[u0 + 7]
+        let h1 = lr[u0 + 8]
+        let h2 = lr[u0 + 9]
+        let h3 = 128 - 2 * (h0 + h1 + h2)
+        let uw = ux1 - ux0
+        if wTmp.count < nb * uw {
+            wTmp = pfZeros(nb * uw)
+        }
+        let offset = 1 << (bitDepth + 7 - round0 - 1)
+        let limit = (1 << (bitDepth + 1 + 7 - round0)) - 1
+        let rnd0 = 1 << (round0 - 1)
+        let lo = -offset
+        let hi = limit - offset
+        for r in 0..nb {
+            // Buffer column of plane x is x + 3; taps x - 3 … x + 3.
+            let b = r * bw + ux0
+            let o = r * uw
+            for c in 0..uw {
+                let a = b + c
+                let s = h0 * (sbuf[a] + sbuf[a + 6]) + h1 * (sbuf[a + 1] + sbuf[a + 5]) + h2 * (sbuf[a + 2] + sbuf[a + 4]) + h3 * sbuf[a + 3]
+                wTmp[o + c] = pfClip(lo, hi, (s + rnd0) >> round0)
+            }
+        }
+        let rnd1 = 1 << (round1 - 1)
+        let mv = maxV
+        for r in 0..(y1 - y0 + 1) {
+            let outAt = (y0 + r) * stride + ux0
+            let o = r * uw
+            for c in 0..uw {
+                let a = o + c
+                let s = v0 * (wTmp[a] + wTmp[a + 6 * uw]) + v1 * (wTmp[a + uw] + wTmp[a + 5 * uw]) +
+                    v2 * (wTmp[a + 2 * uw] + wTmp[a + 4 * uw]) + v3 * wTmp[a + 3 * uw]
+                dst[outAt + c] = pfClip(0, mv, (s + rnd1) >> round1)
+            }
+        }
+    }
+
+    // The self guided filter process (7.17.2) for rows y0 … y1, columns
+    // ux0 ..< ux1.
+    fn lrSgr(_ lr: [Int], _ u0: Int, _ y0: Int, _ y1: Int, _ ux0: Int, _ ux1: Int, _ stride: Int, _ bw: Int, _ nb: Int) {
+        let set = lr[u0 + 1]
+        let w0 = lr[u0 + 2]
+        let w1 = lr[u0 + 3]
+        let w2 = 128 - w0 - w1
+        let r0 = tSgr[set * 4]
+        let r1 = tSgr[set * 4 + 2]
+        let uw = ux1 - ux0
+        let hh = y1 - y0 + 1
+        if flt0.count < hh * uw {
+            flt0 = pfZeros(hh * uw)
+            flt1 = pfZeros(hh * uw)
+        }
+        if r0 != 0 {
+            lrBox(0, r0, tSgr[set * 4 + 1], y0, hh, ux0, uw, stride, bw)
+        }
+        if r1 != 0 {
+            lrBox(1, r1, tSgr[set * 4 + 3], y0, hh, ux0, uw, stride, bw)
+        }
+        let mv = maxV
+        for i in 0..hh {
+            let at = (y0 + i) * stride + ux0
+            let o = i * uw
+            for j in 0..uw {
+                let uu = dst[at + j] << 4
+                var vv = w1 * uu
+                if r0 != 0 {
+                    vv += w0 * flt0[o + j]
+                } else {
+                    vv += w0 * uu
+                }
+                if r1 != 0 {
+                    vv += w2 * flt1[o + j]
+                } else {
+                    vv += w2 * uu
+                }
+                dst[at + j] = pfClip(0, mv, (vv + (1 << 10)) >> 11)
+            }
+        }
+    }
+
+    // The box filter process (7.17.3): F (flt0 for pass 0, flt1 for
+    // pass 1) for the hh x uw block at row y0, column ux0.
+    fn lrBox(_ pass: Int, _ r: Int, _ eps: Int, _ y0: Int, _ hh: Int, _ ux0: Int, _ uw: Int, _ stride: Int, _ bw: Int) {
+        let n = (2 * r + 1) * (2 * r + 1)
+        let n2e = n * n * eps
+        let s = ((1 << 20) + n2e / 2) / n2e
+        let oneOverN = ((1 << 12) + (n / 2)) / n
+        let aw = uw + 2
+        let ah = hh + 2
+        if aBuf.count < aw * ah {
+            aBuf = pfZeros(aw * ah)
+            bBuf = pfZeros(aw * ah)
+        }
+        // Vertical sums of c and c * c over 2r + 1 rows, for the A/B rows
+        // i = -1 … hh and buffer columns of x = ux0 - 1 - r … ux0 + uw + r.
+        let vw = aw + 2 * r
+        if vsum.count < vw {
+            vsum = pfZeros(vw)
+            vsq = pfZeros(vw)
+        }
+        let bd2 = 2 * (bitDepth - 8)
+        let bd1 = bitDepth - 8
+        let rnd2 = if bd2 > 0 { 1 << (bd2 - 1) } else { 0 }
+        let rnd1 = if bd1 > 0 { 1 << (bd1 - 1) } else { 0 }
+        let tab = a2Tab
+        // Buffer row of plane row y0 + i is i + 3; column of plane x is x + 3.
+        let col0 = ux0 - 1 - r + 3
+        var first = true
+        var prevI = 0
+        for i in -1..(hh + 1) {
+            if pass == 0 && ((y0 + i) & 1) == 0 {
+                continue
+            }
+            // Vertical window sums for this row (rows i - r … i + r of the
+            // block, buffer rows + 3), slid down from the previous row.
+            if first {
+                first = false
+                for k in 0..vw {
+                    var cs = 0
+                    var cq = 0
+                    var rr = i - r + 3
+                    let col = col0 + k
+                    while rr <= i + r + 3 {
+                        let c = sbuf[rr * bw + col]
+                        cs += c
+                        cq += c * c
+                        rr += 1
+                    }
+                    vsum[k] = cs
+                    vsq[k] = cq
+                }
+            } else {
+                var rr = prevI + r + 1
+                while rr <= i + r {
+                    let ab = (rr + 3) * bw + col0
+                    let sb = (rr - 2 * r - 1 + 3) * bw + col0
+                    for k in 0..vw {
+                        let c = sbuf[ab + k]
+                        let o = sbuf[sb + k]
+                        vsum[k] += c - o
+                        vsq[k] += c * c - o * o
+                    }
+                    rr += 1
+                }
+            }
+            prevI = i
+            // Horizontal window and A/B.
+            var bs = 0
+            var aq = 0
+            for k in 0..(2 * r + 1) {
+                bs += vsum[k]
+                aq += vsq[k]
+            }
+            let rowO = (i + 1) * aw
+            for j in 0..aw {
+                if j > 0 {
+                    bs += vsum[j + 2 * r] - vsum[j - 1]
+                    aq += vsq[j + 2 * r] - vsq[j - 1]
+                }
+                let a = (aq + rnd2) >> bd2
+                let d = (bs + rnd1) >> bd1
+                let p = max(0, a * n - d * d)
+                let z = (p * s + (1 << 19)) >> 20
+                let a2 = if z >= 255 { 256 } else { tab[z] }
+                let b2 = (256 - a2) * bs * oneOverN
+                aBuf[rowO + j] = a2
+                bBuf[rowO + j] = (b2 + (1 << 11)) >> 12
+            }
+        }
+        // The output F.
+        for i in 0..hh {
+            let at = (y0 + i) * stride + ux0
+            let o = i * uw
+            if pass == 0 {
+                if ((y0 + i) & 1) == 1 {
+                    // Odd row: its own A/B row with weights 5 6 5, shift 4.
+                    let ro = (i + 1) * aw + 1
+                    for j in 0..uw {
+                        let q = ro + j
+                        let a = 6 * aBuf[q] + 5 * (aBuf[q - 1] + aBuf[q + 1])
+                        let b = 6 * bBuf[q] + 5 * (bBuf[q - 1] + bBuf[q + 1])
+                        let vv = a * dst[at + j] + b
+                        let f = (vv + (1 << 7)) >> 8
+                        flt0[o + j] = f
+                    }
+                } else {
+                    // Even row: the rows above and below, shift 5.
+                    let ru = i * aw + 1
+                    let rd = (i + 2) * aw + 1
+                    for j in 0..uw {
+                        let qu = ru + j
+                        let qd = rd + j
+                        let a = 6 * (aBuf[qu] + aBuf[qd]) + 5 * (aBuf[qu - 1] + aBuf[qu + 1] + aBuf[qd - 1] + aBuf[qd + 1])
+                        let b = 6 * (bBuf[qu] + bBuf[qd]) + 5 * (bBuf[qu - 1] + bBuf[qu + 1] + bBuf[qd - 1] + bBuf[qd + 1])
+                        let vv = a * dst[at + j] + b
+                        flt0[o + j] = (vv + (1 << 8)) >> 9
+                    }
+                }
+            } else {
+                let ru = i * aw + 1
+                let rm = (i + 1) * aw + 1
+                let rd = (i + 2) * aw + 1
+                for j in 0..uw {
+                    let qu = ru + j
+                    let qm = rm + j
+                    let qd = rd + j
+                    let a = 4 * (aBuf[qm] + aBuf[qm - 1] + aBuf[qm + 1] + aBuf[qu] + aBuf[qd]) +
+                        3 * (aBuf[qu - 1] + aBuf[qu + 1] + aBuf[qd - 1] + aBuf[qd + 1])
+                    let b = 4 * (bBuf[qm] + bBuf[qm - 1] + bBuf[qm + 1] + bBuf[qu] + bBuf[qd]) +
+                        3 * (bBuf[qu - 1] + bBuf[qu + 1] + bBuf[qd - 1] + bBuf[qd + 1])
+                    let vv = a * dst[at + j] + b
+                    flt1[o + j] = (vv + (1 << 8)) >> 9
+                }
+            }
+        }
+    }
+}
+
+// constrain() of 7.15.3 with dampingAdj already worked out (adj).
+fn pfConstrain(_ diff: Int, _ threshold: Int, _ adj: Int) -> Int {
+    if threshold == 0 {
+        return 0
+    }
+    if diff < 0 {
+        let a = -diff
+        return -max(0, min(a, threshold - (a >> adj)))
+    }
+    max(0, min(diff, threshold - (diff >> adj)))
+}
+
+fn pfClip(_ lo: Int, _ hi: Int, _ v: Int) -> Int {
+    if v < lo {
+        return lo
+    }
+    if v > hi {
+        return hi
+    }
+    v
+}
+
+fn pfFloorLog2(_ x: Int) -> Int {
+    var s = 0
+    var v = x
+    while v > 1 {
+        v = v >> 1
+        s += 1
+    }
+    s
+}
+
+fn pfZeros(_ n: Int) -> [Int] {
+    var out: [Int] = []
+    for _ in 0..n {
+        out.append(0)
+    }
+    out
+}

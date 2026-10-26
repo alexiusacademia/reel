@@ -1,0 +1,66 @@
+{
+ "format": "mov,mp4,m4a,3gp,3g2,mj2",
+ "duration": 0.1,
+ "tags": {
+  "major_brand": "M4A ",
+  "minor_version": "512",
+  "compatible_brands": "M4A isomiso2",
+  "encoder": "Lavf62.12.102"
+ },
+ "tracks": [
+  {
+   "index": 0,
+   "kind": "audio",
+   "codec": "alac",
+   "ffCodec": "alac",
+   "profile": "",
+   "timescale": 44100,
+   "duration": 4410,
+   "extraHex": "00000024616c616300000000000010000018280a0e01000000003004001026600000ac44",
+   "width": 0,
+   "height": 0,
+   "sarNum": 1,
+   "sarDen": 1,
+   "fpsNum": 0,
+   "fpsDen": 0,
+   "rotation": 0,
+   "pixFmt": "",
+   "sampleRate": 44100,
+   "channels": 1,
+   "channelLayout": "mono",
+   "bitsPerSample": 24,
+   "pcm": {
+    "bits": 16,
+    "float": false,
+    "bigEndian": false,
+    "signed": true
+   },
+   "language": "",
+   "title": "",
+   "isDefault": true,
+   "isCover": false,
+   "frames": 2
+  }
+ ],
+ "packets": [
+  {
+   "track": 0,
+   "pts": 0,
+   "dts": 0,
+   "duration": 4096,
+   "key": true,
+   "pos": 44,
+   "size": 12292
+  },
+  {
+   "track": 0,
+   "pts": 4096,
+   "dts": 4096,
+   "duration": 314,
+   "key": true,
+   "pos": 12336,
+   "size": 950
+  }
+ ],
+ "chapters": []
+}

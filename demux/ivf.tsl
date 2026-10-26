@@ -1,0 +1,141 @@
+// IVF files (.ivf): the simple container of the VP8, VP9 and AV1 test
+// vectors and of libvpx/libaom tools. A 32-byte header ("DKIF", version,
+// header size, fourcc, width, height, timebase rate and scale, frame
+// count), then frames, each a 12-byte header (size, 64-bit timestamp, both
+// little-endian) and the frame's bytes. One video track; a packet is one
+// frame (VP8/VP9: a frame or superframe; AV1: a temporal unit of OBUs).
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../core"
+
+public fn ivfOpen(_ file: Data) -> Result<core.Media> {
+    let n = file.count
+    if n < 32 || file.slice(from: 0, to: 4).latin1 != "DKIF" {
+        return Result.failure(error: Error("not an IVF file"))
+    }
+    let headerSize = max(file.uint16(at: 6), 32)
+    let fourcc = file.slice(from: 8, to: 12).latin1
+    var t = core.Track(index: 0, kind: .video, codec: ivfCodec(fourcc))
+    t.tag = fourcc
+    t.width = file.uint16(at: 12)
+    t.height = file.uint16(at: 14)
+    let rate = file.uint32(at: 16)
+    let scale = file.uint32(at: 20)
+    // Timestamps count `scale / rate` seconds.
+    t.timescale = max(rate, 1)
+    if rate > 0 && scale > 0 {
+        let g = ivfGcd(rate, scale)
+        t.fpsNum = rate / g
+        t.fpsDen = scale / g
+    }
+    var m = core.Media(format: "ivf")
+    var p = headerSize
+    var last = 0
+    while p + 12 <= n {
+        let size = file.uint32(at: p)
+        let ts = file.uint32(at: p + 4) + file.uint32(at: p + 8) * 4294967296
+        let body = p + 12
+        if size <= 0 || body + size > n {
+            if body + size > n {
+                m.warnings.append("ivf: the last frame is cut short")
+            }
+            break
+        }
+        let pts = ts * max(scale, 1)
+        m.packets.append(core.PacketRef(track: 0, pts: pts, dts: pts, duration: max(scale, 1), key: ivfIsKey(file, body, size, t.codec), offset: body, size: size))
+        last = pts + max(scale, 1)
+        p = body + size
+    }
+    // Durations: up to the next frame's time.
+    for i in 0..m.packets.count {
+        if i + 1 < m.packets.count {
+            m.packets[i].duration = max(m.packets[i + 1].pts - m.packets[i].pts, 0)
+        }
+    }
+    t.duration = last
+    m.tracks.append(t)
+    m.duration = core.seconds(last, t.timescale)
+    Result.ok(value: m)
+}
+
+fn ivfCodec(_ fourcc: String) -> String {
+    match fourcc {
+        "VP80" -> "vp8"
+        "VP90" -> "vp9"
+        "AV01" -> "av1"
+        _ -> "unknown:" + fourcc
+    }
+}
+
+// Whether a frame can start decoding: VP8 and VP9 keyframes by their
+// first header bits, AV1 temporal units that carry a sequence header.
+fn ivfIsKey(_ d: Data, _ at: Int, _ size: Int, _ codec: String) -> Bool {
+    let b = d[at]
+    match codec {
+        "vp8" -> (b & 1) == 0
+        "vp9" -> {
+            // frame_marker (2), profile_low, profile_high, [reserved_zero
+            // for profile 3], show_existing_frame, frame_type (0 = key).
+            let profile = ((b >> 5) & 1) | (((b >> 4) & 1) << 1)
+            var bit = 4
+            if profile == 3 {
+                bit = 3
+            }
+            let showExisting = (b >> (bit - 1)) & 1
+            if showExisting == 1 {
+                return false
+            }
+            ((b >> (bit - 2)) & 1) == 0
+        }
+        "av1" -> ivfHasSequenceHeader(d, at, size)
+        _ -> true
+    }
+}
+
+// AV1 low-overhead OBUs: header byte (type in bits 6..3, extension flag,
+// has_size flag), an optional extension byte, a leb128 size.
+fn ivfHasSequenceHeader(_ d: Data, _ at: Int, _ size: Int) -> Bool {
+    var p = at
+    let end = at + size
+    while p < end {
+        let h = d[p]
+        let type = (h >> 3) & 15
+        if type == 1 {
+            return true
+        }
+        let ext = (h >> 2) & 1
+        let hasSize = (h >> 1) & 1
+        p += 1 + ext
+        if hasSize == 0 {
+            return false
+        }
+        var len = 0
+        var shift = 0
+        var i = 0
+        while p < end && i < 8 {
+            let c = d[p]
+            p += 1
+            len |= (c & 0x7f) << shift
+            shift += 7
+            i += 1
+            if (c & 0x80) == 0 {
+                break
+            }
+        }
+        p += len
+    }
+    false
+}
+
+fn ivfGcd(_ a: Int, _ b: Int) -> Int {
+    var x = a
+    var y = b
+    while y != 0 {
+        let r = x % y
+        x = y
+        y = r
+    }
+    max(x, 1)
+}

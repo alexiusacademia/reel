@@ -1,0 +1,552 @@
+// Tests for the export module: Matroska and MP4 writers, lossless clip
+// planning and the GIF encoder. Written files are re-opened with demux and
+// their packets compared with the source's (payload md5 per track, times);
+// GIFs are decoded back with export.decodeGif. tests/export/check.sh then
+// checks the same files (left in build/scratch/export/out) with ffprobe and
+// ffmpeg as outside oracles.
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+import "../../core"
+import "../../demux"
+import "../../export"
+import "../../h264"
+import "../../testkit"
+
+let outDir = "build/scratch/export/out"
+
+struct Tally {
+    passed: Int = 0
+    total: Int = 0
+
+    fn check(_ ok: Bool, _ what: String) {
+        total += 1
+        if ok {
+            passed += 1
+        } else {
+            print("FAIL: {what}")
+        }
+    }
+}
+
+// md5 of a track's packet bytes, in stored order.
+fn trackMd5(_ file: Data, _ m: core.Media, _ track: Int) -> String {
+    var all = Data()
+    for p in m.packets {
+        if p.track == track {
+            all += core.packetBytes(file, m, p)
+        }
+    }
+    all.hash("md5").hex
+}
+
+fn planMd5(_ file: Data, _ plan: export.ClipPlan, _ track: Int, mp4: Bool) -> String {
+    var all = Data()
+    for p in plan.packets {
+        if p.track == track {
+            all += export.packetPayload(file, plan, p, mp4: mp4)
+        }
+    }
+    all.hash("md5").hex
+}
+
+fn ptsOf(_ m: core.Media, _ track: Int) -> [Float] {
+    var out: [Float] = []
+    let ts = Float(m.tracks[track].timescale)
+    for p in m.packets {
+        if p.track == track {
+            out.append(Float(p.pts) / ts)
+        }
+    }
+    out
+}
+
+fn planPts(_ plan: export.ClipPlan, _ track: Int) -> [Float] {
+    var out: [Float] = []
+    let ts = Float(plan.tracks[track].timescale)
+    for p in plan.packets {
+        if p.track == track {
+            out.append(Float(p.pts) / ts)
+        }
+    }
+    out
+}
+
+// Writes `plan` in both containers and checks every track comes back with
+// the same bytes and times. `shiftOk`: the Matroska writer may move all
+// times by one constant (it keeps them ≥ 0).
+fn roundTrip(_ t: bind Tally, _ label: String, _ file: Data, _ plan0: export.ClipPlan, mkv: Bool, mp4: Bool, ext: String = "mkv") {
+    for (kind, wanted) in [("mkv", mkv), ("mp4", mp4)] {
+        if !wanted {
+            continue
+        }
+        let isMp4 = kind == "mp4"
+        let plan = if isMp4 { plan0 } else { export.withoutEmptySubtitles(file, plan0) }
+        let outName = "{label}.{if isMp4 { "mp4" } else { ext }}"
+        let path = joinPath(outDir, outName)
+        let res = if isMp4 { export.writeMp4(file, plan, path: path) } else { export.writeMkv(file, plan, path: path) }
+        match res {
+            .ok(r) -> {
+                for w in r.warnings {
+                    print("note {outName}: {w}")
+                }
+                let back = readData(path) ?? Data()
+                t.check(back.count == r.bytes, "{outName}: {back.count} bytes on disk, {r.bytes} reported")
+                match demux.open(back, name: outName) {
+                    .ok(m) -> {
+                        t.check(m.tracks.count == plan.tracks.count, "{outName}: {m.tracks.count} tracks, want {plan.tracks.count}")
+                        for k in 0..min(m.tracks.count, plan.tracks.count) {
+                            let src = plan.tracks[k]
+                            let got = m.tracks[k]
+                            let codecOk = got.codec == src.codec || (isMp4 && src.kind == .subtitle && got.codec == "tx3g") || (!isMp4 && src.codec == "tx3g" && got.codec == "srt")
+                            t.check(codecOk, "{outName} track {k}: codec {got.codec}, want {src.codec}")
+                            t.check(trackMd5(back, m, k) == planMd5(file, plan, k, mp4: isMp4), "{outName} track {k} ({src.codec}): packet bytes differ")
+                            let a = ptsOf(m, k)
+                            let b = planPts(plan, k)
+                            t.check(a.count == b.count, "{outName} track {k}: {a.count} packets, want {b.count}")
+                            if a.count == b.count && a.count > 0 {
+                                let shift = if isMp4 { 0.0 } else { a[0] - b[0] }
+                                var worst = 0.0
+                                for i in 0..a.count {
+                                    worst = max(worst, abs(a[i] - b[i] - shift))
+                                }
+                                let tol = if isMp4 { 1.5 / Float(max(1, got.timescale)) + 0.0006 } else { 0.0011 }
+                                t.check(worst <= tol, "{outName} track {k}: times off by {worst} s")
+                                if src.kind == .video {
+                                    t.check(m.tracks[k].width == src.width && m.tracks[k].height == src.height, "{outName} track {k}: size {got.width}×{got.height}")
+                                }
+                                if src.kind == .audio {
+                                    t.check(got.channels == src.channels, "{outName} track {k}: {got.channels} channels, want {src.channels}")
+                                }
+                            }
+                        }
+                    }
+                    .failure(e) -> t.check(false, "{outName}: demux.open: {e.message}")
+                }
+            }
+            .failure(e) -> t.check(false, "{outName}: {e.message}")
+        }
+    }
+}
+
+fn openFixture(_ name: String) -> (Data, core.Media) {
+    let file = testkit.fixture(name)
+    (file, demux.open(file, name: name).valueOr(core.Media()))
+}
+
+fn main() {
+    var t = Tally()
+    createFolder("build/scratch/export")
+    createFolder(outDir)
+
+    // ---- Remuxes: every packet copied, both containers. ----
+    let remuxes = [
+        ("h264_main_bframes.mp4", "bframes"),
+        ("h264_high.mkv", "high"),
+        ("h264.ts", "ts"),
+        ("multi.mkv", "multi"),
+        ("vp9.webm", "vp9"),
+        ("hevc.mp4", "hevc"),
+        ("av1.mkv", "av1"),
+        ("subs_srt.mkv", "subsrt"),
+        ("subs_tx3g.mp4", "subtx3g"),
+        ("flac.flac", "flac"),
+        ("opus.opus", "opus"),
+        ("ac3.ac3", "ac3"),
+        ("eac3.eac3", "eac3"),
+        ("mp3_cbr.mp3", "mp3"),
+        ("aac_mono.aac", "adts"),
+        ("alac.m4a", "alac"),
+        ("he_aac.m4a", "heaac"),
+    ]
+    for (name, label) in remuxes {
+        let (file, media) = openFixture(name)
+        t.check(!media.packets.isEmpty, "{name} opens")
+        let plan = export.planAll(media)
+        let ext = if label == "vp9" || label == "opus" { "webm" } else { "mkv" }
+        roundTrip(t, label, file, plan, mkv: true, mp4: true, ext: ext)
+    }
+    // Matroska-only codecs.
+    for (name, label) in [("subs_ass.mkv", "subass"), ("vorbis.ogg", "vorbis"), ("mpeg4.avi", "mpeg4"), ("pcm_s16.wav", "pcm"), ("mjpeg.avi", "mjpeg"), ("mpeg2.ts", "mpeg2ts")] {
+        let (file, media) = openFixture(name)
+        roundTrip(t, label, file, export.planAll(media), mkv: true, mp4: false)
+    }
+
+    // ---- Avc/hvc setup built from an Annex B stream. ----
+    let (tsFile, tsMedia) = openFixture("h264.ts")
+    let tsPlan = export.planAll(tsMedia)
+    if let mkvBack = readData(joinPath(outDir, "ts.mkv")) {
+        let m = demux.open(mkvBack, name: "ts.mkv").valueOr(core.Media())
+        if !m.tracks.isEmpty {
+            let x = m.tracks[0].extra
+            t.check(x.count > 10 && x[0] == 1 && x[4] == 0xFF, "ts.mkv: avcC built ({x.count} bytes)")
+            // Decodes like the source.
+            var a: [String] = []
+            var b: [String] = []
+            match h264.newDecoder(m.tracks[0]) {
+                .ok(d0) -> {
+                    var d = d0
+                    for p in m.packets {
+                        if p.track == 0 {
+                            for pic in d.decode(core.packetBytes(mkvBack, m, p), pts: p.pts, dts: p.dts, key: p.key) {
+                                a.append(testkit.pictureMd5(pic))
+                            }
+                        }
+                    }
+                    for pic in d.flush() {
+                        a.append(testkit.pictureMd5(pic))
+                    }
+                }
+                .failure(e) -> print("h264: {e.message}")
+            }
+            match h264.newDecoder(tsMedia.tracks[0]) {
+                .ok(d0) -> {
+                    var d = d0
+                    for p in tsMedia.packets {
+                        if p.track == 0 {
+                            for pic in d.decode(core.packetBytes(tsFile, tsMedia, p), pts: p.pts, dts: p.dts, key: p.key) {
+                                b.append(testkit.pictureMd5(pic))
+                            }
+                        }
+                    }
+                    for pic in d.flush() {
+                        b.append(testkit.pictureMd5(pic))
+                    }
+                }
+                .failure(e) -> print("h264: {e.message}")
+            }
+            t.check(!a.isEmpty && a == b, "ts.mkv decodes to the same {b.count} pictures as h264.ts ({a.count})")
+        }
+    }
+    t.check(tsPlan.tracks.count == 2, "h264.ts: two tracks")
+
+    // ---- Clips. ----
+    let (bf, bfMedia) = openFixture("h264_main_bframes.mp4")
+    // Keyframe start: 1.5 s falls in the GOP that starts at 1.32 s.
+    match export.planClip(bfMedia, from: 1.5, to: 1.9) {
+        .ok(plan) -> {
+            t.check(abs(plan.origin - 1.32) < 0.001, "clip origin {plan.origin}, want 1.32")
+            let v = plan.packets.filter { p in p.track == 0 }
+            t.check(!v.isEmpty && v[0].key && v[0].pts == 0, "clip starts with the keyframe at 0")
+            var minPts = 1 << 40
+            var maxPts = -1
+            for p in v {
+                minPts = min(minPts, p.pts)
+                maxPts = max(maxPts, p.pts)
+            }
+            t.check(minPts == 0, "clip: no picture before the keyframe ({minPts})")
+            t.check(Float(maxPts) / 12800.0 >= 0.54 && Float(maxPts) / 12800.0 < 0.7, "clip: last picture at {Float(maxPts) / 12800.0} s")
+            let a = plan.packets.filter { p in p.track == 1 }
+            t.check(!a.isEmpty && Float(a[0].pts) / 48000.0 > -0.03 && a[0].pts <= 0, "clip: audio starts at {Float(a[0].pts) / 48000.0}")
+            t.check(abs(plan.duration - 0.58) < 0.01, "clip duration {plan.duration}")
+            roundTrip(t, "clip_key", bf, plan, mkv: true, mp4: true)
+        }
+        .failure(e) -> t.check(false, "planClip: {e.message}")
+    }
+    // Exact start: 1.5 s is 0; pictures from 1.32 s are decoded first.
+    match export.planClip(bfMedia, from: 1.5, to: 1.9, exactStart: true) {
+        .ok(plan) -> {
+            t.check(abs(plan.origin - 1.5) < 0.0001 && plan.exactStart, "exact clip origin {plan.origin}")
+            let v = plan.packets.filter { p in p.track == 0 }
+            t.check(!v.isEmpty && v[0].key && abs(Float(v[0].pts) / 12800.0 + 0.18) < 0.001, "exact clip: keyframe at {Float(v[0].pts) / 12800.0}")
+            t.check(abs(plan.duration - 0.4) < 0.01, "exact clip duration {plan.duration}")
+            let path = joinPath(outDir, "clip_exact.mp4")
+            match export.writeMp4(bf, plan, path: path) {
+                .ok(_) -> {
+                    let back = readData(path) ?? Data()
+                    let m = demux.open(back, name: "clip_exact.mp4").valueOr(core.Media())
+                    // The demuxer applies the edit list: hidden pictures
+                    // come back before 0, the one at 1.52 s at 0.02.
+                    let pts = ptsOf(m, 0).sorted()
+                    var shown = 0
+                    for x in pts {
+                        if x >= -0.0001 && x < 0.4 {
+                            shown += 1
+                        }
+                    }
+                    t.check(!pts.isEmpty && abs(pts[0] + 0.18) < 0.001 && shown == 10, "clip_exact.mp4: first pts {if pts.isEmpty { 0.0 } else { pts[0] }}, {shown} shown in 0.4 s")
+                    t.check(m.duration > 0.39 && m.duration < 0.52, "clip_exact.mp4 duration {m.duration}")
+                }
+                .failure(e) -> t.check(false, "clip_exact.mp4: {e.message}")
+            }
+            match export.writeMkv(bf, plan, path: joinPath(outDir, "clip_exact.mkv")) {
+                .ok(r) -> {
+                    let back = readData(joinPath(outDir, "clip_exact.mkv")) ?? Data()
+                    let m = demux.open(back, name: "clip_exact.mkv").valueOr(core.Media())
+                    let pts = ptsOf(m, 0).sorted()
+                    t.check(!pts.isEmpty && abs(pts[0] + 0.18) < 0.002, "clip_exact.mkv keeps negative times ({if pts.isEmpty { 0.0 } else { pts[0] }})")
+                    t.check(r.bytes == back.count, "clip_exact.mkv size")
+                }
+                .failure(e) -> t.check(false, "clip_exact.mkv: {e.message}")
+            }
+        }
+        .failure(e) -> t.check(false, "planClip exact: {e.message}")
+    }
+    // A clip with chapters, one track chosen, written to memory.
+    let (mm, mmMedia) = openFixture("multi.mkv")
+    t.check(mmMedia.chapters.count == 2, "multi.mkv has 2 chapters")
+    match export.planClip(mmMedia, tracks: [0, 2], from: 0.5, to: 1.8) {
+        .ok(plan) -> {
+            t.check(plan.tracks.count == 2 && plan.tracks[1].codec == "opus", "clip of chosen tracks")
+            t.check(!plan.chapters.isEmpty && plan.chapters[0].start == 0.0, "clip chapters rebased ({plan.chapters.count})")
+            for c in plan.chapters {
+                t.check(c.end <= plan.duration + 0.001 && c.start >= 0.0, "chapter '{c.title}' {c.start}–{c.end} inside the clip")
+            }
+            match export.writeMkv(mm, plan) {
+                .ok(r) -> {
+                    t.check(r.data.count == r.bytes && r.bytes > 0, "in-memory Matroska")
+                    let m = demux.open(r.data, name: "x.mkv").valueOr(core.Media())
+                    t.check(m.chapters.count == plan.chapters.count, "Matroska chapters come back ({m.chapters.count})")
+                    t.check(m.tracks.count == 2 && m.tracks[1].codec == "opus" && m.tracks[1].extra == plan.tracks[1].extra, "OpusHead kept")
+                }
+                .failure(e) -> t.check(false, "in-memory mkv: {e.message}")
+            }
+            match export.writeMp4(mm, plan) {
+                .ok(r) -> {
+                    let m = demux.open(r.data, name: "x.mp4").valueOr(core.Media())
+                    t.check(m.chapters.count == plan.chapters.count, "MP4 chapters come back ({m.chapters.count})")
+                    t.check(m.tracks.count == 2 && m.tracks[1].extra == plan.tracks[1].extra, "OpusHead → dOps → OpusHead")
+                }
+                .failure(e) -> t.check(false, "in-memory mp4: {e.message}")
+            }
+        }
+        .failure(e) -> t.check(false, "planClip multi: {e.message}")
+    }
+    // Subtitles cut to the range.
+    let (ss, ssMedia) = openFixture("subs_srt.mkv")
+    match export.planClip(ssMedia, from: 1.0, to: 3.0) {
+        .ok(plan) -> {
+            let subs = plan.packets.filter { p in p.track == 1 }
+            var inside = true
+            for p in subs {
+                let s = Float(p.pts) / Float(plan.tracks[1].timescale) + plan.origin
+                let e = s + Float(p.duration) / Float(plan.tracks[1].timescale)
+                if s < plan.origin - 0.001 || e > 3.0 + 0.001 {
+                    inside = false
+                }
+            }
+            t.check(!subs.isEmpty && inside, "subtitles inside the clip ({subs.count})")
+            roundTrip(t, "clip_subs", ss, plan, mkv: true, mp4: true)
+        }
+        .failure(e) -> t.check(false, "planClip subs: {e.message}")
+    }
+    t.check(export.planClip(bfMedia, from: 2.0, to: 1.0).error() != nil, "an empty range is refused")
+    // Audio-only clip.
+    let (fl, flMedia) = openFixture("flac.flac")
+    match export.planClip(flMedia, from: 0.5, to: 1.0) {
+        .ok(plan) -> {
+            let first = Float(plan.packets[0].pts) / Float(plan.tracks[0].timescale)
+            t.check(first <= 0.0 && first > -0.2, "audio clip starts at {first}")
+            roundTrip(t, "clip_flac", fl, plan, mkv: true, mp4: true)
+        }
+        .failure(e) -> t.check(false, "flac clip: {e.message}")
+    }
+
+    // ---- Tags, cover art, attachments. ----
+    let (cv, cvMedia) = openFixture("cover.m4a")
+    var cvPlan = export.planAll(cvMedia)
+    cvPlan.attachments.append(core.Attachment(name: "font.ttf", mime: "font/ttf", data: Data(text: "not really a font")))
+    cvPlan.tags["title"] = "Reel test"
+    for ext in ["mkv", "mp4"] {
+        let r = if ext == "mkv" { export.writeMkv(cv, cvPlan) } else { export.writeMp4(cv, cvPlan) }
+        let m = demux.open(r.valueOr(export.WriteResult()).data, name: "x.{ext}").valueOr(core.Media())
+        t.check(!cvMedia.cover.isEmpty && m.cover == cvMedia.cover, "cover art kept in {ext}")
+        t.check(m.tags["title"] == "Reel test", "title tag in {ext}: {m.tags["title"] ?? "none"}")
+        if ext == "mkv" {
+            t.check(m.attachments.count == 2 && m.attachments[0].name == "font.ttf" && m.attachments[0].data == Data(text: "not really a font"), "attachments in mkv ({m.attachments.count})")
+        }
+    }
+
+    // ---- Speed: a long synthetic plan (the same packets over and over). ----
+    var big = export.planAll(bfMedia)
+    var many: [core.PacketRef] = []
+    let ts0 = 12800
+    for rep in 0..60 {
+        for p in big.packets {
+            var q = p
+            let shift = if q.track == 0 { rep * 2 * ts0 } else { rep * 2 * 48000 }
+            q.pts += shift
+            q.dts += shift
+            many.append(q)
+        }
+    }
+    big.packets = many
+    big.duration = 120.0
+    let s1 = now()
+    let bigMkv = export.writeMkv(bf, big, path: joinPath(outDir, "big.mkv"))
+    let s2 = now()
+    let bigMp4 = export.writeMp4(bf, big, path: joinPath(outDir, "big.mp4"))
+    let s3 = now()
+    t.check(bigMkv.isOk() && bigMp4.isOk(), "2-minute outputs written")
+    print("time write 2 min (8.7k packets, 19 MB) mkv: {Int((s2 - s1) * 1000.0)} ms")
+    print("time write 2 min (8.7k packets, 19 MB) mp4: {Int((s3 - s2) * 1000.0)} ms")
+    let bm = demux.open(readData(joinPath(outDir, "big.mp4")) ?? Data(), name: "big.mp4").valueOr(core.Media())
+    t.check(bm.packets.count == many.count, "big.mp4: {bm.packets.count} packets")
+
+    // ---- GIF ----
+    gifTests(t)
+    print("export: {t.passed} of {t.total} passed")
+}
+
+fn gifTests(_ t: bind Tally) {
+    // Flat graphics (≤ 256 colours) come back exactly, through palette per
+    // frame, change rectangles and LZW table resets.
+    let w = 120
+    let h = 90
+    var frames: [[Int]] = []
+    for f in 0..4 {
+        var px: [Int] = []
+        for y in 0..h {
+            for x in 0..w {
+                let cell = ((x + f * 7) / 10) + (y / 10) * 13
+                let r = (cell * 37) & 255
+                let g = (cell * 91 + f * 40) & 255
+                let b = (cell * 53) & 255
+                // A moving square.
+                let inSq = x >= 10 + f * 20 && x < 30 + f * 20 && y >= 30 && y < 50
+                px.append(if inSq { 0xFF0000FF } else { (r << 24) | (g << 16) | (b << 8) | 255 })
+            }
+        }
+        frames.append(px)
+    }
+    let gif = export.encodeGif(frames, width: w, height: h, delays: [0.1, 0.2, 0.05, 0.5])
+    // The frames as raw RGBA, for check.sh to compare with ffmpeg's decoding.
+    var raw: [Int] = []
+    for f in frames {
+        for v in f {
+            raw.append((v >> 24) & 255)
+            raw.append((v >> 16) & 255)
+            raw.append((v >> 8) & 255)
+            raw.append(v & 255)
+        }
+    }
+    writeData(path: joinPath(outDir, "flat.rgba"), data: Data(bytes: raw))
+    writeData(path: joinPath(outDir, "flat.gif"), data: gif)
+    match export.decodeGif(gif) {
+        .ok(img) -> {
+            t.check(img.width == w && img.height == h && img.frames.count == 4, "flat.gif: {img.frames.count} frames {img.width}×{img.height}")
+            var same = img.frames.count == 4
+            for f in 0..min(4, img.frames.count) {
+                if img.frames[f] != frames[f] {
+                    same = false
+                    var bad = 0
+                    for i in 0..(w * h) {
+                        if img.frames[f][i] != frames[f][i] {
+                            bad += 1
+                        }
+                    }
+                    print("flat.gif frame {f}: {bad} pixels differ")
+                }
+            }
+            t.check(same, "flat.gif decodes to the same pixels")
+            t.check(img.delays == [0.1, 0.2, 0.05, 0.5], "flat.gif delays {img.delays}")
+            t.check(img.loop == 0, "flat.gif loops forever")
+        }
+        .failure(e) -> t.check(false, "flat.gif: {e.message}")
+    }
+    // Noise with 256 colours: long LZW runs with several table clears.
+    var noise: [Int] = []
+    var seed = 12345
+    for _ in 0..(256 * 256) {
+        seed = (seed * 1103515245 + 12345) % 2147483648
+        let c = (seed >> 16) & 255
+        noise.append(((c * 3 & 255) << 24) | ((c * 7 & 255) << 16) | (c << 8) | 255)
+    }
+    let ng = export.encodeGif([noise], width: 256, height: 256, delays: [1.0], options: export.GifOptions(loop: -1))
+    writeData(path: joinPath(outDir, "noise.gif"), data: ng)
+    let nd = export.decodeGif(ng).valueOr(export.GifImage())
+    t.check(nd.frames.count == 1 && nd.frames[0] == noise && nd.loop == -1, "noise.gif decodes exactly ({ng.count} bytes)")
+    // A smooth picture (thousands of colours): median cut, with and
+    // without dithering.
+    let gw = 320
+    let gh = 180
+    var smooth: [Int] = []
+    for y in 0..gh {
+        for x in 0..gw {
+            let r = x * 255 / (gw - 1)
+            let g = y * 255 / (gh - 1)
+            let b = ((x + y) * 3) & 255
+            smooth.append((r << 24) | (g << 16) | (b << 8) | 255)
+        }
+    }
+    for dither in [false, true] {
+        let st = now()
+        let d = export.encodeGif([smooth, smooth], width: gw, height: gh, delays: [0.5, 0.25], options: export.GifOptions(dither: dither))
+        let ms = (now() - st) * 1000.0
+        print("time gif 320×180 {if dither { "dithered" } else { "plain" }} (2 frames): {Int(ms)} ms")
+        let label = if dither { "smooth_dither.gif" } else { "smooth.gif" }
+        writeData(path: joinPath(outDir, label), data: d)
+        let img = export.decodeGif(d).valueOr(export.GifImage())
+        // The unchanged second frame only lengthens the first.
+        t.check(img.frames.count == 1 && img.delays == [0.75], "{label}: one frame of 0.75 s ({img.frames.count}, {img.delays})")
+        if img.frames.count >= 1 {
+            var se = 0.0
+            for i in 0..(gw * gh) {
+                let a = smooth[i]
+                let b = img.frames[0][i]
+                for sh in [24, 16, 8] {
+                    let e = Float(((a >> sh) & 255) - ((b >> sh) & 255))
+                    se += e * e
+                }
+            }
+            let mse = se / Float(gw * gh * 3)
+            let p = 10.0 * log10(255.0 * 255.0 / max(mse, 0.0001))
+            print("{label}: PSNR {Int(p * 10.0 + 0.5) / 10}.{Int(p * 10.0 + 0.5) % 10} dB")
+            t.check(p > (if dither { 24.0 } else { 27.0 }), "{label}: PSNR {p} dB")
+        }
+    }
+    // Video frames → GIF: the first second of h264_baseline.mp4, decoded,
+    // halved and converted (BT.601 video range) here, then encoded.
+    let file = testkit.fixture("h264_baseline.mp4")
+    let media = demux.open(file, name: "h264_baseline.mp4").valueOr(core.Media())
+    var pics: [core.Picture] = []
+    match h264.newDecoder(media.tracks[0]) {
+        .ok(d0) -> {
+            var d = d0
+            for p in media.packets {
+                if p.track == 0 && pics.count < 25 {
+                    pics.appendAll(d.decode(core.packetBytes(file, media, p), pts: p.pts, dts: p.dts, key: p.key))
+                }
+            }
+        }
+        .failure(e) -> print("h264: {e.message}")
+    }
+    var enc = export.newGifEncoder(width: 160, height: 120, options: export.GifOptions(dither: true))
+    var gifData = Data()
+    let st = now()
+    for pic in pics {
+        enc.addFrame(rgbaHalf(pic), delay: 0.04)
+        gifData += enc.takeData()
+    }
+    gifData += enc.finish()
+    let ms = (now() - st) * 1000.0
+    print("time gif from video 160×120 dithered, per frame: {Int(ms / Float(max(1, pics.count)))} ms")
+    writeData(path: joinPath(outDir, "video.gif"), data: gifData)
+    let vd = export.decodeGif(gifData).valueOr(export.GifImage())
+    t.check(pics.count >= 25 && vd.frames.count == pics.count, "video.gif: {vd.frames.count} frames")
+    var total = 0.0
+    for x in vd.delays {
+        total += x
+    }
+    t.check(abs(total - Float(pics.count) * 0.04) < 0.011, "video.gif plays {total} s")
+}
+
+// A picture at half size as RGBA (BT.601, video range), for the GIF test.
+fn rgbaHalf(_ p: core.Picture) -> [Int] {
+    var out: [Int] = []
+    let w = p.width / 2
+    let h = p.height / 2
+    for y in 0..h {
+        for x in 0..w {
+            let yy = p.luma(2 * x, 2 * y) - 16
+            let cb = p.cb(x, y) - 128
+            let cr = p.cr(x, y) - 128
+            let r = max(0, min(255, (298 * yy + 409 * cr + 128) >> 8))
+            let g = max(0, min(255, (298 * yy - 100 * cb - 208 * cr + 128) >> 8))
+            let b = max(0, min(255, (298 * yy + 516 * cb + 128) >> 8))
+            out.append((r << 24) | (g << 16) | (b << 8) | 255)
+        }
+    }
+    out
+}

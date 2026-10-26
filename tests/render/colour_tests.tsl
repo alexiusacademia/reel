@@ -1,0 +1,148 @@
+// The render test's colour checks: against ffmpeg and against the exact
+// formulas, and known colours.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../../render"
+import "../../core"
+
+struct ColourCase {
+    name: String
+    pic: core.Picture
+}
+
+fn colourTests(_ t: bind Tally, _ full: core.Picture, _ mj: core.Picture) {
+    // Same size, against ffmpeg (make_refs.sh).
+    var base = cropOf(full)
+    base.matrix = .bt601
+    var cases: [ColourCase] = []
+    cases.append(ColourCase(name: "m2_601_tv", pic: base))
+    var c709 = base
+    c709.matrix = .bt709
+    cases.append(ColourCase(name: "m2_709_tv", pic: c709))
+    var c709pc = c709
+    c709pc.fullRange = true
+    cases.append(ColourCase(name: "m2_709_pc", pic: c709pc))
+    var c2020 = base
+    c2020.matrix = .bt2020
+    cases.append(ColourCase(name: "m2_2020_tv", pic: c2020))
+    var mjc = cropOf(mj)
+    mjc.matrix = .bt601
+    mjc.fullRange = true
+    cases.append(ColourCase(name: "mj422_601_pc", pic: mjc))
+    // 10-bit: sample·4 + (x + y) % 4 (as make_refs.sh makes it).
+    var ten = full
+    ten.depth = 10
+    for y in 0..240 {
+        for x in 0..320 {
+            ten.y[y * 320 + x] = full.y[y * 320 + x] * 4 + (x + y) % 4
+        }
+    }
+    for y in 0..120 {
+        for x in 0..160 {
+            ten.u[y * 160 + x] = full.u[y * 160 + x] * 4 + (x + y) % 4
+            ten.v[y * 160 + x] = full.v[y * 160 + x] * 4 + (x + y) % 4
+        }
+    }
+    var ten709 = cropOf(ten)
+    ten709.matrix = .bt709
+    cases.append(ColourCase(name: "m2_709_tv_10bit", pic: ten709))
+    // 4:4:4: chroma repeated 2×2.
+    var p444 = core.Picture(width: 320, height: 240, chroma: .yuv444)
+    p444.yStride = 320
+    p444.cStride = 320
+    p444.y = full.y
+    for y in 0..240 {
+        for x in 0..320 {
+            p444.u.append(full.u[(y / 2) * 160 + x / 2])
+            p444.v.append(full.v[(y / 2) * 160 + x / 2])
+        }
+    }
+    var c444 = cropOf(p444)
+    c444.matrix = .bt601
+    cases.append(ColourCase(name: "m2_444_601_tv", pic: c444))
+    var renderer = render.newRenderer()
+    for cs in cases {
+        let px = renderer.toRgba(cs.pic, width: 160, height: 120)
+        let (worst, mean) = compareRgb(px, loadRgb(cs.name))
+        print("colour {cs.name} vs ffmpeg: max {worst}, mean {f2(mean)}")
+        t.check(worst <= 2, "{cs.name}: max difference from ffmpeg {worst} (≤ 2)")
+        t.check(render.toRgba(cs.pic, width: 160, height: 120) == px, "{cs.name}: toRgba same as a Renderer's")
+    }
+
+    // Against the exact formulas: every matrix and range, odd sizes and
+    // offsets, 4:2:2, gray, 12-bit.
+    var odd = full
+    odd.width = 157
+    odd.height = 117
+    odd.yOffset = 33 * 320 + 51
+    odd.cOffset = 17 * 160 + 25
+    let mats: [(core.ColorMatrix, Float, Float)] = [(.bt601, 0.299, 0.114), (.bt709, 0.2126, 0.0722), (.bt2020, 0.2627, 0.0593)]
+    var worstExact = 0
+    for (m, kr, kb) in mats {
+        for fr in [false, true] {
+            var p = odd
+            p.matrix = m
+            p.fullRange = fr
+            let e = exactError(p, render.toRgba(p, width: p.width, height: p.height), kr: kr, kb: kb)
+            worstExact = max(worstExact, e)
+            t.check(e <= 1, "exact {m} full={fr} 157×117: max error {e} (≤ 1)")
+        }
+    }
+    var odd422 = mj
+    odd422.width = 159
+    odd422.height = 99
+    odd422.yOffset = 7 * 320 + 3
+    odd422.cOffset = 7 * 160 + 1
+    odd422.matrix = .bt709
+    let e422 = exactError(odd422, render.toRgba(odd422, width: 159, height: 99), kr: 0.2126, kb: 0.0722)
+    t.check(e422 <= 1, "exact 4:2:2 odd size: max error {e422}")
+    var gray = full
+    gray.chroma = .gray
+    gray.u = []
+    gray.v = []
+    gray.matrix = .bt601
+    let eg = exactError(gray, render.toRgba(gray, width: 320, height: 240), kr: 0.299, kb: 0.114)
+    t.check(eg <= 1, "exact gray: max error {eg}")
+    var twelve = mj
+    twelve.depth = 12
+    for i in 0..twelve.y.count {
+        twelve.y[i] = twelve.y[i] * 16 + i % 16
+    }
+    for i in 0..twelve.u.count {
+        twelve.u[i] = twelve.u[i] * 16 + (i * 7) % 16
+        twelve.v[i] = twelve.v[i] * 16 + (i * 3) % 16
+    }
+    twelve.matrix = .bt2020
+    let e12 = exactError(twelve, render.toRgba(twelve, width: 320, height: 240), kr: 0.2627, kb: 0.0593)
+    t.check(e12 <= 1, "exact 12-bit 4:2:2 BT.2020: max error {e12}")
+    var twelveFull = twelve
+    twelveFull.fullRange = true
+    let e12f = exactError(twelveFull, render.toRgba(twelveFull, width: 320, height: 240), kr: 0.2627, kb: 0.0593)
+    t.check(e12f <= 1, "exact 12-bit full range: max error {e12f}")
+    var unknown = odd
+    unknown.matrix = .unknown
+    t.check(exactError(unknown, render.toRgba(unknown, width: unknown.width, height: unknown.height), kr: 0.299, kb: 0.114) <= 1, "unknown matrix at SD is BT.601")
+    print("colour vs exact formulas: max {max(worstExact, e422, eg, e12, e12f)}")
+
+    // Known colours: white, black, and BT.601/709 primaries (video range).
+    t.check(flatPixel(235, 128, 128, .bt709) == 0xffffffff, "white is 255, 255, 255")
+    t.check(flatPixel(16, 128, 128, .bt709) == 0x000000ff, "black is 0, 0, 0")
+    t.check(flatPixel(0, 128, 128, .bt709) == 0x000000ff && flatPixel(255, 128, 128, .bt709) == 0xffffffff, "below black and above white clamp")
+    t.check(near(flatPixel(81, 90, 240, .bt601), 255, 0, 0), "BT.601 red")
+    t.check(near(flatPixel(145, 54, 34, .bt601), 0, 255, 0), "BT.601 green")
+    t.check(near(flatPixel(41, 240, 110, .bt601), 0, 0, 255), "BT.601 blue")
+    t.check(near(flatPixel(63, 102, 240, .bt709), 255, 0, 0), "BT.709 red")
+    t.check(near(flatPixel(173, 42, 26, .bt709), 0, 255, 0), "BT.709 green")
+    t.check(near(flatPixel(32, 240, 118, .bt709), 0, 0, 255), "BT.709 blue")
+    t.check(near(flatPixel(180, 128, 128, .bt709), 191, 191, 191), "BT.709 75 % gray")
+    t.check(render.toRgba(base, width: 0, height: 10).isEmpty, "zero size gives no pixels")
+    var broken = base
+    broken.y = [1, 2, 3]
+    let bk = render.toRgba(broken, width: 20, height: 10)
+    t.check(bk.count == 200 && bk.all(where: { v in v == 255 }), "a picture with too small planes gives black, not a crash")
+    var brokenChroma = base
+    brokenChroma.v = []
+    t.check(!render.planesFit(brokenChroma) && render.toRgba(brokenChroma, width: 8, height: 8).count == 64, "missing chroma plane")
+}

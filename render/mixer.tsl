@@ -1,0 +1,402 @@
+// The audio mixer of the render module: turns any decoder's output into
+// the channel count and rate the sound device is fed with.
+//
+// 1. Channel mixing by layout name (core/samples.tsl). Channels the output
+//    also has are passed through. Others fold into stereo with the ITU-R
+//    BS.775 downmix coefficients: centre −3 dB into both sides, surround
+//    and back channels −3 dB into their side, back centre −6 dB into both,
+//    LFE dropped (as BS.775 says it may be). Mono is copied to both sides
+//    at full level. A mono output gets the mean of the stereo mix.
+// 2. Resampling by a windowed-sinc polyphase filter: for output sample m,
+//    at input time t = m·M/L (L/M = output rate / input rate in lowest
+//    terms), y = Σ x[k]·h(t − k) over the 2Z input samples around t, where
+//    h is sinc low-pass at 95 % of the lower Nyquist frequency, Kaiser-
+//    windowed (β = 10, about 100 dB stop band), tabulated for the L
+//    phases (j/L for j < L) so each output costs 2Z multiply-adds. The
+//    filter is centred, so there is no delay: an output is made once the
+//    input Z samples past its time has arrived (flush gives the rest).
+// 3. A soft clip: past ±0.9 the signal bends smoothly towards ±1, so a
+//    downmix that adds up to more than full scale doesn't wrap or click.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../core"
+
+// Taps on each side of the filter's centre, in samples of the lower rate.
+let resampleHalfTaps = 64
+// Pass band edge as a fraction of the lower Nyquist frequency: the filter's
+// −6 dB point; the transition runs from 90 % to 100 %.
+let resampleCutoff = 0.95
+let resampleBeta = 10.0
+// Rate ratios whose terms are larger than this are approximated.
+let resampleMaxPhases = 4096
+
+// How much each named channel gives to the left and right of a stereo
+// downmix.
+fn stereoShare(_ name: String, _ index: Int) -> (Float, Float) {
+    let h = 0.7071067811865476
+    match name {
+        "FL" -> (1.0, 0.0)
+        "FR" -> (0.0, 1.0)
+        "FC" -> (h, h)
+        "LFE" -> (0.0, 0.0)
+        "BL", "SL", "TFL" -> (h, 0.0)
+        "BR", "SR", "TFR" -> (0.0, h)
+        "FLC" -> (1.0, 0.0)
+        "FRC" -> (0.0, 1.0)
+        "BC", "TC", "TFC", "TBC" -> (0.5, 0.5)
+        "TBL" -> (0.5, 0.0)
+        "TBR" -> (0.0, 0.5)
+        _ -> if index % 2 == 0 { (h, 0.0) } else { (0.0, h) }
+    }
+}
+
+// The mixing matrix out × in (row-major) from one layout to another.
+public fn mixMatrix(from: [String], to: [String]) -> [Float] {
+    var m: [Float] = []
+    let nIn = from.count
+    let nOut = to.count
+    for _ in 0..(nIn * nOut) {
+        m.append(0.0)
+    }
+    if nIn == 1 {
+        // Mono: the same signal on every front output (or the only one).
+        for o in 0..nOut {
+            let name = to[o]
+            if nOut == 1 || name == "FL" || name == "FR" || name == "FC" && !to.contains("FL") {
+                m[o * nIn] = 1.0
+            }
+        }
+        return m
+    }
+    let li = to.index(of: "FL")
+    let ri = to.index(of: "FR")
+    for i in 0..nIn {
+        let name = from[i]
+        if let o = to.index(of: name) {
+            if nOut > 1 || name == "FC" {
+                m[o * nIn + i] = 1.0
+                continue
+            }
+        }
+        let (l, r) = stereoShare(name, i)
+        if li != nil && ri != nil {
+            let lo = li ?? 0
+            let ro = ri ?? 1
+            m[lo * nIn + i] += l
+            m[ro * nIn + i] += r
+        } else if nOut == 1 {
+            m[i] += (l + r) * 0.5
+        } else {
+            // An output without FL/FR: put left on the first, right on
+            // the second.
+            m[i] += l
+            if nOut > 1 {
+                m[nIn + i] += r
+            }
+        }
+    }
+    m
+}
+
+fn gcd(_ a: Int, _ b: Int) -> Int {
+    var x = abs(a)
+    var y = abs(b)
+    while y != 0 {
+        let t = x % y
+        x = y
+        y = t
+    }
+    x
+}
+
+// The zeroth-order modified Bessel function of the first kind (the series
+// Σ ((x/2)^k / k!)²), for the Kaiser window.
+fn besselI0(_ x: Float) -> Float {
+    var sum = 1.0
+    var term = 1.0
+    let q = x * x / 4.0
+    var k = 1.0
+    while k < 60.0 {
+        term = term * q / (k * k)
+        sum += term
+        if term < sum * 1e-17 {
+            break
+        }
+        k += 1.0
+    }
+    sum
+}
+
+// The soft clip: identity up to ±0.9, then a tanh knee that never reaches
+// ±1 (slope 1 at the joint, so no corner).
+public fn softClip(_ x: Float) -> Float {
+    let a = abs(x)
+    if a <= 0.9 {
+        return x
+    }
+    let e = exp(-2.0 * (a - 0.9) / 0.1)
+    // (Capped just under 1: tanh rounds to 1 in floating point far out.)
+    let v = min(0.9 + 0.1 * (1.0 - e) / (1.0 + e), 0.99997)
+    if x < 0.0 { -v } else { v }
+}
+
+// Streaming channel mixer and resampler. Feed it every block in order;
+// it keeps the filter's history between blocks.
+public struct Mixer {
+    channels: Int
+    rate: Int
+    // The input setup the state is made for.
+    inRate: Int = 0
+    inChannels: Int = 0
+    inLayout: [String] = []
+    matrix: [Float] = []
+    passThrough: Bool = false
+    // Resampler: L/M, taps per phase (2Z), coefficients phase-major.
+    up: Int = 1
+    down: Int = 1
+    taps: Int = 0
+    half: Int = 0
+    coeffs: [Float] = []
+    // Mixed input not yet used, interleaved at the output channel count;
+    // bufStart is the input frame index of its first frame.
+    buf: [Float] = []
+    bufStart: Int = 0
+    // The next output's input time: frame n0 plus phase/up.
+    n0: Int = 0
+    phase: Int = 0
+    // Input frames received and outputs made since the setup.
+    received: Int = 0
+    made: Int = 0
+    lastPts: Int = -9223372036854775807
+    // The output channel names.
+    layout: [String] = []
+
+    // Input frames received but not yet in the output (the resampler's
+    // look-ahead, about 1.5 ms; 0 when the rates are the same).
+    latency: Int {
+        if inRate == 0 || inRate == rate {
+            return 0
+        }
+        max(0, received - n0)
+    }
+
+    // The block mixed to `channels` and resampled to `rate`. The output's
+    // pts is the block's (the look-ahead shifts it by `latency`).
+    fn process(_ s: core.Samples) -> core.Samples {
+        if s.channels <= 0 || s.rate <= 0 {
+            return core.Samples(rate: rate, channels: channels, layout: layout)
+        }
+        let lay = if s.layout.count == s.channels { s.layout } else { core.defaultLayout(s.channels) }
+        if s.rate != inRate || s.channels != inChannels || lay != inLayout {
+            setup(s.rate, s.channels, lay)
+        }
+        lastPts = s.pts
+        let mixed = mix(s)
+        var out = core.Samples(rate: rate, channels: channels, layout: layout, pts: s.pts)
+        if inRate == rate {
+            out.data = clipAll(mixed)
+            return out
+        }
+        buf.appendAll(mixed)
+        received += mixed.count / channels
+        out.data = resample(false)
+        out
+    }
+
+    // The outputs still held back for the filter's look-ahead (at the end
+    // of a stream).
+    fn flush() -> core.Samples {
+        var out = core.Samples(rate: rate, channels: channels, layout: layout)
+        if inRate == 0 || inRate == rate {
+            return out
+        }
+        out.data = resample(true)
+        out
+    }
+
+    // Forgets the history (after a seek).
+    fn reset() {
+        inRate = 0
+        inChannels = 0
+        inLayout = []
+    }
+
+    fn setup(_ r: Int, _ c: Int, _ lay: [String]) {
+        inRate = r
+        inChannels = c
+        inLayout = lay
+        layout = core.defaultLayout(channels)
+        matrix = mixMatrix(from: lay, to: layout)
+        passThrough = lay == layout
+        if r != rate {
+            designFilter(r)
+        }
+        buf = []
+        // Z zero frames of history before the first input.
+        for _ in 0..(half * channels) {
+            buf.append(0.0)
+        }
+        bufStart = -half
+        n0 = 0
+        phase = 0
+        received = 0
+        made = 0
+    }
+
+    // Tabulates the polyphase filter for inputs at rate r.
+    fn designFilter(_ r: Int) {
+        let g = gcd(rate, r)
+        up = rate / g
+        down = r / g
+        if up > resampleMaxPhases {
+            // An odd rate pair: use the nearest ratio with few phases
+            // (an error under 0.03 %).
+            let ratio = Float(rate) / Float(r)
+            up = resampleMaxPhases
+            down = max(1, Int(floor(Float(up) / ratio + 0.5)))
+            let g2 = gcd(up, down)
+            up = up / g2
+            down = down / g2
+        }
+        // Cut-off relative to the input's Nyquist frequency, and the
+        // filter's half length in input samples.
+        var fc = resampleCutoff
+        var z = resampleHalfTaps
+        if down > up {
+            fc = resampleCutoff * Float(up) / Float(down)
+            z = Int(ceil(Float(resampleHalfTaps) * Float(down) / Float(up)))
+        }
+        half = z
+        taps = 2 * z
+        coeffs = []
+        let i0b = besselI0(resampleBeta)
+        for ph in 0..up {
+            let frac = Float(ph) / Float(up)
+            var row: [Float] = []
+            var sum = 0.0
+            // Tap t takes input frame k = n0 − z + 1 + t, at a distance
+            // d = (n0 + frac) − k = frac + z − 1 − t from the output.
+            for t in 0..taps {
+                let d = frac + Float(z - 1 - t)
+                let xx = fc * d
+                let sinc = if abs(xx) < 1e-12 { 1.0 } else { sin(pi * xx) / (pi * xx) }
+                let u = d / Float(z)
+                let win = if abs(u) >= 1.0 { 0.0 } else { besselI0(resampleBeta * sqrt(1.0 - u * u)) / i0b }
+                let v = fc * sinc * win
+                row.append(v)
+                sum += v
+            }
+            // Unity gain at DC for every phase.
+            for t in 0..taps {
+                coeffs.append(row[t] / sum)
+            }
+        }
+    }
+
+    // The block's frames mixed to the output channels.
+    fn mix(_ s: core.Samples) -> [Float] {
+        if passThrough {
+            return s.data
+        }
+        let nIn = s.channels
+        let nOut = channels
+        let frames = s.data.count / nIn
+        let m = matrix
+        let d = s.data
+        var out: [Float] = []
+        var f = 0
+        while f < frames {
+            let base = f * nIn
+            for o in 0..nOut {
+                var acc = 0.0
+                let mb = o * nIn
+                for i in 0..nIn {
+                    acc += m[mb + i] * d[base + i]
+                }
+                out.append(acc)
+            }
+            f += 1
+        }
+        out
+    }
+
+    fn clipAll(_ d: [Float]) -> [Float] {
+        var out = d
+        var i = 0
+        while i < out.count {
+            let x = out[i]
+            if x > 0.9 || x < -0.9 {
+                out[i] = softClip(x)
+            }
+            i += 1
+        }
+        out
+    }
+
+    // Makes every output whose input window has arrived (all of them, with
+    // zeros past the end, when `final`).
+    fn resample(_ final: Bool) -> [Float] {
+        let c = channels
+        var out: [Float] = []
+        var total = 9223372036854775807
+        if final {
+            // Outputs up to the input's end: ceil(received · L / M).
+            total = (received * up + down - 1) / down
+            for _ in 0..((half + 1) * c) {
+                buf.append(0.0)
+            }
+        }
+        let available = bufStart + buf.count / c
+        let cf = coeffs
+        let n = taps
+        let stepWhole = down / up
+        let stepFrac = down % up
+        while made < total {
+            // Taps cover input frames n0 − Z + 1 … n0 + Z.
+            let last = n0 + half
+            if last >= available {
+                break
+            }
+            let firstFrame = n0 - half + 1 - bufStart
+            let cb = phase * n
+            for ch in 0..c {
+                var acc = 0.0
+                var at = firstFrame * c + ch
+                var t = 0
+                while t < n {
+                    acc += cf[cb + t] * buf[at]
+                    at += c
+                    t += 1
+                }
+                if acc > 0.9 || acc < -0.9 {
+                    acc = softClip(acc)
+                }
+                out.append(acc)
+            }
+            made += 1
+            n0 += stepWhole
+            phase += stepFrac
+            if phase >= up {
+                phase -= up
+                n0 += 1
+            }
+        }
+        // Drop input frames no later output needs.
+        let keepFrom = n0 - half + 1
+        let drop = keepFrom - bufStart
+        if drop > 4096 && drop * c <= buf.count {
+            buf = buf.slice(from: drop * c, to: buf.count)
+            bufStart = keepFrom
+        }
+        out
+    }
+}
+
+// A mixer to `channels` at `rate`.
+public fn newMixer(channels: Int, rate: Int) -> Mixer {
+    var m = Mixer(channels: max(1, channels), rate: max(1, rate))
+    m.layout = core.defaultLayout(m.channels)
+    m
+}

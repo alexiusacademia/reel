@@ -1,0 +1,1647 @@
+// The Theora I video decoder (Theora I specification, Xiph.Org, with
+// FFmpeg's vp3.c as the bit-exact reference): frame header (§7.1), coded
+// superblocks and blocks (§7.3), macroblock modes (§7.4), motion vectors
+// (§7.5), block quantizer indices (§7.6), DCT tokens (§7.7), DC
+// prediction (§7.8), dequantization and the inverse DCT (§7.9), motion
+// compensation (§7.9.1), the loop filter (§7.10) and the reference frames.
+//
+// Coordinates follow Theora: block rows count upwards from the bottom of
+// the frame. Planes are stored top down (as pictures are shown) with a
+// border of edge copies around the coded frame, so a block at Theora
+// position (x, y) starts at org - 8y * stride + 8x and goes "up" with a
+// step of -stride, as FFmpeg does with its negative linesize.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../core"
+
+let thBorder = 32
+
+// The 8-bit clip.
+fn thClip(_ v: Int) -> Int {
+    if v < 0 {
+        return 0
+    }
+    if v > 255 {
+        return 255
+    }
+    v
+}
+
+// A value stored in a 16-bit signed integer (FFmpeg's int16_t blocks).
+fn thW16(_ v: Int) -> Int {
+    if v >= -32768 && v <= 32767 {
+        return v
+    }
+    ((v + 32768) & 65535) - 32768
+}
+
+// FFmpeg's M(a, b): a 32-bit product shifted down 16.
+fn thM(_ c: Int, _ x: Int) -> Int {
+    var p = c * x
+    if p > 2147483647 || p < -2147483648 {
+        p = ((p + 2147483648) & 0xFFFFFFFF) - 2147483648
+    }
+    p >> 16
+}
+
+// RSHIFT: division by 2^b rounding half away from zero.
+fn thRshift(_ a: Int, _ b: Int) -> Int {
+    if a > 0 {
+        return (a + ((1 << b) >> 1)) >> b
+    }
+    (a + ((1 << b) >> 1) - 1) >> b
+}
+
+public struct Decoder {
+    skipNonReference: Bool = false
+    warnings: [String] = []
+
+    info: ThInfo = ThInfo()
+    setup: ThSetup = ThSetup()
+    ready: Bool = false
+    sarNum: Int = 1
+    sarDen: Int = 1
+    trackMatrix: core.ColorMatrix = .unknown
+    // Frames decoded / time spent (seconds), for benchmarks.
+    frames: Int = 0
+
+    // Geometry (set by layout()).
+    cxs: Int = 1
+    cys: Int = 1
+    fw0: Int = 0
+    fh0: Int = 0
+    fw1: Int = 0
+    fh1: Int = 0
+    nfrag: Int = 0
+    fstart1: Int = 0
+    fstart2: Int = 0
+    sbw0: Int = 0
+    sbh0: Int = 0
+    sbw1: Int = 0
+    sbh1: Int = 0
+    nsb: Int = 0
+    sbStart1: Int = 0
+    sbStart2: Int = 0
+    mbw: Int = 0
+    mbh: Int = 0
+    // Superblock → its 16 fragments in Hilbert order (-1 outside).
+    sbFrag: [Int] = []
+    // Macroblocks in coding order, their 4 luma fragments, and the U
+    // fragments covering them (ncPerMb of 4 slots; V is U + c count).
+    mbOrder: [Int] = []
+    mbLuma: [Int] = []
+    mbChroma: [Int] = []
+    ncPerMb: Int = 1
+    // Per fragment: plane, sample index of its Theora origin in the plane.
+    fplane: [Int] = []
+    fbase: [Int] = []
+    // Planes: coded width/height, stride, index of Theora (0, 0).
+    pw: [Int] = [0, 0, 0]
+    ph: [Int] = [0, 0, 0]
+    ps: [Int] = [0, 0, 0]
+    porg: [Int] = [0, 0, 0]
+    prows: [Int] = [0, 0, 0]
+
+    // Per-frame state.
+    key: Bool = false
+    mode: [Int] = []
+    qpi: [Int] = []
+    dc: [Int] = []
+    mvx: [Int] = []
+    mvy: [Int] = []
+    tis: [Int] = []
+    eobAt: [Int] = []
+    ncoef: [Int] = []
+    fc: [Int] = []
+    sbCoded: [Int] = []
+    mbMode: [Int] = []
+    coded: [Int] = []
+    ncoded: [Int] = [0, 0, 0]
+    act: [Int] = []
+    actN: [Int] = [0, 0, 0]
+    br: ThBits = ThBits()
+
+    // Quantizers: qps of this frame and the last, dequantization factors
+    // [qpi 3][inter 2][plane 3][64 raster], loop filter bounding values.
+    qps: [Int] = [-1, -1, -1]
+    lastQps: [Int] = [-1, -1, -1]
+    nqps: Int = 1
+    qm: [Int] = []
+    bv: [Int] = []
+    // Huffman lookup: 80 tables × 2048 entries (token * 32 + length, or
+    // -1 for codes longer than 11 bits, found in hcode/hlen/hsym).
+    hlut: [Int] = []
+    hcode: [Int] = []
+    hlen: [Int] = []
+    hsym: [Int] = []
+
+    // Frames: current, last, golden.
+    cy: [Int] = []
+    cu: [Int] = []
+    cv: [Int] = []
+    ly: [Int] = []
+    lu: [Int] = []
+    lv: [Int] = []
+    gy: [Int] = []
+    gu: [Int] = []
+    gv: [Int] = []
+    haveRef: Bool = false
+    // The plane being reconstructed and its two references.
+    pl: [Int] = []
+    rl: [Int] = []
+    rg: [Int] = []
+    blk: [Int] = []
+    lastPic: core.Picture = core.Picture(width: 0, height: 0)
+    hasLast: Bool = false
+    // Tables copied from module constants (local reads are faster).
+    tZig: [Int] = []
+    tHil: [Int] = []
+
+    fn warn(_ s: String) {
+        if warnings.count < 200 {
+            warnings.append(s)
+        }
+    }
+
+    // Sets up from the identification and setup headers.
+    fn configure(_ i: ThInfo, _ s: ThSetup) {
+        info = i
+        setup = s
+        tZig = thZigzag
+        tHil = thHilbert
+        layout()
+        buildHuffman()
+        qps = [-1, -1, -1]
+        lastQps = [-1, -1, -1]
+        haveRef = false
+        hasLast = false
+        ready = true
+    }
+
+    // §2: fragments, superblocks and macroblocks of the coded frame.
+    fn layout() {
+        let pf = info.pixelFormat
+        cxs = if pf == 3 { 0 } else { 1 }
+        cys = if pf == 0 { 1 } else { 0 }
+        let w = info.width
+        let h = info.height
+        fw0 = w / 8
+        fh0 = h / 8
+        fw1 = fw0 >> cxs
+        fh1 = fh0 >> cys
+        let ny = fw0 * fh0
+        let nc = fw1 * fh1
+        nfrag = ny + 2 * nc
+        fstart1 = ny
+        fstart2 = ny + nc
+        sbw0 = (w + 31) / 32
+        sbh0 = (h + 31) / 32
+        let cw = w >> cxs
+        let ch = h >> cys
+        sbw1 = (cw + 31) / 32
+        sbh1 = (ch + 31) / 32
+        sbStart1 = sbw0 * sbh0
+        sbStart2 = sbStart1 + sbw1 * sbh1
+        nsb = sbStart2 + sbw1 * sbh1
+        mbw = (w + 15) / 16
+        mbh = (h + 15) / 16
+        let hil = tHil
+        sbFrag = []
+        for plane in 0..3 {
+            let sw = if plane == 0 { sbw0 } else { sbw1 }
+            let sh = if plane == 0 { sbh0 } else { sbh1 }
+            let fw = if plane == 0 { fw0 } else { fw1 }
+            let fh = if plane == 0 { fh0 } else { fh1 }
+            let start = if plane == 0 { 0 } else if plane == 1 { fstart1 } else { fstart2 }
+            for sy in 0..sh {
+                for sx in 0..sw {
+                    for j in 0..16 {
+                        let x = 4 * sx + hil[2 * j]
+                        let y = 4 * sy + hil[2 * j + 1]
+                        if x < fw && y < fh {
+                            sbFrag.append(start + y * fw + x)
+                        } else {
+                            sbFrag.append(-1)
+                        }
+                    }
+                }
+            }
+        }
+        // Macroblocks in coding order (§2.4: within each luma superblock,
+        // the four macroblocks in Hilbert order).
+        mbOrder = []
+        mbLuma = core.filled(mbw * mbh * 4, 0)
+        mbChroma = core.filled(mbw * mbh * 4, -1)
+        ncPerMb = if cys == 1 { 1 } else if cxs == 1 { 2 } else { 4 }
+        for sy in 0..sbh0 {
+            for sx in 0..sbw0 {
+                for j in 0..4 {
+                    let mx = 2 * sx + (j >> 1)
+                    let my = 2 * sy + (((j >> 1) + j) & 1)
+                    if mx >= mbw || my >= mbh {
+                        continue
+                    }
+                    mbOrder.append(my * mbw + mx)
+                }
+            }
+        }
+        for my in 0..mbh {
+            for mx in 0..mbw {
+                let m = my * mbw + mx
+                for k in 0..4 {
+                    mbLuma[m * 4 + k] = (2 * my + (k >> 1)) * fw0 + 2 * mx + (k & 1)
+                }
+                if cys == 1 {
+                    mbChroma[m * 4] = fstart1 + my * fw1 + mx
+                } else if cxs == 1 {
+                    mbChroma[m * 4] = fstart1 + 2 * my * fw1 + mx
+                    mbChroma[m * 4 + 1] = fstart1 + (2 * my + 1) * fw1 + mx
+                } else {
+                    for k in 0..4 {
+                        mbChroma[m * 4 + k] = fstart1 + (2 * my + (k >> 1)) * fw1 + 2 * mx + (k & 1)
+                    }
+                }
+            }
+        }
+        // Planes with borders.
+        for p in 0..3 {
+            pw[p] = if p == 0 { w } else { cw }
+            ph[p] = if p == 0 { h } else { ch }
+            ps[p] = pw[p] + 2 * thBorder
+            prows[p] = ph[p] + 2 * thBorder
+            porg[p] = (thBorder + ph[p] - 1) * ps[p] + thBorder
+        }
+        fplane = core.zeros(nfrag)
+        fbase = core.zeros(nfrag)
+        for p in 0..3 {
+            let fw = if p == 0 { fw0 } else { fw1 }
+            let fh = if p == 0 { fh0 } else { fh1 }
+            let start = if p == 0 { 0 } else if p == 1 { fstart1 } else { fstart2 }
+            for y in 0..fh {
+                for x in 0..fw {
+                    let f = start + y * fw + x
+                    fplane[f] = p
+                    fbase[f] = porg[p] - 8 * y * ps[p] + 8 * x
+                }
+            }
+        }
+        mode = core.zeros(nfrag)
+        qpi = core.zeros(nfrag)
+        dc = core.zeros(nfrag)
+        mvx = core.zeros(nfrag)
+        mvy = core.zeros(nfrag)
+        tis = core.zeros(nfrag)
+        eobAt = core.zeros(nfrag)
+        ncoef = core.zeros(nfrag)
+        fc = core.zeros(nfrag * 64)
+        sbCoded = core.zeros(nsb)
+        mbMode = core.zeros(mbw * mbh)
+        coded = core.zeros(nfrag)
+        act = core.zeros(nfrag)
+        qm = core.zeros(3 * 2 * 3 * 64)
+        bv = core.zeros(260)
+        blk = core.zeros(64)
+        cy = []
+        cu = []
+        cv = []
+        ly = []
+        lu = []
+        lv = []
+        gy = []
+        gu = []
+        gv = []
+    }
+
+    // Lookup tables for the 80 Huffman codes (canonical in tree order).
+    fn buildHuffman() {
+        hlut = core.filled(80 * 2048, -2)
+        hcode = core.zeros(80 * 32)
+        hlen = core.zeros(80 * 32)
+        hsym = core.zeros(80 * 32)
+        for t in 0..80 {
+            let ls = setup.huffLen[t]
+            let ss = setup.huffSym[t]
+            var c = 0
+            for i in 0..ls.count {
+                let len = ls[i]
+                let code = if len == 0 { 0 } else { c >> (32 - len) }
+                if len > 0 {
+                    c += 1 << (32 - len)
+                }
+                hcode[t * 32 + i] = code
+                hlen[t * 32 + i] = len
+                hsym[t * 32 + i] = ss[i]
+                if len <= 11 {
+                    let from = code << (11 - len)
+                    let n = 1 << (11 - len)
+                    for k in 0..n {
+                        hlut[t * 2048 + from + k] = ss[i] * 32 + len
+                    }
+                } else {
+                    hlut[t * 2048 + (code >> (len - 11))] = -1
+                }
+            }
+        }
+    }
+
+    // A token from table t (-1 for an invalid code).
+    fn huff(_ t: Int) -> Int {
+        let e = hlut[t * 2048 + br.peek(11)]
+        if e >= 0 {
+            br.skip(e & 31)
+            return e >> 5
+        }
+        if e == -1 {
+            let n = setup.huffLen[t].count
+            for i in 0..n {
+                let len = hlen[t * 32 + i]
+                if len > 11 && br.peek(len) == hcode[t * 32 + i] {
+                    br.skip(len)
+                    return hsym[t * 32 + i]
+                }
+            }
+        }
+        br.skip(1)
+        -1
+    }
+
+    // §7.3 superblock run lengths (1…4129).
+    fn sbRun() -> Int {
+        let v = br.peek(6)
+        if v < 32 {
+            br.skip(1)
+            return 1
+        }
+        if v < 48 {
+            br.skip(2)
+            return 2 + br.bit()
+        }
+        if v < 56 {
+            br.skip(3)
+            return 4 + br.bit()
+        }
+        if v < 60 {
+            br.skip(4)
+            return 6 + br.bits(2)
+        }
+        if v < 62 {
+            br.skip(5)
+            return 10 + br.bits(3)
+        }
+        if v < 63 {
+            br.skip(6)
+            return 18 + br.bits(4)
+        }
+        br.skip(6)
+        34 + br.bits(12)
+    }
+
+    // §7.3 block run lengths, minus one (0…29).
+    fn fragRun() -> Int {
+        let v = br.peek(5)
+        if v < 16 {
+            br.skip(1)
+            return br.bit()
+        }
+        if v < 24 {
+            br.skip(2)
+            return 2 + br.bit()
+        }
+        if v < 28 {
+            br.skip(3)
+            return 4 + br.bit()
+        }
+        if v < 30 {
+            br.skip(4)
+            return 6 + br.bits(2)
+        }
+        if v < 31 {
+            br.skip(5)
+            return 10 + br.bits(2)
+        }
+        br.skip(5)
+        14 + br.bits(4)
+    }
+
+    // ---- decoding one frame ----
+
+    fn decode(_ packet: Data, pts: Int, dts: Int, key: Bool) -> [core.Picture] {
+        var out: [core.Picture] = []
+        if packet.count == 0 {
+            // FFmpeg outputs nothing for an empty packet (a dropped frame:
+            // the previous picture stays on screen).
+            return out
+        }
+        if (packet[0] & 0x80) != 0 {
+            headerPacket(packet)
+            return out
+        }
+        if !ready {
+            warn("theora: no headers before the first frame")
+            return out
+        }
+        let ok = decodeFrame(packet)
+        if ok == 1 {
+            let p = picture(pts)
+            lastPic = p
+            hasLast = true
+            out.append(p)
+        } else if ok == 0 {
+            // Damaged: show the last picture again.
+            if hasLast {
+                var p = lastPic
+                p.pts = pts
+                p.key = false
+                out.append(p)
+            }
+        }
+        out
+    }
+
+    fn flush() -> [core.Picture] {
+        []
+    }
+
+    fn reset() {
+        haveRef = false
+        hasLast = false
+    }
+
+    // A header in the stream (a new identification or setup header
+    // reconfigures the decoder, as FFmpeg does).
+    fn headerPacket(_ p: Data) {
+        let t = p[0]
+        if t == 0x80 {
+            if let i: ThInfo = thParseInfo(p).value() {
+                info = i
+                ready = false
+            } else {
+                warn("theora: bad identification header in the stream")
+            }
+        } else if t == 0x82 {
+            if let s: ThSetup = thParseSetup(p).value() {
+                configure(info, s)
+            } else {
+                warn("theora: bad setup header in the stream")
+            }
+        }
+    }
+
+    // Returns 1 when a picture was decoded, 0 when the packet was damaged
+    // (concealed), -1 when there's nothing to show (waiting for a keyframe).
+    fn decodeFrame(_ packet: Data) -> Int {
+        br.start(packet)
+        br.skip(1)
+        key = br.bit() == 0
+        if !key && !haveRef {
+            return -1
+        }
+        // §7.1 frame header.
+        nqps = 0
+        qps[0] = br.bits(6)
+        nqps = 1
+        while nqps < 3 && br.bit() == 1 {
+            qps[nqps] = br.bits(6)
+            nqps += 1
+        }
+        for i in nqps..3 {
+            qps[i] = -1
+        }
+        if key {
+            br.skip(3)
+        }
+        if qps[0] != lastQps[0] {
+            boundingValues(setup.filterLimit[qps[0]])
+        }
+        for i in 0..nqps {
+            if qps[i] != lastQps[i] || qps[0] != lastQps[0] {
+                dequantizer(i)
+            }
+        }
+        for i in 0..3 {
+            lastQps[i] = qps[i]
+        }
+        // Start the new frame from the last one: blocks that aren't coded
+        // keep its samples (the planes are copied on first write).
+        if !haveRef {
+            cy = core.filled(ps[0] * prows[0], 0)
+            cu = core.filled(ps[1] * prows[1], 0)
+            cv = core.filled(ps[2] * prows[2], 0)
+            ly = cy
+            lu = cu
+            lv = cv
+            gy = cy
+            gu = cu
+            gv = cv
+        } else {
+            cy = ly
+            cu = lu
+            cv = lv
+        }
+        for f in 0..nfrag {
+            qpi[f] = 0
+            dc[f] = 0
+        }
+        if !blockFlags() {
+            warn("theora: damaged coded block flags")
+            return 0
+        }
+        if !modes() {
+            warn("theora: damaged macroblock modes")
+            return 0
+        }
+        if !vectors() {
+            warn("theora: damaged motion vectors")
+            return 0
+        }
+        if !blockQpis() {
+            warn("theora: damaged block quantizers")
+            return 0
+        }
+        if !tokens() {
+            warn("theora: damaged DCT coefficients")
+            return 0
+        }
+        dcPrediction(0, fw0, fh0)
+        dcPrediction(fstart1, fw1, fh1)
+        dcPrediction(fstart2, fw1, fh1)
+        let lfOn = setup.filterLimit[qps[0]] != 0
+        for p in 0..3 {
+            usePlane(p)
+            reconstructPlane(p)
+            if lfOn {
+                loopFilter(p)
+            }
+            extendEdges(p)
+            unusePlane(p)
+        }
+        if key {
+            gy = cy
+            gu = cu
+            gv = cv
+        }
+        ly = cy
+        lu = cu
+        lv = cv
+        haveRef = true
+        frames += 1
+        1
+    }
+
+    fn usePlane(_ p: Int) {
+        if p == 0 {
+            let t = cy
+            cy = pl
+            pl = t
+            rl = ly
+            rg = gy
+        } else if p == 1 {
+            let t = cu
+            cu = pl
+            pl = t
+            rl = lu
+            rg = gu
+        } else {
+            let t = cv
+            cv = pl
+            pl = t
+            rl = lv
+            rg = gv
+        }
+    }
+
+    fn unusePlane(_ p: Int) {
+        if p == 0 {
+            let t = pl
+            pl = cy
+            cy = t
+        } else if p == 1 {
+            let t = pl
+            pl = cu
+            cu = t
+        } else {
+            let t = pl
+            pl = cv
+            cv = t
+        }
+        rl = pl
+        rg = pl
+    }
+
+    // §7.9.2 / FFmpeg init_dequantizer: the factors for quantizer index
+    // number i (qps[i]).
+    fn dequantizer(_ qn: Int) {
+        let q = qps[qn]
+        let ac = setup.acScale[q]
+        let dcs = setup.dcScale[q]
+        for inter in 0..2 {
+            for plane in 0..3 {
+                let ip = inter * 3 + plane
+                let count = setup.qrCount[ip]
+                var sum = 0
+                var qri = 0
+                while qri < count {
+                    sum += setup.qrSize[ip * 64 + qri]
+                    if q <= sum {
+                        break
+                    }
+                    qri += 1
+                }
+                let size = max(setup.qrSize[ip * 64 + min(qri, 63)], 1)
+                let qistart = sum - size
+                let bmi = setup.qrBase[ip * 65 + qri] * 64
+                let bmj = setup.qrBase[ip * 65 + qri + 1] * 64
+                let o = ((qn * 2 + inter) * 3 + plane) * 64
+                for i in 0..64 {
+                    let coeff = (2 * (sum - q) * setup.base[bmi + i] - 2 * (qistart - q) * setup.base[bmj + i] + size) / (2 * size)
+                    let qmin = if i == 0 { 16 << inter } else { 8 << inter }
+                    let qscale = if i == 0 { dcs } else { ac }
+                    qm[o + i] = min(max((qscale * coeff) / 100 * 4, qmin), 4096)
+                }
+                // All DC factors are those of the first quantizer index, so
+                // DC prediction works across blocks with different ones.
+                qm[o] = qm[(inter * 3 + plane) * 64]
+            }
+        }
+    }
+
+    // FFmpeg ff_vp3dsp_set_bounding_values: the loop filter's response
+    // (§7.10.2, the lflim function), indexed by value + 128.
+    fn boundingValues(_ limit: Int) {
+        for i in 0..260 {
+            bv[i] = 0
+        }
+        for x in 0..limit {
+            bv[128 - x] = -x
+            bv[128 + x] = x
+        }
+        var x = limit
+        var value = limit
+        while x < 128 && value > 0 {
+            bv[128 + x] = value
+            bv[128 - x] = -value
+            x += 1
+            value -= 1
+        }
+        if value > 0 {
+            bv[256] = value
+        }
+    }
+
+    // §7.3 which superblocks and blocks are coded; builds the coded block
+    // list (per plane, superblocks in raster order, blocks in Hilbert
+    // order).
+    fn blockFlags() -> Bool {
+        let sf = sbFrag
+        if key {
+            var n = 0
+            for p in 0..3 {
+                let from = if p == 0 { 0 } else if p == 1 { sbStart1 } else { sbStart2 }
+                let to = if p == 0 { sbStart1 } else if p == 1 { sbStart2 } else { nsb }
+                var c = 0
+                for sb in from..to {
+                    for j in 0..16 {
+                        let f = sf[sb * 16 + j]
+                        if f >= 0 {
+                            mode[f] = thModeIntra
+                            coded[n] = f
+                            n += 1
+                            c += 1
+                        }
+                    }
+                }
+                ncoded[p] = c
+            }
+            return true
+        }
+        for i in 0..nsb {
+            sbCoded[i] = 0
+        }
+        // Partially coded superblocks.
+        var bit = br.bit() ^ 1
+        var run = 0
+        var cur = 0
+        var partial = 0
+        while cur < nsb && br.left() > 0 {
+            if run == 4129 {
+                bit = br.bit()
+            } else {
+                bit = bit ^ 1
+            }
+            run = sbRun()
+            if run > nsb - cur {
+                return false
+            }
+            for i in cur..(cur + run) {
+                sbCoded[i] = bit
+            }
+            cur += run
+            if bit == 1 {
+                partial += run
+            }
+        }
+        // Fully coded ones among the rest.
+        if partial < nsb {
+            var decoded = 0
+            cur = 0
+            bit = br.bit() ^ 1
+            run = 0
+            while decoded < nsb - partial && br.left() > 0 {
+                if run == 4129 {
+                    bit = br.bit()
+                } else {
+                    bit = bit ^ 1
+                }
+                run = sbRun()
+                var j = 0
+                while j < run {
+                    if cur >= nsb {
+                        return false
+                    }
+                    if sbCoded[cur] == 0 {
+                        sbCoded[cur] = 2 * bit
+                        j += 1
+                    }
+                    cur += 1
+                }
+                decoded += run
+            }
+        }
+        if partial > 0 {
+            run = 0
+            bit = br.bit() ^ 1
+        }
+        // Blocks of partially coded superblocks.
+        var n = 0
+        var y0 = 0
+        for p in 0..3 {
+            let from = if p == 0 { 0 } else if p == 1 { sbStart1 } else { sbStart2 }
+            let to = if p == 0 { sbStart1 } else if p == 1 { sbStart2 } else { nsb }
+            var c = 0
+            var sb = from
+            while sb < to && br.left() > 0 {
+                if br.left() < (y0 >> 2) {
+                    return false
+                }
+                let sc = sbCoded[sb]
+                for j in 0..16 {
+                    let f = sf[sb * 16 + j]
+                    if f < 0 {
+                        continue
+                    }
+                    var isCoded = sc
+                    if sc == 1 {
+                        if run == 0 {
+                            bit = bit ^ 1
+                            run = fragRun()
+                        } else {
+                            run -= 1
+                        }
+                        isCoded = bit
+                    }
+                    if isCoded != 0 {
+                        mode[f] = thModeInterNoMv
+                        coded[n] = f
+                        n += 1
+                        c += 1
+                    } else {
+                        mode[f] = thModeCopy
+                    }
+                }
+                sb += 1
+            }
+            // (Superblocks left unread when the data ran out.)
+            while sb < to {
+                for j in 0..16 {
+                    let f = sf[sb * 16 + j]
+                    if f >= 0 {
+                        mode[f] = thModeCopy
+                    }
+                }
+                sb += 1
+            }
+            ncoded[p] = c
+            if p == 0 {
+                y0 = c
+            }
+        }
+        true
+    }
+
+    // §7.4 macroblock coding modes.
+    fn modes() -> Bool {
+        if key {
+            return true
+        }
+        let scheme = br.bits(3)
+        var alphabet: [Int] = [0, 0, 0, 0, 0, 0, 0, 0]
+        if scheme == 0 {
+            for i in 0..8 {
+                alphabet[br.bits(3)] = i
+            }
+        } else if scheme < 7 {
+            for i in 0..8 {
+                alphabet[i] = thModeAlphabets[(scheme - 1) * 8 + i]
+            }
+        }
+        let order = mbOrder
+        let lumaOf = mbLuma
+        let chromaOf = mbChroma
+        let nc = ncPerMb
+        let cOff = fstart2 - fstart1
+        let perSb = 4
+        var done = 0
+        for m in order {
+            // (FFmpeg checks for data once per superblock.)
+            if done % perSb == 0 && br.left() <= 0 {
+                return false
+            }
+            done += 1
+            var anyCoded = false
+            for k in 0..4 {
+                if mode[lumaOf[m * 4 + k]] != thModeCopy {
+                    anyCoded = true
+                }
+            }
+            if !anyCoded {
+                mbMode[m] = thModeInterNoMv
+                continue
+            }
+            var md = 0
+            if scheme == 7 {
+                md = br.bits(3)
+            } else {
+                var i = 0
+                while i < 7 && br.bit() == 1 {
+                    i += 1
+                }
+                md = alphabet[i]
+            }
+            mbMode[m] = md
+            for k in 0..4 {
+                let f = lumaOf[m * 4 + k]
+                if mode[f] != thModeCopy {
+                    mode[f] = md
+                }
+            }
+            for k in 0..nc {
+                let f = chromaOf[m * 4 + k]
+                if mode[f] != thModeCopy {
+                    mode[f] = md
+                }
+                if mode[f + cOff] != thModeCopy {
+                    mode[f + cOff] = md
+                }
+            }
+        }
+        true
+    }
+
+    // §7.5.1 one motion vector component.
+    fn mvc(_ fixed: Bool) -> Int {
+        if fixed {
+            return thFixedMv[br.bits(6)]
+        }
+        // Canonical code in the order of thMvValues.
+        let v = br.peek(8)
+        if v < 0x60 {
+            // 3-bit codes 000 001 010 → 0, 1, -1.
+            br.skip(3)
+            let k = v >> 5
+            return if k == 0 { 0 } else if k == 1 { 1 } else { -1 }
+        }
+        if v < 0xA0 {
+            // 4-bit codes 0110 … 1001 → 2, -2, 3, -3.
+            br.skip(4)
+            return thMvValues[3 + (v >> 4) - 6]
+        }
+        if v < 0xC0 {
+            // 6-bit codes 101000 … 101111 → ±4 … ±7.
+            br.skip(6)
+            return thMvValues[7 + (v >> 2) - 40]
+        }
+        if v < 0xE0 {
+            // 7-bit codes 1100000 … 1101111 → ±8 … ±15.
+            br.skip(7)
+            return thMvValues[15 + (v >> 1) - 96]
+        }
+        // 8-bit codes 11100000 … 11111111 → ±16 … ±31.
+        br.skip(8)
+        thMvValues[31 + v - 0xE0]
+    }
+
+    // §7.5 motion vectors of every coded macroblock, then of its blocks.
+    fn vectors() -> Bool {
+        if key {
+            return true
+        }
+        let fixed = br.bit() == 1
+        var lastX = 0
+        var lastY = 0
+        var priorX = 0
+        var priorY = 0
+        var mx: [Int] = [0, 0, 0, 0]
+        var my: [Int] = [0, 0, 0, 0]
+        let order = mbOrder
+        let lumaOf = mbLuma
+        let chromaOf = mbChroma
+        let cOff = fstart2 - fstart1
+        var done = 0
+        for m in order {
+            if done % 4 == 0 && br.left() <= 0 {
+                return false
+            }
+            done += 1
+            let md = mbMode[m]
+            if md == thModeCopy {
+                continue
+            }
+            if md == thModeInterMv || md == thModeGoldenMv {
+                mx[0] = mvc(fixed)
+                my[0] = mvc(fixed)
+                if md == thModeInterMv {
+                    priorX = lastX
+                    priorY = lastY
+                    lastX = mx[0]
+                    lastY = my[0]
+                }
+            } else if md == thModeFourMv {
+                priorX = lastX
+                priorY = lastY
+                for k in 0..4 {
+                    if mode[lumaOf[m * 4 + k]] != thModeCopy {
+                        mx[k] = mvc(fixed)
+                        my[k] = mvc(fixed)
+                        lastX = mx[k]
+                        lastY = my[k]
+                    } else {
+                        mx[k] = 0
+                        my[k] = 0
+                    }
+                }
+            } else if md == thModeInterLast {
+                mx[0] = lastX
+                my[0] = lastY
+            } else if md == thModeInterPrior {
+                mx[0] = priorX
+                my[0] = priorY
+                priorX = lastX
+                priorY = lastY
+                lastX = mx[0]
+                lastY = my[0]
+            } else {
+                mx[0] = 0
+                my[0] = 0
+            }
+            let four = md == thModeFourMv
+            for k in 0..4 {
+                let f = lumaOf[m * 4 + k]
+                if four {
+                    mvx[f] = mx[k]
+                    mvy[f] = my[k]
+                } else {
+                    mvx[f] = mx[0]
+                    mvy[f] = my[0]
+                }
+            }
+            // Chroma vectors (§7.5.2): averaged for 4MV, then halved
+            // where chroma is subsampled ((v >> 1) | (v & 1), as FFmpeg).
+            if cys == 1 {
+                var cx = mx[0]
+                var cyv = my[0]
+                if four {
+                    cx = thRshift(mx[0] + mx[1] + mx[2] + mx[3], 2)
+                    cyv = thRshift(my[0] + my[1] + my[2] + my[3], 2)
+                }
+                cx = (cx >> 1) | (cx & 1)
+                cyv = (cyv >> 1) | (cyv & 1)
+                let f = chromaOf[m * 4]
+                mvx[f] = cx
+                mvy[f] = cyv
+                mvx[f + cOff] = cx
+                mvy[f + cOff] = cyv
+            } else if cxs == 1 {
+                var x0 = mx[0]
+                var y0 = my[0]
+                var x1 = mx[0]
+                var y1 = my[0]
+                if four {
+                    x0 = thRshift(mx[0] + mx[1], 1)
+                    y0 = thRshift(my[0] + my[1], 1)
+                    x1 = thRshift(mx[2] + mx[3], 1)
+                    y1 = thRshift(my[2] + my[3], 1)
+                }
+                x0 = (x0 >> 1) | (x0 & 1)
+                x1 = (x1 >> 1) | (x1 & 1)
+                let f0 = chromaOf[m * 4]
+                let f1 = chromaOf[m * 4 + 1]
+                mvx[f0] = x0
+                mvy[f0] = y0
+                mvx[f1] = x1
+                mvy[f1] = y1
+                mvx[f0 + cOff] = x0
+                mvy[f0 + cOff] = y0
+                mvx[f1 + cOff] = x1
+                mvy[f1 + cOff] = y1
+            } else {
+                for k in 0..4 {
+                    let f = chromaOf[m * 4 + k]
+                    let vx = if four { mx[k] } else { mx[0] }
+                    let vy = if four { my[k] } else { my[0] }
+                    mvx[f] = vx
+                    mvy[f] = vy
+                    mvx[f + cOff] = vx
+                    mvy[f + cOff] = vy
+                }
+            }
+        }
+        true
+    }
+
+    // §7.6 block-level quantizer indices.
+    fn blockQpis() -> Bool {
+        let total = ncoded[0] + ncoded[1] + ncoded[2]
+        var numBlocks = total
+        var qn = 0
+        while qn < nqps - 1 && numBlocks > 0 {
+            var i = 0
+            var decoded = 0
+            var atQ = 0
+            var bit = br.bit() ^ 1
+            var run = 0
+            while true {
+                if run == 4129 {
+                    bit = br.bit()
+                } else {
+                    bit = bit ^ 1
+                }
+                run = sbRun()
+                decoded += run
+                if bit == 0 {
+                    atQ += run
+                }
+                var j = 0
+                while j < run {
+                    if i >= total {
+                        return false
+                    }
+                    let f = coded[i]
+                    if qpi[f] == qn {
+                        qpi[f] += bit
+                        j += 1
+                    }
+                    i += 1
+                }
+                if !(decoded < numBlocks && br.left() > 0) {
+                    break
+                }
+            }
+            numBlocks -= atQ
+            qn += 1
+        }
+        true
+    }
+
+    // §7.7 the DCT tokens, coefficient index by coefficient index; within
+    // one index the Y blocks, then U, then V, in coded order. End-of-block
+    // runs carry over between planes and indices. Each block keeps its
+    // coefficients (value * 64 + zig-zag index) in fc.
+    fn tokens() -> Bool {
+        if br.left() < 16 {
+            return false
+        }
+        let total = ncoded[0] + ncoded[1] + ncoded[2]
+        for k in 0..total {
+            let f = coded[k]
+            act[k] = f
+            tis[f] = 0
+            eobAt[f] = 0
+            ncoef[f] = 0
+        }
+        var actStart: [Int] = [0, ncoded[0], ncoded[0] + ncoded[1]]
+        actN[0] = ncoded[0]
+        actN[1] = ncoded[1]
+        actN[2] = ncoded[2]
+        let dcY = br.bits(4)
+        let dcC = br.bits(4)
+        var acY = 0
+        var acC = 0
+        var eobs = 0
+        var ranOut = false
+        let cb = thCoefBase
+        let cbits = thCoefBits
+        let rb = thRunBase
+        let rbits = thRunBits
+        for ti in 0..64 {
+            if ti == 1 {
+                if br.left() < 8 {
+                    return false
+                }
+                acY = br.bits(4)
+                acC = br.bits(4)
+            }
+            let grp = if ti == 0 { 0 } else if ti <= 5 { 1 } else if ti <= 14 { 2 } else if ti <= 27 { 3 } else { 4 }
+            for p in 0..3 {
+                if ti == 0 && p == 1 && br.left() < 8 {
+                    return false
+                }
+                let tsel = if p == 0 { if ti == 0 { dcY } else { acY } } else { if ti == 0 { dcC } else { acC } }
+                let tab = grp * 16 + tsel
+                let s0 = actStart[p]
+                let n = s0 + actN[p]
+                var w = s0
+                var k = s0
+                while k < n {
+                    let f = act[k]
+                    k += 1
+                    if tis[f] != ti {
+                        act[w] = f
+                        w += 1
+                        continue
+                    }
+                    if eobs > 0 {
+                        eobs -= 1
+                        eobAt[f] = ti
+                        tis[f] = 64
+                        continue
+                    }
+                    if br.left() <= 0 {
+                        // The data ran out: the rest of the block is zero.
+                        ranOut = true
+                        eobAt[f] = ti
+                        tis[f] = 64
+                        continue
+                    }
+                    let tok = huff(tab)
+                    if tok < 0 {
+                        return false
+                    }
+                    if tok < 7 {
+                        var r = thEobBase[tok]
+                        let eb = thEobBits[tok]
+                        if eb > 0 {
+                            r += br.bits(eb)
+                        }
+                        if r == 0 {
+                            r = 1 << 40
+                        }
+                        eobAt[f] = ti
+                        tis[f] = 64
+                        eobs = r - 1
+                        continue
+                    }
+                    var coef = cb[tok]
+                    let nb = cbits[tok]
+                    if nb > 0 {
+                        let v = br.bits(nb)
+                        coef += v & ((1 << (nb - 1)) - 1)
+                        if (v >> (nb - 1)) != 0 {
+                            coef = -coef
+                        }
+                    }
+                    var zr = rb[tok]
+                    let zb = rbits[tok]
+                    if zb > 0 {
+                        zr += br.bits(zb)
+                    }
+                    let pos = ti + zr
+                    if pos > 63 {
+                        // FFmpeg: "Coefficient index overflow".
+                        eobAt[f] = pos
+                        tis[f] = 64
+                        continue
+                    }
+                    if ti == 0 && zr == 0 {
+                        dc[f] = coef
+                    }
+                    if coef != 0 {
+                        fc[f * 64 + ncoef[f]] = coef * 64 + pos
+                        ncoef[f] += 1
+                    }
+                    if pos == 63 {
+                        eobAt[f] = 63
+                        tis[f] = 64
+                    } else {
+                        tis[f] = pos + 1
+                        act[w] = f
+                        w += 1
+                    }
+                }
+                actN[p] = w - s0
+            }
+        }
+        if ranOut || br.left() < 0 {
+            warn("theora: a frame's coefficients are cut short")
+        }
+        true
+    }
+
+    // §7.8 undoes DC prediction over one plane, in raster order.
+    fn dcPrediction(_ first: Int, _ fw: Int, _ fh: Int) {
+        let wts = thPredWeights
+        let grpOf = thPredGroup
+        var lastDc: [Int] = [0, 0, 0]
+        var i = first
+        var vl = 0
+        var vul = 0
+        var vu = 0
+        var vur = 0
+        for y in 0..fh {
+            for x in 0..fw {
+                let m = mode[i]
+                if m != thModeCopy {
+                    let g = grpOf[m]
+                    var t = 0
+                    if x > 0 {
+                        vl = dc[i - 1]
+                        if grpOf[mode[i - 1]] == g {
+                            t = t | 1
+                        }
+                    }
+                    if y > 0 {
+                        let u = i - fw
+                        vu = dc[u]
+                        if grpOf[mode[u]] == g {
+                            t = t | 4
+                        }
+                        if x > 0 {
+                            vul = dc[u - 1]
+                            if grpOf[mode[u - 1]] == g {
+                                t = t | 8
+                            }
+                        }
+                        if x + 1 < fw {
+                            vur = dc[u + 1]
+                            if grpOf[mode[u + 1]] == g {
+                                t = t | 2
+                            }
+                        }
+                    }
+                    var pred = 0
+                    if t == 0 {
+                        pred = lastDc[g]
+                    } else {
+                        pred = (wts[t * 4] * vul + wts[t * 4 + 1] * vu + wts[t * 4 + 2] * vur + wts[t * 4 + 3] * vl) / 128
+                        if t == 15 || t == 13 {
+                            if abs(pred - vu) > 128 {
+                                pred = vu
+                            } else if abs(pred - vl) > 128 {
+                                pred = vl
+                            } else if abs(pred - vul) > 128 {
+                                pred = vul
+                            }
+                        }
+                    }
+                    let v = thW16(dc[i] + pred)
+                    dc[i] = v
+                    lastDc[g] = v
+                }
+                i += 1
+            }
+        }
+    }
+
+    // §7.9 every coded block of plane p: prediction (none for intra; from
+    // the previous or golden frame), then the dequantized residual.
+    fn reconstructPlane(_ p: Int) {
+        let st = -ps[p]
+        let first = if p == 0 { 0 } else if p == 1 { ncoded[0] } else { ncoded[0] + ncoded[1] }
+        let n = ncoded[p]
+        let zz = tZig
+        for k in first..(first + n) {
+            let f = coded[k]
+            let m = mode[f]
+            let base = fbase[f]
+            let inter = if m == thModeIntra { 0 } else { 1 }
+            if m != thModeIntra {
+                var src = base
+                var hp = 0
+                var vx = 0
+                var vy = 0
+                if m > thModeIntra && m != thModeGolden {
+                    vx = mvx[f]
+                    vy = mvy[f]
+                    src = base + (vx >> 1) + (vy >> 1) * st
+                    hp = (vx & 1) | ((vy & 1) << 1)
+                }
+                if m == thModeGolden || m == thModeGoldenMv {
+                    predict(rg, src, base, st, hp, vx, vy)
+                } else {
+                    predict(rl, src, base, st, hp, vx, vy)
+                }
+            }
+            // Dequantize (§7.9.2) into the raster-order block.
+            let qo = ((qpi[f] * 2 + inter) * 3 + p) * 64
+            let nc = ncoef[f]
+            for c in 0..nc {
+                let e = fc[f * 64 + c]
+                let r = zz[e & 63]
+                blk[r] = thW16((e >> 6) * qm[qo + r])
+            }
+            let eob = eobAt[f]
+            if eob <= 63 {
+                blk[0] = thW16(dc[f] * qm[(inter * 3 + p) * 64])
+            }
+            if inter == 0 {
+                idct(base, st, true)
+            } else if eob != 0 {
+                idct(base, st, false)
+            } else {
+                dcAdd(base, st)
+            }
+        }
+    }
+
+    // FFmpeg's put_no_rnd_pixels (8×8, half-sample cases averaged with
+    // truncation; the diagonal case averages two of the four samples).
+    fn predict(_ ref: [Int], _ src: Int, _ dst: Int, _ st: Int, _ hp: Int, _ vx: Int, _ vy: Int) {
+        if hp == 0 {
+            for r in 0..8 {
+                let s = src + r * st
+                let d = dst + r * st
+                for c in 0..8 {
+                    pl[d + c] = ref[s + c]
+                }
+            }
+        } else if hp == 1 {
+            for r in 0..8 {
+                let s = src + r * st
+                let d = dst + r * st
+                for c in 0..8 {
+                    pl[d + c] = (ref[s + c] + ref[s + c + 1]) >> 1
+                }
+            }
+        } else if hp == 2 {
+            for r in 0..8 {
+                let s = src + r * st
+                let d = dst + r * st
+                for c in 0..8 {
+                    pl[d + c] = (ref[s + c] + ref[s + c + st]) >> 1
+                }
+            }
+        } else {
+            let dd = if (vx ^ vy) < 0 { -1 } else { 0 }
+            let s1 = src - dd
+            let s2 = src + st + 1 + dd
+            for r in 0..8 {
+                let a = s1 + r * st
+                let b = s2 + r * st
+                let d = dst + r * st
+                for c in 0..8 {
+                    pl[d + c] = (ref[a + c] + ref[b + c]) >> 1
+                }
+            }
+        }
+    }
+
+    // FFmpeg vp3_idct_dc_add.
+    fn dcAdd(_ base: Int, _ st: Int) {
+        let v = (blk[0] + 15) >> 5
+        blk[0] = 0
+        for r in 0..8 {
+            let d = base + r * st
+            for c in 0..8 {
+                pl[d + c] = thClip(pl[d + c] + v)
+            }
+        }
+    }
+
+    // The inverse DCT of §7.9.3 exactly as FFmpeg's vp3dsp idct (rows,
+    // then columns; 16-bit intermediate values), put (intra, + 128) or
+    // added to the prediction. Clears the block.
+    fn idct(_ base: Int, _ st: Int, _ put: Bool) {
+        let c1 = 64277
+        let c2 = 60547
+        let c3 = 54491
+        let c4 = 46341
+        let c5 = 36410
+        let c6 = 25080
+        let c7 = 12785
+        for r in 0..8 {
+            let o = r * 8
+            let i0 = blk[o]
+            let i1 = blk[o + 1]
+            let i2 = blk[o + 2]
+            let i3 = blk[o + 3]
+            let i4 = blk[o + 4]
+            let i5 = blk[o + 5]
+            let i6 = blk[o + 6]
+            let i7 = blk[o + 7]
+            if (i0 | i1 | i2 | i3 | i4 | i5 | i6 | i7) != 0 {
+                let a = thM(c1, i1) + thM(c7, i7)
+                let b = thM(c7, i1) - thM(c1, i7)
+                let c = thM(c3, i3) + thM(c5, i5)
+                let d = thM(c3, i5) - thM(c5, i3)
+                let ad = thM(c4, a - c)
+                let bd = thM(c4, b - d)
+                let cd = a + c
+                let dd = b + d
+                let e = thM(c4, i0 + i4)
+                let f = thM(c4, i0 - i4)
+                let g = thM(c2, i2) + thM(c6, i6)
+                let h = thM(c6, i2) - thM(c2, i6)
+                let ed = e - g
+                let gd = e + g
+                let add = f + ad
+                let bdd = bd - h
+                let fd = f - ad
+                let hd = bd + h
+                blk[o] = thW16(gd + cd)
+                blk[o + 7] = thW16(gd - cd)
+                blk[o + 1] = thW16(add + hd)
+                blk[o + 2] = thW16(add - hd)
+                blk[o + 3] = thW16(ed + dd)
+                blk[o + 4] = thW16(ed - dd)
+                blk[o + 5] = thW16(fd + bdd)
+                blk[o + 6] = thW16(fd - bdd)
+            }
+        }
+        for col in 0..8 {
+            let i0 = blk[col]
+            let i1 = blk[8 + col]
+            let i2 = blk[16 + col]
+            let i3 = blk[24 + col]
+            let i4 = blk[32 + col]
+            let i5 = blk[40 + col]
+            let i6 = blk[48 + col]
+            let i7 = blk[56 + col]
+            let d0 = base + col
+            if (i1 | i2 | i3 | i4 | i5 | i6 | i7) != 0 {
+                let a = thM(c1, i1) + thM(c7, i7)
+                let b = thM(c7, i1) - thM(c1, i7)
+                let c = thM(c3, i3) + thM(c5, i5)
+                let d = thM(c3, i5) - thM(c5, i3)
+                let ad = thM(c4, a - c)
+                let bd = thM(c4, b - d)
+                let cd = a + c
+                let dd = b + d
+                var e = thM(c4, i0 + i4) + 8
+                var f = thM(c4, i0 - i4) + 8
+                if put {
+                    e += 2048
+                    f += 2048
+                }
+                let g = thM(c2, i2) + thM(c6, i6)
+                let h = thM(c6, i2) - thM(c2, i6)
+                let ed = e - g
+                let gd = e + g
+                let add = f + ad
+                let bdd = bd - h
+                let fd = f - ad
+                let hd = bd + h
+                let o0 = (gd + cd) >> 4
+                let o7 = (gd - cd) >> 4
+                let o1 = (add + hd) >> 4
+                let o2 = (add - hd) >> 4
+                let o3 = (ed + dd) >> 4
+                let o4 = (ed - dd) >> 4
+                let o5 = (fd + bdd) >> 4
+                let o6 = (fd - bdd) >> 4
+                if put {
+                    pl[d0] = thClip(o0)
+                    pl[d0 + st] = thClip(o1)
+                    pl[d0 + 2 * st] = thClip(o2)
+                    pl[d0 + 3 * st] = thClip(o3)
+                    pl[d0 + 4 * st] = thClip(o4)
+                    pl[d0 + 5 * st] = thClip(o5)
+                    pl[d0 + 6 * st] = thClip(o6)
+                    pl[d0 + 7 * st] = thClip(o7)
+                } else {
+                    pl[d0] = thClip(pl[d0] + o0)
+                    pl[d0 + st] = thClip(pl[d0 + st] + o1)
+                    pl[d0 + 2 * st] = thClip(pl[d0 + 2 * st] + o2)
+                    pl[d0 + 3 * st] = thClip(pl[d0 + 3 * st] + o3)
+                    pl[d0 + 4 * st] = thClip(pl[d0 + 4 * st] + o4)
+                    pl[d0 + 5 * st] = thClip(pl[d0 + 5 * st] + o5)
+                    pl[d0 + 6 * st] = thClip(pl[d0 + 6 * st] + o6)
+                    pl[d0 + 7 * st] = thClip(pl[d0 + 7 * st] + o7)
+                }
+            } else if put {
+                let v = thClip(128 + ((c4 * i0 + 524288) >> 20))
+                for k in 0..8 {
+                    pl[d0 + k * st] = v
+                }
+            } else if i0 != 0 {
+                let v = (c4 * i0 + 524288) >> 20
+                for k in 0..8 {
+                    pl[d0 + k * st] = thClip(pl[d0 + k * st] + v)
+                }
+            }
+        }
+        for i in 0..64 {
+            blk[i] = 0
+        }
+    }
+
+    // §7.10 the loop filter over plane p: for each coded block (raster
+    // order) its left and top edges, and its right and bottom edges when
+    // that neighbour isn't coded (FFmpeg apply_loop_filter).
+    fn loopFilter(_ p: Int) {
+        let st = -ps[p]
+        let fw = if p == 0 { fw0 } else { fw1 }
+        let fh = if p == 0 { fh0 } else { fh1 }
+        let start = if p == 0 { 0 } else if p == 1 { fstart1 } else { fstart2 }
+        let org = porg[p]
+        for y in 0..fh {
+            var f = start + y * fw
+            let rowBase = org + 8 * y * st
+            for x in 0..fw {
+                if mode[f] != thModeCopy {
+                    let b = rowBase + 8 * x
+                    if x > 0 {
+                        hFilter(b, st)
+                    }
+                    if y > 0 {
+                        vFilter(b, st)
+                    }
+                    if x < fw - 1 && mode[f + 1] == thModeCopy {
+                        hFilter(b + 8, st)
+                    }
+                    if y < fh - 1 && mode[f + fw] == thModeCopy {
+                        vFilter(b + 8 * st, st)
+                    }
+                }
+                f += 1
+            }
+        }
+    }
+
+    // A vertical edge at column b (8 rows up from b).
+    fn hFilter(_ b: Int, _ st: Int) {
+        for k in 0..8 {
+            let q = b + k * st
+            let fv = (pl[q - 2] - pl[q + 1]) + 3 * (pl[q] - pl[q - 1])
+            let v = bv[((fv + 4) >> 3) + 128]
+            pl[q - 1] = thClip(pl[q - 1] + v)
+            pl[q] = thClip(pl[q] - v)
+        }
+    }
+
+    // A horizontal edge below row b (between b - st and b).
+    fn vFilter(_ b: Int, _ st: Int) {
+        for c in 0..8 {
+            let q = b + c
+            let fv = (pl[q - 2 * st] - pl[q + st]) + 3 * (pl[q] - pl[q - st])
+            let v = bv[((fv + 4) >> 3) + 128]
+            pl[q - st] = thClip(pl[q - st] + v)
+            pl[q] = thClip(pl[q] - v)
+        }
+    }
+
+    // Copies the coded frame's edge samples into the border, so motion
+    // vectors that point outside read the nearest edge sample (FFmpeg's
+    // emulated_edge_mc).
+    fn extendEdges(_ p: Int) {
+        let s = ps[p]
+        let w = pw[p]
+        let h = ph[p]
+        let b = thBorder
+        for row in b..(b + h) {
+            let o = row * s
+            let left = pl[o + b]
+            let right = pl[o + b + w - 1]
+            for x in 0..b {
+                pl[o + x] = left
+                pl[o + b + w + x] = right
+            }
+        }
+        let top = b * s
+        let bottom = (b + h - 1) * s
+        for row in 0..b {
+            let o = row * s
+            let o2 = (b + h + row) * s
+            for x in 0..s {
+                pl[o + x] = pl[top + x]
+                pl[o2 + x] = pl[bottom + x]
+            }
+        }
+    }
+
+    // The visible picture region of the current frame.
+    fn picture(_ pts: Int) -> core.Picture {
+        var p = core.Picture(width: info.picW, height: info.picH)
+        p.chroma = if info.pixelFormat == 0 { core.Chroma.yuv420 } else if info.pixelFormat == 2 { core.Chroma.yuv422 } else { core.Chroma.yuv444 }
+        p.y = cy
+        p.u = cu
+        p.v = cv
+        p.yStride = ps[0]
+        p.cStride = ps[1]
+        p.yOffset = (thBorder + info.picY) * ps[0] + thBorder + info.picX
+        p.cOffset = (thBorder + (info.picY >> cys)) * ps[1] + thBorder + (info.picX >> cxs)
+        p.pts = pts
+        p.key = key
+        p.fullRange = false
+        if info.colorSpace == 1 || info.colorSpace == 2 {
+            p.matrix = .bt601
+        } else if trackMatrix != .unknown {
+            p.matrix = trackMatrix
+        } else {
+            p.matrix = core.guessMatrix(width: info.picW, height: info.picH)
+        }
+        p.sarNum = sarNum
+        p.sarDen = sarDen
+        p
+    }
+}

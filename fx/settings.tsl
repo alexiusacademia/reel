@@ -1,0 +1,149 @@
+// The settings of Reel's audio effects chain, as one plain struct the
+// player can save with toJson and load with fromJson (every field has a
+// default, so older files keep loading), and the equalizer presets.
+//
+// The presets are Reel's own: each was shaped by hand for its name
+// (octave bands 31 Hz … 16 kHz, in dB), not copied from any other player.
+// Each preset's preamp is half its largest boost, negated, so a preset
+// rarely drives the signal into the limiter.
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+// What the stereo stage does with the two channels (only for 2-channel
+// sound; other channel counts pass through it unchanged).
+public enum StereoMode { stereo, mono, swap, left, right }
+
+// Where the loudness normalisation takes its measurement from.
+//   off:    no normalisation gain.
+//   live:   the integrated loudness measured so far in this track.
+//   scan:   a whole-track measurement the player made beforehand
+//           (Chain.setScan); live until one is given.
+//   track:  ReplayGain track gain from the tags (Chain.setTags); else
+//           scan, else live.
+//   album:  ReplayGain album gain; else track gain, else scan, else live.
+public enum NormalizeMode { off, live, scan, track, album }
+
+public struct Settings {
+    // Equalizer: 10 bands (see eqFrequencies), each −12 … +12 dB, and a
+    // preamp (−12 … +12 dB) applied before them.
+    eqOn: Bool = false
+    eqPreset: String = "Flat"
+    eqPreamp: Float = 0.0
+    eqGains: [Float] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+
+    // Loudness normalisation towards targetLufs, never boosting by more
+    // than maxBoost dB nor cutting by more than maxCut dB.
+    normalize: NormalizeMode = .off
+    targetLufs: Float = -18.0
+    maxBoost: Float = 12.0
+    maxCut: Float = 24.0
+    // Whether the loudness meter runs (it must for live normalisation;
+    // the player may also show its readings).
+    meterOn: Bool = true
+
+    // Compressor (feed-forward, peak detector, soft knee).
+    compOn: Bool = false
+    compThreshold: Float = -20.0
+    compRatio: Float = 3.0
+    compKnee: Float = 6.0
+    compAttackMs: Float = 10.0
+    compReleaseMs: Float = 150.0
+    compMakeup: Float = 0.0
+
+    // Look-ahead limiter: the output never goes past ceiling dBFS (sample
+    // peak). It also runs whenever normalisation is on.
+    limiterOn: Bool = true
+    limiterCeiling: Float = -1.0
+    limiterReleaseMs: Float = 80.0
+
+    // Stereo stage.
+    stereoMode: StereoMode = .stereo
+    // Mid-side width: 0 = mono, 1 = as recorded, up to 2 = wider.
+    width: Float = 1.0
+    // −1 = left only … 0 = centre … 1 = right only.
+    balance: Float = 0.0
+    // Headphone crossfeed: amount 0 … 1 of the low-passed opposite
+    // channel fed across (0.3 is a natural setting), and the low-pass
+    // corner in Hz.
+    crossfeedOn: Bool = false
+    crossfeedAmount: Float = 0.3
+    crossfeedHz: Float = 700.0
+
+    // Keep the latest output for the visualiser (Chain.bands/waveform).
+    visualOn: Bool = true
+}
+
+// The equalizer's band centres, in Hz: octaves around 1 kHz.
+public let eqFrequencies: [Float] = [31.25, 62.5, 125.0, 250.0, 500.0, 1000.0, 2000.0, 4000.0, 8000.0, 16000.0]
+
+// The band width of each peaking filter, in octaves (between the points
+// where the boost is half its dB value, as the Audio EQ Cookbook defines
+// BW for peaking filters).
+public let eqBandwidth = 1.0
+
+// Limits of a band's gain and of the preamp, in dB.
+public let eqMaxDb = 12.0
+
+public struct Preset {
+    name: String
+    preamp: Float
+    gains: [Float]
+}
+
+fn fxPreset(_ name: String, _ g: [Float]) -> Preset {
+    var top = 0.0
+    for v in g {
+        top = max(top, v)
+    }
+    Preset(name: name, preamp: -0.5 * top, gains: g)
+}
+
+// Reel's equalizer presets, in menu order.
+public fn presets() -> [Preset] {
+    [
+        fxPreset("Flat", [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+        fxPreset("Classical", [2.0, 1.5, 1.0, 0.0, 0.0, 0.0, -1.0, -2.0, -2.5, -3.0]),
+        fxPreset("Club", [0.0, 0.0, 3.0, 4.0, 4.0, 3.5, 2.5, 1.0, 0.0, 0.0]),
+        fxPreset("Dance", [7.0, 5.5, 2.0, 0.0, 0.0, -2.0, -3.0, -3.0, 0.0, 1.0]),
+        fxPreset("Bass boost", [8.0, 7.0, 5.0, 2.5, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0]),
+        fxPreset("Treble boost", [0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 3.0, 5.5, 7.0, 8.0]),
+        fxPreset("Bass and treble", [6.0, 5.0, 2.0, 0.0, -2.0, -1.0, 1.0, 4.0, 6.0, 7.0]),
+        fxPreset("Headphones", [3.0, 5.0, 3.0, -1.0, -2.0, 0.0, 2.0, 4.0, 5.5, 6.0]),
+        fxPreset("Large hall", [7.0, 6.5, 4.0, 3.0, 0.0, -2.0, -2.5, -2.0, 0.0, 0.0]),
+        fxPreset("Live", [-3.0, 0.0, 2.5, 3.0, 3.5, 3.5, 2.5, 2.0, 2.0, 1.5]),
+        fxPreset("Party", [5.5, 5.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 5.5, 5.5]),
+        fxPreset("Pop", [-1.0, 2.0, 3.5, 4.5, 3.0, 0.0, -1.0, -1.5, -1.0, -1.0]),
+        fxPreset("Reggae", [0.0, 0.0, -0.5, -4.0, 0.0, 4.0, 5.0, 0.0, 0.0, 0.0]),
+        fxPreset("Rock", [5.0, 3.5, -3.0, -4.5, -2.0, 2.0, 4.5, 6.0, 6.5, 6.5]),
+        fxPreset("Ska", [-1.5, -2.5, -2.0, 0.0, 2.5, 3.5, 5.0, 5.5, 6.5, 5.5]),
+        fxPreset("Soft", [2.5, 1.0, 0.0, -1.0, 0.0, 2.0, 4.5, 5.5, 6.5, 7.0]),
+        fxPreset("Soft rock", [2.5, 2.5, 1.5, 0.0, -2.0, -3.0, -2.0, 0.0, 1.5, 5.0]),
+        fxPreset("Techno", [5.0, 4.0, 0.0, -3.0, -2.5, 0.0, 4.0, 5.0, 5.0, 4.5]),
+        fxPreset("Vocal", [-2.0, -3.0, -2.0, 1.0, 3.5, 4.0, 3.5, 2.0, 0.0, -1.5]),
+    ]
+}
+
+// The preset with that name (case-insensitive), or nil.
+public fn preset(named: String) -> Preset? {
+    let want = named.lowercase()
+    for p in presets() {
+        if p.name.lowercase() == want {
+            return p
+        }
+    }
+    nil
+}
+
+// Settings with a preset's gains and preamp (and the equalizer on, unless
+// the preset is unknown, when they are returned unchanged).
+public fn withPreset(_ s: Settings, _ name: String) -> Settings {
+    var out = s
+    if let p = preset(named: name) {
+        out.eqOn = true
+        out.eqPreset = p.name
+        out.eqPreamp = p.preamp
+        out.eqGains = p.gains
+    }
+    out
+}

@@ -1,0 +1,360 @@
+// The 10-band graphic equalizer: one peaking biquad per band (Audio EQ
+// Cookbook formulas, see biquad.tsl) at the octave centres in
+// eqFrequencies, run in transposed direct form II on every channel.
+//
+// Gain changes are smoothed: a band's gain moves linearly in dB to its new
+// value over eqRampMs, with the coefficients worked out again every
+// eqSegment frames, so moving a slider never clicks. Bands at 0 dB are
+// skipped (a peaking filter at 0 dB is the identity), once their state
+// has died away. Bands whose centre is too close to the Nyquist frequency
+// for the sample rate (above 0.45 · rate) stay flat.
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+let eqRampMs = 50.0
+let eqSegment = 4
+
+public struct Equalizer {
+    rate: Int = 0
+    channels: Int = 0
+    bands: Int = 0
+    usable: [Bool] = []
+    cw: [Float] = []
+    alpha: [Float] = []
+    curDb: [Float] = []
+    tgtDb: [Float] = []
+    stepDb: [Float] = []
+    // Frames a band at 0 dB keeps running so its state dies away.
+    settle: [Int] = []
+    active: [Bool] = []
+    b0: [Float] = []
+    b1: [Float] = []
+    b2: [Float] = []
+    a1: [Float] = []
+    a2: [Float] = []
+    // State, band-major: z1[b * channels + ch].
+    z1: [Float] = []
+    z2: [Float] = []
+
+    // Makes the filters for a rate and channel count (state cleared, gains
+    // kept).
+    fn setup(_ r0: Int, _ c0: Int) {
+        let r = r0
+        let c = c0
+        let keep = curDb
+        let keepT = tgtDb
+        rate = r
+        channels = c
+        bands = eqFrequencies.count
+        usable = []
+        cw = []
+        alpha = []
+        curDb = []
+        tgtDb = []
+        stepDb = []
+        settle = []
+        active = []
+        b0 = []
+        b1 = []
+        b2 = []
+        a1 = []
+        a2 = []
+        for b in 0..bands {
+            let f0 = eqFrequencies[b]
+            let w0 = 2.0 * pi * f0 / Float(r)
+            usable.append(f0 < 0.45 * Float(r))
+            cw.append(cos(w0))
+            alpha.append(sin(w0) * sinh(log(2.0) / 2.0 * eqBandwidth * w0 / sin(w0)))
+            curDb.append(if b < keep.count { keep[b] } else { 0.0 })
+            tgtDb.append(if b < keepT.count { keepT[b] } else { 0.0 })
+            stepDb.append(0.0)
+            settle.append(0)
+            active.append(false)
+            b0.append(1.0)
+            b1.append(0.0)
+            b2.append(0.0)
+            a1.append(0.0)
+            a2.append(0.0)
+        }
+        z1 = []
+        z2 = []
+        for _ in 0..(bands * c) {
+            z1.append(0.0)
+            z2.append(0.0)
+        }
+        for b in 0..bands {
+            if !usable[b] {
+                curDb[b] = 0.0
+            }
+            design(b)
+            active[b] = usable[b] && (curDb[b] != 0.0 || tgtDb[b] != 0.0)
+            setStep(b)
+        }
+    }
+
+    // Clears the filter state (after a seek).
+    fn clear() {
+        for i in 0..z1.count {
+            z1[i] = 0.0
+            z2[i] = 0.0
+        }
+    }
+
+    // New target gains in dB (clamped to ±eqMaxDb); on = false means flat.
+    fn setTargets(_ gains: [Float], on: Bool) {
+        for b in 0..bands {
+            var g = 0.0
+            if on && b < gains.count && usable[b] {
+                g = max(-eqMaxDb, min(eqMaxDb, gains[b]))
+            }
+            if g != tgtDb[b] {
+                tgtDb[b] = g
+                setStep(b)
+                if g != curDb[b] {
+                    active[b] = true
+                }
+            }
+        }
+    }
+
+    // Jumps straight to the targets (for a fresh start: no ramp needed).
+    fn snap() {
+        for b in 0..bands {
+            curDb[b] = tgtDb[b]
+            stepDb[b] = 0.0
+            design(b)
+            active[b] = usable[b] && curDb[b] != 0.0
+        }
+    }
+
+    fn setStep(_ b: Int) {
+        let segs = max(1.0, ceil(eqRampMs * 0.001 * Float(rate) / Float(eqSegment)))
+        stepDb[b] = abs(tgtDb[b] - curDb[b]) / segs
+    }
+
+    fn design(_ b: Int) {
+        let q = peakingFrom(cw[b], alpha[b], curDb[b])
+        b0[b] = q.b0
+        b1[b] = q.b1
+        b2[b] = q.b2
+        a1[b] = q.a1
+        a2[b] = q.a2
+    }
+
+    // Whether any band is still moving.
+    fn ramping() -> Bool {
+        for b in 0..bands {
+            if curDb[b] != tgtDb[b] {
+                return true
+            }
+        }
+        false
+    }
+
+    // Whether the equalizer currently changes the sound at all.
+    fn idle() -> Bool {
+        for b in 0..bands {
+            if active[b] {
+                return false
+            }
+        }
+        true
+    }
+
+    // Filters the interleaved block in place.
+    fn process(_ d: bind [Float]) {
+        let c = channels
+        if c <= 0 {
+            return
+        }
+        let n = d.count / c
+        if ramping() {
+            var f = 0
+            while f < n {
+                let e = min(n, f + eqSegment)
+                for b in 0..bands {
+                    if curDb[b] != tgtDb[b] {
+                        let diff = tgtDb[b] - curDb[b]
+                        if abs(diff) <= stepDb[b] {
+                            curDb[b] = tgtDb[b]
+                        } else if diff > 0.0 {
+                            curDb[b] += stepDb[b]
+                        } else {
+                            curDb[b] -= stepDb[b]
+                        }
+                        design(b)
+                    }
+                }
+                runActive(d, f, e)
+                f = e
+            }
+        } else {
+            runActive(d, 0, n)
+        }
+        // Bands that came back to 0 dB: let the state die away, then stop.
+        for b in 0..bands {
+            if active[b] && curDb[b] == 0.0 && tgtDb[b] == 0.0 {
+                if settle[b] <= 0 {
+                    settle[b] = 64
+                } else {
+                    settle[b] -= n
+                    if settle[b] <= 0 {
+                        settle[b] = 0
+                        active[b] = false
+                        for ch in 0..c {
+                            z1[b * c + ch] = 0.0
+                            z2[b * c + ch] = 0.0
+                        }
+                    }
+                }
+            } else {
+                settle[b] = 0
+            }
+        }
+    }
+
+    // Every active band over frames [f0, f1): for stereo, two bands at a
+    // time in one loop, so four filter chains are in flight at once (a
+    // biquad's speed is bound by its own feedback, not by arithmetic).
+    fn runActive(_ d: bind [Float], _ f0: Int, _ f1: Int) {
+        var pending = -1
+        for b in 0..bands {
+            if !active[b] {
+                continue
+            }
+            if channels != 2 {
+                run(d, b, f0, f1)
+            } else if pending < 0 {
+                pending = b
+            } else {
+                runPair(d, pending, b, f0, f1)
+                pending = -1
+            }
+        }
+        if pending >= 0 {
+            run(d, pending, f0, f1)
+        }
+    }
+
+    // Bands b then c, stereo, over frames [f0, f1).
+    fn runPair(_ d: bind [Float], _ b: Int, _ c: Int, _ f0: Int, _ f1: Int) {
+        let k0 = b0[b]
+        let k1 = b1[b]
+        let k2 = b2[b]
+        let m1 = a1[b]
+        let m2 = a2[b]
+        let j0 = b0[c]
+        let j1 = b1[c]
+        let j2 = b2[c]
+        let n1 = a1[c]
+        let n2 = a2[c]
+        let s = b * 2
+        let t = c * 2
+        var p1 = z1[s]
+        var p2 = z2[s]
+        var q1 = z1[s + 1]
+        var q2 = z2[s + 1]
+        var u1 = z1[t]
+        var u2 = z2[t]
+        var v1 = z1[t + 1]
+        var v2 = z2[t + 1]
+        var i = f0 * 2
+        let end = f1 * 2
+        while i < end {
+            let x = d[i]
+            let w = d[i + 1]
+            let y = k0 * x + p1
+            let z = k0 * w + q1
+            p1 = k1 * x - m1 * y + p2
+            q1 = k1 * w - m1 * z + q2
+            p2 = k2 * x - m2 * y
+            q2 = k2 * w - m2 * z
+            let y2 = j0 * y + u1
+            let z2v = j0 * z + v1
+            u1 = j1 * y - n1 * y2 + u2
+            v1 = j1 * z - n1 * z2v + v2
+            u2 = j2 * y - n2 * y2
+            v2 = j2 * z - n2 * z2v
+            d[i] = y2
+            d[i + 1] = z2v
+            i += 2
+        }
+        z1[s] = p1
+        z2[s] = p2
+        z1[s + 1] = q1
+        z2[s + 1] = q2
+        z1[t] = u1
+        z2[t] = u2
+        z1[t + 1] = v1
+        z2[t + 1] = v2
+    }
+
+    // Band b over frames [f0, f1).
+    fn run(_ d: bind [Float], _ b: Int, _ f0: Int, _ f1: Int) {
+        let c = channels
+        let k0 = b0[b]
+        let k1 = b1[b]
+        let k2 = b2[b]
+        let m1 = a1[b]
+        let m2 = a2[b]
+        if c == 2 {
+            // Both channels in one loop (two independent chains).
+            let s = b * 2
+            var p1 = z1[s]
+            var p2 = z2[s]
+            var q1 = z1[s + 1]
+            var q2 = z2[s + 1]
+            var i = f0 * 2
+            let end = f1 * 2
+            while i < end {
+                let x = d[i]
+                let u = d[i + 1]
+                let y = k0 * x + p1
+                let v = k0 * u + q1
+                p1 = k1 * x - m1 * y + p2
+                q1 = k1 * u - m1 * v + q2
+                p2 = k2 * x - m2 * y
+                q2 = k2 * u - m2 * v
+                d[i] = y
+                d[i + 1] = v
+                i += 2
+            }
+            z1[s] = p1
+            z2[s] = p2
+            z1[s + 1] = q1
+            z2[s + 1] = q2
+            return
+        }
+        for ch in 0..c {
+            let s = b * c + ch
+            var p1 = z1[s]
+            var p2 = z2[s]
+            var i = f0 * c + ch
+            let end = f1 * c
+            while i < end {
+                let x = d[i]
+                let y = k0 * x + p1
+                p1 = k1 * x - m1 * y + p2
+                p2 = k2 * x - m2 * y
+                d[i] = y
+                i += c
+            }
+            z1[s] = p1
+            z2[s] = p2
+        }
+    }
+
+    // The designed response in dB at frequency f with the current gains
+    // (the product of the band filters).
+    fn responseDb(_ f: Float) -> Float {
+        var total = 0.0
+        for b in 0..bands {
+            if usable[b] && curDb[b] != 0.0 {
+                let q = Biquad(b0: b0[b], b1: b1[b], b2: b2[b], a1: a1[b], a2: a2[b])
+                total += q.db(f, Float(rate))
+            }
+        }
+        total
+    }
+}

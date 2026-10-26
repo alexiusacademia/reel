@@ -1,0 +1,151 @@
+// Variable length code tables shared by every decoder in this module
+// (MS-MPEG4, WMV1/2 and VC-1 all code their syntax elements with
+// prefix-free codes of up to ~26 bits).
+//
+// A table is one flat [Int]: the root part indexed by the next `rootBits`
+// bits of the stream, then sub-tables for codes longer than that. Entry e:
+//   e > 0   a code ends here: symbol (e >> 6) - 1, using (e & 63) bits of
+//           the current level's index
+//   e == 0  no code starts with these bits (damaged data)
+//   e < 0   a sub-table: -e = offset << 6 | its index bits; the current
+//           level's bits are used up and the next bits index the sub-table
+// The symbol of a code is its position in the (codes, lens) lists the
+// table was built from; callers map positions to values with their own
+// lists (run/level/last, motion vector parts, …).
+//
+// Big tables copied from the specifications come as base64 text (a long
+// list literal compiles slowly); wmvUnpack turns them back into lists.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../core"
+
+// Builds a table from codes[i] (the code's bits, right aligned) and
+// lens[i] (its length; 0 = symbol unused). rootBits is the root index
+// width (8 to 10 is a good balance; at least the most common codes'
+// length).
+fn wmvBuildVlc(_ codes: [Int], _ lens: [Int], rootBits: Int) -> [Int] {
+    var lut = core.zeros(1 << rootBits)
+    // Pending tables: offset, index bits, prefix, prefix length.
+    var tOff: [Int] = [0]
+    var tBits: [Int] = [rootBits]
+    var tPre: [Int] = [0]
+    var tPreLen: [Int] = [0]
+    var t = 0
+    let n = codes.count
+    while t < tOff.count {
+        let off = tOff[t]
+        let bits = tBits[t]
+        let pre = tPre[t]
+        let preLen = tPreLen[t]
+        t += 1
+        // Longest remainder below each index that needs a sub-table.
+        var need: [Int] = []
+        for _ in 0..(1 << bits) {
+            need.append(0)
+        }
+        for i in 0..n {
+            let len = lens[i]
+            if len <= preLen {
+                continue
+            }
+            let code = codes[i]
+            if (code >> (len - preLen)) != pre {
+                continue
+            }
+            let rem = len - preLen
+            let low = code & ((1 << rem) - 1)
+            if rem <= bits {
+                let first = low << (bits - rem)
+                for k in 0..(1 << (bits - rem)) {
+                    lut[off + first + k] = ((i + 1) << 6) | rem
+                }
+            } else {
+                let idx = low >> (rem - bits)
+                need[idx] = max(need[idx], rem - bits)
+            }
+        }
+        for idx in 0..(1 << bits) {
+            let m = need[idx]
+            if m > 0 {
+                let subBits = min(m, 9)
+                let subOff = lut.count
+                for _ in 0..(1 << subBits) {
+                    lut.append(0)
+                }
+                lut[off + idx] = -((subOff << 6) | subBits)
+                tOff.append(subOff)
+                tBits.append(subBits)
+                tPre.append((pre << bits) | idx)
+                tPreLen.append(preLen + bits)
+            }
+        }
+    }
+    lut
+}
+
+// Reads one code: its symbol, or -1 (nothing consumed at the failing
+// level) when the bits start no code. Hot code should copy this as a
+// method of the struct that owns the BitReader (see BRIEF: calls through
+// bind parameters are slow).
+fn wmvVlc(_ br: bind core.BitReader, _ lut: [Int], _ rootBits: Int) -> Int {
+    var e = lut[br.peek(rootBits)]
+    if e > 0 {
+        br.bits(e & 63)
+        return (e >> 6) - 1
+    }
+    var bits = rootBits
+    while e < 0 {
+        br.bits(bits)
+        let p = -e
+        bits = p & 63
+        e = lut[(p >> 6) + br.peek(bits)]
+    }
+    if e == 0 {
+        return -1
+    }
+    br.bits(e & 63)
+    (e >> 6) - 1
+}
+
+// The 0, 1, … n-1 list (symbols that are their own values).
+fn wmvIota(_ n: Int) -> [Int] {
+    var out: [Int] = []
+    for i in 0..n {
+        out.append(i)
+    }
+    out
+}
+
+// Every `step`-th item of a list from `first` (to split interleaved
+// C tables such as {code, len} pairs).
+fn wmvEvery(_ list: [Int], _ first: Int, _ step: Int) -> [Int] {
+    var out: [Int] = []
+    var i = first
+    while i < list.count {
+        out.append(list[i])
+        i += step
+    }
+    out
+}
+
+// Unpacks base64 text of little-endian items `width` bytes wide (1, 2 or
+// 4), signed or not.
+fn wmvUnpack(_ text: String, width: Int, signed: Bool) -> [Int] {
+    let d = decodeBase64(text) ?? Data()
+    var out: [Int] = []
+    var i = 0
+    while i + width <= d.count {
+        var v = 0
+        for k in 0..width {
+            v = v | (d[i + k] << (8 * k))
+        }
+        if signed && v >= (1 << (8 * width - 1)) {
+            v -= 1 << (8 * width)
+        }
+        out.append(v)
+        i += width
+    }
+    out
+}

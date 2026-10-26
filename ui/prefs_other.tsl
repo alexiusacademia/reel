@@ -1,0 +1,148 @@
+// The Library, Network and OpenSubtitles pages of the Preferences window.
+// Adding a folder, rescanning, clearing thumbnails and checking the
+// OpenSubtitles key are the app's work, through callbacks; the pages show
+// what the app passes back (PrefsStatus).
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+import "../library"
+
+// Library: the folders scanned, scanning, the thumbnail cache.
+public view LibraryPrefs(prefs: bind library.Preferences, status: PrefsStatus = PrefsStatus(), onAddFolder: fn(), onRescan: fn(), onClearThumbnails: fn()) {
+    PrefsPage {
+        Grid(spacing: 10) {
+            PrefsHeader("Folders")
+            PrefsRow("Media folders") {
+                VStack(spacing: 4, alignment: .leading) {
+                    if prefs.libraryFolders.isEmpty {
+                        Text("No folders yet: add the folders your films, shows and music are in.")
+                            .font(size: 12)
+                            .color(.secondary)
+                            .frame(maxWidth: 360, alignment: .leading)
+                    }
+                    for (i, folder) in prefs.libraryFolders.enumerated() {
+                        HStack(spacing: 8) {
+                            VStack(spacing: 0, alignment: .leading) {
+                                Text(folder.fileName)
+                                Text(folder).font(size: 11).color(.secondary).lineLimit(1)
+                            }
+                            .frame(width: 300, alignment: .leading)
+                            Button("Remove") { prefs.libraryFolders.remove(at: i) }
+                                .accessibilityLabel("Remove {folder.fileName} from the library")
+                            Spacer()
+                        }
+                        .id(folder)
+                    }
+                    Button("Add Folder…") { onAddFolder() }
+                }
+            }
+            PrefsRow("Scanning") {
+                Toggle("Look for new files when Reel starts", isOn: prefs.scanOnStart)
+            }
+            PrefsRow("") {
+                Button(if status.scanning { "Scanning…" } else { "Rescan Now" }) { onRescan() }
+                    .disabled(status.scanning || prefs.libraryFolders.isEmpty)
+                if !status.libraryStatus.isEmpty {
+                    Text(status.libraryStatus).color(.secondary).lineLimit(2).frame(maxWidth: 300, alignment: .leading)
+                }
+            }
+            PrefsRow("Read tags of files up to") {
+                Stepper(value: prefs.scanTagMB, step: 10, from: 0, to: 2000)
+                    .accessibilityLabel("Read tags of audio files up to this many megabytes")
+                Text("MB").color(.secondary)
+            }
+
+            PrefsHeader("Thumbnails")
+            PrefsRow("Cache size") {
+                Stepper(value: prefs.thumbnailCacheMB, step: 50, from: 50, to: 10000)
+                    .accessibilityLabel("Thumbnail cache size in megabytes")
+                Text("MB at most").color(.secondary)
+            }
+            PrefsRow("") {
+                Button("Clear Thumbnails") { onClearThumbnails() }
+                    .disabled(status.thumbnailCacheBytes == 0)
+                if status.thumbnailCacheBytes >= 0 {
+                    Text("{prefsBytes(status.thumbnailCacheBytes)} used").color(.secondary)
+                }
+            }
+        }
+    }
+}
+
+// Network: caching, quality, user agent.
+public view NetworkPrefs(prefs: bind library.Preferences) {
+    PrefsPage {
+        Grid(spacing: 10) {
+            PrefsHeader("Streams")
+            PrefsRow("Read ahead") {
+                Stepper(value: prefs.networkCacheSeconds, step: 1, from: 1, to: 600)
+                    .accessibilityLabel("Seconds of a stream to read ahead")
+                Text("seconds").color(.secondary)
+            }
+            PrefsNote("More is smoother on a slow connection; less starts sooner.")
+            PrefsRow("Highest quality") {
+                Picker(selection: prefs.maxStreamHeight, style: .menu) {
+                    for h in prefsStreamHeights {
+                        Text(prefsHeightTitle(h)).tag(h)
+                    }
+                    if !prefsStreamHeights.contains(prefs.maxStreamHeight) {
+                        Text(prefsHeightTitle(prefs.maxStreamHeight)).tag(prefs.maxStreamHeight)
+                    }
+                }
+                .frame(width: 160)
+                .accessibilityLabel("Highest quality of adaptive streams")
+            }
+            PrefsNote("For adaptive streams (HLS, DASH): Reel picks the best one up to this height.")
+            PrefsRow("User agent") {
+                TextField("Reel's own", text: prefs.userAgent)
+                    .frame(width: 320)
+                    .accessibilityLabel("User agent")
+            }
+            PrefsNote("What Reel tells web servers it is. Leave empty unless a site needs another.")
+        }
+    }
+}
+
+// OpenSubtitles: the API key, the account, and the status the app passes in.
+public view OpenSubtitlesPrefs(prefs: bind library.Preferences, status: String = "", onCheck: fn(), onLogOut: fn()) {
+    PrefsPage {
+        Grid(spacing: 10) {
+            PrefsHeader("OpenSubtitles.com")
+            PrefsNote("Reel searches and downloads subtitles from OpenSubtitles.com with your own API key, which is free.")
+            PrefsRow("API key") {
+                TextField("Paste your API key", text: prefs.openSubtitlesApiKey, secure: true)
+                    .frame(width: 300)
+                    .accessibilityLabel("OpenSubtitles API key")
+            }
+            PrefsRow("") {
+                Link("Get a key at opensubtitles.com", url: "https://www.opensubtitles.com/en/consumers")
+            }
+            PrefsRow("Username") {
+                TextField("For downloads", text: prefs.openSubtitlesUser)
+                    .frame(width: 220)
+                    .accessibilityLabel("OpenSubtitles username")
+            }
+            PrefsNote("Searching needs only the key; downloading also needs an account. Reel asks for the password when it logs in, and keeps only the login token.")
+            PrefsRow("") {
+                Button("Check Key") { onCheck() }
+                    .disabled(prefs.openSubtitlesApiKey.trim().isEmpty)
+                if !prefs.openSubtitlesToken.isEmpty {
+                    Button("Log Out") {
+                        prefs.openSubtitlesToken = ""
+                        onLogOut()
+                    }
+                }
+            }
+            if !prefs.openSubtitlesToken.isEmpty {
+                PrefsNote(if prefs.openSubtitlesUser.isEmpty { "Logged in." } else { "Logged in as {prefs.openSubtitlesUser}." })
+            }
+            if !status.isEmpty {
+                PrefsRow("Status") {
+                    Text(status).frame(maxWidth: 360, alignment: .leading).selectable()
+                    Spacer()
+                }
+            }
+        }
+    }
+}

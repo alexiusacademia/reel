@@ -1,0 +1,337 @@
+// The SILK layer of an Opus decoder (RFC 6716 section 4.2; libopus
+// silk/dec_API.c, stereo_decode_pred.c, stereo_MS_to_LR.c): the per-packet
+// header bits (VAD and LBRR flags, section 4.2.3-4.2.4), skipping of the
+// low-bitrate redundancy, mid/side stereo (section 4.2.7.1 and 4.2.8),
+// the two channel decoders and the resampler to 48 kHz.
+//
+// SilkDecoder.decode does what libopus's opus_decode_frame does with SILK
+// for one Opus frame: it calls the per-frame decoder once per 10 or 20 ms
+// SILK frame and returns 48 kHz 16-bit sample values, interleaved.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+struct SilkDecoder {
+    // Output channels (the Opus decoder's), 1 or 2.
+    apiChannels: Int = 2
+    ch: [SilkChannel] = []
+    nChannelsAPI: Int = 0
+    nChannelsInternal: Int = 0
+    prevDecodeOnlyMiddle: Int = 0
+    // Stereo state (stereo_dec_state).
+    predPrevQ13: [Int] = [0, 0]
+    sMid: [Int] = [0, 0]
+    sSide: [Int] = [0, 0]
+    // The rate and channels of the last packet, for concealment.
+    lastInternalRate: Int = 0
+    lastStreamChannels: Int = 1
+    // Mid and side (later left and right) of one frame, with two samples
+    // of history in front.
+    tmp0: [Int] = []
+    tmp1: [Int] = []
+    msPred: [Int] = [0, 0]
+    out: [Int] = []
+
+    // silk_ResetDecoder.
+    fn reset() {
+        for n in 0..2 {
+            ch[n].initState()
+        }
+        predPrevQ13 = [0, 0]
+        sMid = [0, 0]
+        sSide = [0, 0]
+        prevDecodeOnlyMiddle = 0
+    }
+
+    // One Opus frame's SILK layer (see the file comment). frameMs is 10,
+    // 20, 40 or 60; when lost, the time to conceal (10 ms steps).
+    fn decode(rc: bind OpusRange, internalRate: Int, streamChannels: Int, frameMs: Int, lost: Bool) -> [Int] {
+        out = []
+        var rate = internalRate
+        var nInt = streamChannels
+        if lost {
+            if lastInternalRate == 0 {
+                // Nothing decoded yet: silence.
+                for _ in 0..(frameMs * 48 * apiChannels) {
+                    out.append(0)
+                }
+                return out
+            }
+            rate = lastInternalRate
+            nInt = lastStreamChannels
+            // libopus conceals at most 20 ms per call, each as a new packet.
+            var left = frameMs
+            while left > 0 {
+                let step = if left >= 20 { 20 } else { 10 }
+                decodeOnce(rc, true, true, step, rate, nInt)
+                left -= step
+            }
+            return out
+        }
+        lastInternalRate = rate
+        lastStreamChannels = nInt
+        let calls = if frameMs <= 20 { 1 } else { frameMs / 20 }
+        for i in 0..calls {
+            decodeOnce(rc, false, i == 0, frameMs, rate, nInt)
+        }
+        out
+    }
+
+    // silk_stereo_decode_pred (section 4.2.7.1).
+    fn stereoDecodePred(_ rc: bind OpusRange) {
+        let n = rc.icdf(silkStereoPredJointICDF, 8)
+        let ix02 = n / 5
+        let ix12 = n - 5 * ix02
+        let ix00 = rc.icdf(silkUniform3ICDF, 8)
+        let ix01 = rc.icdf(silkUniform5ICDF, 8)
+        let ix10 = rc.icdf(silkUniform3ICDF, 8)
+        let ix11 = rc.icdf(silkUniform5ICDF, 8)
+        for k in 0..2 {
+            let a = (if k == 0 { ix00 } else { ix10 }) + 3 * (if k == 0 { ix02 } else { ix12 })
+            let b = if k == 0 { ix01 } else { ix11 }
+            let low = silkStereoPredQuantQ13[a]
+            let step = silkSMULWB(silkStereoPredQuantQ13[a + 1] - low, 6554)
+            msPred[k] = low + silkSMULBB(step, 2 * b + 1)
+        }
+        msPred[0] -= msPred[1]
+    }
+
+    // silk_stereo_MS_to_LR (section 4.2.8): tmp0/tmp1 from mid/side to
+    // left/right, samples 1...len.
+    fn msToLR(_ fsKHz: Int, _ len: Int) {
+        tmp0[0] = sMid[0]
+        tmp0[1] = sMid[1]
+        tmp1[0] = sSide[0]
+        tmp1[1] = sSide[1]
+        sMid[0] = tmp0[len]
+        sMid[1] = tmp0[len + 1]
+        sSide[0] = tmp1[len]
+        sSide[1] = tmp1[len + 1]
+        var pred0 = predPrevQ13[0]
+        var pred1 = predPrevQ13[1]
+        let interp = 8 * fsKHz
+        let denomQ16 = (1 << 16) / interp
+        let delta0 = silkRshiftRound(silkSMULBB(msPred[0] - predPrevQ13[0], denomQ16), 16)
+        let delta1 = silkRshiftRound(silkSMULBB(msPred[1] - predPrevQ13[1], denomQ16), 16)
+        for n in 0..len {
+            if n < interp {
+                pred0 += delta0
+                pred1 += delta1
+            } else if n == interp {
+                pred0 = msPred[0]
+                pred1 = msPred[1]
+            }
+            var sum = (tmp0[n] + tmp0[n + 2] + (tmp0[n + 1] << 1)) << 9
+            sum = silkSMLAWB(tmp1[n + 1] << 8, sum, pred0)
+            sum = silkSMLAWB(sum, tmp0[n + 1] << 11, pred1)
+            tmp1[n + 1] = silkSat16(silkRshiftRound(sum, 8))
+        }
+        predPrevQ13[0] = msPred[0]
+        predPrevQ13[1] = msPred[1]
+        for n in 0..len {
+            let s = tmp0[n + 1] + tmp1[n + 1]
+            let d = tmp0[n + 1] - tmp1[n + 1]
+            tmp0[n + 1] = silkSat16(s)
+            tmp1[n + 1] = silkSat16(d)
+        }
+    }
+
+    // silk_Decode: one call decodes one 10/20 ms SILK frame (of each
+    // channel) and appends its 48 kHz samples to `out`.
+    fn decodeOnce(_ rc: bind OpusRange, _ lost: Bool, _ newPacket: Bool, _ payloadMs: Int, _ internalRate: Int, _ nInt: Int) {
+        if newPacket {
+            for n in 0..nInt {
+                ch[n].nFramesDecoded = 0
+            }
+        }
+        // Mono to stereo in the stream: start the side channel afresh.
+        if nInt > nChannelsInternal {
+            ch[1].initState()
+        }
+        let stereoToMono = nInt == 1 && nChannelsInternal == 2 && internalRate == 1000 * ch[0].fsKHz
+        if ch[0].nFramesDecoded == 0 {
+            for n in 0..nInt {
+                if payloadMs == 10 {
+                    ch[n].nFramesPerPacket = 1
+                    ch[n].nbSubfr = 2
+                } else if payloadMs == 20 {
+                    ch[n].nFramesPerPacket = 1
+                    ch[n].nbSubfr = 4
+                } else if payloadMs == 40 {
+                    ch[n].nFramesPerPacket = 2
+                    ch[n].nbSubfr = 4
+                } else {
+                    ch[n].nFramesPerPacket = 3
+                    ch[n].nbSubfr = 4
+                }
+                ch[n].setFs((internalRate >> 10) + 1)
+            }
+        }
+        if apiChannels == 2 && nInt == 2 && (nChannelsAPI == 1 || nChannelsInternal == 1) {
+            predPrevQ13 = [0, 0]
+            sSide = [0, 0]
+            ch[1].resampler = ch[0].resampler
+        }
+        nChannelsAPI = apiChannels
+        nChannelsInternal = nInt
+
+        if !lost && ch[0].nFramesDecoded == 0 {
+            // VAD and LBRR flags (sections 4.2.3, 4.2.4).
+            for n in 0..nInt {
+                for i in 0..ch[n].nFramesPerPacket {
+                    ch[n].vadFlags[i] = if rc.bitLogp(1) { 1 } else { 0 }
+                }
+                ch[n].lbrrFlag = if rc.bitLogp(1) { 1 } else { 0 }
+            }
+            for n in 0..nInt {
+                ch[n].lbrrFlags = [0, 0, 0]
+                if ch[n].lbrrFlag != 0 {
+                    if ch[n].nFramesPerPacket == 1 {
+                        ch[n].lbrrFlags[0] = 1
+                    } else {
+                        let table = if ch[n].nFramesPerPacket == 2 { silkLBRRFlags2ICDF } else { silkLBRRFlags3ICDF }
+                        let sym = rc.icdf(table, 8) + 1
+                        for i in 0..ch[n].nFramesPerPacket {
+                            ch[n].lbrrFlags[i] = (sym >> i) & 1
+                        }
+                    }
+                }
+            }
+            // Skip the LBRR frames (section 4.2.7.2 onwards, decoded and
+            // dropped; their side effects on the coding state are kept as in
+            // libopus).
+            for i in 0..ch[0].nFramesPerPacket {
+                for n in 0..nInt {
+                    if ch[n].lbrrFlags[i] != 0 {
+                        if nInt == 2 && n == 0 {
+                            stereoDecodePred(rc)
+                            if ch[1].lbrrFlags[i] == 0 {
+                                rc.icdf(silkStereoOnlyCodeMidICDF, 8)
+                            }
+                        }
+                        let cond = if i > 0 && ch[n].lbrrFlags[i - 1] != 0 { 2 } else { 0 }
+                        ch[n].decodeIndices(rc, i, true, cond)
+                        ch[n].decodePulses(rc, ch[n].signalType, ch[n].quantOffsetType, ch[n].frameLength)
+                    }
+                }
+            }
+        }
+
+        // Mid/side predictors (section 4.2.7.1).
+        var decodeOnlyMiddle = 0
+        if nInt == 2 {
+            if !lost {
+                stereoDecodePred(rc)
+                if ch[1].vadFlags[ch[0].nFramesDecoded] == 0 {
+                    decodeOnlyMiddle = rc.icdf(silkStereoOnlyCodeMidICDF, 8)
+                }
+            } else {
+                msPred[0] = predPrevQ13[0]
+                msPred[1] = predPrevQ13[1]
+            }
+        }
+        // First frame with a side channel after mid-only ones: reset it.
+        if nInt == 2 && decodeOnlyMiddle == 0 && prevDecodeOnlyMiddle == 1 {
+            for i in 0..480 {
+                ch[1].outBuf[i] = 0
+            }
+            for i in 0..16 {
+                ch[1].sLPCQ14Buf[i] = 0
+            }
+            ch[1].lagPrev = 100
+            ch[1].lastGainIndex = 10
+            ch[1].prevSignalType = 0
+            ch[1].firstFrameAfterReset = true
+        }
+        let hasSide = if !lost { decodeOnlyMiddle == 0 } else { prevDecodeOnlyMiddle == 0 }
+
+        let flen = ch[0].frameLength
+        if tmp0.count < flen + 2 {
+            tmp0 = silkZeros(flen + 2)
+            tmp1 = silkZeros(flen + 2)
+        }
+        var nOut = flen
+        for n in 0..nInt {
+            if n == 0 || hasSide {
+                let frameIndex = ch[0].nFramesDecoded - n
+                var cond = 2
+                if frameIndex <= 0 {
+                    cond = 0
+                } else if n > 0 && prevDecodeOnlyMiddle != 0 {
+                    cond = 1
+                }
+                ch[n].decodeFrame(rc, lost, cond)
+                nOut = ch[n].frameLength
+                if n == 0 {
+                    for i in 0..nOut {
+                        tmp0[2 + i] = ch[0].xq[i]
+                    }
+                } else {
+                    for i in 0..nOut {
+                        tmp1[2 + i] = ch[1].xq[i]
+                    }
+                }
+            } else {
+                for i in 0..nOut {
+                    tmp1[2 + i] = 0
+                }
+            }
+            ch[n].nFramesDecoded += 1
+        }
+
+        if apiChannels == 2 && nInt == 2 {
+            msToLR(ch[0].fsKHz, nOut)
+        } else {
+            tmp0[0] = sMid[0]
+            tmp0[1] = sMid[1]
+            sMid[0] = tmp0[nOut]
+            sMid[1] = tmp0[nOut + 1]
+        }
+
+        // Resample to 48 kHz and interleave.
+        let base = out.count
+        let n48 = nOut * 48 / ch[0].fsKHz
+        for _ in 0..(n48 * apiChannels) {
+            out.append(0)
+        }
+        for n in 0..min(apiChannels, nInt) {
+            if n == 0 {
+                ch[0].resampler.process(tmp0, 1, nOut)
+            } else {
+                ch[1].resampler.process(tmp1, 1, nOut)
+            }
+            for i in 0..n48 {
+                out[base + n + apiChannels * i] = ch[n].resampler.work[i]
+            }
+        }
+        if apiChannels == 2 && nInt == 1 {
+            if stereoToMono {
+                ch[1].resampler.process(tmp0, 1, nOut)
+                for i in 0..n48 {
+                    out[base + 1 + 2 * i] = ch[1].resampler.work[i]
+                }
+            } else {
+                for i in 0..n48 {
+                    out[base + 1 + 2 * i] = out[base + 2 * i]
+                }
+            }
+        }
+
+        if lost {
+            for i in 0..nChannelsInternal {
+                ch[i].lastGainIndex = 10
+            }
+        } else {
+            prevDecodeOnlyMiddle = decodeOnlyMiddle
+        }
+    }
+}
+
+// A SILK decoder whose output (48 kHz) has apiChannels channels.
+fn newSilkDecoder(apiChannels: Int) -> SilkDecoder {
+    var d = SilkDecoder(apiChannels: apiChannels)
+    var c = SilkChannel()
+    c.initState()
+    d.ch = [c, c]
+    d
+}

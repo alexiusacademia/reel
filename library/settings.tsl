@@ -1,0 +1,329 @@
+// Per-file memory: what Reel remembers about each file it has played (the
+// chosen audio and subtitle tracks by language and codec, volume, speed,
+// delays, picture settings, equalizer preset, bookmarks and the A-B loop),
+// and the rules for picking tracks again from that memory or from the
+// preferred languages.
+//
+// Tracks are remembered by what they are, not by their number, so the
+// choice carries over to the next episode of a show (whose English AAC
+// track may be track 2 instead of 1). Languages are compared as ISO 639-2
+// codes, accepting the 639-1 two-letter codes, both 639-2 forms (B and T,
+// "ger"/"deu") and English names (ISO 639-2 code list, Library of Congress).
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+import "../core"
+
+// A remembered track choice.
+public struct TrackChoice {
+    // Whether anything is remembered (false: use the defaults).
+    chosen: Bool = false
+    // The user turned the track kind off.
+    off: Bool = false
+    language: String = ""
+    codec: String = ""
+    title: String = ""
+    // Among tracks with the same language and codec, which one (0 = first).
+    nth: Int = 0
+    // A subtitle file loaded beside the video instead of a track.
+    file: String = ""
+}
+
+// A named time in a file.
+public struct Bookmark {
+    time: Float
+    name: String = ""
+    // When it was made (seconds since 1970).
+    created: Float = 0.0
+}
+
+// Everything remembered for one file. Values at their defaults mean "not
+// changed by the user": the app uses its preferences then.
+public struct FileSettings {
+    audio: TrackChoice = TrackChoice()
+    subtitle: TrackChoice = TrackChoice()
+    // A second subtitle track shown at the top.
+    secondarySubtitle: TrackChoice = TrackChoice()
+    // 0…1, or −1 when not remembered.
+    volume: Float = -1.0
+    // 0.25…4, or −1 when not remembered.
+    speed: Float = -1.0
+    // Seconds (positive: later).
+    audioDelay: Float = 0.0
+    subtitleDelay: Float = 0.0
+    // "" none, "auto" (detect black bars), or "left,top,right,bottom" pixels.
+    crop: String = ""
+    // "" as the file says, "16:9" "4:3" "2.35:1" "1:1" or "w:h".
+    aspect: String = ""
+    zoom: Float = 1.0
+    panX: Float = 0.0
+    panY: Float = 0.0
+    // Extra rotation in degrees (0 90 180 270), on top of the file's.
+    rotation: Int = 0
+    flipH: Bool = false
+    flipV: Bool = false
+    // "" (the preference), "off" "auto" "bob" "blend" "adaptive".
+    deinterlace: String = ""
+    // Equalizer preset name, "" for the global setting.
+    equalizer: String = ""
+    // Picture adjustments (1.0 / 0.0 = unchanged).
+    brightness: Float = 0.0
+    contrast: Float = 1.0
+    saturation: Float = 1.0
+    gamma: Float = 1.0
+    hue: Float = 0.0
+    bookmarks: [Bookmark] = []
+    // The A-B loop, seconds (−1: not set).
+    abStart: Float = -1.0
+    abEnd: Float = -1.0
+}
+
+// Whether the A-B loop is set (both ends, B after A).
+public fn hasABLoop(_ s: FileSettings) -> Bool {
+    s.abStart >= 0.0 && s.abEnd > s.abStart
+}
+
+// Where to go at time `t` with the A-B loop on: A when t has passed B,
+// else t.
+public fn abLoopTime(_ s: FileSettings, at: Float) -> Float {
+    if hasABLoop(s) && at >= s.abEnd {
+        return s.abStart
+    }
+    at
+}
+
+// Sets the A point, then B, then clears (the usual one-key cycle). Gives
+// the new settings.
+public fn cycleABLoop(_ s0: FileSettings, at: Float) -> FileSettings {
+    let t = at
+    var s = s0
+    if s.abStart < 0.0 {
+        s.abStart = t
+        s.abEnd = -1.0
+    } else if s.abEnd < 0.0 && t > s.abStart {
+        s.abEnd = t
+    } else {
+        s.abStart = -1.0
+        s.abEnd = -1.0
+    }
+    s
+}
+
+// Adds a bookmark, keeping them in time order. An empty name becomes the
+// time ("1:02:03").
+public fn addBookmark(_ s0: FileSettings, time: Float, name: String = "") -> FileSettings {
+    var s = s0
+    let label = if name.isEmpty { clockText(time) } else { name }
+    s.bookmarks.append(Bookmark(time: time, name: label, created: now()))
+    s.bookmarks = s.bookmarks.sorted(by: { a, b in a.time < b.time })
+    s
+}
+
+// Removes the bookmark at `index` (in time order).
+public fn removeBookmark(_ s0: FileSettings, index: Int) -> FileSettings {
+    var s = s0
+    if index >= 0 && index < s.bookmarks.count {
+        s.bookmarks.remove(at: index)
+    }
+    s
+}
+
+// Renames the bookmark at `index`.
+public fn renameBookmark(_ s0: FileSettings, index: Int, name: String) -> FileSettings {
+    var s = s0
+    if index >= 0 && index < s.bookmarks.count {
+        s.bookmarks[index].name = name
+    }
+    s
+}
+
+// The bookmark after (or before) time `t`, for "next bookmark" keys; nil
+// when there's none.
+public fn nextBookmark(_ s: FileSettings, after: Float, forward: Bool = true) -> Bookmark? {
+    let t = after
+    if forward {
+        return s.bookmarks.first(where: { b in b.time > t + 0.5 })
+    }
+    s.bookmarks.last(where: { b in b.time < t - 0.5 })
+}
+
+// "1:02:03" or "2:03".
+public fn clockText(_ t: Float) -> String {
+    let s = Int(max(t, 0.0))
+    let h = s / 3600
+    let m = (s / 60) % 60
+    let sec = "{s % 60}".padStart(2, with: "0")
+    if h > 0 {
+        return "{h}:{"{m}".padStart(2, with: "0")}:{sec}"
+    }
+    "{m}:{sec}"
+}
+
+// --- Languages ---
+
+// ISO 639-1 code, ISO 639-2/B code, ISO 639-2/T code (when different, else
+// ""), English name — for the languages media files most often carry.
+let languageTable: [(String, String, String, String)] = [
+    ("en", "eng", "", "english"), ("fr", "fre", "fra", "french"), ("de", "ger", "deu", "german"),
+    ("es", "spa", "", "spanish"), ("it", "ita", "", "italian"), ("pt", "por", "", "portuguese"),
+    ("nl", "dut", "nld", "dutch"), ("sv", "swe", "", "swedish"), ("no", "nor", "", "norwegian"),
+    ("nb", "nob", "", "norwegian bokmal"), ("nn", "nno", "", "norwegian nynorsk"), ("da", "dan", "", "danish"),
+    ("fi", "fin", "", "finnish"), ("is", "ice", "isl", "icelandic"), ("pl", "pol", "", "polish"),
+    ("cs", "cze", "ces", "czech"), ("sk", "slo", "slk", "slovak"), ("hu", "hun", "", "hungarian"),
+    ("ro", "rum", "ron", "romanian"), ("bg", "bul", "", "bulgarian"), ("hr", "hrv", "", "croatian"),
+    ("sr", "srp", "", "serbian"), ("sl", "slv", "", "slovenian"), ("el", "gre", "ell", "greek"),
+    ("tr", "tur", "", "turkish"), ("ru", "rus", "", "russian"), ("uk", "ukr", "", "ukrainian"),
+    ("be", "bel", "", "belarusian"), ("lt", "lit", "", "lithuanian"), ("lv", "lav", "", "latvian"),
+    ("et", "est", "", "estonian"), ("ja", "jpn", "", "japanese"), ("zh", "chi", "zho", "chinese"),
+    ("ko", "kor", "", "korean"), ("vi", "vie", "", "vietnamese"), ("th", "tha", "", "thai"),
+    ("id", "ind", "", "indonesian"), ("ms", "may", "msa", "malay"), ("tl", "tgl", "", "tagalog"),
+    ("fil", "fil", "", "filipino"), ("hi", "hin", "", "hindi"), ("bn", "ben", "", "bengali"),
+    ("ta", "tam", "", "tamil"), ("te", "tel", "", "telugu"), ("ur", "urd", "", "urdu"),
+    ("fa", "per", "fas", "persian"), ("ar", "ara", "", "arabic"), ("he", "heb", "", "hebrew"),
+    ("ca", "cat", "", "catalan"), ("eu", "baq", "eus", "basque"), ("gl", "glg", "", "galician"),
+    ("ga", "gle", "", "irish"), ("cy", "wel", "cym", "welsh"), ("la", "lat", "", "latin"),
+    ("sq", "alb", "sqi", "albanian"), ("mk", "mac", "mkd", "macedonian"), ("ka", "geo", "kat", "georgian"),
+    ("hy", "arm", "hye", "armenian"), ("af", "afr", "", "afrikaans"), ("sw", "swa", "", "swahili"),
+]
+
+// A language as Reel compares it: the ISO 639-2/B code ("eng", "ger",
+// "fre"), from a 639-1 code ("en"), a 639-2/T code ("deu"), a BCP 47 tag
+// ("en-US", "pt_BR"), or an English name ("English"); other text lower-cased;
+// "" for unknown ("und", "zxx", "mul").
+public fn languageCode(_ s: String) -> String {
+    var t = s.trim().lowercase()
+    if let dash = t.find("-") {
+        t = t.substring(from: 0, to: dash)
+    }
+    if let us = t.find("_") {
+        t = t.substring(from: 0, to: us)
+    }
+    if t.isEmpty || t == "und" || t == "zxx" || t == "mul" || t == "mis" {
+        return ""
+    }
+    for (one, b, tc, name) in languageTable {
+        if t == one || t == b || (!tc.isEmpty && t == tc) || t == name {
+            return b
+        }
+    }
+    t
+}
+
+// The English name of a language code ("eng" → "English"), or the code.
+public fn languageName(_ s: String) -> String {
+    let c = languageCode(s)
+    for (_, b, _, name) in languageTable {
+        if b == c {
+            return name.capitalized()
+        }
+    }
+    s
+}
+
+// Whether two language texts mean the same language.
+public fn sameLanguage(_ a: String, _ b: String) -> Bool {
+    let x = languageCode(a)
+    !x.isEmpty && x == languageCode(b)
+}
+
+// --- Choosing tracks ---
+
+// What to remember about choosing track `index` of `media` (or −1: off).
+public fn rememberTrack(_ media: core.Media, index: Int, kind: core.TrackKind) -> TrackChoice {
+    if index < 0 || index >= media.tracks.count {
+        return TrackChoice(chosen: true, off: true)
+    }
+    let t = media.tracks[index]
+    var nth = 0
+    for o in media.tracks {
+        if o.index == t.index {
+            break
+        }
+        if o.kind == kind && languageCode(o.language) == languageCode(t.language) && o.codec == t.codec {
+            nth += 1
+        }
+    }
+    TrackChoice(chosen: true, language: languageCode(t.language), codec: t.codec, title: t.title, nth: nth)
+}
+
+// The track a remembered choice picks in `media`: its index, −1 for off, or
+// nil when nothing is remembered or nothing fits (use the defaults then).
+// Best: same language, codec and title; then language and codec (the nth
+// one); then language alone.
+public fn chooseTrack(_ c: TrackChoice, _ media: core.Media, kind: core.TrackKind) -> Int? {
+    if !c.chosen {
+        return nil
+    }
+    if c.off {
+        return -1
+    }
+    let ts = core.tracksOf(media, kind)
+    let lang = languageCode(c.language)
+    if !c.title.isEmpty {
+        if let t = ts.first(where: { t in languageCode(t.language) == lang && t.codec == c.codec && t.title == c.title }) {
+            return t.index
+        }
+    }
+    let same = ts.filter { t in languageCode(t.language) == lang && t.codec == c.codec }
+    if !same.isEmpty {
+        return same[min(c.nth, same.count - 1)].index
+    }
+    if !lang.isEmpty {
+        if let t = ts.first(where: { t in languageCode(t.language) == lang }) {
+            return t.index
+        }
+    }
+    nil
+}
+
+// The track of a kind to start with from preferred languages (first match
+// wins), else the default-flagged track, else the first; −1 when there are
+// none. `canUse` filters out tracks the player can't decode.
+public fn preferredTrack(_ media: core.Media, kind: core.TrackKind, languages: [String], canUse: fn(core.Track) -> Bool = { t in true }) -> Int {
+    let ts = core.tracksOf(media, kind).filter { t in canUse(t) }
+    if ts.isEmpty {
+        return -1
+    }
+    for l in languages {
+        let code = languageCode(l)
+        if let t = ts.first(where: { t in languageCode(t.language) == code && !t.isForced }) {
+            return t.index
+        }
+    }
+    if let t = ts.first(where: { t in t.isDefault }) {
+        return t.index
+    }
+    ts[0].index
+}
+
+// The subtitle track to start with: "never" → −1; "forced" → a forced
+// track in the audio's language (or any forced one); "always" → by the
+// preferred languages; "auto" → like "always" but only when the audio's
+// language isn't one of the preferred ones (a foreign film), else a
+// forced track if there is one.
+public fn preferredSubtitle(_ media: core.Media, audioIndex: Int, mode: String, languages: [String]) -> Int {
+    let ts = core.tracksOf(media, .subtitle)
+    if ts.isEmpty || mode == "never" {
+        return -1
+    }
+    let audioLang = if audioIndex >= 0 && audioIndex < media.tracks.count { languageCode(media.tracks[audioIndex].language) } else { "" }
+    let forced = ts.first(where: { t in t.isForced && (audioLang.isEmpty || languageCode(t.language) == audioLang) }) ?? ts.first(where: { t in t.isForced })
+    if mode == "forced" {
+        return forced?.index ?? -1
+    }
+    let understood = !audioLang.isEmpty && languages.any(where: { l in languageCode(l) == audioLang })
+    if mode == "auto" && (understood || languages.isEmpty) {
+        return forced?.index ?? -1
+    }
+    for l in languages {
+        let code = languageCode(l)
+        if let t = ts.first(where: { t in languageCode(t.language) == code && !t.isForced }) {
+            return t.index
+        }
+    }
+    if mode == "always" {
+        return ts.first(where: { t in t.isDefault })?.index ?? ts[0].index
+    }
+    forced?.index ?? -1
+}

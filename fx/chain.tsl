@@ -1,0 +1,339 @@
+// fx.Chain: Reel's whole audio effects chain on the player's output.
+//
+// Order, per block:
+//   1. loudness meter (on the input, before any gain: it measures the
+//      programme for live normalisation and for display);
+//   2. input gain = normalisation gain + equalizer preamp;
+//   3. 10-band equalizer;
+//   4. compressor;
+//   5. stereo stage (mode, width, balance, crossfeed; 2 channels only);
+//   6. look-ahead limiter (always in the path, so the delay never changes;
+//      a plain delay when it has nothing to do);
+//   7. visualiser ring (the last 2048 frames of output).
+//
+// Settings live in `settings` (a plain struct to save as JSON). Change
+// them at any time between calls to `process`: every change is smoothed
+// (EQ gains glide over 50 ms, the preamp and the stereo matrix over 20 ms,
+// the compressor's parameters over ~20 ms, the normalisation gain
+// by ≤ 3 dB/s up and 10 dB/s down), except at the start of a track,
+// where everything starts at its target.
+//
+// Timing: the limiter looks `latency` frames ahead. With `align` on (the
+// default) the chain drops the first `latency` frames it makes after
+// newTrack/reset, so output frame k is input frame k (pts unchanged),
+// and `flush()` gives the last `latency` frames at the end of a stream.
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+import "../core"
+
+let fxLookMs = 5.0
+let fxNormUpDbPerSec = 3.0
+let fxNormDownDbPerSec = 10.0
+let fxPreampDbPerSec = 600.0
+
+public struct Chain {
+    settings: Settings = Settings()
+    // Drop the look-ahead's delay at the start (see above).
+    align: Bool = true
+    rate: Int = 0
+    channels: Int = 0
+    layout: [String] = []
+    eq: Equalizer = Equalizer()
+    comp: Compressor = Compressor()
+    lim: Limiter = Limiter()
+    stereo: StereoStage = StereoStage()
+    meter: Meter = Meter()
+    visual: Visual = Visual()
+    // A whole-track loudness the player measured beforehand, and the
+    // track's ReplayGain tags.
+    scanLufs: Float? = nil
+    tags: ReplayGain = ReplayGain()
+    // The normalisation gain and preamp being applied, dB, and the
+    // linear input gain at the end of the last block.
+    normDb: Float = 0.0
+    preDb: Float = 0.0
+    inGain: Float = 1.0
+    // Start of a track: settings apply at once, no ramps.
+    fresh: Bool = true
+    trimLeft: Int = 0
+    framesIn: Int = 0
+
+    // Frames of look-ahead delay (5 ms).
+    latency: Int {
+        if rate <= 0 {
+            Int(floor(fxLookMs * 0.001 * 48000.0 + 0.5))
+        } else {
+            lim.look
+        }
+    }
+
+    // The normalisation gain now applied, dB.
+    gainDb: Float { normDb }
+
+    // Gain reduction of the compressor (dB, ≥ 0) and the limiter's gain
+    // (linear, ≤ 1) at the end of the last block.
+    compressorReduction: Float { comp.reduction }
+    limiterGain: Float { lim.gain }
+
+    // Processes the next block of sound.
+    fn process(_ s: core.Samples) -> core.Samples {
+        if s.channels <= 0 || s.rate <= 0 || s.data.isEmpty {
+            return s
+        }
+        if s.rate != rate || s.channels != channels {
+            configure(s.rate, s.channels, s.layout)
+        }
+        apply()
+        var d = s.data
+        let n = d.count / channels
+        if settings.meterOn || settings.normalize != .off {
+            meter.addData(d)
+        }
+        gainStage(d, n)
+        eq.process(d)
+        comp.process(d)
+        if channels == 2 {
+            stereo.process(d)
+        }
+        lim.process(d)
+        if settings.visualOn {
+            visual.add(d, channels)
+        }
+        framesIn += n
+        fresh = false
+        var out = core.Samples(rate: s.rate, channels: s.channels, layout: s.layout, pts: s.pts)
+        if trimLeft > 0 {
+            let drop = min(trimLeft, n)
+            trimLeft -= drop
+            out.data = d.dropFirst(drop * channels)
+        } else {
+            out.data = d
+        }
+        out
+    }
+
+    // The sound still in the look-ahead (call at the end of a stream).
+    fn flush() -> core.Samples {
+        var out = core.Samples(rate: max(1, rate), channels: max(1, channels), layout: layout)
+        if rate <= 0 {
+            return out
+        }
+        var tail = lim.drain()
+        if !align {
+            out.data = tail
+            return out
+        }
+        // Without alignment trimming done, part of the tail is the delay's
+        // initial silence.
+        if trimLeft > 0 {
+            let drop = min(trimLeft, tail.count / channels)
+            trimLeft -= drop
+            tail = tail.dropFirst(drop * channels)
+        }
+        if settings.visualOn {
+            visual.add(tail, channels)
+        }
+        out.data = tail
+        out
+    }
+
+    // After a seek: forgets the filters' history and the look-ahead's
+    // contents; the loudness measured so far and the normalisation gain
+    // stay (it's the same track).
+    fn reset() {
+        if rate > 0 {
+            eq.clear()
+            comp.clear()
+            lim.clear()
+            stereo.clear()
+            meter.clearFilters()
+            visual.clear()
+        }
+        trimLeft = if align { lim.look } else { 0 }
+    }
+
+    // A new track: also forgets the loudness measurement, the scan and
+    // the tags, and the next block starts with every setting at its value.
+    fn newTrack() {
+        reset()
+        if rate > 0 {
+            meter.reset()
+        }
+        scanLufs = nil
+        tags = ReplayGain()
+        fresh = true
+        framesIn = 0
+    }
+
+    // The whole-track loudness (integrated LUFS) the player measured,
+    // e.g. with fx.measure or a Meter fed the decoded track.
+    fn setScan(lufs: Float) {
+        scanLufs = lufs
+    }
+
+    // The track's tags (media.tags) for ReplayGain.
+    fn setTags(_ t: [String: String]) {
+        tags = replayGain(t)
+    }
+
+    // Loudness readings of the input so far.
+    fn loudness() -> Loudness {
+        meter.report()
+    }
+
+    // Visualiser data from the latest output.
+    fn bands(_ count: Int) -> [Float] {
+        visual.bands(count)
+    }
+
+    fn waveform(_ points: Int) -> [Float] {
+        visual.waveform(points)
+    }
+
+    // The normalisation gain the settings and measurements ask for, dB.
+    fn targetGainDb() -> Float {
+        let st = settings
+        let ref = -18.0
+        var g = 0.0
+        var useLive = false
+        match st.normalize {
+            .off -> {
+                return 0.0
+            }
+            .album -> {
+                if let a = tags.albumGain {
+                    g = a + (st.targetLufs - ref)
+                } else if let t = tags.trackGain {
+                    g = t + (st.targetLufs - ref)
+                } else if let sc = scanLufs {
+                    g = st.targetLufs - sc
+                } else {
+                    useLive = true
+                }
+            }
+            .track -> {
+                if let t = tags.trackGain {
+                    g = t + (st.targetLufs - ref)
+                } else if let sc = scanLufs {
+                    g = st.targetLufs - sc
+                } else {
+                    useLive = true
+                }
+            }
+            .scan -> {
+                if let sc = scanLufs {
+                    g = st.targetLufs - sc
+                } else {
+                    useLive = true
+                }
+            }
+            .live -> {
+                useLive = true
+            }
+        }
+        if useLive {
+            let l = meter.integrated()
+            if l <= silenceLufs {
+                // Nothing measured yet: hold.
+                return normDb
+            }
+            g = st.targetLufs - l
+        }
+        max(-st.maxCut, min(st.maxBoost, g))
+    }
+
+    fn configure(_ r: Int, _ c: Int, _ lay: [String]) {
+        rate = r
+        channels = c
+        layout = if lay.count == c { lay } else { core.defaultLayout(c) }
+        eq.setup(r, c)
+        comp.setup(r, c)
+        lim.setup(r, c, fxLookMs)
+        stereo.setup(r)
+        // Same programme at a new rate: keep the measurement only when
+        // nothing was measured yet anyway.
+        meter.setup(r, c, layout)
+        visual.setup(r)
+        trimLeft = if align { lim.look } else { 0 }
+    }
+
+    // Hands the settings to the stages.
+    fn apply() {
+        let st = settings
+        eq.setTargets(st.eqGains, on: st.eqOn)
+        comp.on = st.compOn
+        comp.threshold = st.compThreshold
+        comp.ratio = st.compRatio
+        comp.knee = st.compKnee
+        comp.attackMs = st.compAttackMs
+        comp.releaseMs = st.compReleaseMs
+        comp.makeup = st.compMakeup
+        let limit = st.limiterOn || st.normalize != .off
+        lim.ceiling = if limit { fromDb(min(0.0, st.limiterCeiling)) } else { 1e9 }
+        lim.releaseMs = st.limiterReleaseMs
+        if channels == 2 {
+            stereo.set(mode: st.stereoMode, width: st.width, balance: st.balance, crossfeed: st.crossfeedOn, st.crossfeedAmount, hz: st.crossfeedHz)
+        }
+        if fresh {
+            eq.snap()
+            stereo.snap()
+        }
+    }
+
+    // Normalisation gain and preamp, ramped linearly over the block.
+    fn gainStage(_ d: bind [Float], _ n: Int) {
+        let st = settings
+        let target = targetGainDb()
+        let preTarget = if st.eqOn { max(-eqMaxDb, min(eqMaxDb, st.eqPreamp)) } else { 0.0 }
+        let secs = Float(n) / Float(rate)
+        if fresh {
+            normDb = target
+            preDb = preTarget
+        } else {
+            if target > normDb {
+                normDb = min(target, normDb + fxNormUpDbPerSec * secs)
+            } else {
+                normDb = max(target, normDb - fxNormDownDbPerSec * secs)
+            }
+            let step = fxPreampDbPerSec * secs
+            if preTarget > preDb {
+                preDb = min(preTarget, preDb + step)
+            } else {
+                preDb = max(preTarget, preDb - step)
+            }
+        }
+        let g1 = fromDb(normDb + preDb)
+        let g0 = if fresh { g1 } else { inGain }
+        inGain = g1
+        if g0 == 1.0 && g1 == 1.0 {
+            return
+        }
+        let c = channels
+        if g0 == g1 {
+            var i = 0
+            let total = d.count
+            while i < total {
+                d[i] = d[i] * g1
+                i += 1
+            }
+            return
+        }
+        let dg = (g1 - g0) / Float(n)
+        var g = g0
+        var i = 0
+        for _ in 0..n {
+            g += dg
+            for ch in 0..c {
+                d[i + ch] = d[i + ch] * g
+            }
+            i += c
+        }
+    }
+}
+
+// A chain with these settings.
+public fn newChain(_ settings: Settings = Settings()) -> Chain {
+    Chain(settings: settings)
+}

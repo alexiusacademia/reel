@@ -1,0 +1,148 @@
+// XSPF and WPL playlists, read and written with the xml module.
+//
+// XSPF: "XML Shareable Playlist Format" Version 1 (xspf.org/spec):
+// <playlist version="1" xmlns="http://xspf.org/ns/0/"> with <title>,
+// <creator>, <annotation>, and <trackList> of <track> elements, each with
+// <location> (a URI; relative ones against the playlist's own URI),
+// <title>, <creator>, <album>, <trackNum>, <duration> (milliseconds) and
+// <annotation>. Only the first <location> of a track is used; <extension>
+// elements (application data such as VLC's) are ignored.
+//
+// WPL: Windows Media Player playlists, as described by Microsoft's
+// "Windows Media Player Playlist" documentation and Wikipedia: a SMIL
+// document <smil><head><title/><meta name="Generator" …/></head><body>
+// <seq><media src="…"/>…</seq></body></smil>, with optional trackTitle,
+// albumTitle and duration attributes on <media>; src is a path, often
+// relative with "\" separators.
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+import "../xml"
+
+// Reads an XSPF playlist (bytes: the xml module finds the encoding).
+public fn parseXSPF(_ data: Data, base: String = "") -> Result<Playlist> {
+    let root = try xml.parseData(data)
+    if root.localName != "playlist" {
+        return Result.failure(error: Error("not an XSPF playlist (the root element is <{root.name}>)"))
+    }
+    var pl = Playlist(title: root.childText("title", anyPrefix: true), format: "xspf")
+    // xml:base on the playlist changes what relative locations are against.
+    var b = base
+    if let xb = root.attr("xml:base") {
+        b = if isURL(xb) || isAbsolutePath(xb) { pathFromFileURL(xb) } else { resolveLocation(xb, base: base) }
+    }
+    if let list = root.child("trackList", anyPrefix: true) {
+        for t in list.children("track", anyPrefix: true) {
+            let loc = t.childText("location", anyPrefix: true)
+            if loc.isEmpty {
+                pl.warnings.append("a track without a location (line {t.line})")
+                continue
+            }
+            let ms = parseFloat(t.childText("duration", anyPrefix: true)).valueOr(-1.0)
+            let d = if ms >= 0.0 { ms / 1000.0 } else { -1.0 }
+            let location = if isURL(loc) { resolveLocation(loc, base: b) } else { resolveLocation(percentDecode(loc), base: b) }
+            pl.entries.append(PlaylistEntry(location: location, title: t.childText("title", anyPrefix: true), duration: d, artist: t.childText("creator", anyPrefix: true), album: t.childText("album", anyPrefix: true), trackNumber: parseInt(t.childText("trackNum", anyPrefix: true)).valueOr(0), note: t.childText("annotation", anyPrefix: true)))
+        }
+    } else {
+        pl.warnings.append("no <trackList>")
+    }
+    Result.ok(value: pl)
+}
+
+// Writes XSPF. Locations inside `base` are written as relative URIs, others
+// as file:// URLs (or as the URL they are).
+public fn writeXSPF(_ pl: Playlist, base: String = "", relative: Bool = true) -> String {
+    var tracks: [xml.Node] = []
+    for e in pl.entries {
+        var kids: [xml.Node] = []
+        let rel = relativeLocation(e.location, base: base, relative: relative)
+        let loc = if isURL(rel) { rel } else if rel != e.location || !isAbsolutePath(rel) { percentEncodePath(rel.replace("\\", with: "/")) } else { fileURL(rel) }
+        kids.append(xml.element("location", loc))
+        if !e.title.isEmpty {
+            kids.append(xml.element("title", e.title))
+        }
+        if !e.artist.isEmpty {
+            kids.append(xml.element("creator", e.artist))
+        }
+        if !e.album.isEmpty {
+            kids.append(xml.element("album", e.album))
+        }
+        if !e.note.isEmpty {
+            kids.append(xml.element("annotation", e.note))
+        }
+        if e.trackNumber > 0 {
+            kids.append(xml.element("trackNum", "{e.trackNumber}"))
+        }
+        if e.duration >= 0.0 {
+            kids.append(xml.element("duration", "{Int(e.duration * 1000.0 + 0.5)}"))
+        }
+        tracks.append(xml.element("track", elements: kids))
+    }
+    var top: [xml.Node] = []
+    if !pl.title.isEmpty {
+        top.append(xml.element("title", pl.title))
+    }
+    top.append(xml.element("trackList", elements: tracks))
+    let root = xml.element("playlist", attributes: [xml.Attribute(name: "version", value: "1"), xml.Attribute(name: "xmlns", value: "http://xspf.org/ns/0/")], elements: top)
+    root.toText(indent: 2, declaration: true)
+}
+
+// Reads a WPL playlist.
+public fn parseWPL(_ data: Data, base: String = "") -> Result<Playlist> {
+    let root = try xml.parseData(data)
+    if root.localName.lowercase() != "smil" {
+        return Result.failure(error: Error("not a WPL playlist (the root element is <{root.name}>)"))
+    }
+    var pl = Playlist(format: "wpl")
+    if let head = root.child("head") {
+        pl.title = head.childText("title")
+    }
+    if let body = root.child("body") {
+        // Media may sit in <seq> (usual) or straight in <body>.
+        var media = body.children("media")
+        for seq in body.children("seq") {
+            media.appendAll(seq.children("media"))
+        }
+        for m in media {
+            let src = m.attrOr("src", "")
+            if src.isEmpty {
+                pl.warnings.append("a <media> without src (line {m.line})")
+                continue
+            }
+            let ms = parseFloat(m.attrOr("duration", "")).valueOr(-1.0)
+            pl.entries.append(PlaylistEntry(location: resolveLocation(src, base: base), title: m.attrOr("trackTitle", ""), duration: if ms >= 0.0 { ms / 1000.0 } else { -1.0 }, artist: m.attrOr("trackArtist", ""), album: m.attrOr("albumTitle", "")))
+        }
+    } else {
+        pl.warnings.append("no <body>")
+    }
+    Result.ok(value: pl)
+}
+
+// Writes WPL (paths inside `base` relative, with the separator of the
+// system, as Windows Media Player writes them).
+public fn writeWPL(_ pl: Playlist, base: String = "", relative: Bool = true) -> String {
+    var media: [xml.Node] = []
+    for e in pl.entries {
+        var attrs = [xml.Attribute(name: "src", value: relativeLocation(e.location, base: base, relative: relative))]
+        if !e.title.isEmpty {
+            attrs.append(xml.Attribute(name: "trackTitle", value: e.title))
+        }
+        if !e.artist.isEmpty {
+            attrs.append(xml.Attribute(name: "trackArtist", value: e.artist))
+        }
+        if !e.album.isEmpty {
+            attrs.append(xml.Attribute(name: "albumTitle", value: e.album))
+        }
+        if e.duration >= 0.0 {
+            attrs.append(xml.Attribute(name: "duration", value: "{Int(e.duration * 1000.0 + 0.5)}"))
+        }
+        media.append(xml.element("media", attributes: attrs))
+    }
+    let head = xml.element("head", elements: [
+        xml.element("meta", attributes: [xml.Attribute(name: "name", value: "Generator"), xml.Attribute(name: "content", value: "Reel")]),
+        xml.element("title", pl.title),
+    ])
+    let body = xml.element("body", elements: [xml.element("seq", elements: media)])
+    "<?wpl version=\"1.0\"?>\n" + xml.element("smil", elements: [head, body]).toText(indent: 2)
+}

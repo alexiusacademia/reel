@@ -1,0 +1,76 @@
+// The Preferences window's content: a sidebar of pages (General,
+// Playback, Audio, Video, Subtitles, Library, Network, OpenSubtitles,
+// Shortcuts) and the page chosen. It edits the app's preferences, keymap
+// and PrefsExtra through bindings and calls onChange after every edit
+// (the app saves, debounced); the other callbacks ask the app for work a
+// view doesn't do itself (dialogs, scans, the history, the network).
+//
+// A sidebar rather than a TabView: nine tabs of at least 90 points don't
+// fit a window of a sensible width, and Tessel's tab bar doesn't scroll.
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+import "../library"
+
+// One entry of the sidebar: a button, so Tab and Space reach it.
+view PrefsSidebarItem(title: String, tag: String, tab: bind String) {
+    let on = tab == tag
+
+    Button(title) { tab = tag }
+        .color(if on { .white } else { .primary })
+        .background(if on { prefsAccent } else { .clear }, radius: 6)
+        .frame(width: 150, height: 28)
+        .accessibilityLabel("{title} preferences")
+}
+
+// The whole Preferences window.
+//
+// - prefs, keymap: the app's state (library.Preferences, library.Keymap);
+//   keymap edits also set prefs.keyOverrides.
+// - extra: settings Preferences has no field for yet (see PrefsExtra).
+// - tab: the page shown, a tag of prefsTabs ("general" … "shortcuts").
+// - status: what the app tells the window (history size, cache size, scan
+//   state, OpenSubtitles status, a picture for the subtitle preview).
+// - onChange: after any edit of prefs, keymap or extra.
+// - onAddFolder: ask for a folder (chooseFolder) and append it to
+//   prefs.libraryFolders. onRescan: scan the library folders now.
+// - onClearHistory: the user confirmed clearing the watch history.
+// - onClearThumbnails: empty the thumbnail cache.
+// - onChooseSnapshotFolder: ask for a folder and set prefs.snapshotFolder.
+// - onCheckOpenSubtitles: try the API key (and login token) and report in
+//   status.openSubtitlesStatus. onLogOutOpenSubtitles: the token was
+//   cleared (prefs.openSubtitlesToken is "" already); tell the server.
+public view PreferencesView(prefs: bind library.Preferences, keymap: bind library.Keymap, extra: bind PrefsExtra, tab: bind String, status: PrefsStatus = PrefsStatus(), onChange: fn(), onAddFolder: fn(), onRescan: fn(), onClearHistory: fn(), onClearThumbnails: fn() = {}, onChooseSnapshotFolder: fn() = {}, onCheckOpenSubtitles: fn() = {}, onLogOutOpenSubtitles: fn() = {}) {
+    let page = prefsTabTag(tab)
+
+    HStack(spacing: 0) {
+        VStack(spacing: 2, alignment: .leading) {
+            for (tag, title) in prefsTabs {
+                PrefsSidebarItem(title: title, tag: tag, tab: tab)
+            }
+            Spacer()
+        }
+        .padding(10)
+        .frame(width: 170, maxHeight: .infinity)
+        .background(.sidebar)
+        Divider()
+        VStack(spacing: 0, alignment: .leading) {
+            match page {
+                "playback" -> PlaybackPrefs(prefs: prefs, extra: extra)
+                "audio" -> AudioPrefs(prefs: prefs, extra: extra)
+                "video" -> VideoPrefs(prefs: prefs, extra: extra, onChooseSnapshotFolder: onChooseSnapshotFolder)
+                "subtitles" -> SubtitlePrefs(prefs: prefs, extra: extra, previewPixels: status.previewPixels, previewWidth: status.previewWidth, previewHeight: status.previewHeight)
+                "library" -> LibraryPrefs(prefs: prefs, status: status, onAddFolder: onAddFolder, onRescan: onRescan, onClearThumbnails: onClearThumbnails)
+                "network" -> NetworkPrefs(prefs: prefs)
+                "opensubtitles" -> OpenSubtitlesPrefs(prefs: prefs, status: status.openSubtitlesStatus, onCheck: onCheckOpenSubtitles, onLogOut: onLogOutOpenSubtitles)
+                "shortcuts" -> ShortcutPrefs(keymap: keymap, overrides: prefs.keyOverrides, os: status.os)
+                _ -> GeneralPrefs(prefs: prefs, historyCount: status.historyCount, onClearHistory: onClearHistory)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .id(page)
+    }
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
+    PrefsChangeWatch(key: toJson(prefs) + toJson(extra) + toJson(keymap), onChange: onChange)
+}

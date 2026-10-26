@@ -1,0 +1,210 @@
+// The stereo stage, for two-channel sound: channel mode, mid-side width
+// and balance folded into one 2×2 matrix, then a headphone crossfeed.
+//
+// Matrix = Balance × Width × Mode, where
+//   Mode: stereo I, mono ½[1 1; 1 1], swap [0 1; 1 0], left [1 0; 1 0],
+//         right [0 1; 0 1];
+//   Width w (mid-side: M = (L+R)/2, S = (L−R)/2 · w):
+//         ½[1+w 1−w; 1−w 1+w];
+//   Balance b: the far side is turned down, diag(min(1, 1−b), min(1, 1+b)).
+// A change moves every coefficient linearly to its new value over 20 ms,
+// so switching modes doesn't click.
+//
+// Crossfeed (Reel's design after B. Bauer's idea, "Stereophonic
+// Earphones and Binaural Loudspeakers", JAES 1961: at low frequencies
+// each ear hears both speakers, a little later from the far one): each
+// channel is low-passed by a one-pole filter (corner crossfeedHz, 700 Hz
+// by default); the other side's low-passed signal, delayed 0.3 ms (the
+// time between the ears), is added with weight `amount`, and the
+// channel's own low-passed signal is taken away with the same weight:
+//   L' = L + a·(lpR(t − 0.3 ms) − lpL(t))
+//   R' = R + a·(lpL(t − 0.3 ms) − lpR(t))
+// So sound in both channels (the centre of the stage) is almost unchanged
+// (only the 0.3 ms delay differs) while hard-panned bass is shared between
+// the ears, which makes headphones less tiring. The amount ramps too.
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+let stereoRampMs = 20.0
+let crossfeedDelayMs = 0.3
+
+public struct StereoStage {
+    rate: Int = 48000
+    // Current and target matrix [ll, lr, rl, rr], and the ramp's steps.
+    cur: [Float] = [1.0, 0.0, 0.0, 1.0]
+    tgt: [Float] = [1.0, 0.0, 0.0, 1.0]
+    step: [Float] = [0.0, 0.0, 0.0, 0.0]
+    left: Int = 0
+    // Crossfeed.
+    amount: Float = 0.0
+    amountTgt: Float = 0.0
+    amountStep: Float = 0.0
+    amountLeft: Int = 0
+    k: Float = 0.0
+    lpL: Float = 0.0
+    lpR: Float = 0.0
+    delay: Int = 14
+    // Ring of the low-passed signals (L, R interleaved).
+    ring: [Float] = []
+    ringPos: Int = 0
+
+    fn setup(_ r: Int) {
+        rate = r
+        delay = max(1, Int(floor(crossfeedDelayMs * 0.001 * Float(r) + 0.5)))
+        clear()
+    }
+
+    fn clear() {
+        lpL = 0.0
+        lpR = 0.0
+        ring = []
+        for _ in 0..(2 * delay) {
+            ring.append(0.0)
+        }
+        ringPos = 0
+    }
+
+    fn rampFrames() -> Int {
+        max(1, Int(stereoRampMs * 0.001 * Float(rate)))
+    }
+
+    // New settings (they ramp in).
+    fn set(mode: StereoMode, width: Float, balance: Float, crossfeed: Bool, _ a: Float, hz: Float) {
+        let m = stereoMatrix(mode, width, balance)
+        if m != tgt {
+            tgt = m
+            let n = rampFrames()
+            for i in 0..4 {
+                step[i] = (tgt[i] - cur[i]) / Float(n)
+            }
+            left = n
+        }
+        let want = if crossfeed { max(0.0, min(1.0, a)) } else { 0.0 }
+        if want != amountTgt {
+            amountTgt = want
+            let n = rampFrames()
+            amountStep = (want - amount) / Float(n)
+            amountLeft = n
+        }
+        k = 1.0 - exp(-2.0 * pi * max(20.0, hz) / Float(rate))
+    }
+
+    // Jumps to the targets.
+    fn snap() {
+        cur = tgt
+        left = 0
+        amount = amountTgt
+        amountLeft = 0
+    }
+
+    fn idle() -> Bool {
+        left == 0 && amountLeft == 0 && amount == 0.0 && cur == [1.0, 0.0, 0.0, 1.0]
+    }
+
+    // Processes interleaved stereo in place.
+    fn process(_ d: bind [Float]) {
+        if idle() {
+            if lpL != 0.0 || lpR != 0.0 {
+                clear()
+            }
+            return
+        }
+        let n = d.count / 2
+        var ll = cur[0]
+        var lr = cur[1]
+        var rl = cur[2]
+        var rr = cur[3]
+        let s0 = step[0]
+        let s1 = step[1]
+        let s2 = step[2]
+        let s3 = step[3]
+        var rem = left
+        var a = amount
+        var aRem = amountLeft
+        let aStep = amountStep
+        let kk = k
+        var pl = lpL
+        var pr = lpR
+        var pos = ringPos
+        let dly = delay
+        let cross = a != 0.0 || aRem > 0
+        var i = 0
+        for _ in 0..n {
+            if rem > 0 {
+                ll += s0
+                lr += s1
+                rl += s2
+                rr += s3
+                rem -= 1
+                if rem == 0 {
+                    ll = tgt[0]
+                    lr = tgt[1]
+                    rl = tgt[2]
+                    rr = tgt[3]
+                }
+            }
+            let x = d[i]
+            let y = d[i + 1]
+            var l = ll * x + lr * y
+            var r = rl * x + rr * y
+            if cross {
+                if aRem > 0 {
+                    a += aStep
+                    aRem -= 1
+                    if aRem == 0 {
+                        a = amountTgt
+                    }
+                }
+                pl += kk * (l - pl)
+                pr += kk * (r - pr)
+                let rp = pos * 2
+                let oldL = ring[rp]
+                let oldR = ring[rp + 1]
+                ring[rp] = pl
+                ring[rp + 1] = pr
+                pos += 1
+                if pos == dly {
+                    pos = 0
+                }
+                l += a * (oldR - pl)
+                r += a * (oldL - pr)
+            }
+            d[i] = l
+            d[i + 1] = r
+            i += 2
+        }
+        cur[0] = ll
+        cur[1] = lr
+        cur[2] = rl
+        cur[3] = rr
+        left = rem
+        amount = a
+        amountLeft = aRem
+        lpL = pl
+        lpR = pr
+        ringPos = pos
+    }
+}
+
+// The stage's matrix [ll, lr, rl, rr] for the settings.
+public fn stereoMatrix(_ mode: StereoMode, _ width: Float, _ balance: Float) -> [Float] {
+    var m = match mode {
+        .stereo -> [1.0, 0.0, 0.0, 1.0]
+        .mono -> [0.5, 0.5, 0.5, 0.5]
+        .swap -> [0.0, 1.0, 1.0, 0.0]
+        .left -> [1.0, 0.0, 1.0, 0.0]
+        .right -> [0.0, 1.0, 0.0, 1.0]
+    }
+    let w = max(0.0, min(2.0, width))
+    if w != 1.0 {
+        let p = (1.0 + w) / 2.0
+        let q = (1.0 - w) / 2.0
+        let r = [p * m[0] + q * m[2], p * m[1] + q * m[3], q * m[0] + p * m[2], q * m[1] + p * m[3]]
+        m = r
+    }
+    let b = max(-1.0, min(1.0, balance))
+    let gl = min(1.0, 1.0 - b)
+    let gr = min(1.0, 1.0 + b)
+    [m[0] * gl, m[1] * gl, m[2] * gr, m[3] * gr]
+}

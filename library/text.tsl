@@ -1,0 +1,579 @@
+// Text helpers for the library: decoding playlist bytes (UTF-8 with or
+// without a byte order mark, UTF-16 with one, Windows-1252/Latin-1 when the
+// bytes aren't UTF-8), folding text for search (lower case, accents
+// removed), natural ordering of names ("Ep 2" before "Ep 10"), and paths
+// and URLs as playlists write them (relative paths, `file://` URLs,
+// Windows separators).
+//
+// Followed: the Unicode Standard's UTF-8/UTF-16 encoding forms (chapter
+// 3.9), the WHATWG Encoding Standard's index for windows-1252, RFC 8089
+// (the "file" URI scheme) and RFC 3986 (percent-encoding).
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+// --- Code points ---
+
+// The Unicode code points of a text.
+public fn codePoints(_ s: String) -> [Int] {
+    utf8CodePoints(Data(text: s).bytes)
+}
+
+// Code points from UTF-8 bytes; a damaged sequence gives U+FFFD.
+fn utf8CodePoints(_ b: [Int]) -> [Int] {
+    var out: [Int] = []
+    var i = 0
+    let n = b.count
+    while i < n {
+        let c = b[i]
+        if c < 0x80 {
+            out.append(c)
+            i += 1
+        } else if c >= 0xc0 && c < 0xe0 && i + 1 < n {
+            out.append((c & 0x1f) << 6 | (b[i + 1] & 0x3f))
+            i += 2
+        } else if c >= 0xe0 && c < 0xf0 && i + 2 < n {
+            out.append((c & 0x0f) << 12 | (b[i + 1] & 0x3f) << 6 | (b[i + 2] & 0x3f))
+            i += 3
+        } else if c >= 0xf0 && i + 3 < n {
+            out.append((c & 0x07) << 18 | (b[i + 1] & 0x3f) << 12 | (b[i + 2] & 0x3f) << 6 | (b[i + 3] & 0x3f))
+            i += 4
+        } else {
+            out.append(0xfffd)
+            i += 1
+        }
+    }
+    out
+}
+
+// A text from code points (UTF-8 encoded, Unicode 3.9 table 3-6).
+public fn fromCodePoints(_ cps: [Int]) -> String {
+    var d = Data()
+    for c0 in cps {
+        var c = c0
+        if c < 0 || c > 0x10ffff || (c >= 0xd800 && c < 0xe000) {
+            c = 0xfffd
+        }
+        if c < 0x80 {
+            d.append(byte: c)
+        } else if c < 0x800 {
+            d.append(byte: 0xc0 | c >> 6)
+            d.append(byte: 0x80 | c & 0x3f)
+        } else if c < 0x10000 {
+            d.append(byte: 0xe0 | c >> 12)
+            d.append(byte: 0x80 | (c >> 6) & 0x3f)
+            d.append(byte: 0x80 | c & 0x3f)
+        } else {
+            d.append(byte: 0xf0 | c >> 18)
+            d.append(byte: 0x80 | (c >> 12) & 0x3f)
+            d.append(byte: 0x80 | (c >> 6) & 0x3f)
+            d.append(byte: 0x80 | c & 0x3f)
+        }
+    }
+    d.text ?? ""
+}
+
+// --- Decoding bytes ---
+
+// windows-1252 bytes 0x80–0x9F (WHATWG index-windows-1252); the rest of the
+// bytes are the same code points as Latin-1.
+let cp1252High: [Int] = [
+    0x20ac, 0x81, 0x201a, 0x192, 0x201e, 0x2026, 0x2020, 0x2021,
+    0x2c6, 0x2030, 0x160, 0x2039, 0x152, 0x8d, 0x17d, 0x8f,
+    0x90, 0x2018, 0x2019, 0x201c, 0x201d, 0x2022, 0x2013, 0x2014,
+    0x2dc, 0x2122, 0x161, 0x203a, 0x153, 0x9d, 0x17e, 0x178,
+]
+
+// The text of a playlist (or any small text file): UTF-8 (a byte order mark
+// is dropped), UTF-16 when it starts with a byte order mark, otherwise
+// Windows-1252 (which is Latin-1 plus printable characters at 0x80–0x9F).
+public fn decodeText(_ d: Data) -> String {
+    decodeTextAs(d, encoding: "")
+}
+
+// The same with the encoding named: "utf-8", "utf-16le", "utf-16be",
+// "latin-1" (ISO-8859-1), "windows-1252"; "" finds it out.
+public fn decodeTextAs(_ d: Data, encoding: String) -> String {
+    let n = d.count
+    let enc = encoding.lowercase().replace("_", with: "-")
+    if enc == "" || enc == "utf-8" || enc == "utf8" {
+        if n >= 3 && d[0] == 0xef && d[1] == 0xbb && d[2] == 0xbf {
+            return d.slice(from: 3, to: n).text ?? cp1252Text(d.slice(from: 3, to: n), latin1: false)
+        }
+        if enc == "" && n >= 2 && d[0] == 0xff && d[1] == 0xfe {
+            return utf16Text(d.slice(from: 2, to: n), bigEndian: false)
+        }
+        if enc == "" && n >= 2 && d[0] == 0xfe && d[1] == 0xff {
+            return utf16Text(d.slice(from: 2, to: n), bigEndian: true)
+        }
+        if let t = d.text {
+            return t
+        }
+        return cp1252Text(d, latin1: false)
+    }
+    if enc == "utf-16le" || enc == "utf-16" {
+        let skip = if n >= 2 && d[0] == 0xff && d[1] == 0xfe { 2 } else { 0 }
+        return utf16Text(d.slice(from: skip, to: n), bigEndian: false)
+    }
+    if enc == "utf-16be" {
+        let skip = if n >= 2 && d[0] == 0xfe && d[1] == 0xff { 2 } else { 0 }
+        return utf16Text(d.slice(from: skip, to: n), bigEndian: true)
+    }
+    if enc == "latin-1" || enc == "latin1" || enc == "iso-8859-1" {
+        return cp1252Text(d, latin1: true)
+    }
+    cp1252Text(d, latin1: false)
+}
+
+fn cp1252Text(_ d: Data, latin1: Bool) -> String {
+    var cps: [Int] = []
+    for b in d.bytes {
+        if b >= 0x80 && b < 0xa0 && !latin1 {
+            cps.append(cp1252High[b - 0x80])
+        } else {
+            cps.append(b)
+        }
+    }
+    fromCodePoints(cps)
+}
+
+// UTF-16 code units to text, with surrogate pairs (Unicode 3.9, D91).
+fn utf16Text(_ d: Data, bigEndian: Bool) -> String {
+    var cps: [Int] = []
+    var i = 0
+    let n = d.count - 1
+    while i < n {
+        let u = d.uint16(at: i, bigEndian: bigEndian)
+        i += 2
+        if u >= 0xd800 && u < 0xdc00 && i < n {
+            let lo = d.uint16(at: i, bigEndian: bigEndian)
+            if lo >= 0xdc00 && lo < 0xe000 {
+                cps.append(0x10000 + ((u - 0xd800) << 10) + (lo - 0xdc00))
+                i += 2
+                continue
+            }
+        }
+        cps.append(u)
+    }
+    fromCodePoints(cps)
+}
+
+// Whether the bytes are valid UTF-8 (without a byte order mark, too).
+public fn isUtf8(_ d: Data) -> Bool {
+    d.text != nil
+}
+
+// --- Folding for search ---
+
+// The letters U+00C0…U+017F without their accents (lower case): "" keeps
+// the character as it is.
+let foldLatin: [String] = [
+    // C0–DF
+    "a", "a", "a", "a", "a", "a", "ae", "c", "e", "e", "e", "e", "i", "i", "i", "i",
+    "d", "n", "o", "o", "o", "o", "o", "", "o", "u", "u", "u", "u", "y", "th", "ss",
+    // E0–FF
+    "a", "a", "a", "a", "a", "a", "ae", "c", "e", "e", "e", "e", "i", "i", "i", "i",
+    "d", "n", "o", "o", "o", "o", "o", "", "o", "u", "u", "u", "u", "y", "th", "y",
+    // 100–17F (Latin Extended-A)
+    "a", "a", "a", "a", "a", "a", "c", "c", "c", "c", "c", "c", "c", "c", "d", "d",
+    "d", "d", "e", "e", "e", "e", "e", "e", "e", "e", "e", "e", "g", "g", "g", "g",
+    "g", "g", "g", "g", "h", "h", "h", "h", "i", "i", "i", "i", "i", "i", "i", "i",
+    "i", "i", "ij", "ij", "j", "j", "k", "k", "k", "l", "l", "l", "l", "l", "l", "l",
+    "l", "l", "l", "n", "n", "n", "n", "n", "n", "n", "n", "n", "o", "o", "o", "o",
+    "o", "o", "oe", "oe", "r", "r", "r", "r", "r", "r", "s", "s", "s", "s", "s", "s",
+    "s", "s", "t", "t", "t", "t", "t", "t", "u", "u", "u", "u", "u", "u", "u", "u",
+    "u", "u", "u", "u", "w", "w", "y", "y", "y", "z", "z", "z", "z", "z", "z", "s",
+]
+
+// Text for comparing and searching: lower case, accents removed (Latin-1
+// and Latin Extended-A letters, and combining marks U+0300–U+036F), so
+// "Amélie" and "AMELIE" fold to the same "amelie".
+public fn fold(_ s: String) -> String {
+    let low = s.lowercase()
+    let d = Data(text: low)
+    if d.count == low.count {
+        return low
+    }
+    var out = ""
+    var run: [Int] = []
+    for c in utf8CodePoints(d.bytes) {
+        if c >= 0xc0 && c < 0x180 {
+            let f = foldLatin[c - 0xc0]
+            if !f.isEmpty {
+                if !run.isEmpty {
+                    out += fromCodePoints(run)
+                    run = []
+                }
+                out += f
+                continue
+            }
+        } else if c >= 0x300 && c < 0x370 {
+            continue
+        } else if c == 0x2019 || c == 0x2018 {
+            run.append(0x27)
+            continue
+        }
+        run.append(c)
+    }
+    if !run.isEmpty {
+        out += fromCodePoints(run)
+    }
+    out
+}
+
+// The words of a folded text: runs of letters and digits; every other
+// character (spaces, dots, dashes, brackets, underscores) separates them.
+public fn searchWords(_ s: String) -> [String] {
+    var words: [String] = []
+    var cur: [Int] = []
+    for c in codePoints(fold(s)) {
+        if c == 0x27 || c == 0x2019 {
+            // "Don't" → "dont": an apostrophe joins.
+            continue
+        }
+        if isWordCodePoint(c) {
+            cur.append(c)
+        } else if !cur.isEmpty {
+            words.append(fromCodePoints(cur))
+            cur = []
+        }
+    }
+    if !cur.isEmpty {
+        words.append(fromCodePoints(cur))
+    }
+    words
+}
+
+// Letters and digits: ASCII ones, and everything from U+00C0 up except
+// the punctuation and symbol blocks (× ÷, General Punctuation, arrows and
+// other symbols U+2000–U+2BFF, CJK punctuation, full-width ASCII
+// punctuation).
+fn isWordCodePoint(_ c: Int) -> Bool {
+    if c < 0x80 {
+        return (c >= 0x30 && c <= 0x39) || (c >= 0x61 && c <= 0x7a) || (c >= 0x41 && c <= 0x5a)
+    }
+    if c < 0xc0 || c == 0xd7 || c == 0xf7 {
+        return false
+    }
+    if c >= 0x2000 && c < 0x2c00 {
+        return false
+    }
+    if c >= 0x3000 && c < 0x3040 {
+        return false
+    }
+    if c >= 0xff00 && c < 0xff10 {
+        return false
+    }
+    if c >= 0xfe30 && c < 0xfe70 {
+        return false
+    }
+    c != 0xfffd
+}
+
+// Whether every word of `query` appears in `text` (both folded): the
+// library's search rule, also usable on lists in memory.
+public fn matchesSearch(_ text: String, query: String) -> Bool {
+    let hay = " " + searchWords(text).joined(separator: " ")
+    for w in searchWords(query) {
+        if !hay.contains(w) {
+            return false
+        }
+    }
+    true
+}
+
+// --- Natural order ---
+
+// Compares two names the way people expect: digit runs by their value
+// ("Ep 2" < "Ep 10", "track 007" = "track 7" with the shorter first), the
+// rest by folded text. Returns −1, 0 or 1.
+public fn naturalCompare(_ a: String, _ b: String) -> Int {
+    let x = codePoints(fold(a))
+    let y = codePoints(fold(b))
+    var i = 0
+    var j = 0
+    while i < x.count && j < y.count {
+        let cx = x[i]
+        let cy = y[j]
+        let dx = cx >= 0x30 && cx <= 0x39
+        let dy = cy >= 0x30 && cy <= 0x39
+        if dx && dy {
+            // Skip leading zeros, then the longer run is bigger; equal
+            // lengths compare digit by digit.
+            var si = i
+            while si < x.count && x[si] == 0x30 {
+                si += 1
+            }
+            var sj = j
+            while sj < y.count && y[sj] == 0x30 {
+                sj += 1
+            }
+            var ei = si
+            while ei < x.count && x[ei] >= 0x30 && x[ei] <= 0x39 {
+                ei += 1
+            }
+            var ej = sj
+            while ej < y.count && y[ej] >= 0x30 && y[ej] <= 0x39 {
+                ej += 1
+            }
+            if ei - si != ej - sj {
+                return if ei - si < ej - sj { -1 } else { 1 }
+            }
+            var k = 0
+            while k < ei - si {
+                if x[si + k] != y[sj + k] {
+                    return if x[si + k] < y[sj + k] { -1 } else { 1 }
+                }
+                k += 1
+            }
+            // Same value: fewer leading zeros first.
+            if ei - i != ej - j {
+                return if ei - i < ej - j { -1 } else { 1 }
+            }
+            i = ei
+            j = ej
+            continue
+        }
+        if cx != cy {
+            return if cx < cy { -1 } else { 1 }
+        }
+        i += 1
+        j += 1
+    }
+    if x.count - i == y.count - j {
+        // Same when folded: fall back to the raw text, so the order is total.
+        if a == b {
+            return 0
+        }
+        return if a < b { -1 } else { 1 }
+    }
+    if x.count - i < y.count - j { -1 } else { 1 }
+}
+
+// Whether `a` comes before `b` in natural order (for `sorted(by:)`).
+public fn naturalLess(_ a: String, _ b: String) -> Bool {
+    naturalCompare(a, b) < 0
+}
+
+// Names in natural order.
+public fn naturalSorted(_ names: [String]) -> [String] {
+    names.sorted(by: { a, b in naturalCompare(a, b) < 0 })
+}
+
+// --- Paths and URLs ---
+
+// Whether a playlist location is a URL with a scheme ("http://…",
+// "rtsp://…", "file://…") rather than a path.
+public fn isURL(_ s: String) -> Bool {
+    if let i = s.find("://") {
+        if i < 2 {
+            return false
+        }
+        for ch in s.substring(from: 0, to: i).characters {
+            let ok = (ch >= "a" && ch <= "z") || (ch >= "A" && ch <= "Z") || (ch >= "0" && ch <= "9") || ch == "+" || ch == "-" || ch == "."
+            if !ok {
+                return false
+            }
+        }
+        return true
+    }
+    false
+}
+
+// Whether a path is absolute: "/…", "C:\…" or "C:/…", "\\server\…".
+public fn isAbsolutePath(_ s: String) -> Bool {
+    if s.hasPrefix("/") || s.hasPrefix("\\\\") {
+        return true
+    }
+    if s.count >= 3 && s.character(at: 1) == ":" && (s.character(at: 2) == "\\" || s.character(at: 2) == "/") {
+        let c = s.character(at: 0) ?? ""
+        return (c >= "a" && c <= "z") || (c >= "A" && c <= "Z")
+    }
+    false
+}
+
+// A path with "." and ".." parts worked out and doubled separators removed.
+public fn normalizePath(_ p: String) -> String {
+    let abs = p.hasPrefix("/")
+    var parts: [String] = []
+    for part in p.split("/") {
+        if part == "" || part == "." {
+            continue
+        }
+        if part == ".." {
+            if !parts.isEmpty && parts[parts.count - 1] != ".." {
+                parts.removeLast()
+            } else if !abs {
+                parts.append("..")
+            }
+            continue
+        }
+        parts.append(part)
+    }
+    let body = parts.joined(separator: "/")
+    if abs { "/" + body } else { body }
+}
+
+// A file:// URL as a path ("file:///Users/a/b%20c.mp3" → "/Users/a/b c.mp3",
+// "file:///C:/x.mp3" → "C:/x.mp3"); other text is returned as it is.
+public fn pathFromFileURL(_ url: String) -> String {
+    if !url.lowercase().hasPrefix("file:") {
+        return url
+    }
+    var rest = url.substring(from: 5, to: url.count)
+    if rest.hasPrefix("//") {
+        rest = rest.substring(from: 2, to: rest.count)
+        // Skip the host ("localhost" or empty).
+        if let slash = rest.find("/") {
+            rest = rest.substring(from: slash, to: rest.count)
+        } else {
+            rest = "/" + rest
+        }
+    }
+    let decoded = percentDecode(rest)
+    // "/C:/…" is a Windows drive.
+    if decoded.count >= 3 && decoded.hasPrefix("/") && decoded.character(at: 2) == ":" {
+        return decoded.substring(from: 1, to: decoded.count)
+    }
+    decoded
+}
+
+// Percent-decoding without reading "+" as a space (RFC 3986 2.1); a bad
+// escape is kept as it is.
+public fn percentDecode(_ s: String) -> String {
+    if !s.contains("%") {
+        return s
+    }
+    let b = Data(text: s).bytes
+    var out = Data()
+    var i = 0
+    while i < b.count {
+        if b[i] == 0x25 && i + 2 < b.count {
+            let h = hexValue(b[i + 1])
+            let l = hexValue(b[i + 2])
+            if h >= 0 && l >= 0 {
+                out.append(byte: h * 16 + l)
+                i += 3
+                continue
+            }
+        }
+        out.append(byte: b[i])
+        i += 1
+    }
+    out.text ?? cp1252Text(out, latin1: false)
+}
+
+fn hexValue(_ c: Int) -> Int {
+    if c >= 0x30 && c <= 0x39 {
+        return c - 0x30
+    }
+    if c >= 0x41 && c <= 0x46 {
+        return c - 0x41 + 10
+    }
+    if c >= 0x61 && c <= 0x66 {
+        return c - 0x61 + 10
+    }
+    -1
+}
+
+// A path percent-encoded for a URI, keeping "/" (RFC 3986 unreserved
+// characters and "/" are left alone).
+public fn percentEncodePath(_ p: String) -> String {
+    let hex = "0123456789ABCDEF"
+    var out = ""
+    var plain: [Int] = []
+    for b in Data(text: p).bytes {
+        let keep = (b >= 0x30 && b <= 0x39) || (b >= 0x41 && b <= 0x5a) || (b >= 0x61 && b <= 0x7a) || b == 0x2d || b == 0x2e || b == 0x5f || b == 0x7e || b == 0x2f
+        if keep {
+            plain.append(b)
+        } else {
+            if !plain.isEmpty {
+                out += Data(bytes: plain).text ?? ""
+                plain = []
+            }
+            out += "%" + (hex.character(at: b >> 4) ?? "0") + (hex.character(at: b & 15) ?? "0")
+        }
+    }
+    if !plain.isEmpty {
+        out += Data(bytes: plain).text ?? ""
+    }
+    out
+}
+
+// A path as a file:// URL (RFC 8089): "/a b.mp3" → "file:///a%20b.mp3".
+public fn fileURL(_ path: String) -> String {
+    let p = path.replace("\\", with: "/")
+    if p.hasPrefix("/") {
+        return "file://" + percentEncodePath(p)
+    }
+    "file:///" + percentEncodePath(p)
+}
+
+// Where a playlist entry points, as an absolute path or a URL: URLs stay
+// (file:// URLs become paths), absolute paths stay, relative ones are taken
+// from the playlist's folder `base`. Windows separators in relative paths
+// become "/" except on Windows.
+public fn resolveLocation(_ loc0: String, base: String) -> String {
+    let loc = loc0.trim()
+    if loc.isEmpty {
+        return ""
+    }
+    if isURL(loc) {
+        if loc.lowercase().hasPrefix("file:") {
+            return pathFromFileURL(loc)
+        }
+        return loc
+    }
+    if loc.hasPrefix("/") && isURL(base) {
+        return resolveURL(loc, base: base)
+    }
+    if isAbsolutePath(loc) {
+        return loc
+    }
+    var rel = loc
+    if platform() != "windows" {
+        rel = rel.replace("\\", with: "/")
+    }
+    if base.isEmpty {
+        return rel
+    }
+    if isURL(base) {
+        // A playlist read from the web: entries are relative to its URL.
+        return resolveURL(rel, base: base)
+    }
+    normalizePath(joinPath(base, rel))
+}
+
+// A relative reference against a base URL's folder (RFC 3986 5.2, the
+// common cases: "/x" from the host, "x" beside the playlist).
+public fn resolveURL(_ rel: String, base: String) -> String {
+    if isURL(rel) {
+        return rel
+    }
+    let schemeEnd = (base.find("://") ?? 0) + 3
+    let afterScheme = base.substring(from: schemeEnd, to: base.count)
+    let hostEnd = schemeEnd + (afterScheme.find("/") ?? afterScheme.count)
+    let origin = base.substring(from: 0, to: hostEnd)
+    if rel.hasPrefix("/") {
+        return origin + rel
+    }
+    var path = base.substring(from: hostEnd, to: base.count)
+    if let q = path.find("?") {
+        path = path.substring(from: 0, to: q)
+    }
+    let folder = if let slash = path.findLast("/") { path.substring(from: 0, to: slash + 1) } else { "/" }
+    origin + normalizePath(folder + rel).replace("//", with: "/")
+}
+
+// How to write `path` in a playlist kept in folder `base`: relative when it
+// is inside `base` (or `relative` is false: always as it is).
+public fn relativeLocation(_ path: String, base: String, relative: Bool = true) -> String {
+    if !relative || base.isEmpty || isURL(path) {
+        return path
+    }
+    let b = if base.hasSuffix("/") { base } else { base + "/" }
+    if path.hasPrefix(b) {
+        return path.substring(from: b.count, to: path.count)
+    }
+    path
+}

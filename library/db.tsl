@@ -1,0 +1,718 @@
+// The media library and the playing history in one SQLite database
+// (`openDatabase`): watched folders, every media file found under them
+// (name, size, dates, kind; duration, tags and codecs once known), groups
+// (Movies, TV shows by series and season, Music by artist and album,
+// Other), accent- and case-insensitive search, sorting, rescans that
+// notice removed and changed files; and per-file memory (position,
+// finished, last played, play count, `FileSettings`) keyed by path plus
+// size, so a moved file is found again by its name and size.
+//
+// Tables (schema version 1):
+//   meta(key, value)                       schema version
+//   folders(path, added)                   watched folders
+//   media(id, path, root, name, size, modified, added, kind, container,
+//         duration, title, artist, album, albumartist, genre, year, track,
+//         disc, codecs, width, height, series, series_key, season,
+//         episode, epdate, grp, search, details)
+//         details: 0 name only, 1 read by a scan, 2 reported by the player
+//   files(id, path, size, name, position, duration, finished,
+//         last_played, play_count, settings)   settings: FileSettings JSON
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+import "../core"
+
+// One file of the library, with its history when it has been played.
+public struct MediaItem {
+    id: Int
+    path: String
+    name: String = ""
+    // The watched folder it is under.
+    root: String = ""
+    size: Int = 0
+    modified: Float = 0.0
+    added: Float = 0.0
+    // "video" "audio".
+    kind: String = ""
+    container: String = ""
+    duration: Float = -1.0
+    title: String = ""
+    artist: String = ""
+    album: String = ""
+    albumArtist: String = ""
+    genre: String = ""
+    year: Int = 0
+    track: Int = 0
+    disc: Int = 0
+    codecs: String = ""
+    width: Int = 0
+    height: Int = 0
+    series: String = ""
+    seriesKey: String = ""
+    season: Int = -1
+    episode: Int = -1
+    episodeDate: String = ""
+    // "movies" "tv" "music" "other".
+    group: String = ""
+    details: Int = 0
+    // From the history (0 / false when never played).
+    lastPlayed: Float = 0.0
+    playCount: Int = 0
+    position: Float = 0.0
+    finished: Bool = false
+
+    // The title to show: the tag's, else the file name without extension.
+    displayTitle: String {
+        if !title.isEmpty {
+            return title
+        }
+        episodeStem(name)
+    }
+}
+
+// What a scan did.
+public struct ScanResult {
+    added: Int = 0
+    changed: Int = 0
+    removed: Int = 0
+    unchanged: Int = 0
+    // Files whose tags were read during the scan.
+    tagged: Int = 0
+    files: Int = 0
+    ms: Float = 0.0
+}
+
+// One show of the TV group.
+public struct ShowSummary {
+    name: String
+    key: String
+    seasons: [Int] = []
+    episodes: Int = 0
+    // Episodes not finished yet.
+    unwatched: Int = 0
+}
+
+// One album of the Music group.
+public struct AlbumSummary {
+    album: String
+    artist: String
+    year: Int = 0
+    tracks: Int = 0
+    duration: Float = 0.0
+}
+
+// One played file of the history.
+public struct HistoryEntry {
+    path: String
+    name: String
+    size: Int
+    position: Float
+    duration: Float
+    finished: Bool
+    lastPlayed: Float
+    playCount: Int
+}
+
+// A per-file memory row.
+public struct FileRecord {
+    id: Int
+    path: String
+    size: Int
+    name: String
+    position: Float = 0.0
+    duration: Float = -1.0
+    finished: Bool = false
+    lastPlayed: Float = 0.0
+    playCount: Int = 0
+    settings: FileSettings = FileSettings()
+}
+
+// The library: an open database and the rules for keeping it.
+public struct Library {
+    db: Database
+    path: String = ""
+    // A finished file: one played to within this many seconds of its end
+    // (or past `finishedFraction` of it).
+    finishedMargin: Float = 20.0
+    finishedFraction: Float = 0.95
+    // Shorter non-episode videos (seconds) go to Other, not Movies.
+    shortVideo: Float = 1200.0
+
+    // --- Folders ---
+
+    fn addFolder(_ folder: String) -> Error? {
+        let f = if folder.hasSuffix("/") && folder.count > 1 { folder.substring(from: 0, to: folder.count - 1) } else { folder }
+        let r = db.execute("INSERT OR IGNORE INTO folders (path, added) VALUES (?, ?)", [f, now()])
+        r.error()
+    }
+
+    // Stops watching a folder and drops its files from the library (their
+    // history stays).
+    fn removeFolder(_ folder: String) -> Error? {
+        try db.execute("DELETE FROM folders WHERE path = ?", [folder])
+        try db.execute("DELETE FROM media WHERE root = ?", [folder])
+        nil
+    }
+
+    fn folders() -> [String] {
+        (db.query("SELECT path FROM folders ORDER BY path").valueOr([])).map { r in r.text("path") }
+    }
+
+    // --- Scanning ---
+
+    // Walks the watched folders and brings the library up to date; with
+    // `readTags`, also reads audio files up to `maxTagBytes` whole for their
+    // duration and tags. For big libraries, run `findMediaFiles` and
+    // `readMediaReport` in background work and give the results to
+    // `applyScan` and `applyReport` here instead.
+    fn scan(readTags: Bool = true, maxTagBytes: Int = 50_000_000) -> ScanResult {
+        let t0 = now()
+        let found = findMediaFiles(folders())
+        var r = applyScan(found)
+        if readTags {
+            let todo = filesNeedingTags(maxBytes: maxTagBytes)
+            if !todo.isEmpty {
+                db.execute("BEGIN")
+                for p in todo {
+                    if let rep = readMediaReport(p, maxBytes: maxTagBytes) {
+                        applyReport(rep, details: 1)
+                        r.tagged += 1
+                    } else {
+                        // Unreadable: don't try again until it changes.
+                        db.execute("UPDATE media SET details = 1 WHERE path = ?", [p])
+                    }
+                }
+                db.execute("COMMIT")
+            }
+        }
+        r.ms = (now() - t0) * 1000.0
+        r
+    }
+
+    // Brings the media table in line with a folder walk: new files are
+    // added (with what their names say), files whose size or date changed
+    // are marked to be read again, files that are gone are removed.
+    fn applyScan(_ found: [FoundFile]) -> ScanResult {
+        var r = ScanResult(files: found.count)
+        var known: [String: (Int, Float)] = [:]
+        for row in db.query("SELECT path, size, modified FROM media").valueOr([]) {
+            known[row.text("path")] = (row.int("size"), row.float("modified"))
+        }
+        var seen: Set<String> = []
+        db.execute("BEGIN")
+        let t = now()
+        for f in found {
+            seen.insert(f.path)
+            if let (size, modified) = known[f.path] {
+                if size == f.size && abs(modified - f.modified) < 1.0 {
+                    r.unchanged += 1
+                    continue
+                }
+                db.execute("UPDATE media SET size = ?, modified = ?, details = 0, duration = -1 WHERE path = ?", [f.size, f.modified, f.path])
+                r.changed += 1
+                continue
+            }
+            insertFound(f, added: t)
+            r.added += 1
+        }
+        // Gone: under a watched folder (or one no longer watched) but not
+        // found.
+        for (p, _) in known {
+            if !seen.contains(p) {
+                db.execute("DELETE FROM media WHERE path = ?", [p])
+                r.removed += 1
+            }
+        }
+        db.execute("COMMIT")
+        r
+    }
+
+    // Adds a file found by a walk, with what its name says.
+    private fn insertFound(_ f: FoundFile, added: Float) {
+        let kind = mediaKindOf(f.path)
+        let e = parseEpisode(f.path)
+        let group = groupFor(kind: kind, isEpisode: e.isEpisode, duration: -1.0, hasVideo: kind == "video")
+        let name = f.path.fileName
+        let title = if e.isEpisode { e.title } else { "" }
+        let search = searchText([episodeStem(name), e.series])
+        db.execute("INSERT OR REPLACE INTO media (path, root, name, size, modified, added, kind, container, duration, title, artist, album, albumartist, genre, year, track, disc, codecs, width, height, series, series_key, season, episode, epdate, grp, search, details) VALUES (?, ?, ?, ?, ?, ?, ?, '', -1, ?, '', '', '', '', ?, 0, 0, '', 0, 0, ?, ?, ?, ?, ?, ?, ?, 0)", [f.path, f.root, name, f.size, f.modified, added, kind, title, max(e.year, 0), if e.isEpisode { e.series } else { "" }, e.key, e.season, e.episode, e.date, group, search])
+    }
+
+    // Adds one file (outside a scan, e.g. dropped on the window) under
+    // `root` ("" when it isn't in a watched folder).
+    fn addFile(_ path: String, root: String = "") -> Error? {
+        if !fileExists(path) {
+            return Error("{path} doesn't exist")
+        }
+        insertFound(FoundFile(path: path, root: root, size: fileSize(path) ?? 0, modified: modifiedTime(path) ?? 0.0), added: now())
+        nil
+    }
+
+    // Audio files whose tags haven't been read and that are small enough
+    // to read whole.
+    fn filesNeedingTags(maxBytes: Int = 50_000_000) -> [String] {
+        (db.query("SELECT path FROM media WHERE kind = 'audio' AND details = 0 AND size <= ? ORDER BY path", [maxBytes]).valueOr([])).map { r in r.text("path") }
+    }
+
+    // Stores what is known about a file's content (from the player after
+    // it opened the file: details 2, or a scan: 1). Files not in the
+    // library are ignored.
+    fn applyReport(_ rep: MediaReport, details: Int = 2) {
+        let rows = db.query("SELECT name, series, title FROM media WHERE path = ?", [rep.path]).valueOr([])
+        if rows.isEmpty {
+            return
+        }
+        let name = rows[0].text("name")
+        let e = parseEpisode(rep.path)
+        let kind = if rep.hasVideo { "video" } else if rep.hasAudio { "audio" } else { mediaKindOf(rep.path) }
+        let group = groupFor(kind: kind, isEpisode: e.isEpisode, duration: rep.duration, hasVideo: rep.hasVideo || (kind == "video" && !rep.hasAudio))
+        let title = if !rep.title.isEmpty { rep.title } else if e.isEpisode { e.title } else { rows[0].text("title") }
+        let search = searchText([episodeStem(name), title, rep.artist, rep.album, rep.albumArtist, rows[0].text("series")])
+        db.execute("UPDATE media SET kind = ?, container = ?, duration = ?, title = ?, artist = ?, album = ?, albumartist = ?, genre = ?, year = CASE WHEN ? > 0 THEN ? ELSE year END, track = ?, disc = ?, codecs = ?, width = ?, height = ?, grp = ?, search = ?, details = MAX(details, ?) WHERE path = ?", [kind, rep.container, rep.duration, title, rep.artist, rep.album, rep.albumArtist, rep.genre, rep.year, rep.year, rep.track, rep.disc, rep.codecs, rep.width, rep.height, group, search, details, rep.path])
+    }
+
+    // The player opened `path` (of `size` bytes) and found `media`.
+    fn reportPlayed(_ path: String, size: Int, media: core.Media) {
+        applyReport(reportFromMedia(path, size: size, media: media), details: 2)
+    }
+
+    // Which group a file goes in.
+    private fn groupFor(kind: String, isEpisode: Bool, duration: Float, hasVideo: Bool) -> String {
+        if kind == "audio" && !hasVideo {
+            return "music"
+        }
+        if kind == "video" || hasVideo {
+            if isEpisode {
+                return "tv"
+            }
+            if duration > 0.0 && duration < shortVideo {
+                return "other"
+            }
+            return "movies"
+        }
+        "other"
+    }
+
+    // --- Reading the library ---
+
+    fn count(group: String = "") -> Int {
+        let rows = if group.isEmpty { db.query("SELECT count(*) AS n FROM media").valueOr([]) } else { db.query("SELECT count(*) AS n FROM media WHERE grp = ?", [group]).valueOr([]) }
+        if rows.isEmpty { 0 } else { rows[0].int("n") }
+    }
+
+    // How many files each group has ("movies" "tv" "music" "other").
+    fn groupCounts() -> [String: Int] {
+        var out: [String: Int] = ["movies": 0, "tv": 0, "music": 0, "other": 0]
+        for r in db.query("SELECT grp, count(*) AS n FROM media GROUP BY grp").valueOr([]) {
+            out[r.text("grp")] = r.int("n")
+        }
+        out
+    }
+
+    // The item for a path, or nil.
+    fn item(_ path: String) -> MediaItem? {
+        let rows = db.query(itemSelect + " WHERE m.path = ?", [path]).valueOr([])
+        if rows.isEmpty {
+            return nil
+        }
+        rowItem(rows[0])
+    }
+
+    // Files of a group ("" for all), sorted by "name" "title" "artist"
+    // "album" "added" "modified" "duration" "size" "played" "year"
+    // "episode".
+    fn items(group: String = "", sort: String = "name", descending: Bool = false, limit: Int = 0) -> [MediaItem] {
+        let rows = if group.isEmpty { db.query(itemSelect).valueOr([]) } else { db.query(itemSelect + " WHERE m.grp = ?", [group]).valueOr([]) }
+        let list = sortItems(rows.map { r in rowItem(r) }, sort: sort, descending: descending)
+        if limit > 0 { list.prefix(limit) } else { list }
+    }
+
+    // Files whose title, artist, album, show or file name contain every word
+    // of `query` (case and accents ignored), in a group or all.
+    fn search(_ query: String, group: String = "", sort: String = "name", descending: Bool = false, limit: Int = 0) -> [MediaItem] {
+        let words = searchWords(query)
+        var sql = itemSelect + " WHERE 1"
+        var values: [SqlValue] = []
+        for w in words {
+            sql += " AND m.search LIKE ? ESCAPE '\\'"
+            values.append(.text(value: "%" + likeEscape(w) + "%"))
+        }
+        if !group.isEmpty {
+            sql += " AND m.grp = ?"
+            values.append(.text(value: group))
+        }
+        let rows = db.query(sql, values).valueOr([])
+        let list = sortItems(rows.map { r in rowItem(r) }, sort: sort, descending: descending)
+        if limit > 0 { list.prefix(limit) } else { list }
+    }
+
+    // The TV group by show: seasons, episode counts, unwatched counts.
+    fn shows() -> [ShowSummary] {
+        var byKey: [String: ShowSummary] = [:]
+        var order: [String] = []
+        let rows = db.query("SELECT m.series, m.series_key, m.season, f.finished FROM media m LEFT JOIN files f ON f.path = m.path AND f.size = m.size WHERE m.grp = 'tv'").valueOr([])
+        for r in rows {
+            let key = r.text("series_key")
+            if byKey[key] == nil {
+                byKey[key] = ShowSummary(name: r.text("series"), key: key)
+                order.append(key)
+            }
+            if let s0 = byKey[key] {
+                var s = s0
+                let season = r.int("season")
+                if !s.seasons.contains(season) {
+                    s.seasons.append(season)
+                }
+                s.episodes += 1
+                if !r.bool("finished") {
+                    s.unwatched += 1
+                }
+                if s.name.isEmpty {
+                    s.name = r.text("series")
+                }
+                byKey[key] = s
+            }
+        }
+        var out: [ShowSummary] = []
+        for k in order {
+            if let s0 = byKey[k] {
+                var s = s0
+                s.seasons = s.seasons.sorted()
+                out.append(s)
+            }
+        }
+        out.sorted(by: { a, b in naturalCompare(a.name, b.name) < 0 })
+    }
+
+    // A show's episodes in order (`season` −2 for all seasons).
+    fn episodes(key: String, season: Int = -2) -> [MediaItem] {
+        let rows = if season == -2 { db.query(itemSelect + " WHERE m.grp = 'tv' AND m.series_key = ?", [key]).valueOr([]) } else { db.query(itemSelect + " WHERE m.grp = 'tv' AND m.series_key = ? AND m.season = ?", [key, season]).valueOr([]) }
+        sortItems(rows.map { r in rowItem(r) }, sort: "episode", descending: false)
+    }
+
+    // The first unfinished episode of a show (to "continue watching"), or
+    // nil when all are finished.
+    fn nextUnwatched(key: String) -> MediaItem? {
+        episodes(key: key).first(where: { i in !i.finished })
+    }
+
+    // Artists of the Music group (album artist when tagged, else artist).
+    fn artists() -> [String] {
+        let rows = db.query("SELECT DISTINCT CASE WHEN albumartist != '' THEN albumartist ELSE artist END AS a FROM media WHERE grp = 'music'").valueOr([])
+        naturalSorted(rows.map { r in r.text("a") })
+    }
+
+    // Albums (of one artist, or all).
+    fn albums(artist: String = "") -> [AlbumSummary] {
+        let base = "SELECT album, CASE WHEN albumartist != '' THEN albumartist ELSE artist END AS a, max(year) AS y, count(*) AS n, sum(CASE WHEN duration > 0 THEN duration ELSE 0 END) AS d FROM media WHERE grp = 'music'"
+        let rows = if artist.isEmpty { db.query(base + " GROUP BY album, a").valueOr([]) } else { db.query(base + " AND (albumartist = ? OR (albumartist = '' AND artist = ?)) GROUP BY album, a", [artist, artist]).valueOr([]) }
+        let list = rows.map { r in AlbumSummary(album: r.text("album"), artist: r.text("a"), year: r.int("y"), tracks: r.int("n"), duration: r.float("d")) }
+        list.sorted(by: { x, y in
+            let c = naturalCompare(x.artist, y.artist)
+            if c != 0 {
+                return c < 0
+            }
+            naturalCompare(x.album, y.album) < 0
+        })
+    }
+
+    // An album's tracks by disc and track number (then file name).
+    fn albumTracks(album: String, artist: String = "") -> [MediaItem] {
+        let rows = if artist.isEmpty { db.query(itemSelect + " WHERE m.grp = 'music' AND m.album = ?", [album]).valueOr([]) } else { db.query(itemSelect + " WHERE m.grp = 'music' AND m.album = ? AND (m.albumartist = ? OR (m.albumartist = '' AND m.artist = ?))", [album, artist, artist]).valueOr([]) }
+        let list = rows.map { r in rowItem(r) }
+        list.sorted(by: { a, b in
+            if a.disc != b.disc {
+                return a.disc < b.disc
+            }
+            if a.track != b.track {
+                return a.track < b.track
+            }
+            naturalCompare(a.name, b.name) < 0
+        })
+    }
+
+    // The next episode of the show `path` belongs to, from the library
+    // (then from the folder beside it); "" when there's none.
+    fn nextEpisodeOf(_ path: String) -> String {
+        let e = parseEpisode(path)
+        if e.isEpisode && !e.key.isEmpty {
+            let cands = (db.query("SELECT path FROM media WHERE series_key = ?", [e.key]).valueOr([])).map { r in r.text("path") }
+            let n = nextEpisode(path, candidates: cands)
+            if !n.isEmpty {
+                return n
+            }
+        }
+        nextInFolder(path)
+    }
+
+    // --- History and per-file memory ---
+
+    // The memory row of a file: by path and size; else (a moved or renamed
+    // folder) by file name and size where the old path is gone, which is
+    // then moved to the new path. nil when the file was never seen.
+    fn record(_ path: String, size: Int) -> FileRecord? {
+        let rows = db.query("SELECT * FROM files WHERE path = ? AND size = ?", [path, size]).valueOr([])
+        if !rows.isEmpty {
+            return recordOf(rows[0])
+        }
+        if size <= 0 {
+            return nil
+        }
+        let moved = db.query("SELECT * FROM files WHERE name = ? AND size = ? ORDER BY last_played DESC", [path.fileName, size]).valueOr([])
+        for r in moved {
+            let old = r.text("path")
+            if old != path && !fileExists(old) {
+                db.execute("DELETE FROM files WHERE path = ? AND size = ?", [path, size])
+                db.execute("UPDATE files SET path = ? WHERE id = ?", [path, r.int("id")])
+                var rec = recordOf(r)
+                rec.path = path
+                return rec
+            }
+        }
+        nil
+    }
+
+    // The row id for a file, made when needed.
+    private fn ensureRecord(_ path: String, size: Int) -> Int {
+        if let r = record(path, size: size) {
+            return r.id
+        }
+        db.execute("INSERT INTO files (path, size, name, position, duration, finished, last_played, play_count, settings) VALUES (?, ?, ?, 0, -1, 0, 0, 0, '')", [path, size, path.fileName])
+        db.lastInsertId()
+    }
+
+    // What's remembered for a file (defaults when nothing is).
+    fn fileSettings(_ path: String, size: Int) -> FileSettings {
+        record(path, size: size)?.settings ?? FileSettings()
+    }
+
+    fn saveFileSettings(_ path: String, size: Int, _ s: FileSettings) -> Error? {
+        let id = ensureRecord(path, size: size)
+        let r = db.execute("UPDATE files SET settings = ? WHERE id = ?", [toJson(s), id])
+        r.error()
+    }
+
+    // Changes the remembered settings with a function (read, change, save).
+    fn updateFileSettings(_ path: String, size: Int, _ change: fn(FileSettings) -> FileSettings) -> FileSettings {
+        let s = change(fileSettings(path, size: size))
+        saveFileSettings(path, size: size, s)
+        s
+    }
+
+    // A file started playing: one more play, played now.
+    fn startedPlaying(_ path: String, size: Int, duration: Float = -1.0) {
+        let id = ensureRecord(path, size: size)
+        db.execute("UPDATE files SET play_count = play_count + 1, last_played = ?, duration = CASE WHEN ? > 0 THEN ? ELSE duration END WHERE id = ?", [now(), duration, duration, id])
+    }
+
+    // Remembers where a file was left. Near the end (within
+    // `finishedMargin` seconds, or past `finishedFraction`) it is marked
+    // finished and its position cleared. Returns whether it is finished.
+    fn savePosition(_ path: String, size: Int, position: Float, duration: Float) -> Bool {
+        let id = ensureRecord(path, size: size)
+        let done = duration > 0.0 && (position >= duration - finishedMargin || position >= duration * finishedFraction)
+        if done {
+            db.execute("UPDATE files SET position = 0, finished = 1, duration = ?, last_played = ? WHERE id = ?", [duration, now(), id])
+        } else {
+            db.execute("UPDATE files SET position = ?, finished = 0, duration = CASE WHEN ? > 0 THEN ? ELSE duration END, last_played = ? WHERE id = ?", [position, duration, duration, now(), id])
+        }
+        done
+    }
+
+    // Where to continue a file from: its saved position when it's at least
+    // `minSeconds` in and not finished, else −1.
+    fn resumePosition(_ path: String, size: Int, minSeconds: Float = 10.0) -> Float {
+        if let r = record(path, size: size) {
+            if !r.finished && r.position >= minSeconds {
+                return r.position
+            }
+        }
+        -1.0
+    }
+
+    fn setFinished(_ path: String, size: Int, _ finished: Bool) {
+        let id = ensureRecord(path, size: size)
+        db.execute("UPDATE files SET finished = ?, position = CASE WHEN ? THEN 0 ELSE position END WHERE id = ?", [finished, finished, id])
+    }
+
+    // The files played most recently first.
+    fn history(limit: Int = 100) -> [HistoryEntry] {
+        let rows = db.query("SELECT * FROM files WHERE last_played > 0 ORDER BY last_played DESC LIMIT ?", [limit]).valueOr([])
+        rows.map { r in HistoryEntry(path: r.text("path"), name: r.text("name"), size: r.int("size"), position: r.float("position"), duration: r.float("duration"), finished: r.bool("finished"), lastPlayed: r.float("last_played"), playCount: r.int("play_count")) }
+    }
+
+    // The paths for "Open Recent" (still existing files and URLs).
+    fn recentPaths(limit: Int = 12) -> [String] {
+        var out: [String] = []
+        for h in history(limit: limit * 3) {
+            if out.count >= limit {
+                break
+            }
+            if (isURL(h.path) || fileExists(h.path)) && !out.contains(h.path) {
+                out.append(h.path)
+            }
+        }
+        out
+    }
+
+    // Forgets a file's history and settings.
+    fn forget(_ path: String, size: Int) {
+        db.execute("DELETE FROM files WHERE path = ? AND size = ?", [path, size])
+    }
+
+    // Clears the history (plays, positions, finished marks); with
+    // `settings`, the per-file settings too.
+    fn clearHistory(settings: Bool = false) {
+        if settings {
+            db.execute("DELETE FROM files")
+        } else {
+            db.execute("UPDATE files SET last_played = 0, play_count = 0, position = 0, finished = 0")
+        }
+    }
+
+    // Takes in the app's older recent.json (paths, newest first) and
+    // positions.json ({path: seconds}). Returns how many files were taken.
+    fn importLegacy(recent: [String], positions: [String: Float]) -> Int {
+        var n = 0
+        let t = now()
+        db.execute("BEGIN")
+        for (i, p) in recent.enumerated() {
+            let size = fileSize(p) ?? 0
+            let id = ensureRecord(p, size: size)
+            db.execute("UPDATE files SET last_played = MAX(last_played, ?), play_count = MAX(play_count, 1) WHERE id = ?", [t - Float(i) - 1.0, id])
+            n += 1
+        }
+        for (p, pos) in positions {
+            let size = fileSize(p) ?? 0
+            let id = ensureRecord(p, size: size)
+            db.execute("UPDATE files SET position = ? WHERE id = ?", [pos, id])
+            if !recent.contains(p) {
+                n += 1
+            }
+        }
+        db.execute("COMMIT")
+        n
+    }
+
+    // Moves recent.json and positions.json in `folder` into the database
+    // once (they're renamed to *.imported afterwards). Returns how many
+    // files were taken in.
+    fn migrateLegacyFiles(folder: String) -> Int {
+        let rf = joinPath(folder, "recent.json")
+        let pf = joinPath(folder, "positions.json")
+        let recent: [String] = fromJson(readFile(rf) ?? "[]") ?? []
+        let positions: [String: Float] = fromJson(readFile(pf) ?? "\{}") ?? [:]
+        if recent.isEmpty && positions.isEmpty {
+            return 0
+        }
+        let n = importLegacy(recent: recent, positions: positions)
+        if fileExists(rf) {
+            renameFile(from: rf, to: rf + ".imported")
+        }
+        if fileExists(pf) {
+            renameFile(from: pf, to: pf + ".imported")
+        }
+        n
+    }
+
+    // Closes the database.
+    fn close() {
+        db.close()
+    }
+}
+
+// Opens (or creates) the library database at `path` (":memory:" for one
+// that lasts while the program runs).
+public fn openLibrary(_ path: String) -> Result<Library> {
+    let db = try openDatabase(path)
+    try db.execute("PRAGMA journal_mode = WAL")
+    try db.execute(librarySchema)
+    let v = db.query("SELECT value FROM meta WHERE key = 'schema'").valueOr([])
+    if v.isEmpty {
+        try db.execute("INSERT INTO meta (key, value) VALUES ('schema', '1')")
+    }
+    Result.ok(value: Library(db: db, path: path))
+}
+
+let librarySchema = [
+    "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)",
+    "CREATE TABLE IF NOT EXISTS folders (path TEXT PRIMARY KEY, added REAL)",
+    "CREATE TABLE IF NOT EXISTS media (id INTEGER PRIMARY KEY, path TEXT UNIQUE NOT NULL, root TEXT NOT NULL DEFAULT '', name TEXT NOT NULL DEFAULT '', size INTEGER NOT NULL DEFAULT 0, modified REAL NOT NULL DEFAULT 0, added REAL NOT NULL DEFAULT 0, kind TEXT NOT NULL DEFAULT '', container TEXT NOT NULL DEFAULT '', duration REAL NOT NULL DEFAULT -1, title TEXT NOT NULL DEFAULT '', artist TEXT NOT NULL DEFAULT '', album TEXT NOT NULL DEFAULT '', albumartist TEXT NOT NULL DEFAULT '', genre TEXT NOT NULL DEFAULT '', year INTEGER NOT NULL DEFAULT 0, track INTEGER NOT NULL DEFAULT 0, disc INTEGER NOT NULL DEFAULT 0, codecs TEXT NOT NULL DEFAULT '', width INTEGER NOT NULL DEFAULT 0, height INTEGER NOT NULL DEFAULT 0, series TEXT NOT NULL DEFAULT '', series_key TEXT NOT NULL DEFAULT '', season INTEGER NOT NULL DEFAULT -1, episode INTEGER NOT NULL DEFAULT -1, epdate TEXT NOT NULL DEFAULT '', grp TEXT NOT NULL DEFAULT 'other', search TEXT NOT NULL DEFAULT '', details INTEGER NOT NULL DEFAULT 0)",
+    "CREATE INDEX IF NOT EXISTS media_grp ON media (grp)",
+    "CREATE INDEX IF NOT EXISTS media_series ON media (series_key, season, episode)",
+    "CREATE INDEX IF NOT EXISTS media_album ON media (album)",
+    "CREATE INDEX IF NOT EXISTS media_root ON media (root)",
+    "CREATE TABLE IF NOT EXISTS files (id INTEGER PRIMARY KEY, path TEXT NOT NULL, size INTEGER NOT NULL, name TEXT NOT NULL, position REAL NOT NULL DEFAULT 0, duration REAL NOT NULL DEFAULT -1, finished INTEGER NOT NULL DEFAULT 0, last_played REAL NOT NULL DEFAULT 0, play_count INTEGER NOT NULL DEFAULT 0, settings TEXT NOT NULL DEFAULT '', UNIQUE (path, size))",
+    "CREATE INDEX IF NOT EXISTS files_name ON files (name, size)",
+    "CREATE INDEX IF NOT EXISTS files_played ON files (last_played)",
+].joined(separator: "; ")
+
+let itemSelect = "SELECT m.*, IFNULL(f.last_played, 0) AS h_last, IFNULL(f.play_count, 0) AS h_count, IFNULL(f.position, 0) AS h_pos, IFNULL(f.finished, 0) AS h_done FROM media m LEFT JOIN files f ON f.path = m.path AND f.size = m.size"
+
+fn rowItem(_ r: DatabaseRow) -> MediaItem {
+    MediaItem(id: r.int("id"), path: r.text("path"), name: r.text("name"), root: r.text("root"), size: r.int("size"), modified: r.float("modified"), added: r.float("added"), kind: r.text("kind"), container: r.text("container"), duration: r.float("duration"), title: r.text("title"), artist: r.text("artist"), album: r.text("album"), albumArtist: r.text("albumartist"), genre: r.text("genre"), year: r.int("year"), track: r.int("track"), disc: r.int("disc"), codecs: r.text("codecs"), width: r.int("width"), height: r.int("height"), series: r.text("series"), seriesKey: r.text("series_key"), season: r.int("season"), episode: r.int("episode"), episodeDate: r.text("epdate"), group: r.text("grp"), details: r.int("details"), lastPlayed: r.float("h_last"), playCount: r.int("h_count"), position: r.float("h_pos"), finished: r.bool("h_done"))
+}
+
+fn recordOf(_ r: DatabaseRow) -> FileRecord {
+    let text = r.text("settings")
+    let s: FileSettings = if text.isEmpty { FileSettings() } else { fromJson(text) ?? FileSettings() }
+    FileRecord(id: r.int("id"), path: r.text("path"), size: r.int("size"), name: r.text("name"), position: r.float("position"), duration: r.float("duration"), finished: r.bool("finished"), lastPlayed: r.float("last_played"), playCount: r.int("play_count"), settings: s)
+}
+
+// The folded words of several texts, space-separated with a space at the
+// start, for the search column.
+fn searchText(_ parts: [String]) -> String {
+    var words: [String] = []
+    for p in parts {
+        words.appendAll(searchWords(p))
+    }
+    " " + words.joined(separator: " ")
+}
+
+// LIKE patterns: % and _ and \ taken literally (ESCAPE '\').
+fn likeEscape(_ s: String) -> String {
+    s.replace("\\", with: "\\\\").replace("%", with: "\\%").replace("_", with: "\\_")
+}
+
+// Sorts items by a key (see Library.items); name and title in natural
+// order.
+public fn sortItems(_ items: [MediaItem], sort: String, descending: Bool = false) -> [MediaItem] {
+    let s = items.sorted(by: { a, b in itemBefore(a, b, sort) })
+    if descending { s.reversed() } else { s }
+}
+
+fn itemBefore(_ a: MediaItem, _ b: MediaItem, _ sort: String) -> Bool {
+    match sort {
+        "title" -> naturalCompare(a.displayTitle, b.displayTitle) < 0
+        "artist" -> {
+            let c = naturalCompare(a.artist, b.artist)
+            if c != 0 { c < 0 } else { naturalCompare(a.displayTitle, b.displayTitle) < 0 }
+        }
+        "album" -> {
+            let c = naturalCompare(a.album, b.album)
+            if c != 0 { c < 0 } else if a.disc != b.disc { a.disc < b.disc } else if a.track != b.track { a.track < b.track } else { naturalCompare(a.name, b.name) < 0 }
+        }
+        "added" -> a.added < b.added
+        "modified" -> a.modified < b.modified
+        "duration" -> a.duration < b.duration
+        "size" -> a.size < b.size
+        "played" -> a.lastPlayed < b.lastPlayed
+        "year" -> if a.year != b.year { a.year < b.year } else { naturalCompare(a.displayTitle, b.displayTitle) < 0 }
+        "episode" -> {
+            let c = naturalCompare(a.seriesKey, b.seriesKey)
+            if c != 0 {
+                c < 0
+            } else if a.season != b.season {
+                a.season < b.season
+            } else if a.episodeDate != b.episodeDate {
+                a.episodeDate < b.episodeDate
+            } else if a.episode != b.episode {
+                a.episode < b.episode
+            } else {
+                naturalCompare(a.name, b.name) < 0
+            }
+        }
+        _ -> naturalCompare(a.name, b.name) < 0
+    }
+}

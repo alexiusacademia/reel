@@ -1,0 +1,302 @@
+// CELT bit allocation (RFC 6716 section 4.3.3): how the frame's bits are
+// shared between the bands' PVQ shapes and their fine energy, from the
+// static allocation table, the trim, the dynamic boosts and the caps; also
+// decides the band skipping, intensity and dual stereo parameters, which
+// are read from the stream in the middle of it. Follows libopus rate.c
+// (clt_compute_allocation, interp_bits2pulses) exactly: the result must be
+// bit-exact because everything after it depends on it.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+// The output of the allocation.
+struct CeltAlloc {
+    codedBands: Int = 0
+    intensity: Int = 0
+    dualStereo: Int = 0
+    balance: Int = 0
+    // Per band: PVQ bits (1/8 bit), fine energy bits, fine priority.
+    pulses: [Int] = celtZerosI(21)
+    ebits: [Int] = celtZerosI(21)
+    finePriority: [Int] = celtZerosI(21)
+}
+
+// init_caps: the most bits each band can use.
+fn celtInitCaps(_ lm: Int, _ c: Int) -> [Int] {
+    var cap: [Int] = []
+    for i in 0..21 {
+        let n = (celtEBands[i + 1] - celtEBands[i]) << lm
+        cap.append(((celtCacheCaps[21 * (2 * lm + c - 1) + i] + 64) * c * n) >> 2)
+    }
+    cap
+}
+
+fn celtComputeAllocation(rc: bind OpusRange, start: Int, end: Int, offsets: [Int], cap: [Int], allocTrim: Int, totalIn: Int, c: Int, lm: Int) -> CeltAlloc {
+    var out = CeltAlloc()
+    var total = max(totalIn, 0)
+    var skipStart = start
+    // Reserve a bit to signal the end of manually skipped bands.
+    let skipRsv = if total >= 8 { 8 } else { 0 }
+    total -= skipRsv
+    // Reserve bits for the intensity and dual stereo parameters.
+    var intensityRsv = 0
+    var dualStereoRsv = 0
+    if c == 2 {
+        intensityRsv = celtLog2FracTable[end - start]
+        if intensityRsv > total {
+            intensityRsv = 0
+        } else {
+            total -= intensityRsv
+            dualStereoRsv = if total >= 8 { 8 } else { 0 }
+            total -= dualStereoRsv
+        }
+    }
+    var bits1 = celtZerosI(21)
+    var bits2 = celtZerosI(21)
+    var thresh = celtZerosI(21)
+    var trimOffset = celtZerosI(21)
+    for j in start..end {
+        let w = celtEBands[j + 1] - celtEBands[j]
+        // Below this threshold no PVQ bits are given.
+        thresh[j] = max(c << 3, ((3 * w) << lm << 3) >> 4)
+        // The tilt of the allocation curve.
+        trimOffset[j] = (c * w * (allocTrim - 5 - lm) * (end - j - 1) * (1 << (lm + 3))) >> 6
+        // Less resolution for single-coefficient bands.
+        if w << lm == 1 {
+            trimOffset[j] -= c << 3
+        }
+    }
+    var lo = 1
+    var hi = 10
+    while true {
+        var done = false
+        var psum = 0
+        let mid = (lo + hi) >> 1
+        var j = end - 1
+        while j >= start {
+            let n = celtEBands[j + 1] - celtEBands[j]
+            var bitsj = ((c * n * celtBandAllocation[mid * 21 + j]) << lm) >> 2
+            if bitsj > 0 {
+                bitsj = max(0, bitsj + trimOffset[j])
+            }
+            bitsj += offsets[j]
+            if bitsj >= thresh[j] || done {
+                done = true
+                psum += min(bitsj, cap[j])
+            } else if bitsj >= c << 3 {
+                psum += c << 3
+            }
+            j -= 1
+        }
+        if psum > total {
+            hi = mid - 1
+        } else {
+            lo = mid + 1
+        }
+        if lo > hi {
+            break
+        }
+    }
+    hi = lo
+    lo -= 1
+    for j in start..end {
+        let n = celtEBands[j + 1] - celtEBands[j]
+        var b1 = ((c * n * celtBandAllocation[lo * 21 + j]) << lm) >> 2
+        var b2 = if hi >= 11 { cap[j] } else { ((c * n * celtBandAllocation[hi * 21 + j]) << lm) >> 2 }
+        if b1 > 0 {
+            b1 = max(0, b1 + trimOffset[j])
+        }
+        if b2 > 0 {
+            b2 = max(0, b2 + trimOffset[j])
+        }
+        if lo > 0 {
+            b1 += offsets[j]
+        }
+        b2 += offsets[j]
+        if offsets[j] > 0 {
+            skipStart = j
+        }
+        b2 = max(0, b2 - b1)
+        bits1[j] = b1
+        bits2[j] = b2
+    }
+
+    // interp_bits2pulses.
+    let allocFloor = c << 3
+    let stereo = if c > 1 { 1 } else { 0 }
+    let logM = lm << 3
+    lo = 0
+    hi = 64
+    for _ in 0..6 {
+        let mid = (lo + hi) >> 1
+        var psum = 0
+        var done = false
+        var j = end - 1
+        while j >= start {
+            let tmp = bits1[j] + ((mid * bits2[j]) >> 6)
+            if tmp >= thresh[j] || done {
+                done = true
+                psum += min(tmp, cap[j])
+            } else if tmp >= allocFloor {
+                psum += allocFloor
+            }
+            j -= 1
+        }
+        if psum > total {
+            hi = mid
+        } else {
+            lo = mid
+        }
+    }
+    var psum = 0
+    var done = false
+    var bits = celtZerosI(21)
+    var j = end - 1
+    while j >= start {
+        var tmp = bits1[j] + ((lo * bits2[j]) >> 6)
+        if tmp < thresh[j] && !done {
+            tmp = if tmp >= allocFloor { allocFloor } else { 0 }
+        } else {
+            done = true
+        }
+        tmp = min(tmp, cap[j])
+        bits[j] = tmp
+        psum += tmp
+        j -= 1
+    }
+    // Decide which bands to skip, working backwards from the end.
+    var codedBands = end
+    while true {
+        j = codedBands - 1
+        if j <= skipStart {
+            // Give the bit reserved to end skipping back.
+            total += skipRsv
+            break
+        }
+        var left = total - psum
+        let percoeff = left / (celtEBands[codedBands] - celtEBands[start])
+        left -= (celtEBands[codedBands] - celtEBands[start]) * percoeff
+        let rem = max(left - (celtEBands[j] - celtEBands[start]), 0)
+        let bandWidth = celtEBands[codedBands] - celtEBands[j]
+        var bandBits = bits[j] + percoeff * bandWidth + rem
+        // Only code a skip decision above the band's threshold.
+        if bandBits >= max(thresh[j], allocFloor + 8) {
+            if rc.bitLogp(1) {
+                break
+            }
+            // A bit was used to skip this band.
+            psum += 8
+            bandBits -= 8
+        }
+        // Reclaim the bits originally allocated to this band.
+        psum -= bits[j] + intensityRsv
+        if intensityRsv > 0 {
+            intensityRsv = celtLog2FracTable[j - start]
+        }
+        psum += intensityRsv
+        if bandBits >= allocFloor {
+            // Enough for a fine energy bit per channel.
+            psum += allocFloor
+            bits[j] = allocFloor
+        } else {
+            bits[j] = 0
+        }
+        codedBands -= 1
+    }
+    // The intensity and dual stereo parameters.
+    var intensity = 0
+    if intensityRsv > 0 {
+        intensity = start + rc.uint(codedBands + 1 - start)
+    }
+    if intensity <= start {
+        total += dualStereoRsv
+        dualStereoRsv = 0
+    }
+    var dualStereo = 0
+    if dualStereoRsv > 0 {
+        dualStereo = if rc.bitLogp(1) { 1 } else { 0 }
+    }
+    // Allocate the remaining bits.
+    var left = total - psum
+    let percoeff = left / (celtEBands[codedBands] - celtEBands[start])
+    left -= (celtEBands[codedBands] - celtEBands[start]) * percoeff
+    for jj in start..codedBands {
+        bits[jj] += percoeff * (celtEBands[jj + 1] - celtEBands[jj])
+    }
+    for jj in start..codedBands {
+        let tmp = min(left, celtEBands[jj + 1] - celtEBands[jj])
+        bits[jj] += tmp
+        left -= tmp
+    }
+    var balance = 0
+    j = start
+    while j < codedBands {
+        let n0 = celtEBands[j + 1] - celtEBands[j]
+        let n = n0 << lm
+        let bit = bits[j] + balance
+        var excess = 0
+        if n > 1 {
+            excess = max(bit - cap[j], 0)
+            bits[j] = bit - excess
+            // Compensate for the extra degree of freedom in stereo.
+            let den = c * n + (if c == 2 && n > 2 && dualStereo == 0 && j < intensity { 1 } else { 0 })
+            let nclogn = den * (celtLogN[j] + logM)
+            // Offset the fine bits by log2(N)/2 + FINE_OFFSET (21)
+            // compared to their fair share of total/N.
+            var offset = (nclogn >> 1) - den * 21
+            // N = 2 is the only point that doesn't match the curve.
+            if n == 2 {
+                offset += (den << 3) >> 2
+            }
+            // Changing the offset for the second and third fine bit.
+            if bits[j] + offset < (den * 2) << 3 {
+                offset += nclogn >> 2
+            } else if bits[j] + offset < (den * 3) << 3 {
+                offset += nclogn >> 3
+            }
+            // Divide with rounding.
+            var eb = max(0, bits[j] + offset + (den << 2))
+            eb = (eb / den) >> 3
+            // Don't bust.
+            if c * eb > (bits[j] >> 3) {
+                eb = (bits[j] >> stereo) >> 3
+            }
+            eb = min(eb, 8)
+            out.ebits[j] = eb
+            // A candidate for the final fine energy pass if rounded down
+            // or capped.
+            out.finePriority[j] = if eb * (den << 3) >= bits[j] + offset { 1 } else { 0 }
+            // The rest goes to PVQ.
+            bits[j] -= (c * eb) << 3
+        } else {
+            // N = 1: everything to fine energy but a single sign bit.
+            excess = max(0, bit - (c << 3))
+            bits[j] = bit - excess
+            out.ebits[j] = 0
+            out.finePriority[j] = 1
+        }
+        // Re-balancing for fine energy.
+        if excess > 0 {
+            let extraFine = min(excess >> (stereo + 3), 8 - out.ebits[j])
+            out.ebits[j] += extraFine
+            let extraBits = (extraFine * c) << 3
+            out.finePriority[j] = if extraBits >= excess - balance { 1 } else { 0 }
+            excess -= extraBits
+        }
+        balance = excess
+        j += 1
+    }
+    out.balance = balance
+    // Skipped bands use all their bits for fine energy.
+    while j < end {
+        out.ebits[j] = (bits[j] >> stereo) >> 3
+        bits[j] = 0
+        out.finePriority[j] = if out.ebits[j] < 1 { 1 } else { 0 }
+        j += 1
+    }
+    out.pulses = bits
+    out.codedBands = codedBands
+    out.intensity = intensity
+    out.dualStereo = dualStereo
+    out
+}

@@ -1,0 +1,93 @@
+{
+ "format": "mov,mp4,m4a,3gp,3g2,mj2",
+ "duration": 0.4,
+ "tags": {
+  "major_brand": "qt  ",
+  "minor_version": "512",
+  "compatible_brands": "qt  ",
+  "encoder": "Lavf62.12.102"
+ },
+ "tracks": [
+  {
+   "index": 0,
+   "kind": "audio",
+   "codec": "alac",
+   "ffCodec": "alac",
+   "profile": "",
+   "timescale": 44100,
+   "duration": 17640,
+   "extraHex": "00000024616c616300000000000010000010280a0e01000000002004000ac4400000ac44",
+   "width": 0,
+   "height": 0,
+   "sarNum": 1,
+   "sarDen": 1,
+   "fpsNum": 0,
+   "fpsDen": 0,
+   "rotation": 0,
+   "pixFmt": "",
+   "sampleRate": 44100,
+   "channels": 1,
+   "channelLayout": "mono",
+   "bitsPerSample": 16,
+   "pcm": {
+    "bits": 16,
+    "float": false,
+    "bigEndian": false,
+    "signed": true
+   },
+   "language": "",
+   "title": "",
+   "isDefault": true,
+   "isCover": false,
+   "frames": 5
+  }
+ ],
+ "packets": [
+  {
+   "track": 0,
+   "pts": 0,
+   "dts": 0,
+   "duration": 4096,
+   "key": true,
+   "pos": 36,
+   "size": 1626
+  },
+  {
+   "track": 0,
+   "pts": 4096,
+   "dts": 4096,
+   "duration": 4096,
+   "key": true,
+   "pos": 1662,
+   "size": 1641
+  },
+  {
+   "track": 0,
+   "pts": 8192,
+   "dts": 8192,
+   "duration": 4096,
+   "key": true,
+   "pos": 3303,
+   "size": 1629
+  },
+  {
+   "track": 0,
+   "pts": 12288,
+   "dts": 12288,
+   "duration": 4096,
+   "key": true,
+   "pos": 4932,
+   "size": 1630
+  },
+  {
+   "track": 0,
+   "pts": 16384,
+   "dts": 16384,
+   "duration": 1256,
+   "key": true,
+   "pos": 6562,
+   "size": 658
+  }
+ ],
+ "chapters": []
+}

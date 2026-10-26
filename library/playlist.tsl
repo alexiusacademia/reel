@@ -1,0 +1,371 @@
+// Playlists: reading and writing M3U/M3U8, PLS, XSPF, WPL and CUE sheets
+// as one `Playlist` model (entries with a location, title, duration,
+// artist, album, and a start/end inside the file for CUE tracks).
+//
+// Formats, as documented:
+// - M3U/M3U8: the "extended M3U" form (#EXTM3U header, `#EXTINF:<seconds>
+//   [attributes],<title>` before each location, #PLAYLIST title, #EXTALB
+//   and #EXTART), as described by Wikipedia's "M3U" article. Other `#`
+//   lines (#EXTVLCOPT, #EXTGRP …) are ignored. M3U8 is UTF-8; plain .m3u
+//   is read as UTF-8 when it is valid UTF-8, else Windows-1252.
+//   A playlist with #EXT-X- tags is an HLS stream, not a list of files:
+//   `playlistFormat` says "hls" for it.
+// - PLS: the INI-style `[playlist]` section with FileN/TitleN/LengthN,
+//   NumberOfEntries and Version=2 (Wikipedia "PLS (file format)").
+// - XSPF: XSPF Version 1 (xspf.org/spec), see xspf.tsl.
+// - WPL: Windows Media Player playlists (SMIL-based <smil><head><body><seq>
+//   <media src=…/>), see wpl.tsl.
+// - CUE: see cue.tsl.
+//
+// Locations are resolved against the playlist's folder (or URL) when read,
+// and written relative to the folder of the file being saved when they're
+// inside it.
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+import "../core"
+
+public struct PlaylistEntry {
+    // An absolute path or a URL.
+    location: String
+    title: String = ""
+    // Seconds, or −1 when unknown.
+    duration: Float = -1.0
+    artist: String = ""
+    album: String = ""
+    // For CUE tracks (several entries in one file): where the entry starts
+    // and ends in the file, seconds (end −1: the end of the file).
+    start: Float = 0.0
+    end: Float = -1.0
+    trackNumber: Int = 0
+    // Text the format keeps for an entry that Reel doesn't use (XSPF
+    // annotation, CUE PERFORMER of a track …).
+    note: String = ""
+}
+
+public struct Playlist {
+    title: String = ""
+    entries: [PlaylistEntry] = []
+    // "m3u" "m3u8" "pls" "xspf" "wpl" "cue": where it was read from.
+    format: String = ""
+    // Lines or elements that couldn't be read (the rest was).
+    warnings: [String] = []
+}
+
+// The playlist extensions Reel reads.
+public let playlistExtensions = ["m3u", "m3u8", "pls", "xspf", "wpl", "cue"]
+
+// Whether a path (or URL) names a playlist by its extension.
+public fn isPlaylistPath(_ path: String) -> Bool {
+    var p = path
+    if let q = p.find("?") {
+        p = p.substring(from: 0, to: q)
+    }
+    playlistExtensions.contains(p.fileExtension.lowercase())
+}
+
+// What a playlist is: "m3u" "m3u8" "pls" "xspf" "wpl" "cue", "hls" (an
+// HLS stream playlist: give it to the network player), or "" when it isn't
+// a playlist. Looks at the text first, then at the name's extension.
+public fn playlistFormat(_ data: Data, name: String = "") -> String {
+    let head = decodeText(data.slice(from: 0, to: 4096))
+    let t = head.trimStart()
+    let low = t.lowercase()
+    if low.hasPrefix("#extm3u") || low.hasPrefix("#extinf") {
+        if head.contains("#EXT-X-") {
+            return "hls"
+        }
+        return if name.lowercase().hasSuffix(".m3u8") { "m3u8" } else { "m3u" }
+    }
+    if low.hasPrefix("[playlist]") {
+        return "pls"
+    }
+    if low.hasPrefix("<?xml") || low.hasPrefix("<") {
+        if low.contains("<playlist") && low.contains("xspf") {
+            return "xspf"
+        }
+        if low.contains("<smil") || low.contains("<?wpl") {
+            return "wpl"
+        }
+        if low.contains("<playlist") {
+            return "xspf"
+        }
+    }
+    let ext = name.fileExtension.lowercase()
+    if ext == "cue" || low.contains("\nfile \"") || low.hasPrefix("file \"") || (low.contains("track 01 audio") && low.contains("index 01")) {
+        return "cue"
+    }
+    if ext == "m3u" || ext == "m3u8" {
+        if head.contains("#EXT-X-") {
+            return "hls"
+        }
+        return ext
+    }
+    if playlistExtensions.contains(ext) {
+        return ext
+    }
+    ""
+}
+
+// Reads a playlist file. Entries are resolved against its folder.
+public fn readPlaylist(_ path: String) -> Result<Playlist> {
+    let data = try readBytes(path)
+    parsePlaylist(data, name: path, base: path.folder)
+}
+
+// Reads a playlist from its bytes. `name` is its file name or URL (for the
+// format and encoding); `base` the folder or URL relative entries are in.
+public fn parsePlaylist(_ data: Data, name: String = "", base: String = "") -> Result<Playlist> {
+    let format = playlistFormat(data, name: name)
+    match format {
+        "m3u" -> Result.ok(value: parseM3U(decodeText(data), base: base, format: "m3u"))
+        "m3u8" -> Result.ok(value: parseM3U(decodeTextAs(data, encoding: "utf-8"), base: base, format: "m3u8"))
+        "pls" -> Result.ok(value: parsePLS(decodeText(data), base: base))
+        "xspf" -> parseXSPF(data, base: base)
+        "wpl" -> parseWPL(data, base: base)
+        "cue" -> {
+            let sheet = try parseCue(decodeText(data), base: base)
+            Result.ok(value: cuePlaylist(sheet))
+        }
+        "hls" -> Result.failure(error: Error("{name.fileName} is an HLS stream, not a playlist of files"))
+        _ -> Result.failure(error: Error("{name.fileName} isn't a playlist Reel knows"))
+    }
+}
+
+// --- M3U ---
+
+// Reads extended (or plain) M3U text.
+public fn parseM3U(_ text: String, base: String = "", format: String = "m3u") -> Playlist {
+    var pl = Playlist(format: format)
+    var title = ""
+    var duration = -1.0
+    var artist = ""
+    var album = ""
+    var groupAlbum = ""
+    var groupArtist = ""
+    for raw in text.lines() {
+        let line = raw.trim()
+        if line.isEmpty {
+            continue
+        }
+        if line.hasPrefix("#") {
+            let up = line.uppercase()
+            if up.hasPrefix("#EXTINF:") {
+                let (d, a, t) = m3uExtinf(line.substring(from: 8, to: line.count))
+                duration = d
+                title = t
+                artist = a
+            } else if up.hasPrefix("#PLAYLIST:") {
+                pl.title = line.substring(from: 10, to: line.count).trim()
+            } else if up.hasPrefix("#EXTALB:") {
+                groupAlbum = line.substring(from: 8, to: line.count).trim()
+            } else if up.hasPrefix("#EXTART:") {
+                groupArtist = line.substring(from: 8, to: line.count).trim()
+            }
+            // #EXTVLCOPT, #EXTGRP, #EXTBYT and comments: ignored.
+            continue
+        }
+        let loc = resolveLocation(line, base: base)
+        album = groupAlbum
+        pl.entries.append(PlaylistEntry(location: loc, title: title, duration: duration, artist: if artist.isEmpty { groupArtist } else { artist }, album: album))
+        title = ""
+        duration = -1.0
+        artist = ""
+    }
+    pl
+}
+
+// "#EXTINF:" arguments: `<seconds>[ key="value" …],<title>`. Gives the
+// duration (−1 when unknown or −1), the artist (from "Artist - Title" or a
+// tvg/artist attribute) and the title.
+fn m3uExtinf(_ s: String) -> (Float, String, String) {
+    // The comma that ends the attributes is the first one outside quotes.
+    var inQuote = false
+    var comma = -1
+    var i = 0
+    for ch in s.characters {
+        if ch == "\"" {
+            inQuote = !inQuote
+        } else if ch == "," && !inQuote {
+            comma = i
+            break
+        }
+        i += 1
+    }
+    let head = if comma >= 0 { s.substring(from: 0, to: comma) } else { s }
+    let display = if comma >= 0 { s.substring(from: comma + 1, to: s.count).trim() } else { "" }
+    let numText = head.trim().split(" ")[0]
+    var duration = parseFloat(numText).valueOr(-1.0)
+    if duration < 0.0 {
+        duration = -1.0
+    }
+    var artist = m3uAttribute(head, "artist")
+    var title = display
+    if artist.isEmpty {
+        if let dash = display.find(" - ") {
+            artist = display.substring(from: 0, to: dash).trim()
+            title = display.substring(from: dash + 3, to: display.count).trim()
+        }
+    }
+    (duration, artist, title)
+}
+
+// The value of `key="value"` in an #EXTINF head, or "".
+fn m3uAttribute(_ head: String, _ key: String) -> String {
+    let lowHead = head.lowercase()
+    if let at = lowHead.find(key + "=\"") {
+        let rest = head.substring(from: at + key.count + 2, to: head.count)
+        if let end = rest.find("\"") {
+            return rest.substring(from: 0, to: end)
+        }
+    }
+    ""
+}
+
+// Writes extended M3U. `base` is the folder the file is saved in (entries
+// inside it are written relative).
+public fn writeM3U(_ pl: Playlist, base: String = "", relative: Bool = true) -> String {
+    var out = "#EXTM3U\n"
+    if !pl.title.isEmpty {
+        out += "#PLAYLIST:{oneLine(pl.title)}\n"
+    }
+    for e in pl.entries {
+        let secs = if e.duration >= 0.0 { Int(e.duration + 0.5) } else { -1 }
+        let shown = if !e.artist.isEmpty && !e.title.isEmpty { "{e.artist} - {e.title}" } else if !e.title.isEmpty { e.title } else { e.location.fileName }
+        out += "#EXTINF:{secs},{oneLine(shown)}\n"
+        out += relativeLocation(e.location, base: base, relative: relative) + "\n"
+    }
+    out
+}
+
+fn oneLine(_ s: String) -> String {
+    s.replace("\r", with: " ").replace("\n", with: " ")
+}
+
+// --- PLS ---
+
+// Reads a PLS playlist. Keys are case-insensitive; entries are numbered
+// from 1 and may come in any order.
+public fn parsePLS(_ text: String, base: String = "") -> Playlist {
+    var pl = Playlist(format: "pls")
+    var files: [Int: String] = [:]
+    var titles: [Int: String] = [:]
+    var lengths: [Int: Float] = [:]
+    var numbers: [Int] = []
+    for raw in text.lines() {
+        let line = raw.trim()
+        if line.isEmpty || line.hasPrefix("[") || line.hasPrefix(";") || line.hasPrefix("#") {
+            continue
+        }
+        if let eq = line.find("=") {
+            let key = line.substring(from: 0, to: eq).trim().lowercase()
+            let value = line.substring(from: eq + 1, to: line.count).trim()
+            var name = key
+            var digits = ""
+            while !name.isEmpty {
+                let last = name.character(at: name.count - 1) ?? ""
+                if last >= "0" && last <= "9" {
+                    digits = last + digits
+                    name = name.substring(from: 0, to: name.count - 1)
+                } else {
+                    break
+                }
+            }
+            let n = parseInt(digits).valueOr(-1)
+            if n < 0 {
+                if key == "x-title" || key == "title" {
+                    pl.title = value
+                }
+                continue
+            }
+            if name == "file" {
+                files[n] = value
+                if !numbers.contains(n) {
+                    numbers.append(n)
+                }
+            } else if name == "title" {
+                titles[n] = value
+            } else if name == "length" {
+                lengths[n] = parseFloat(value).valueOr(-1.0)
+            }
+        } else {
+            pl.warnings.append("not a key=value line: {line}")
+        }
+    }
+    for n in numbers.sorted() {
+        let loc = resolveLocation(files[n] ?? "", base: base)
+        var d = lengths[n] ?? -1.0
+        if d < 0.0 {
+            d = -1.0
+        }
+        pl.entries.append(PlaylistEntry(location: loc, title: titles[n] ?? "", duration: d, trackNumber: n))
+    }
+    pl
+}
+
+// Writes a PLS playlist (version 2).
+public fn writePLS(_ pl: Playlist, base: String = "", relative: Bool = true) -> String {
+    var out = "[playlist]\n"
+    var n = 1
+    for e in pl.entries {
+        out += "File{n}={relativeLocation(e.location, base: base, relative: relative)}\n"
+        let shown = if !e.artist.isEmpty && !e.title.isEmpty { "{e.artist} - {e.title}" } else { e.title }
+        if !shown.isEmpty {
+            out += "Title{n}={oneLine(shown)}\n"
+        }
+        let secs = if e.duration >= 0.0 { Int(e.duration + 0.5) } else { -1 }
+        out += "Length{n}={secs}\n"
+        n += 1
+    }
+    out += "NumberOfEntries={pl.entries.count}\nVersion=2\n"
+    out
+}
+
+// --- Writing any format ---
+
+// The playlist as text in a format ("m3u" "m3u8" "pls" "xspf" "wpl"
+// "cue"). Entries inside `base` are written relative to it.
+public fn writePlaylist(_ pl: Playlist, format: String, base: String = "", relative: Bool = true) -> String {
+    match format.lowercase() {
+        "pls" -> writePLS(pl, base: base, relative: relative)
+        "xspf" -> writeXSPF(pl, base: base, relative: relative)
+        "wpl" -> writeWPL(pl, base: base, relative: relative)
+        "cue" -> writeCue(cueFromPlaylist(pl), base: base)
+        _ -> writeM3U(pl, base: base, relative: relative)
+    }
+}
+
+// Saves a playlist; the format comes from the path's extension (M3U when
+// it has another one). Text is written as UTF-8.
+public fn savePlaylist(_ pl: Playlist, path: String, relative: Bool = true) -> Error? {
+    let ext = path.fileExtension.lowercase()
+    let format = if playlistExtensions.contains(ext) { ext } else { "m3u" }
+    writeText(path: path, text: writePlaylist(pl, format: format, base: path.folder, relative: relative))
+}
+
+// A playlist of paths, titled by file name.
+public fn playlistOf(_ paths: [String], title: String = "") -> Playlist {
+    var pl = Playlist(title: title)
+    for p in paths {
+        pl.entries.append(PlaylistEntry(location: p))
+    }
+    pl
+}
+
+// The entries' locations, in order.
+public fn playlistPaths(_ pl: Playlist) -> [String] {
+    pl.entries.map { e in e.location }
+}
+
+// The chapters a playlist gives one file (the CUE case: several entries in
+// the same file), or [] when it has none.
+public fn chaptersFor(_ pl: Playlist, file: String) -> [core.Chapter] {
+    var out: [core.Chapter] = []
+    for e in pl.entries {
+        if e.location == file && (e.start > 0.0 || e.end >= 0.0 || pl.format == "cue") {
+            out.append(core.Chapter(start: e.start, end: e.end, title: e.title))
+        }
+    }
+    out
+}

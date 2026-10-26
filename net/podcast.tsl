@@ -1,0 +1,446 @@
+// Podcast feeds: RSS 2.0 (with Apple's iTunes podcast tags, the
+// "itunes:" namespace http://www.itunes.com/dtds/podcast-1.0.dtd, Media
+// RSS thumbnails, content:encoded) and Atom (RFC 4287, enclosures as
+// link rel="enclosure") → the show's title, image and episodes with their
+// enclosure URL, type, length, date, duration and description as plain
+// text.
+//
+// Dates: RSS uses RFC 822 dates (as updated by RFC 1123: four-digit
+// years), "Tue, 10 Jun 2003 04:00:00 GMT" / "+0200"; Atom uses RFC 3339.
+// iTunes durations are seconds, MM:SS or HH:MM:SS.
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+import "../xml"
+
+public struct Episode {
+    title: String = ""
+    guid: String = ""
+    link: String = ""
+    // Seconds since 1970, -1 when unknown.
+    published: Float = -1.0
+    publishedText: String = ""
+    enclosureUrl: String = ""
+    enclosureType: String = ""
+    // Bytes, 0 when not given.
+    enclosureLength: Int = 0
+    // Seconds, -1 when unknown.
+    duration: Float = -1.0
+    // Plain text (HTML removed).
+    description: String = ""
+    // The description as given (may be HTML).
+    descriptionHtml: String = ""
+    image: String = ""
+    author: String = ""
+    season: Int = 0
+    episode: Int = 0
+    // "full", "trailer", "bonus" (itunes:episodeType), "" when not given.
+    episodeType: String = ""
+    explicit: Bool = false
+}
+
+public struct Podcast {
+    // "rss" or "atom".
+    format: String = ""
+    title: String = ""
+    description: String = ""
+    link: String = ""
+    author: String = ""
+    image: String = ""
+    language: String = ""
+    categories: [String] = []
+    explicit: Bool = false
+    // Seconds since 1970, -1 when unknown.
+    updated: Float = -1.0
+    // In feed order (usually newest first).
+    episodes: [Episode] = []
+    // itunes:new-feed-url: the feed moved here.
+    newFeedUrl: String = ""
+}
+
+// Parses an RSS 2.0 or Atom feed; `url` resolves relative links.
+public fn parsePodcast(_ text: String, url: String = "") -> Result<Podcast> {
+    let root = try xml.parse(text)
+    if root.localName == "rss" || root.localName == "RDF" {
+        return Result.ok(value: podRss(root, url))
+    }
+    if root.localName == "feed" {
+        return Result.ok(value: podAtom(root, url))
+    }
+    Result.failure(error: Error("not an RSS or Atom feed (the root is <{root.name}>)"))
+}
+
+// Parses feed bytes (any encoding the XML declaration names that xml
+// reads: UTF-8, UTF-16, Latin-1).
+public fn parsePodcastData(_ bytes: Data, url: String = "") -> Result<Podcast> {
+    let root = try xml.parseData(bytes)
+    if root.localName == "rss" || root.localName == "RDF" {
+        return Result.ok(value: podRss(root, url))
+    }
+    if root.localName == "feed" {
+        return Result.ok(value: podAtom(root, url))
+    }
+    Result.failure(error: Error("not an RSS or Atom feed (the root is <{root.name}>)"))
+}
+
+fn podResolve(_ base: String, _ ref: String) -> String {
+    if ref.isEmpty || base.isEmpty {
+        return ref
+    }
+    resolveUrl(base, ref)
+}
+
+fn podRss(_ root: xml.Node, _ url: String) -> Podcast {
+    var p = Podcast(format: "rss")
+    let ch = root.child("channel") ?? root
+    p.title = htmlToText(ch.childText("title"))
+    p.link = podResolve(url, ch.childText("link"))
+    let desc = ch.childText("description")
+    p.description = htmlToText(if desc.isEmpty { ch.childText("itunes:summary") } else { desc })
+    p.author = ch.childText("itunes:author")
+    if p.author.isEmpty {
+        p.author = ch.childText("managingEditor")
+    }
+    p.language = ch.childText("language")
+    p.explicit = podExplicit(ch.childText("itunes:explicit"))
+    p.newFeedUrl = ch.childText("itunes:new-feed-url")
+    if let im = ch.child("itunes:image") {
+        p.image = podResolve(url, im.attrOr("href", ""))
+    }
+    if p.image.isEmpty {
+        if let im = ch.child("image") {
+            p.image = podResolve(url, im.childText("url"))
+        }
+    }
+    for c in ch.children("itunes:category") {
+        let t = c.attrOr("text", "")
+        if !t.isEmpty {
+            p.categories.append(t)
+        }
+        for sub in c.children("itunes:category") {
+            let st = sub.attrOr("text", "")
+            if !st.isEmpty {
+                p.categories.append(st)
+            }
+        }
+    }
+    if p.categories.isEmpty {
+        for c in ch.children("category") {
+            p.categories.append(c.innerText.trim())
+        }
+    }
+    let lb = ch.childText("lastBuildDate")
+    p.updated = parseRfc822Date(if lb.isEmpty { ch.childText("pubDate") } else { lb })
+    // RSS 1.0 (RDF) puts items beside the channel.
+    var items = ch.children("item")
+    if items.isEmpty {
+        items = root.children("item")
+    }
+    for it in items {
+        var e = Episode()
+        e.title = htmlToText(it.childText("title"))
+        e.guid = it.childText("guid")
+        e.link = podResolve(url, it.childText("link"))
+        e.publishedText = it.childText("pubDate")
+        if e.publishedText.isEmpty {
+            e.publishedText = it.childText("dc:date")
+            e.published = hlsParseDate(e.publishedText)
+        } else {
+            e.published = parseRfc822Date(e.publishedText)
+        }
+        if let enc = it.child("enclosure") {
+            e.enclosureUrl = podResolve(url, enc.attrOr("url", "").trim())
+            e.enclosureType = enc.attrOr("type", "")
+            e.enclosureLength = parseInt(enc.attrOr("length", "0").trim()).valueOr(0)
+        } else if let mc = it.child("media:content") {
+            e.enclosureUrl = podResolve(url, mc.attrOr("url", ""))
+            e.enclosureType = mc.attrOr("type", "")
+            e.enclosureLength = parseInt(mc.attrOr("fileSize", "0")).valueOr(0)
+        }
+        e.duration = parseItunesDuration(it.childText("itunes:duration"))
+        var d = it.childText("content:encoded")
+        if d.isEmpty {
+            d = it.childText("description")
+        }
+        if d.isEmpty {
+            d = it.childText("itunes:summary")
+        }
+        if d.isEmpty {
+            d = it.childText("itunes:subtitle")
+        }
+        e.descriptionHtml = d
+        e.description = htmlToText(d)
+        if let im = it.child("itunes:image") {
+            e.image = podResolve(url, im.attrOr("href", ""))
+        } else if let th = it.child("media:thumbnail") {
+            e.image = podResolve(url, th.attrOr("url", ""))
+        }
+        e.author = it.childText("itunes:author")
+        e.season = parseInt(it.childText("itunes:season")).valueOr(0)
+        e.episode = parseInt(it.childText("itunes:episode")).valueOr(0)
+        e.episodeType = it.childText("itunes:episodeType")
+        e.explicit = podExplicit(it.childText("itunes:explicit"))
+        p.episodes.append(e)
+    }
+    p
+}
+
+fn podAtom(_ feed: xml.Node, _ url: String) -> Podcast {
+    var p = Podcast(format: "atom")
+    p.title = htmlToText(feed.childText("title", anyPrefix: true))
+    p.description = htmlToText(feed.childText("subtitle", anyPrefix: true))
+    if let a = feed.child("author", anyPrefix: true) {
+        p.author = a.childText("name", anyPrefix: true)
+    }
+    p.image = podResolve(url, feed.childText("logo", anyPrefix: true))
+    if p.image.isEmpty {
+        p.image = podResolve(url, feed.childText("icon", anyPrefix: true))
+    }
+    if let im = feed.child("itunes:image") {
+        if p.image.isEmpty {
+            p.image = podResolve(url, im.attrOr("href", ""))
+        }
+    }
+    p.language = feed.attrOr("xml:lang", "")
+    p.updated = hlsParseDate(feed.childText("updated", anyPrefix: true))
+    for l in feed.children("link", anyPrefix: true) {
+        let rel = l.attrOr("rel", "alternate")
+        if rel == "alternate" && p.link.isEmpty {
+            p.link = podResolve(url, l.attrOr("href", ""))
+        }
+    }
+    for c in feed.children("category", anyPrefix: true) {
+        let t = c.attrOr("label", c.attrOr("term", ""))
+        if !t.isEmpty {
+            p.categories.append(t)
+        }
+    }
+    for en in feed.children("entry", anyPrefix: true) {
+        var e = Episode()
+        e.title = htmlToText(en.childText("title", anyPrefix: true))
+        e.guid = en.childText("id", anyPrefix: true)
+        let pub = en.childText("published", anyPrefix: true)
+        e.publishedText = if pub.isEmpty { en.childText("updated", anyPrefix: true) } else { pub }
+        e.published = hlsParseDate(e.publishedText)
+        for l in en.children("link", anyPrefix: true) {
+            let rel = l.attrOr("rel", "alternate")
+            if rel == "enclosure" && e.enclosureUrl.isEmpty {
+                e.enclosureUrl = podResolve(url, l.attrOr("href", ""))
+                e.enclosureType = l.attrOr("type", "")
+                e.enclosureLength = parseInt(l.attrOr("length", "0")).valueOr(0)
+            } else if rel == "alternate" && e.link.isEmpty {
+                e.link = podResolve(url, l.attrOr("href", ""))
+            }
+        }
+        var d = ""
+        if let c = en.child("content", anyPrefix: true) {
+            d = podAtomText(c)
+        }
+        if d.isEmpty {
+            if let s = en.child("summary", anyPrefix: true) {
+                d = podAtomText(s)
+            }
+        }
+        e.descriptionHtml = d
+        e.description = htmlToText(d)
+        if let a = en.child("author", anyPrefix: true) {
+            e.author = a.childText("name", anyPrefix: true)
+        }
+        e.duration = parseItunesDuration(en.childText("itunes:duration"))
+        if let th = en.child("media:thumbnail") {
+            e.image = podResolve(url, th.attrOr("url", ""))
+        }
+        p.episodes.append(e)
+    }
+    p
+}
+
+// Atom text constructs (RFC 4287 §3.1): type "text", "html" (escaped
+// HTML, already unescaped by the parser) or "xhtml" (a div of markup:
+// written back as markup).
+fn podAtomText(_ n: xml.Node) -> String {
+    if n.attrOr("type", "text") == "xhtml" {
+        var s = xml.escapeText(n.text)
+        for c in n.elements {
+            s += c.toText(indent: 0).trim() + xml.escapeText(c.tail)
+        }
+        return s.trim()
+    }
+    n.innerText.trim()
+}
+
+fn podExplicit(_ s: String) -> Bool {
+    let v = s.lowercase().trim()
+    v == "yes" || v == "true" || v == "explicit"
+}
+
+// iTunes durations: "3723", "62:03", "1:02:03", "1:02:03.5" → seconds;
+// -1 when empty or unreadable.
+public fn parseItunesDuration(_ text: String) -> Float {
+    let t = text.trim()
+    if t.isEmpty {
+        return -1.0
+    }
+    var total = 0.0
+    for part in t.split(":") {
+        if let v = parseFloat(part.trim()).value() {
+            total = total * 60.0 + v
+        } else {
+            return -1.0
+        }
+    }
+    total
+}
+
+let podMonths = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"]
+
+// RFC 822 / RFC 1123 dates: "Tue, 10 Jun 2003 04:00:00 GMT", with zones
+// GMT/UT/Z, +hhmm, and the US zones EST/EDT/CST/CDT/MST/MDT/PST/PDT;
+// two-digit years are 19xx/20xx; feeds' variants without the weekday or
+// seconds work too. Falls back to ISO 8601. -1 when unreadable.
+public fn parseRfc822Date(_ text: String) -> Float {
+    var t = text.trim()
+    if t.isEmpty {
+        return -1.0
+    }
+    if let c = t.find(",") {
+        t = t.substring(from: c + 1, to: t.count).trim()
+    }
+    let w = t.words()
+    if w.count < 3 {
+        return hlsParseDate(text)
+    }
+    let day = parseInt(w[0]).valueOr(-1)
+    var month = -1
+    let ml = w[1].lowercase()
+    for (i, m) in podMonths.enumerated() {
+        if ml.hasPrefix(m) {
+            month = i + 1
+        }
+    }
+    var year = parseInt(w[2]).valueOr(-1)
+    if day < 1 || month < 1 || year < 0 {
+        return hlsParseDate(text)
+    }
+    if year < 100 {
+        year += if year < 50 { 2000 } else { 1900 }
+    }
+    var h = 0
+    var mi = 0
+    var se = 0
+    var zone = 0
+    if w.count >= 4 {
+        let hms = w[3].split(":")
+        h = parseInt(hms[0]).valueOr(0)
+        if hms.count > 1 {
+            mi = parseInt(hms[1]).valueOr(0)
+        }
+        if hms.count > 2 {
+            se = Int(parseFloat(hms[2]).valueOr(0.0))
+        }
+    }
+    if w.count >= 5 {
+        let z = w[4]
+        if z.hasPrefix("+") || z.hasPrefix("-") {
+            let digits = z.substring(from: 1, to: z.count).replace(":", with: "")
+            let v = parseInt(digits).valueOr(0)
+            zone = (v / 100) * 3600 + (v % 100) * 60
+            if z.hasPrefix("-") {
+                zone = -zone
+            }
+        } else {
+            zone = match z.uppercase() {
+                "EST" -> -5 * 3600
+                "EDT" -> -4 * 3600
+                "CST" -> -6 * 3600
+                "CDT" -> -5 * 3600
+                "MST" -> -7 * 3600
+                "MDT" -> -6 * 3600
+                "PST" -> -8 * 3600
+                "PDT" -> -7 * 3600
+                "CET" -> 3600
+                "CEST" -> 7200
+                "BST" -> 3600
+                _ -> 0
+            }
+        }
+    }
+    let base = date(year: year, month: month, day: day, hour: h, minute: mi, second: se, timeZone: "UTC")
+    if base.isNaN {
+        return -1.0
+    }
+    base - Float(zone)
+}
+
+// HTML (episode notes) to plain text: tags removed, <br>, <p>, <li>,
+// <div> and headings as line breaks, entities decoded (XML ones and the
+// common HTML ones), runs of spaces folded, at most one empty line.
+public fn htmlToText(_ html: String) -> String {
+    if !html.contains("<") && !html.contains("&") {
+        return html.trim()
+    }
+    let b = Data(text: html)
+    var out = Data()
+    var i = 0
+    let n = b.count
+    while i < n {
+        let c = b[i]
+        if c == 0x3c {
+            // A tag: find its end and name.
+            var j = i + 1
+            while j < n && b[j] != 0x3e {
+                j += 1
+            }
+            let tag = b.slice(from: i + 1, to: j).latin1.lowercase()
+            var name = tag
+            if name.hasPrefix("/") {
+                name = name.substring(from: 1, to: name.count)
+            }
+            let cut = name.find(" ") ?? name.count
+            name = name.substring(from: 0, to: cut).replace("/", with: "")
+            let closing = tag.hasPrefix("/")
+            if closing && (name == "li" || name == "tr") {
+                // The next item's opening tag starts its line.
+            } else if name == "br" || name == "p" || name == "div" || name == "li" || name == "tr" || name == "h1" || name == "h2" || name == "h3" || name == "h4" || name == "blockquote" {
+                out.append(byte: 10)
+                if name == "li" && !tag.hasPrefix("/") {
+                    out.append(Data(text: "• "))
+                }
+            }
+            if name == "script" || name == "style" {
+                // Skip to the closing tag.
+                let close = "</" + name
+                var k = j
+                while k + close.count < n && b.slice(from: k, to: k + close.count).latin1.lowercase() != close {
+                    k += 1
+                }
+                j = k
+                while j < n && b[j] != 0x3e {
+                    j += 1
+                }
+            }
+            i = j + 1
+            continue
+        }
+        out.append(byte: c)
+        i += 1
+    }
+    let text = xml.unescape(out.text ?? netLatin1(out))
+    // Fold whitespace: spaces within lines, at most one empty line.
+    var lines: [String] = []
+    var blank = 0
+    for raw in text.replace("\r", with: "").split("\n") {
+        let l = raw.words().joined(separator: " ")
+        if l.isEmpty {
+            blank += 1
+            continue
+        }
+        if !lines.isEmpty && blank > 0 && lines.count > 0 {
+            lines.append("")
+        }
+        blank = 0
+        lines.append(l)
+    }
+    lines.joined(separator: "\n")
+}

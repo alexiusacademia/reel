@@ -1,0 +1,157 @@
+// The Home screen (`HomeView`), shown in the player window while nothing
+// plays: Reel's name and the open buttons (Open File, Open Folder, Open
+// Network Stream, Library), then rows of cards: Continue watching (a
+// thumbnail with a progress bar, the title and the time left), Next
+// episode suggestions, and Recently added. With an empty library it is
+// the welcome text with the buttons. Dark, like the player.
+//
+// The data comes from `loadHomeData(lib)` (lib_model.tsl); pictures from
+// the app (`posters`, asked for with `onNeedPoster`).
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+public view HomeView(data: HomeData, posters: [String: LibThumb] = [:], onPlay: fn(HomeEntry, Bool), onRemove: fn(HomeEntry) = { _ in }, onShowInFinder: fn(String) = { _ in }, onOpenFile: fn(), onOpenFolder: fn(), onOpenStream: fn(), onOpenLibrary: fn(), onNeedPoster: fn(HomeEntry) = { _ in }) {
+    Scroll {
+        VStack(spacing: 18, alignment: .leading) {
+            homeHeader()
+            if !data.continueWatching.isEmpty {
+                homeRow("Continue Watching", data.continueWatching, kind: "continue")
+            }
+            if !data.nextEpisodes.isEmpty {
+                homeRow("Next Episode", data.nextEpisodes, kind: "next")
+            }
+            if !data.recentlyAdded.isEmpty {
+                homeRow("Recently Added", data.recentlyAdded, kind: "added")
+            }
+        }
+        .padding(horizontal: 28, vertical: 24)
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
+    .background(libDarkPanel)
+
+    fn homeHeader() -> View {
+        VStack(spacing: 14, alignment: if data.isEmpty { .center } else { .leading }) {
+            if data.isEmpty {
+                Spacer().frame(height: 110)
+            }
+            HStack(spacing: 10) {
+                Svg(svgFilm()).color(libAccent).frame(width: if data.isEmpty { 44 } else { 28 }, height: if data.isEmpty { 44 } else { 28 })
+                Text("Reel")
+                    .font(size: if data.isEmpty { 40 } else { 26 }, weight: .bold)
+                    .color(libDarkText)
+            }
+            if data.isEmpty {
+                Text("Drop a video or song here, or open one:")
+                    .font(size: 14)
+                    .color(.gray)
+            }
+            HStack(spacing: 8) {
+                homeButton(svgLibFile(), "Open File…", tip: "Open a file (⌘O)", action: onOpenFile)
+                homeButton(svgLibFolder(), "Open Folder…", tip: "Play every file in a folder", action: onOpenFolder)
+                homeButton(svgLibGlobe(), "Open Network Stream…", tip: "Play from a web address", action: onOpenStream)
+                homeButton(svgLibLibrary(), "Library", tip: "Show the media library", action: onOpenLibrary)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: if data.isEmpty { .center } else { .leading })
+    }
+
+    fn homeButton(_ svg: String, _ title: String, tip: String, action: fn()) -> View {
+        HStack(spacing: 6) {
+            Svg(svg).color(libDarkText).frame(width: 15, height: 15)
+            Text(title).font(size: 13).color(libDarkText)
+        }
+        .padding(horizontal: 12, vertical: 7)
+        .background(libDarkCard, radius: 7)
+        .hoverBackground(.rgb(58, 58, 58), radius: 7)
+        .onTap { action() }
+        .tooltip(tip)
+        .accessibilityLabel(title)
+    }
+
+    fn homeRow(_ title: String, _ entries: [HomeEntry], kind: String) -> View {
+        VStack(spacing: 10, alignment: .leading) {
+            Text(title).font(size: 16, weight: .semibold).color(libDarkText)
+            Scroll(.horizontal) {
+                HStack(spacing: 14, alignment: .top) {
+                    for e in entries {
+                        LibHomeCard(entry: e, thumb: posters[e.path] ?? LibThumb(), kind: kind, onPlay: onPlay, onRemove: onRemove, onShowInFinder: onShowInFinder)
+                            .onAppear {
+                                if posters[e.path] == nil {
+                                    onNeedPoster(e)
+                                }
+                            }
+                    }
+                }
+                .padding(bottom: 6)
+            }
+            .frame(height: 166)
+        }
+    }
+}
+
+// One card of a Home row: the picture (progress bar on it), the title,
+// and the time left or the subtitle.
+view LibHomeCard(entry: HomeEntry, thumb: LibThumb, kind: String, onPlay: fn(HomeEntry, Bool), onRemove: fn(HomeEntry), onShowInFinder: fn(String)) {
+    let w = 192.0
+    let h = 108.0
+    let partway = entry.position > 0.0 && entry.duration > 0.0 && !entry.finished
+    VStack(spacing: 4, alignment: .leading) {
+        ZStack(alignment: .bottom) {
+            LibThumbView(thumb: thumb, placeholder: libKindSvg(kind: entry.kind, group: ""), width: w, height: h, key: libHomeKey(entry.path), back: libDarkCard, iconColor: .rgb(102, 102, 102), radius: 7)
+            if partway {
+                LibProgressBar(fraction: libProgress(position: entry.position, duration: entry.duration), height: 4, track: .rgba(0, 0, 0, 0.55))
+                    .frame(width: w - 16.0)
+                    .padding(bottom: 7)
+            }
+        }
+        Text(if entry.title.isEmpty { libStem(entry.path.fileName) } else { entry.title })
+            .font(size: 13, weight: .medium)
+            .color(libDarkText)
+            .lineLimit(1)
+            .frame(width: w, alignment: .leading)
+        Text(homeSecondLine())
+            .font(size: 11)
+            .color(libDarkDim)
+            .lineLimit(1)
+            .frame(width: w, alignment: .leading)
+    }
+    .frame(width: w)
+    .padding(4)
+    .hoverBackground(.rgb(40, 40, 40), radius: 9)
+    .onTap { onPlay(entry, false) }
+    .contextMenu {
+        MenuItem(if partway { "Continue" } else { "Play" }) { onPlay(entry, false) }
+        if partway {
+            MenuItem("Play from the Beginning") { onPlay(entry, true) }
+        }
+        MenuDivider()
+        MenuItem("Show in Finder") { onShowInFinder(entry.path) }
+        if kind == "continue" {
+            MenuItem("Remove from Continue Watching") { onRemove(entry) }
+        }
+    }
+    .tooltip(entry.path.fileName)
+    .accessibilityLabel(entry.title)
+
+    fn homeSecondLine() -> String {
+        if kind == "continue" {
+            let left = libTimeLeftText(position: entry.position, duration: entry.duration)
+            if entry.subtitle.isEmpty {
+                return left
+            }
+            return if left.isEmpty { entry.subtitle } else { "{entry.subtitle} · {left}" }
+        }
+        if entry.subtitle.isEmpty { libDurationText(entry.duration) } else { entry.subtitle }
+    }
+}
+
+// A number for a path (the thumbnail canvas's redraw key).
+fn libHomeKey(_ path: String) -> Int {
+    var h = 7
+    for b in Data(text: path).bytes {
+        h = (h * 31 + b) % 1_000_000_007
+    }
+    h
+}

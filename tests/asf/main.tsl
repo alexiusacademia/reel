@@ -1,0 +1,271 @@
+// Tests for the ASF demuxer (demux/asf.tsl): the small files made by
+// tests/asf/make_fixtures.sh (ffmpeg's ASF muxer: WMA 1/2, WMV 1/2, MP3
+// in ASF, tags; variants with cover art, DRM, no index, cut short) and the
+// downloaded samples in build/conformance/wma/ when they're there, each
+// against ffprobe's answers (F.asf.json from tests/asf/make_refs.py):
+// tracks, codecs and setup bytes, every packet's timestamps, key flag,
+// size and md5, tags, chapters, cover art. Also a speed measurement on a
+// long synthetic file when build/scratch/wma/long.wmv exists.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../../demux"
+import "../../core"
+
+struct RefTrack {
+    index: Int = 0
+    kind: String = ""
+    codec: String = ""
+    ffCodec: String = ""
+    tag: String = ""
+    extraHex: String = ""
+    width: Int = 0
+    height: Int = 0
+    sarNum: Int = 1
+    sarDen: Int = 1
+    sampleRate: Int = 0
+    channels: Int = 0
+    bitrate: Int = 0
+    duration: Int = -9223372036854775807
+    language: String = ""
+}
+
+struct RefPacket {
+    track: Int = 0
+    pts: Int = -9223372036854775807
+    dts: Int = -9223372036854775807
+    key: Bool = false
+    size: Int = 0
+    md5: String = ""
+}
+
+struct RefChapter {
+    start: Float = 0.0
+    title: String = ""
+}
+
+struct Ref {
+    format: String = ""
+    duration: Float = -1.0
+    tags: [String: String] = [:]
+    tracks: [RefTrack] = []
+    packets: [RefPacket] = []
+    chapters: [RefChapter] = []
+    coverMd5: String = ""
+}
+
+struct Tally {
+    passed: Int = 0
+    total: Int = 0
+
+    fn check(_ ok: Bool, _ what: String) {
+        total += 1
+        if ok {
+            passed += 1
+        } else {
+            print("FAIL: {what}")
+        }
+    }
+}
+
+// A file and what to expect beyond its reference.
+struct Case {
+    path: String
+    ref: String
+    // The file is DRM-protected: opening must fail saying so.
+    drm: Bool = false
+    // ffmpeg reads a few packets of this file differently (see the case).
+    packetSlack: Int = 0
+    durationTolerance: Float = 0.05
+}
+
+fn kindName(_ k: core.TrackKind) -> String {
+    match k {
+        .video -> "video"
+        .audio -> "audio"
+        .subtitle -> "subtitle"
+        .other -> "other"
+    }
+}
+
+fn checkFile(_ c: Case, _ t: bind Tally) {
+    let file = readData(c.path) ?? Data()
+    let name = c.path.fileName
+    let text = readFile(c.ref) ?? ""
+    let ref: Ref = fromJson(text) ?? Ref()
+    if file.isEmpty || ref.format.isEmpty {
+        t.check(false, "{name}: file or reference missing")
+        return
+    }
+    t.check(demux.sniff(file, name: name) == "asf", "{name}: sniffed as asf")
+    let started = now()
+    let opened = demux.open(file, name: name)
+    let ms = (now() - started) * 1000.0
+    var m = core.Media()
+    match opened {
+        .failure(e) -> {
+            if c.drm {
+                t.check(e.message.contains("DRM"), "{name}: DRM refused with a clear error ({e.message})")
+            } else {
+                t.check(false, "{name}: open failed: {e.message}")
+            }
+            return
+        }
+        .ok(v) -> {
+            m = v
+        }
+    }
+    if c.drm {
+        t.check(false, "{name}: a DRM file opened")
+        return
+    }
+    t.check(m.format == "asf", "{name}: format")
+    t.check(m.tracks.count == ref.tracks.count, "{name}: {m.tracks.count} tracks, want {ref.tracks.count}")
+    if m.tracks.count != ref.tracks.count {
+        return
+    }
+    // A file cut short: ffmpeg guesses durations from the bitrate; Reel
+    // takes them from the last packet. Not compared.
+    var cut = false
+    for w in m.warnings {
+        if w.contains("cut short") {
+            cut = true
+        }
+    }
+    if ref.duration > 0.0 && !cut {
+        t.check(abs(m.duration - ref.duration) <= c.durationTolerance * max(1.0, ref.duration), "{name}: duration {m.duration}, want {ref.duration}")
+    }
+    for (i, rt) in ref.tracks.enumerated() {
+        let tr = m.tracks[i]
+        let what = "{name} track {i}"
+        if rt.codec.hasPrefix("unknown:") {
+            t.check(tr.codec.hasPrefix("unknown:"), "{what}: codec {tr.codec}, ffmpeg's is {rt.ffCodec}")
+        } else {
+            t.check(tr.codec == rt.codec, "{what}: codec {tr.codec}, want {rt.codec}")
+        }
+        t.check(kindName(tr.kind) == rt.kind, "{what}: kind")
+        if rt.kind == "audio" {
+            t.check(tr.sampleRate == rt.sampleRate && tr.channels == rt.channels, "{what}: {tr.sampleRate} Hz {tr.channels} ch, want {rt.sampleRate} {rt.channels}")
+        }
+        if rt.kind == "video" {
+            t.check(tr.width == rt.width && tr.height == rt.height, "{what}: {tr.width}x{tr.height}, want {rt.width}x{rt.height}")
+            t.check(tr.sarNum * rt.sarDen == tr.sarDen * rt.sarNum, "{what}: SAR {tr.sarNum}:{tr.sarDen}, want {rt.sarNum}:{rt.sarDen}")
+        }
+        if !rt.codec.hasPrefix("unknown:") {
+            t.check(tr.extra.hex == rt.extraHex, "{what}: extra {tr.extra.hex}, want {rt.extraHex}")
+        }
+        t.check(tr.language == rt.language, "{what}: language '{tr.language}', want '{rt.language}'")
+        if rt.bitrate > 0 {
+            t.check(tr.bitrate == rt.bitrate, "{what}: bitrate {tr.bitrate}, want {rt.bitrate}")
+        }
+        if rt.duration != core.noTime && !cut {
+            t.check(tr.duration == rt.duration, "{what}: duration {tr.duration}, want {rt.duration}")
+        }
+        // Packets of this track, in order.
+        var mine: [core.PacketRef] = []
+        for p in m.packets {
+            if p.track == i {
+                mine.append(p)
+            }
+        }
+        var want: [RefPacket] = []
+        for p in ref.packets {
+            if p.track == rt.index {
+                want.append(p)
+            }
+        }
+        t.check(abs(mine.count - want.count) <= c.packetSlack, "{what}: {mine.count} packets, want {want.count}")
+        var bad = 0
+        var first = ""
+        let n = min(mine.count, want.count)
+        for k in 0..n {
+            let a = mine[k]
+            let b = want[k]
+            var why = ""
+            if a.size != b.size {
+                why = "size {a.size} want {b.size}"
+            } else if a.dts != b.dts {
+                why = "dts {a.dts} want {b.dts}"
+            } else if b.pts != core.noTime && a.pts != b.pts {
+                why = "pts {a.pts} want {b.pts}"
+            } else if a.key != b.key && !rt.codec.hasPrefix("unknown:") {
+                // (ffmpeg marks every packet of intra-only codecs it knows,
+                // like MSS2, as a keyframe.)
+                why = "key {a.key} want {b.key}"
+            } else if core.packetBytes(file, m, a).hash("md5").hex != b.md5 {
+                why = "md5"
+            }
+            if !why.isEmpty {
+                if bad == 0 {
+                    first = "packet {k}: {why}"
+                }
+                bad += 1
+            }
+        }
+        t.check(bad <= c.packetSlack, "{what}: {bad} packets differ (first: {first})")
+    }
+    for key in ["title", "artist", "album", "date", "genre", "track", "comment", "copyright"] {
+        if let v = ref.tags[key] {
+            t.check(m.tags[key] == v, "{name}: tag {key} '{m.tags[key] ?? ""}', want '{v}'")
+        }
+    }
+    t.check(m.chapters.count == ref.chapters.count, "{name}: {m.chapters.count} chapters, want {ref.chapters.count}")
+    if m.chapters.count == ref.chapters.count {
+        for (k, ch) in ref.chapters.enumerated() {
+            t.check(abs(m.chapters[k].start - ch.start) < 0.001 && m.chapters[k].title == ch.title, "{name}: chapter {k} {m.chapters[k].start} '{m.chapters[k].title}'")
+        }
+    }
+    if !ref.coverMd5.isEmpty {
+        t.check(m.cover.hash("md5").hex == ref.coverMd5, "{name}: cover art")
+    }
+    print("time open {name}: {Int(ms)} ms ({m.packets.count} packets)")
+}
+
+fn main() {
+    var t = Tally()
+    let fx = "tests/asf/fixtures/"
+    var cases: [Case] = [
+        Case(path: fx + "wmav2_tags.wma", ref: fx + "wmav2_tags.wma.asf.json"),
+        Case(path: fx + "wmav1_mono.wma", ref: fx + "wmav1_mono.wma.asf.json"),
+        Case(path: fx + "wmv2_wmav2.wmv", ref: fx + "wmv2_wmav2.wmv.asf.json"),
+        Case(path: fx + "wmv1.wmv", ref: fx + "wmv1.wmv.asf.json"),
+        Case(path: fx + "mp3.asf", ref: fx + "mp3.asf.asf.json"),
+        Case(path: fx + "cover.wma", ref: fx + "cover.wma.asf.json"),
+        Case(path: fx + "noindex.wmv", ref: fx + "noindex.wmv.asf.json"),
+        Case(path: fx + "cut.wmv", ref: fx + "cut.wmv.asf.json"),
+        Case(path: fx + "drm.wma", ref: fx + "drm.wma.asf.json", drm: true),
+    ]
+    let conf = "build/conformance/wma/"
+    let refs = "build/scratch/wma/refs/"
+    for name in listFolder(conf) ?? [] {
+        if !(name.hasSuffix(".wma") || name.hasSuffix(".wmv") || name.hasSuffix(".asf")) {
+            continue
+        }
+        if !fileExists(refs + name + ".asf.json") {
+            continue
+        }
+        cases.append(Case(path: conf + name, ref: refs + name + ".asf.json", drm: name.contains("drm")))
+    }
+    for c in cases {
+        checkFile(c, t)
+    }
+    // Speed: an hour of tiny WMV2 + WMA2 (make it with
+    // ffmpeg -f lavfi -i testsrc2=size=64x48:rate=25:duration=3600 -f lavfi
+    // -i sine=sample_rate=22050:duration=3600 -c:v wmv2 -b:v 100k -g 250
+    // -c:a wmav2 -b:a 32k build/scratch/wma/long.wmv).
+    if let long = readData("build/scratch/wma/long.wmv") {
+        let started = now()
+        match demux.open(long, name: "long.wmv") {
+            .ok(m) -> {
+                let ms = (now() - started) * 1000.0
+                print("time open 1 h WMV ({long.count / 1000000} MB, {m.packets.count} packets): {Int(ms)} ms")
+                t.check(m.packets.count > 90000 && abs(m.duration - 3600.0) < 2.0, "long.wmv: packets and duration")
+            }
+            .failure(e) -> {
+                t.check(false, "long.wmv: {e.message}")
+            }
+        }
+    }
+    print("asf: {t.passed} of {t.total} passed")
+}

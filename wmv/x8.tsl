@@ -1,0 +1,916 @@
+// IntraX8: the "J-frame" intra picture coding of WMV2 (and of some WMV3 /
+// VC-1 Simple/Main pictures, x8_type), decoded exactly as ffmpeg 8.1's
+// intrax8.c and intrax8dsp.c do.
+//
+// A picture is coded in 8×8 blocks (no macroblock layer): each luma block
+// predicts its pixels from its decoded neighbours in one of 12 spatial
+// orientations (from an edge-pixel survey, the neighbours' choices and,
+// when the edges vary enough, a coded orientation), then adds a residual of
+// run/level/final coefficients (WMV2's IDCT). Chroma blocks follow every
+// second luma block of every second row. Flat areas use a predicted DC;
+// an optional deblocking filter runs along each block's top and left edge.
+//
+// API (for MsDecoder's WMV2 and for the VC-1 decoder's x8 pictures):
+//
+//   var x8 = X8Decoder()
+//   x8.setup(mbWidth: mbw, mbHeight: mbh)   // once, macroblock counts
+//   // per picture: move the picture's planes in (swap through a local to
+//   // avoid copies), set their strides and the offset of the top-left
+//   // sample, and the bit reader positioned after the picture header:
+//   x8.y = …; x8.u = …; x8.v = …
+//   x8.ys = lumaStride; x8.cs = chromaStride; x8.yOff = 0; x8.cOff = 0
+//   x8.br = reader
+//   let ok = x8.decodePicture(dquant: 2 * q, quantOffset: (q - 1) | 1,
+//                             loopFilter: lf)
+//   // then take x8.y/u/v back and continue reading from x8.br.
+//
+// decodePicture reads the use_quant_matrix bit itself (as ffmpeg's
+// ff_intrax8_decode_picture does) and writes every block of the
+// mbWidth·16 × mbHeight·16 picture; it returns false when the data is
+// damaged (the blocks decoded so far stay).
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../core"
+
+struct X8Decoder {
+    y: [Int] = []
+    u: [Int] = []
+    v: [Int] = []
+    ys: Int = 0
+    cs: Int = 0
+    yOff: Int = 0
+    cOff: Int = 0
+    br: core.BitReader = core.bitReader(Data())
+    mbWidth: Int = 0
+    mbHeight: Int = 0
+
+    // All VLC tables in one list: ac 32 tables ([quant < 13][mode >> 1]
+    // [select]), dc 16 ([quant < 13][select]), orient 2 high + 4 low.
+    lut: [Int] = []
+    lutBase: [Int] = []
+    sym: [Int] = []
+    symBase: [Int] = []
+
+    // Per picture.
+    quant: Int = 0
+    dquant: Int = 0
+    qsum: Int = 0
+    loopFilter: Bool = false
+    useQuantMatrix: Bool = false
+    quantDcChroma: Int = 0
+    divideDcLuma: Int = 0
+    divideDcChroma: Int = 0
+    acSel: [Int] = [-1, -1, -1, -1]
+    dcSel: [Int] = [-1, -1, -1]
+    orSel: Int = -1
+
+    // Per block.
+    mbx: Int = 0
+    mby: Int = 0
+    edges: Int = 0
+    orient: Int = 0
+    chromaOrient: Int = 0
+    rawOrient: Int = 0
+    estRun: Int = 0
+    flatDc: Bool = false
+    predictedDc: Int = 0
+    range: Int = 0
+    sum: Int = 0
+    dest0: Int = 0
+    dest1: Int = 0
+    dest2: Int = 0
+    predictionTable: [Int] = []
+    pad: [Int] = []
+    block: [Int] = []
+    leftSum: [Int] = []
+    topSum: [Int] = []
+    // Results of the last run/level/final read.
+    run: Int = 0
+    level: Int = 0
+    final: Bool = false
+
+    fn setup(mbWidth: Int, mbHeight: Int) {
+        self.mbWidth = mbWidth
+        self.mbHeight = mbHeight
+        predictionTable = core.zeros(mbWidth * 4 + 4)
+        pad = core.zeros(48)
+        block = core.zeros(64)
+        leftSum = core.zeros(16)
+        topSum = core.zeros(16)
+        lut = []
+        lutBase = []
+        sym = []
+        symBase = []
+        addTables(x8AcCode, x8AcLen, x8AcSym, 32, 77, 9)
+        addTables(x8DcCode, x8DcLen, x8DcSym, 16, 34, 9)
+        addTables(x8OrHiCode, x8OrHiLen, x8OrHiSym, 2, 12, 7)
+        addTables(x8OrLoCode, x8OrLoLen, x8OrLoSym, 4, 12, 7)
+    }
+
+    fn addTables(_ codes: [Int], _ lens: [Int], _ syms: [Int], _ count: Int, _ n: Int, _ bits: Int) {
+        for t in 0..count {
+            let a = t * n
+            let one = wmvBuildVlc(codes.slice(from: a, to: a + n), lens.slice(from: a, to: a + n), rootBits: bits)
+            lutBase.append(lut.count)
+            lut += one
+            symBase.append(sym.count)
+            sym += syms.slice(from: a, to: a + n)
+        }
+    }
+
+    // Reads a code of table t (index into lutBase); its symbol or -1.
+    fn vlc(_ t: Int, _ bits: Int) -> Int {
+        let base = lutBase[t]
+        var e = lut[base + br.peek(bits)]
+        var nb = bits
+        while e < 0 {
+            br.bits(nb)
+            let p = -e
+            nb = p & 63
+            e = lut[base + (p >> 6) + br.peek(nb)]
+        }
+        if e == 0 {
+            return -1
+        }
+        br.bits(e & 63)
+        sym[symBase[t] + (e >> 6) - 1]
+    }
+
+    // --- Plane access ---
+
+    fn px(_ plane: Int, _ i: Int) -> Int {
+        if plane == 0 {
+            return y[i]
+        }
+        if plane == 1 {
+            return u[i]
+        }
+        v[i]
+    }
+
+    fn setPx(_ plane: Int, _ i: Int, _ val: Int) {
+        if plane == 0 {
+            y[i] = val
+        } else if plane == 1 {
+            u[i] = val
+        } else {
+            v[i] = val
+        }
+    }
+
+    fn strideOf(_ plane: Int) -> Int {
+        if plane == 0 { ys } else { cs }
+    }
+
+    fn destOf(_ plane: Int) -> Int {
+        if plane == 0 { dest0 } else if plane == 1 { dest1 } else { dest2 }
+    }
+
+    // --- The picture (ff_intrax8_decode_picture) ---
+
+    fn decodePicture(dquant: Int, quantOffset: Int, loopFilter: Bool) -> Bool {
+        self.dquant = dquant
+        quant = dquant >> 1
+        qsum = quantOffset
+        self.loopFilter = loopFilter
+        if quant <= 0 {
+            return false
+        }
+        useQuantMatrix = br.flag()
+        divideDcLuma = ((1 << 16) + (quant >> 1)) / quant
+        if quant < 5 {
+            quantDcChroma = quant
+            divideDcChroma = divideDcLuma
+        } else {
+            quantDcChroma = quant + ((quant + 3) >> 3)
+            divideDcChroma = ((1 << 16) + (quantDcChroma >> 1)) / quantDcChroma
+        }
+        for i in 0..4 {
+            acSel[i] = -1
+        }
+        for i in 0..3 {
+            dcSel[i] = -1
+        }
+        orSel = -1
+        for i in 0..predictionTable.count {
+            predictionTable[i] = 0
+        }
+        mby = 0
+        while mby < mbHeight * 2 {
+            dest0 = yOff + mby * 8 * ys
+            dest1 = cOff + (mby >> 1) * 8 * cs
+            dest2 = dest1
+            if br.left < 1 {
+                return false
+            }
+            mbx = 0
+            while mbx < mbWidth * 2 {
+                getPrediction()
+                if !setupSpatialPredictor(0) {
+                    return false
+                }
+                if !decodeIntraBlock(0) {
+                    return false
+                }
+                if (mbx & mby & 1) == 1 {
+                    getPredictionChroma()
+                    setupSpatialPredictor(1)
+                    if !decodeIntraBlock(1) {
+                        return false
+                    }
+                    setupSpatialPredictor(2)
+                    if !decodeIntraBlock(2) {
+                        return false
+                    }
+                    dest1 += 8
+                    dest2 += 8
+                }
+                dest0 += 8
+                mbx += 1
+            }
+            mby += 1
+        }
+        true
+    }
+
+    // --- Huffman parts (x8_get_dc_rlf, x8_get_ac_rlf) ---
+
+    // DC: sets level and final; false for a damaged code.
+    fn getDc(_ mode: Int) -> Bool {
+        if dcSel[mode] < 0 {
+            let sel = br.bits(3)
+            dcSel[mode] = 32 + (if quant < 13 { 8 } else { 0 }) + sel
+        }
+        var i = vlc(dcSel[mode], 9)
+        let c = if i > 16 { 1 } else { 0 }
+        final = c == 1
+        i -= 17 * c
+        if i <= 0 {
+            level = 0
+            return i == 0
+        }
+        var n = (i + 1) >> 1
+        if n > 1 {
+            n -= 1
+        }
+        var e = br.bits(n)
+        let k = x8DcIndexOffset[i] + (e >> 1)
+        e = -(e & 1)
+        level = (k ^ e) - e
+        true
+    }
+
+    fn selectAc(_ mode: Int) {
+        if acSel[mode] >= 0 {
+            return
+        }
+        let sel = br.bits(3)
+        acSel[mode] = (if quant < 13 { 16 } else { 0 }) + (mode >> 1) * 8 + sel
+    }
+
+    fn getAc(_ mode: Int) {
+        var i = vlc(acSel[mode], 9)
+        if i < 46 {
+            if i < 0 {
+                level = 64
+                final = true
+                run = 64
+                return
+            }
+            let t = if i > 22 { 1 } else { 0 }
+            final = t == 1
+            i -= 23 * t
+            let l = (0xE50000 >> (i & 0x1E)) & 3
+            let m = 0x01030F >> (l << 3)
+            run = i & m & 0xFF
+            level = l
+        } else if i < 73 {
+            i -= 46
+            var sm = x8AcDecodeTable[i]
+            let e = br.bits(sm & 0xF)
+            sm = sm >> 8
+            let mask = sm & 0xFF
+            sm = sm >> 8
+            run = (sm & 0xFF) + (e & mask)
+            level = (sm >> 8) + (e & (~mask))
+            final = i > 12
+        } else if i < 75 {
+            final = (i & 1) == 0
+            let e = br.bits(5)
+            run = x8CrazyMix[e] >> 4
+            level = x8CrazyMix[e] & 0x0F
+        } else {
+            level = br.bits(7 - 3 * (i & 1))
+            run = br.bits(6)
+            final = br.flag()
+        }
+    }
+
+    fn getOrient() -> Int {
+        if orSel < 0 {
+            let sel = br.bits(1 + (if quant < 13 { 1 } else { 0 }))
+            orSel = if quant < 13 { 48 + 2 + sel } else { 48 + sel }
+        }
+        vlc(orSel, 7)
+    }
+
+    // --- Prediction (x8_get_prediction, x8_get_prediction_chroma) ---
+
+    fn getPrediction() {
+        edges = (if mbx == 0 { 1 } else { 0 }) | (if mby == 0 { 2 } else { 0 }) | (if mbx >= 2 * mbWidth - 1 { 4 } else { 0 })
+        let e = edges & 3
+        let odd = mby & 1
+        let notOdd = 1 - odd
+        if e == 1 {
+            estRun = predictionTable[notOdd] >> 2
+            orient = 1
+            return
+        }
+        if e == 2 {
+            estRun = predictionTable[2 * mbx - 2] >> 2
+            orient = 2
+            return
+        }
+        if e == 3 {
+            estRun = 16
+            orient = 0
+            return
+        }
+        var b = predictionTable[2 * mbx + notOdd]
+        var a = predictionTable[2 * mbx - 2 + odd]
+        var c = predictionTable[2 * mbx - 2 + notOdd]
+        estRun = min(b, a)
+        if (mbx & mby) != 0 {
+            estRun = min(c, estRun)
+        }
+        estRun = estRun >> 2
+        a = a & 3
+        b = b & 3
+        c = c & 3
+        let i = (0xFFEAF4C4 >> (2 * b + 8 * a)) & 3
+        if i != 3 {
+            orient = i
+        } else {
+            orient = (0xFFEAD8 >> (2 * c + 8 * (if quant > 12 { 1 } else { 0 }))) & 3
+        }
+    }
+
+    fn getPredictionChroma() {
+        edges = (if (mbx >> 1) == 0 { 1 } else { 0 }) | (if (mby >> 1) == 0 { 2 } else { 0 }) | (if mbx >= 2 * mbWidth - 1 { 4 } else { 0 })
+        rawOrient = 0
+        if (edges & 3) != 0 {
+            chromaOrient = 4 << ((0xCC >> edges) & 1)
+            return
+        }
+        chromaOrient = (predictionTable[2 * mbx - 2] & 0x03) << 2
+    }
+
+    // --- Spatial prediction set-up (x8_setup_spatial_predictor and
+    // x8_setup_spatial_compensation) ---
+
+    fn setupSpatialPredictor(_ chroma: Int) -> Bool {
+        setupCompensation(chroma)
+        var q = quant
+        if chroma > 0 {
+            orient = chromaOrient
+            q = quantDcChroma
+        }
+        flatDc = false
+        if range < q || range < 3 {
+            orient = 0
+            if range < 3 {
+                flatDc = true
+                sum += 9
+                predictedDc = (sum * 6899) >> 17
+            }
+        }
+        if chroma > 0 {
+            return true
+        }
+        if range < 2 * quant {
+            if (edges & 3) == 0 {
+                if orient == 1 {
+                    orient = 11
+                }
+                if orient == 2 {
+                    orient = 10
+                }
+            } else {
+                orient = 0
+            }
+            rawOrient = 0
+        } else {
+            rawOrient = getOrient()
+            if rawOrient < 0 || rawOrient > 11 {
+                return false
+            }
+            orient = x8PredictionTable[orient * 12 + rawOrient]
+        }
+        true
+    }
+
+    // Fills pad (areas 1 … 6, see intrax8dsp.c) from the block's
+    // neighbours and works out their range and sum.
+    fn setupCompensation(_ plane: Int) {
+        let src = destOf(plane)
+        let stride = strideOf(plane)
+        if (edges & 3) == 3 {
+            sum = 0x80 * (8 + 1 + 8 + 2)
+            range = 0
+            for i in 0..41 {
+                pad[i] = 0x80
+            }
+            return
+        }
+        var minPix = 256
+        var maxPix = -1
+        var s = 0
+        if (edges & 1) == 0 {
+            var p = src - 1
+            var i = 7
+            while i >= 0 {
+                pad[i] = px(plane, p - 1)
+                let c = px(plane, p)
+                s += c
+                minPix = min(minPix, c)
+                maxPix = max(maxPix, c)
+                pad[8 + i] = c
+                p += stride
+                i -= 1
+            }
+        }
+        if (edges & 2) == 0 {
+            let p = src - stride
+            var c = 0
+            for i in 0..8 {
+                c = px(plane, p + i)
+                s += c
+                minPix = min(minPix, c)
+                maxPix = max(maxPix, c)
+            }
+            if (edges & 4) != 0 {
+                for i in 0..8 {
+                    pad[25 + i] = c
+                    pad[17 + i] = px(plane, p + i)
+                }
+            } else {
+                for i in 0..16 {
+                    pad[17 + i] = px(plane, p + i)
+                }
+            }
+            for i in 0..8 {
+                pad[33 + i] = px(plane, p - stride + i)
+            }
+        }
+        if (edges & 3) != 0 {
+            let avg = (s + 4) >> 3
+            if (edges & 1) != 0 {
+                for i in 0..17 {
+                    pad[i] = avg
+                }
+            } else {
+                for i in 16..41 {
+                    pad[i] = avg
+                }
+            }
+            s += avg * 9
+        } else {
+            let c = px(plane, src - 1 - stride)
+            pad[16] = c
+            s += c
+        }
+        range = maxPix - minPix
+        s += pad[25] + pad[26]
+        sum = s
+    }
+
+    // --- The 12 spatial predictions (spatial_compensation_0 … 11),
+    // written into the plane at the block. ---
+
+    fn spatialCompensation(_ plane: Int) {
+        let d0 = destOf(plane)
+        let stride = strideOf(plane)
+        let o = orient
+        if o == 0 {
+            for i in 0..16 {
+                leftSum[i] = 0
+                topSum[i] = 0
+            }
+            for i in 0..8 {
+                let a = pad[8 + 7 - i] << 4
+                for j in 0..8 {
+                    let p = abs(i - j)
+                    leftSum[(p & 1) * 8 + j] = leftSum[(p & 1) * 8 + j] + (a >> (p >> 1))
+                }
+            }
+            for i in 0..12 {
+                let a = pad[17 + i] << 4
+                let jFrom = if i < 8 { 0 } else if i < 10 { 5 } else { 7 }
+                for j in jFrom..8 {
+                    let p = abs(i - j)
+                    topSum[(p & 1) * 8 + j] = topSum[(p & 1) * 8 + j] + (a >> (p >> 1))
+                }
+            }
+            for i in 0..8 {
+                topSum[i] = (topSum[i] + ((topSum[8 + i] * 181 + 128) >> 8)) & 0xFFFF
+                leftSum[i] = (leftSum[i] + ((leftSum[8 + i] * 181 + 128) >> 8)) & 0xFFFF
+            }
+            for yy in 0..8 {
+                for xx in 0..8 {
+                    let w0 = x8ZeroWeights[yy * 16 + xx * 2]
+                    let w1 = x8ZeroWeights[yy * 16 + xx * 2 + 1]
+                    setPx(plane, d0 + yy * stride + xx, ((topSum[xx] * w0 + leftSum[yy] * w1 + 0x8000) >> 16) & 255)
+                }
+            }
+            return
+        }
+        for yy in 0..8 {
+            let row = d0 + yy * stride
+            for xx in 0..8 {
+                var val = 0
+                if o == 1 {
+                    val = pad[17 + min(2 * yy + xx + 2, 15)]
+                } else if o == 2 {
+                    val = pad[17 + 1 + yy + xx]
+                } else if o == 3 {
+                    val = pad[17 + ((yy + 1) >> 1) + xx]
+                } else if o == 4 {
+                    val = (pad[17 + xx] + pad[33 + xx] + 1) >> 1
+                } else if o == 5 {
+                    if 2 * xx - yy < 0 {
+                        val = pad[8 + 9 + 2 * xx - yy]
+                    } else {
+                        val = pad[17 + xx - ((yy + 1) >> 1)]
+                    }
+                } else if o == 6 {
+                    val = pad[16 - yy + xx]
+                } else if o == 7 {
+                    if xx - 2 * yy > 0 {
+                        val = (pad[16 - 1 + xx - 2 * yy] + pad[16 + xx - 2 * yy] + 1) >> 1
+                    } else {
+                        val = pad[8 + 8 - yy + (xx >> 1)]
+                    }
+                } else if o == 8 {
+                    val = (pad[7 - yy] + pad[8 + 7 - yy] + 1) >> 1
+                } else if o == 9 {
+                    val = pad[8 + 6 - min(xx + yy, 6)]
+                } else if o == 10 {
+                    val = (pad[8 + 7 - yy] * (8 - xx) + pad[17 + xx] * xx + 4) >> 3
+                } else {
+                    val = (pad[8 + 7 - yy] * yy + pad[17 + xx] * (8 - yy) + 4) >> 3
+                }
+                setPx(plane, row + xx, val)
+            }
+        }
+    }
+
+    fn solid(_ plane: Int, _ val: Int) {
+        let d0 = destOf(plane)
+        let stride = strideOf(plane)
+        for yy in 0..8 {
+            for xx in 0..8 {
+                setPx(plane, d0 + yy * stride + xx, val)
+            }
+        }
+    }
+
+    // x8_ac_compensation: corrects low AC coefficients for the
+    // prediction's DC (direction 0 both, 1 vertical, 2 horizontal).
+    fn acCompensation(_ direction: Int, _ dc: Int) {
+        if direction == 0 {
+            var t = x8T(3811, dc)
+            block[1] -= t
+            block[8] -= t
+            t = x8T(487, dc)
+            block[2] -= t
+            block[16] -= t
+            t = x8T(506, dc)
+            block[3] -= t
+            block[24] -= t
+            t = x8T(135, dc)
+            block[4] -= t
+            block[32] -= t
+            block[10] += t
+            block[17] += t
+            block[11] += t
+            block[25] += t
+            t = x8T(173, dc)
+            block[5] -= t
+            block[40] -= t
+            t = x8T(61, dc)
+            block[6] -= t
+            block[48] -= t
+            block[13] += t
+            block[41] += t
+            t = x8T(42, dc)
+            block[7] -= t
+            block[56] -= t
+            block[12] += t
+            block[33] += t
+            block[36] += t
+            t = x8T(1084, dc)
+            block[9] += t
+        } else if direction == 1 {
+            block[8] -= x8T(6269, dc)
+            block[24] -= x8T(708, dc)
+            block[40] -= x8T(172, dc)
+            block[56] -= x8T(73, dc)
+        } else if direction == 2 {
+            block[1] -= x8T(6269, dc)
+            block[3] -= x8T(708, dc)
+            block[5] -= x8T(172, dc)
+            block[7] -= x8T(73, dc)
+        }
+    }
+
+    // --- One block (x8_decode_intra_mb) ---
+
+    fn decodeIntraBlock(_ chroma: Int) -> Bool {
+        for i in 0..64 {
+            block[i] = 0
+        }
+        let dcMode = if chroma > 0 { 2 } else { if estRun != 0 { 1 } else { 0 } }
+        if !getDc(dcMode) {
+            return false
+        }
+        var dcLevel = level
+        var n = 0
+        var zerosOnly = false
+        var placed = false
+        if !final {
+            var useMatrix = useQuantMatrix
+            var acMode = 0
+            var est = 64
+            if chroma > 0 {
+                acMode = 1
+            } else {
+                if rawOrient < 3 {
+                    useMatrix = false
+                }
+                if rawOrient > 4 {
+                    acMode = 0
+                } else if estRun > 1 {
+                    acMode = 2
+                    est = estRun
+                } else {
+                    acMode = 3
+                }
+            }
+            selectAc(acMode)
+            let sel = (0x928548 >> (2 * orient)) & 3
+            var pos = 0
+            while true {
+                n += 1
+                if n >= est {
+                    acMode = 3
+                    selectAc(3)
+                }
+                getAc(acMode)
+                pos += run + 1
+                if pos > 63 {
+                    return false
+                }
+                var lv = (level + 1) * dquant + qsum
+                if br.bit() == 1 {
+                    lv = -lv
+                }
+                if useMatrix {
+                    lv = (lv * x8QuantTable[pos]) >> 8
+                }
+                block[x8Scan(sel, pos)] = lv
+                if final {
+                    break
+                }
+            }
+        } else {
+            if flatDc && dcLevel >= -1 && dcLevel <= 1 {
+                let div = if chroma == 0 { divideDcLuma } else { divideDcChroma }
+                let dq = if chroma == 0 { quant } else { quantDcChroma }
+                dcLevel += (predictedDc * div + (1 << 12)) >> 13
+                solid(chroma, msClip((dcLevel * dq + 4) >> 3))
+                placed = true
+            } else {
+                zerosOnly = dcLevel == 0
+            }
+        }
+        if !placed {
+            block[0] = dcLevel * (if chroma == 0 { quant } else { quantDcChroma })
+            if (dcLevel < -1 || dcLevel > 1) && (edges & 3) != 3 {
+                let direction = (0x6A017C >> (orient * 2)) & 3
+                if direction != 3 {
+                    acCompensation(direction, block[0])
+                }
+            }
+            if flatDc {
+                solid(chroma, predictedDc & 255)
+            } else {
+                spatialCompensation(chroma)
+            }
+            if !zerosOnly {
+                addIdct(chroma)
+            }
+        }
+        if chroma == 0 {
+            predictionTable[mbx * 2 + (mby & 1)] = (n << 2) + (if orient == 4 { 1 } else { 0 }) + (if orient == 8 { 2 } else { 0 })
+        }
+        if loopFilter {
+            let p = destOf(chroma)
+            let stride = strideOf(chroma)
+            if !((edges & 2) != 0 || (zerosOnly && (orient | 4) == 4)) {
+                deblock(chroma, p, stride, 1)
+            }
+            if !((edges & 1) != 0 || (zerosOnly && (orient | 8) == 8)) {
+                deblock(chroma, p, 1, stride)
+            }
+        }
+        true
+    }
+
+    // WMV2's IDCT of `block`, added to the plane at the block.
+    fn addIdct(_ plane: Int) {
+        for r in 0..8 {
+            let o = r * 8
+            let a1 = 2841 * block[o + 1] + 565 * block[o + 7]
+            let a7 = 565 * block[o + 1] - 2841 * block[o + 7]
+            let a5 = 1609 * block[o + 5] + 2408 * block[o + 3]
+            let a3 = 2408 * block[o + 5] - 1609 * block[o + 3]
+            let a2 = 2676 * block[o + 2] + 1108 * block[o + 6]
+            let a6 = 1108 * block[o + 2] - 2676 * block[o + 6]
+            let a0 = 2048 * block[o] + 2048 * block[o + 4]
+            let a4 = 2048 * block[o] - 2048 * block[o + 4]
+            let s1 = (181 * (a1 - a5 + a7 - a3) + 128) >> 8
+            let s2 = (181 * (a1 - a5 - a7 + a3) + 128) >> 8
+            block[o] = msI16((a0 + a2 + a1 + a5 + 128) >> 8)
+            block[o + 1] = msI16((a4 + a6 + s1 + 128) >> 8)
+            block[o + 2] = msI16((a4 - a6 + s2 + 128) >> 8)
+            block[o + 3] = msI16((a0 - a2 + a7 + a3 + 128) >> 8)
+            block[o + 4] = msI16((a0 - a2 - a7 - a3 + 128) >> 8)
+            block[o + 5] = msI16((a4 - a6 - s2 + 128) >> 8)
+            block[o + 6] = msI16((a4 + a6 - s1 + 128) >> 8)
+            block[o + 7] = msI16((a0 + a2 - a1 - a5 + 128) >> 8)
+        }
+        for o in 0..8 {
+            let a1 = (2841 * block[o + 8] + 565 * block[o + 56] + 4) >> 3
+            let a7 = (565 * block[o + 8] - 2841 * block[o + 56] + 4) >> 3
+            let a5 = (1609 * block[o + 40] + 2408 * block[o + 24] + 4) >> 3
+            let a3 = (2408 * block[o + 40] - 1609 * block[o + 24] + 4) >> 3
+            let a2 = (2676 * block[o + 16] + 1108 * block[o + 48] + 4) >> 3
+            let a6 = (1108 * block[o + 16] - 2676 * block[o + 48] + 4) >> 3
+            let a0 = (2048 * block[o] + 2048 * block[o + 32]) >> 3
+            let a4 = (2048 * block[o] - 2048 * block[o + 32]) >> 3
+            let s1 = (181 * (a1 - a5 + a7 - a3) + 128) >> 8
+            let s2 = (181 * (a1 - a5 - a7 + a3) + 128) >> 8
+            block[o] = msI16((a0 + a2 + a1 + a5 + 8192) >> 14)
+            block[o + 8] = msI16((a4 + a6 + s1 + 8192) >> 14)
+            block[o + 16] = msI16((a4 - a6 + s2 + 8192) >> 14)
+            block[o + 24] = msI16((a0 - a2 + a7 + a3 + 8192) >> 14)
+            block[o + 32] = msI16((a0 - a2 - a7 - a3 + 8192) >> 14)
+            block[o + 40] = msI16((a4 - a6 - s2 + 8192) >> 14)
+            block[o + 48] = msI16((a4 + a6 - s1 + 8192) >> 14)
+            block[o + 56] = msI16((a0 + a2 - a1 - a5 + 8192) >> 14)
+        }
+        let d0 = destOf(plane)
+        let stride = strideOf(plane)
+        for yy in 0..8 {
+            for xx in 0..8 {
+                let i = d0 + yy * stride + xx
+                setPx(plane, i, msClip(px(plane, i) + block[yy * 8 + xx]))
+            }
+        }
+    }
+
+    // x8_loop_filter across the edge before `p` (a = step across it, b =
+    // step along it).
+    fn deblock(_ plane: Int, _ start: Int, _ a: Int, _ b: Int) {
+        let ql = (quant + 10) >> 3
+        var p = start
+        for _ in 0..8 {
+            let p0 = px(plane, p - 5 * a)
+            let p1 = px(plane, p - 4 * a)
+            let p2 = px(plane, p - 3 * a)
+            let p3 = px(plane, p - 2 * a)
+            let p4 = px(plane, p - a)
+            let p5 = px(plane, p)
+            let p6 = px(plane, p + a)
+            let p7 = px(plane, p + 2 * a)
+            let p8 = px(plane, p + 3 * a)
+            let p9 = px(plane, p + 4 * a)
+            var t = x8Le(p1 - p2, ql) + x8Le(p2 - p3, ql) + x8Le(p3 - p4, ql) + x8Le(p4 - p5, ql)
+            var done = false
+            if t > 0 {
+                t += x8Le(p5 - p6, ql) + x8Le(p6 - p7, ql) + x8Le(p7 - p8, ql) + x8Le(p8 - p9, ql) + x8Le(p0 - p1, ql)
+                if t >= 6 {
+                    var mn = min(min(p1, p3), min(p5, p8))
+                    var mx = max(max(p1, p3), max(p5, p8))
+                    if mx - mn < 2 * quant {
+                        mn = min(mn, min(min(p2, p4), min(p6, p7)))
+                        mx = max(mx, max(max(p2, p4), max(p6, p7)))
+                        if mx - mn < 2 * quant {
+                            setPx(plane, p - 2 * a, (4 * p2 + 3 * p3 + 1 * p7 + 4) >> 3)
+                            setPx(plane, p - a, (3 * p2 + 3 * p4 + 2 * p7 + 4) >> 3)
+                            setPx(plane, p, (2 * p2 + 3 * p5 + 3 * p7 + 4) >> 3)
+                            setPx(plane, p + a, (1 * p2 + 3 * p6 + 4 * p7 + 4) >> 3)
+                            done = true
+                        }
+                    }
+                }
+            }
+            if !done {
+                let x0 = (2 * p3 - 5 * p4 + 5 * p5 - 2 * p6 + 4) >> 3
+                if abs(x0) < quant {
+                    let x1 = (2 * p1 - 5 * p2 + 5 * p3 - 2 * p4 + 4) >> 3
+                    let x2 = (2 * p5 - 5 * p6 + 5 * p7 - 2 * p8 + 4) >> 3
+                    var x = abs(x0) - min(abs(x1), abs(x2))
+                    var m = p4 - p5
+                    if x > 0 && (m ^ x0) < 0 {
+                        let neg = m < 0
+                        m = abs(m) >> 1
+                        x = (5 * x) >> 3
+                        if x > m {
+                            x = m
+                        }
+                        if neg {
+                            x = -x
+                        }
+                        setPx(plane, p - a, (p4 - x) & 255)
+                        setPx(plane, p, (p5 + x) & 255)
+                    }
+                }
+            }
+            p += b
+        }
+    }
+}
+
+fn x8Le(_ d: Int, _ ql: Int) -> Int {
+    if abs(d) <= ql { 1 } else { 0 }
+}
+
+fn x8T(_ x: Int, _ dc: Int) -> Int {
+    (x * dc + 0x8000) >> 16
+}
+
+// The scan of selector 0 (wmv1 inter), 1 (wmv1 intra h), 2 (intra v).
+fn x8Scan(_ sel: Int, _ pos: Int) -> Int {
+    msWmv1Scan[(if sel == 0 { 0 } else if sel == 1 { 128 } else { 192 }) + pos]
+}
+
+let x8DcIndexOffset: [Int] = [0, 1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193]
+
+// ac_decode_table: extra bits | run/level choice << 8 | run offset << 16 |
+// level offset << 24.
+let x8AcDecodeTable: [Int] = [
+    3 | (0xFF << 8) | (16 << 16), 3 | (0xFF << 8) | (24 << 16), 2 | (0xFF << 8) | (4 << 16) | (1 << 24), 3 | (0xFF << 8) | (8 << 16) | (1 << 24),
+    5 | (0xFF << 8) | (32 << 16), 4 | (0xFF << 8) | (16 << 16) | (1 << 24),
+    2 | (4 << 24), 2 | (8 << 24), 2 | (12 << 24), 3 | (16 << 24), 3 | (24 << 24),
+    2 | (1 << 16) | (3 << 24), 3 | (1 << 16) | (7 << 24),
+    2 | (0xFF << 8) | (16 << 16), 2 | (0xFF << 8) | (20 << 16), 2 | (0xFF << 8) | (24 << 16), 2 | (0xFF << 8) | (28 << 16), 4 | (0xFF << 8) | (32 << 16), 4 | (0xFF << 8) | (48 << 16),
+    2 | (0xFF << 8) | (4 << 16) | (1 << 24), 3 | (0xFF << 8) | (8 << 16) | (1 << 24), 4 | (0xFF << 8) | (16 << 16) | (1 << 24),
+    2 | (4 << 24), 3 | (8 << 24), 4 | (16 << 24),
+    2 | (1 << 16) | (3 << 24), 3 | (1 << 16) | (7 << 24)
+]
+
+let x8CrazyMix: [Int] = [
+    0x22, 0x32, 0x33, 0x53, 0x23, 0x42, 0x43, 0x63,
+    0x24, 0x52, 0x34, 0x73, 0x25, 0x62, 0x44, 0x83,
+    0x26, 0x72, 0x35, 0x54, 0x27, 0x82, 0x45, 0x64,
+    0x28, 0x92, 0x36, 0x74, 0x29, 0xa2, 0x46, 0x84
+]
+
+let x8PredictionTable: [Int] = [
+    0, 8, 4, 10, 11, 2, 6, 9, 1, 3, 5, 7,
+    4, 0, 8, 11, 10, 3, 5, 2, 6, 9, 1, 7,
+    8, 0, 4, 10, 11, 1, 7, 2, 6, 9, 3, 5
+]
+
+let x8QuantTable: [Int] = [
+    256, 256, 256, 256, 256, 256, 259, 262,
+    265, 269, 272, 275, 278, 282, 285, 288,
+    292, 295, 299, 303, 306, 310, 314, 317,
+    321, 325, 329, 333, 337, 341, 345, 349,
+    353, 358, 362, 366, 371, 375, 379, 384,
+    389, 393, 398, 403, 408, 413, 417, 422,
+    428, 433, 438, 443, 448, 454, 459, 465,
+    470, 476, 482, 488, 493, 499, 505, 511
+]
+
+let x8ZeroWeights: [Int] = [
+    640, 640, 669, 480, 708, 354, 748, 257,
+    792, 198, 760, 143, 808, 101, 772, 72,
+    480, 669, 537, 537, 598, 416, 661, 316,
+    719, 250, 707, 185, 768, 134, 745, 97,
+    354, 708, 416, 598, 488, 488, 564, 388,
+    634, 317, 642, 241, 716, 179, 706, 132,
+    257, 748, 316, 661, 388, 564, 469, 469,
+    543, 395, 571, 311, 655, 238, 660, 180,
+    198, 792, 250, 719, 317, 634, 395, 543,
+    469, 469, 507, 380, 597, 299, 616, 231,
+    161, 855, 206, 788, 266, 710, 340, 623,
+    411, 548, 455, 455, 548, 366, 576, 288,
+    122, 972, 159, 914, 211, 842, 276, 758,
+    341, 682, 389, 584, 483, 483, 520, 390,
+    110, 1172, 144, 1107, 193, 1028, 254, 932,
+    317, 846, 366, 731, 458, 611, 499, 499
+]

@@ -1,0 +1,1279 @@
+// The second stage of the VP8 decoder: turns ParsedFrames into pictures.
+// It keeps the last, golden and altref frames (RFC 6386 9.7, 9.8), runs
+// intra prediction (section 12), motion compensation with the six-tap or
+// bilinear filters (section 18), the inverse WHT and DCT (section 14),
+// and the loop filter (section 15), and hands out core.Pictures.
+//
+// Work goes plane by plane (Y, then U, then V): the plane being written
+// lives in the field `pl` and the reference plane being read in `rp`, so
+// the hot loops are methods reading fields. Planes cover whole
+// macroblocks with a small border: the row above holds 127 and the
+// column to the left 129, the values intra prediction sees outside the
+// frame (12.2, 12.3). Motion compensation that reaches outside the
+// frame reads a copy of the block with clamped coordinates, which is
+// what libvpx's border extension gives.
+//
+// The loop filter runs on a whole plane once it is reconstructed: intra
+// prediction must see unfiltered samples, and the RFC's reference decoder
+// filters each macroblock row only after the next one is predicted, which
+// comes to the same.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../core"
+
+// A decoded frame.
+struct Vp8Buf {
+    id: Int = 0
+    y: [Int] = []
+    u: [Int] = []
+    v: [Int] = []
+}
+
+public struct Reconstructor {
+    warnings: [String] = []
+    ready: Bool = false
+    // Reference frames: 1 last, 2 golden, 3 altref (index 0 unused).
+    refs: [Vp8Buf] = []
+    hasRefs: Bool = false
+    pool: [Vp8Buf] = []
+    nextId: Int = 1
+    // An empty list to drop references with (assigning `[]` allocates).
+    noList: [Int] = []
+    sarNum: Int = 1
+    sarDen: Int = 1
+    trackMatrix: core.ColorMatrix = .unknown
+    // Geometry of the current size.
+    width: Int = 0
+    height: Int = 0
+    mbCols: Int = 0
+    mbRows: Int = 0
+    yStride: Int = 0
+    cStride: Int = 0
+    yBase: Int = 0
+    cBase: Int = 0
+    ySize: Int = 0
+    cSize: Int = 0
+    // The frame being reconstructed and the reference planes.
+    cy: [Int] = []
+    cu: [Int] = []
+    cv: [Int] = []
+    pl: [Int] = []
+    plIdx: Int = -1
+    rp: [Int] = []
+    rpRef: Int = -1
+    emu: [Int] = []
+    tmp: [Int] = []
+    // Residual of the macroblock being reconstructed: 25 blocks of 16 and
+    // per block 0 nothing, 1 DC only, 2 more.
+    blk: [Int] = []
+    bflag: [Int] = []
+    big: Bool = false
+    wht: [Int] = []
+    filters: [Int] = []
+    sixtap: [Int] = []
+    bilinear: [Int] = []
+    edge: [Int] = []
+    // Loop filter limits by level: interior limit, hev threshold.
+    lfI: [Int] = []
+    lfH: [Int] = []
+    // The frame's records.
+    mbs: [Int] = []
+    coefs: [Int] = []
+    hdr: FrameHeader = FrameHeader()
+    // Time spent (seconds), for benchmarks.
+    tPred: Float = 0.0
+    tFilter: Float = 0.0
+
+    fn setup() {
+        if ready {
+            return
+        }
+        ready = true
+        for _ in 0..4 {
+            refs.append(Vp8Buf())
+        }
+        emu = vp8Zeros(32 * 32)
+        tmp = vp8Zeros(16 * 24)
+        blk = vp8Zeros(25 * 16)
+        bflag = vp8Zeros(25)
+        wht = vp8Zeros(16)
+        edge = vp8Zeros(16)
+        lfI = vp8Zeros(64)
+        lfH = vp8Zeros(64)
+        sixtap = [0, 0, 128, 0, 0, 0,
+                  0, -6, 123, 12, -1, 0,
+                  2, -11, 108, 36, -8, 1,
+                  0, -9, 93, 50, -6, 0,
+                  3, -16, 77, 77, -16, 3,
+                  0, -6, 50, 93, -9, 0,
+                  1, -8, 36, 108, -11, 2,
+                  0, -1, 12, 123, -6, 0]
+        bilinear = [0, 0, 128, 0, 0, 0,
+                    0, 0, 112, 16, 0, 0,
+                    0, 0, 96, 32, 0, 0,
+                    0, 0, 80, 48, 0, 0,
+                    0, 0, 64, 64, 0, 0,
+                    0, 0, 48, 80, 0, 0,
+                    0, 0, 32, 96, 0, 0,
+                    0, 0, 16, 112, 0, 0]
+        filters = sixtap
+    }
+
+    fn warn(_ s: String) {
+        if warnings.count < 200 {
+            warnings.append(s)
+        }
+    }
+
+    // After a seek: references are dropped until the next keyframe.
+    fn reset() {
+        setup()
+        hasRefs = false
+    }
+
+    fn picture(_ b: Vp8Buf, _ pts: Int, _ key: Bool) -> core.Picture {
+        var p = core.Picture(width: width, height: height)
+        p.chroma = .yuv420
+        p.depth = 8
+        p.y = b.y
+        p.u = b.u
+        p.v = b.v
+        p.yStride = yStride
+        p.cStride = cStride
+        p.yOffset = yBase
+        p.cOffset = cBase
+        p.pts = pts
+        p.key = key
+        // VP8 is BT.601 video range (9.2: color_space 0).
+        p.matrix = if trackMatrix != .unknown { trackMatrix } else { core.ColorMatrix.bt601 }
+        p.fullRange = false
+        p.sarNum = sarNum
+        p.sarDen = sarDen
+        p
+    }
+
+    fn reconstruct(_ pf: ParsedFrame) -> [core.Picture] {
+        setup()
+        var out: [core.Picture] = []
+        if pf.kind == 3 {
+            return out
+        }
+        // An inter frame of another size than the references (its keyframe
+        // was lost) can't be decoded either.
+        let lost = !pf.hdr.keyframe && (!hasRefs || pf.hdr.mbCols != mbCols || pf.hdr.mbRows != mbRows)
+        if pf.kind == 2 || lost {
+            if pf.kind == 2 {
+                warn("vp8: damaged frame concealed")
+            }
+            // Show the last frame again (as libvpx does with a corrupt
+            // frame).
+            if hasRefs && pf.hdr.show {
+                out.append(picture(refs[1], pf.pts, false))
+            }
+            return out
+        }
+        let h = pf.hdr
+        if h.keyframe && (h.width != width || h.height != height || !hasRefs) {
+            resize(h)
+        }
+        hdr = h
+        mbs = pf.mbs
+        coefs = pf.coefs
+        decodeFrame()
+        // Let go of the parser's lists so it can reuse them in place.
+        mbs = noList
+        coefs = noList
+        rp = noList
+        rpRef = -1
+        let cur = Vp8Buf(id: nextId, y: cy, u: cu, v: cv)
+        nextId += 1
+        cy = noList
+        cu = noList
+        cv = noList
+        let old = [refs[1], refs[2], refs[3]]
+        // Reference updates in libvpx's order (swap_frame_buffers): copies
+        // to altref, then to golden (which may take the new altref), then
+        // the refreshes with the new frame.
+        if h.keyframe {
+            refs[1] = cur
+            refs[2] = cur
+            refs[3] = cur
+            hasRefs = true
+        } else {
+            if h.copyAltref == 1 {
+                refs[3] = refs[1]
+            } else if h.copyAltref == 2 {
+                refs[3] = refs[2]
+            }
+            if h.copyGolden == 1 {
+                refs[2] = refs[1]
+            } else if h.copyGolden == 2 {
+                refs[2] = refs[3]
+            }
+            if h.refreshGolden {
+                refs[2] = cur
+            }
+            if h.refreshAltref {
+                refs[3] = cur
+            }
+            if h.refreshLast {
+                refs[1] = cur
+            }
+        }
+        // Buffers no reference holds any more go back to the pool.
+        for b in old + [cur] {
+            if b.id != 0 && !isRef(b.id) && !inPool(b.id) && pool.count < 3 {
+                pool.append(b)
+            }
+        }
+        if h.show {
+            let shown = if h.refreshLast { refs[1] } else { cur }
+            out.append(picture(shown, pf.pts, h.keyframe))
+        }
+        out
+    }
+
+    fn isRef(_ id: Int) -> Bool {
+        refs[1].id == id || refs[2].id == id || refs[3].id == id
+    }
+
+    fn inPool(_ id: Int) -> Bool {
+        for b in pool {
+            if b.id == id {
+                return true
+            }
+        }
+        false
+    }
+
+    fn resize(_ h: FrameHeader) {
+        width = h.width
+        height = h.height
+        mbCols = h.mbCols
+        mbRows = h.mbRows
+        let w = mbCols * 16
+        let ht = mbRows * 16
+        yStride = w + 16
+        cStride = w / 2 + 16
+        yBase = 2 * yStride + 8
+        cBase = 2 * cStride + 8
+        ySize = (ht + 3) * yStride
+        cSize = (ht / 2 + 3) * cStride
+        pool = []
+        refs = [Vp8Buf(), Vp8Buf(), Vp8Buf(), Vp8Buf()]
+        hasRefs = false
+    }
+
+    // A buffer for the new frame: a pooled one (no reference holds those),
+    // else a new one.
+    fn takeBuffer() {
+        if pool.count > 0 {
+            let b = pool[pool.count - 1]
+            pool.removeLast()
+            cy = b.y
+            cu = b.u
+            cv = b.v
+            return
+        }
+        cy = vp8Zeros(ySize)
+        cu = vp8Zeros(cSize)
+        cv = vp8Zeros(cSize)
+    }
+
+    fn decodeFrame() {
+        takeBuffer()
+        filters = if hdr.version == 0 || hdr.version > 3 { sixtap } else { bilinear }
+        let t0 = now()
+        for p in 0..3 {
+            usePlane(p)
+            borders(p)
+            reconPlane(p)
+        }
+        let t1 = now()
+        if hdr.filterLevel > 0 {
+            setupFilter()
+            usePlane(0)
+            if hdr.simpleFilter {
+                filterSimple()
+            } else {
+                filterPlane(0)
+                usePlane(1)
+                filterPlane(1)
+                usePlane(2)
+                filterPlane(2)
+            }
+        }
+        usePlane(-1)
+        let t2 = now()
+        tPred += t1 - t0
+        tFilter += t2 - t1
+    }
+
+    // Moves plane p of the current frame into `pl` (and the previous one
+    // back); -1 puts the working plane back.
+    fn usePlane(_ p: Int) {
+        if plIdx == p {
+            return
+        }
+        if plIdx == 0 {
+            let t = cy
+            cy = pl
+            pl = t
+        } else if plIdx == 1 {
+            let t = cu
+            cu = pl
+            pl = t
+        } else if plIdx == 2 {
+            let t = cv
+            cv = pl
+            pl = t
+        }
+        plIdx = p
+        if p == 0 {
+            let t = cy
+            cy = pl
+            pl = t
+        } else if p == 1 {
+            let t = cu
+            cu = pl
+            pl = t
+        } else if p == 2 {
+            let t = cv
+            cv = pl
+            pl = t
+        }
+    }
+
+    // The reference plane for reference r and plane p into `rp`.
+    fn useRef(_ r: Int, _ p: Int) {
+        let key = r * 4 + p
+        if rpRef == key {
+            return
+        }
+        rpRef = key
+        if p == 0 {
+            rp = refs[r].y
+        } else if p == 1 {
+            rp = refs[r].u
+        } else {
+            rp = refs[r].v
+        }
+    }
+
+    // The values intra prediction sees outside the frame: 127 in the row
+    // above (from the corner on), 129 in the column to the left.
+    fn borders(_ p: Int) {
+        let stride = if p == 0 { yStride } else { cStride }
+        let base = if p == 0 { yBase } else { cBase }
+        let rows = if p == 0 { mbRows * 16 } else { mbRows * 8 }
+        let top = base - stride - 8
+        for i in 0..stride {
+            pl[top + i] = 127
+        }
+        for r in 0..rows {
+            pl[base + r * stride - 1] = 129
+        }
+    }
+
+    // Prediction and residual of every macroblock for plane p.
+    fn reconPlane(_ p: Int) {
+        let cols = mbCols
+        let rows = mbRows
+        let R = vp8MbSize
+        let stride = if p == 0 { yStride } else { cStride }
+        let base = if p == 0 { yBase } else { cBase }
+        let n = if p == 0 { 16 } else { 8 }
+        let pw = cols * n
+        let ph = rows * n
+        rpRef = -1
+        for row in 0..rows {
+            for col in 0..cols {
+                let b = (row * cols + col) * R
+                let at = base + row * n * stride + col * n
+                let mode = mbs[b]
+                loadResidual(b, p)
+                if mode <= 4 {
+                    if p == 0 {
+                        if mode == 4 {
+                            bPred(b, at, stride)
+                        } else {
+                            predict(mode, at, stride, 16, row > 0, col > 0)
+                            addBlocks(0, at, stride, 4)
+                        }
+                    } else {
+                        predict(mbs[b + 1], at, stride, 8, row > 0, col > 0)
+                        addBlocks(if p == 1 { 16 } else { 20 }, at, stride, 2)
+                    }
+                } else {
+                    useRef(mbs[b + 2], p)
+                    let rbase = base
+                    if p == 0 {
+                        lumaInter(b, at, stride, col * 16, row * 16, pw, ph, rbase)
+                        addBlocks(0, at, stride, 4)
+                    } else {
+                        chromaInter(b, at, stride, col * 8, row * 8, pw, ph, rbase)
+                        addBlocks(if p == 1 { 16 } else { 20 }, at, stride, 2)
+                    }
+                }
+            }
+            if p == 0 {
+                // Above-right of the last macroblock of the next row: the
+                // last sample of this row's bottom line, four times.
+                let lineEnd = base + (row * 16 + 15) * stride + pw
+                let v = pl[lineEnd - 1]
+                pl[lineEnd] = v
+                pl[lineEnd + 1] = v
+                pl[lineEnd + 2] = v
+                pl[lineEnd + 3] = v
+            }
+        }
+    }
+
+    // Scatters the macroblock's coefficients for plane p into blk and sets
+    // bflag; for luma with Y2, runs the inverse WHT into the Y DCs (14.3).
+    fn loadResidual(_ b: Int, _ p: Int) {
+        big = false
+        let start = mbs[b + 5]
+        if start < 0 {
+            return
+        }
+        let cf = coefs
+        let n = cf[start]
+        let lo = if p == 0 { 0 } else if p == 1 { 16 } else { 20 }
+        let hi = if p == 0 { 16 } else if p == 1 { 20 } else { 24 }
+        var hasY2 = false
+        for i in 0..n {
+            let e = cf[start + 1 + i]
+            let bk = (e >> 4) & 31
+            if (bk >= lo && bk < hi) || (p == 0 && bk == 24) {
+                let pos = e & 15
+                let v = e >> 9
+                blk[bk * 16 + pos] = v
+                if v > 2047 || v < -2047 {
+                    big = true
+                }
+                if pos == 0 {
+                    if bflag[bk] == 0 {
+                        bflag[bk] = 1
+                    }
+                } else {
+                    bflag[bk] = 2
+                }
+                if bk == 24 {
+                    hasY2 = true
+                }
+            }
+        }
+        if hasY2 {
+            iwalsh()
+        }
+    }
+
+    // 14.3 the inverse Walsh-Hadamard transform of block 24 into the DCs
+    // of blocks 0…15 (16-bit intermediates, as libvpx).
+    fn iwalsh() {
+        let o = 24 * 16
+        for i in 0..4 {
+            let a1 = blk[o + i] + blk[o + 12 + i]
+            let b1 = blk[o + 4 + i] + blk[o + 8 + i]
+            let c1 = blk[o + 4 + i] - blk[o + 8 + i]
+            let d1 = blk[o + i] - blk[o + 12 + i]
+            wht[i] = vp8S16(a1 + b1)
+            wht[4 + i] = vp8S16(c1 + d1)
+            wht[8 + i] = vp8S16(a1 - b1)
+            wht[12 + i] = vp8S16(d1 - c1)
+        }
+        for i in 0..4 {
+            let r = i * 4
+            let a1 = wht[r] + wht[r + 3]
+            let b1 = wht[r + 1] + wht[r + 2]
+            let c1 = wht[r + 1] - wht[r + 2]
+            let d1 = wht[r] - wht[r + 3]
+            let v0 = vp8S16((a1 + b1 + 3) >> 3)
+            let v1 = vp8S16((c1 + d1 + 3) >> 3)
+            let v2 = vp8S16((a1 - b1 + 3) >> 3)
+            let v3 = vp8S16((d1 - c1 + 3) >> 3)
+            setDc(r, v0)
+            setDc(r + 1, v1)
+            setDc(r + 2, v2)
+            setDc(r + 3, v3)
+        }
+        for i in 0..16 {
+            blk[o + i] = 0
+        }
+        bflag[24] = 0
+    }
+
+    fn setDc(_ k: Int, _ v: Int) {
+        blk[k * 16] = v
+        if v != 0 && bflag[k] == 0 {
+            bflag[k] = 1
+        }
+    }
+
+    // Adds the residual of the n×n grid of 4×4 blocks from block `first`
+    // (n = 4 luma, 2 chroma) to the prediction at `at`.
+    fn addBlocks(_ first: Int, _ at: Int, _ stride: Int, _ n: Int) {
+        for by in 0..n {
+            for bx in 0..n {
+                let k = first + by * n + bx
+                if bflag[k] != 0 {
+                    idctAdd(k, at + by * 4 * stride + bx * 4, stride)
+                }
+            }
+        }
+    }
+
+    // 14.4 inverse DCT of block k added to the prediction at `at`, then the
+    // block is cleared. DC-only blocks add (dc + 4) >> 3 everywhere.
+    fn idctAdd(_ k: Int, _ at: Int, _ stride: Int) {
+        let o = k * 16
+        if bflag[k] == 1 {
+            let dc = (blk[o] + 4) >> 3
+            blk[o] = 0
+            bflag[k] = 0
+            var i = at
+            for _ in 0..4 {
+                pl[i] = vp8Clip(pl[i] + dc)
+                pl[i + 1] = vp8Clip(pl[i + 1] + dc)
+                pl[i + 2] = vp8Clip(pl[i + 2] + dc)
+                pl[i + 3] = vp8Clip(pl[i + 3] + dc)
+                i += stride
+            }
+            return
+        }
+        bflag[k] = 0
+        let wide = big
+        // Columns (vertical pass) into tmp.
+        for i in 0..4 {
+            let i0 = blk[o + i]
+            let i4 = blk[o + 4 + i]
+            let i8 = blk[o + 8 + i]
+            let i12 = blk[o + 12 + i]
+            let a1 = i0 + i8
+            let b1 = i0 - i8
+            var t1 = (i4 * 35468) >> 16
+            var t2 = i12 + ((i12 * 20091) >> 16)
+            let c1 = t1 - t2
+            t1 = i4 + ((i4 * 20091) >> 16)
+            t2 = (i12 * 35468) >> 16
+            let d1 = t1 + t2
+            if wide {
+                tmp[i] = vp8S16(a1 + d1)
+                tmp[12 + i] = vp8S16(a1 - d1)
+                tmp[4 + i] = vp8S16(b1 + c1)
+                tmp[8 + i] = vp8S16(b1 - c1)
+            } else {
+                tmp[i] = a1 + d1
+                tmp[12 + i] = a1 - d1
+                tmp[4 + i] = b1 + c1
+                tmp[8 + i] = b1 - c1
+            }
+            blk[o + i] = 0
+            blk[o + 4 + i] = 0
+            blk[o + 8 + i] = 0
+            blk[o + 12 + i] = 0
+        }
+        // Rows, rounded, added to the prediction.
+        var d = at
+        for r in 0..4 {
+            let q = r * 4
+            let c0 = tmp[q]
+            let c1v = tmp[q + 1]
+            let c2 = tmp[q + 2]
+            let c3 = tmp[q + 3]
+            let a1 = c0 + c2
+            let b1 = c0 - c2
+            var t1 = (c1v * 35468) >> 16
+            var t2 = c3 + ((c3 * 20091) >> 16)
+            let cc = t1 - t2
+            t1 = c1v + ((c1v * 20091) >> 16)
+            t2 = (c3 * 35468) >> 16
+            let dd = t1 + t2
+            var r0 = (a1 + dd + 4) >> 3
+            var r3 = (a1 - dd + 4) >> 3
+            var r1 = (b1 + cc + 4) >> 3
+            var r2 = (b1 - cc + 4) >> 3
+            if wide {
+                r0 = vp8S16(r0)
+                r1 = vp8S16(r1)
+                r2 = vp8S16(r2)
+                r3 = vp8S16(r3)
+            }
+            pl[d] = vp8Clip(pl[d] + r0)
+            pl[d + 1] = vp8Clip(pl[d + 1] + r1)
+            pl[d + 2] = vp8Clip(pl[d + 2] + r2)
+            pl[d + 3] = vp8Clip(pl[d + 3] + r3)
+            d += stride
+        }
+    }
+
+    // 12.2 / 12.3 whole-block intra prediction (n = 16 luma, 8 chroma):
+    // DC from the edges that are inside the frame (128 when neither is),
+    // V, H and TM from the edges (127 above, 129 left outside the frame).
+    fn predict(_ mode: Int, _ at: Int, _ stride: Int, _ n: Int, _ up: Bool, _ left: Bool) {
+        if mode == 0 {
+            var sum = 0
+            var cnt = 0
+            if up {
+                for i in 0..n {
+                    sum += pl[at - stride + i]
+                }
+                cnt += 1
+            }
+            if left {
+                for i in 0..n {
+                    sum += pl[at + i * stride - 1]
+                }
+                cnt += 1
+            }
+            var dc = 128
+            if cnt > 0 {
+                let shift = (if n == 16 { 3 } else { 2 }) + cnt
+                dc = (sum + (1 << (shift - 1))) >> shift
+            }
+            for r in 0..n {
+                let rb = at + r * stride
+                for i in 0..n {
+                    pl[rb + i] = dc
+                }
+            }
+        } else if mode == 1 {
+            for r in 0..n {
+                let rb = at + r * stride
+                for i in 0..n {
+                    pl[rb + i] = pl[at - stride + i]
+                }
+            }
+        } else if mode == 2 {
+            for r in 0..n {
+                let rb = at + r * stride
+                let v = pl[rb - 1]
+                for i in 0..n {
+                    pl[rb + i] = v
+                }
+            }
+        } else {
+            let p0 = pl[at - stride - 1]
+            for r in 0..n {
+                let rb = at + r * stride
+                let l = pl[rb - 1] - p0
+                for i in 0..n {
+                    pl[rb + i] = vp8Clip(l + pl[at - stride + i])
+                }
+            }
+        }
+    }
+
+    // 12.3 B_PRED: each 4×4 subblock predicted from its edges, then its
+    // residual added before the next. The right column's subblocks (7,
+    // 11, 15) take their above-right samples from the row above the
+    // macroblock, as the reference decoder's copy_down.
+    fn bPred(_ b: Int, _ at: Int, _ stride: Int) {
+        for k in 0..16 {
+            let bat = at + (k >> 2) * 4 * stride + (k & 3) * 4
+            // edge: 0 above-left, 1…8 above 0…7, 9…12 left 0…3.
+            let ab = bat - stride
+            edge[0] = pl[ab - 1]
+            edge[1] = pl[ab]
+            edge[2] = pl[ab + 1]
+            edge[3] = pl[ab + 2]
+            edge[4] = pl[ab + 3]
+            if (k & 3) == 3 && k > 3 {
+                let ar = at - stride + 16
+                edge[5] = pl[ar]
+                edge[6] = pl[ar + 1]
+                edge[7] = pl[ar + 2]
+                edge[8] = pl[ar + 3]
+            } else {
+                edge[5] = pl[ab + 4]
+                edge[6] = pl[ab + 5]
+                edge[7] = pl[ab + 6]
+                edge[8] = pl[ab + 7]
+            }
+            edge[9] = pl[bat - 1]
+            edge[10] = pl[bat + stride - 1]
+            edge[11] = pl[bat + 2 * stride - 1]
+            edge[12] = pl[bat + 3 * stride - 1]
+            predict4(mbs[b + 8 + k], bat, stride)
+            if bflag[k] != 0 {
+                idctAdd(k, bat, stride)
+            }
+        }
+    }
+
+    fn put4(_ at: Int, _ a: Int, _ b: Int, _ c: Int, _ d: Int) {
+        pl[at] = a
+        pl[at + 1] = b
+        pl[at + 2] = c
+        pl[at + 3] = d
+    }
+
+    // The ten subblock modes (12.3), from edge[].
+    fn predict4(_ mode: Int, _ at: Int, _ s: Int) {
+        let p = edge[0]
+        let a0 = edge[1]
+        let a1 = edge[2]
+        let a2 = edge[3]
+        let a3 = edge[4]
+        let a4 = edge[5]
+        let a5 = edge[6]
+        let a6 = edge[7]
+        let a7 = edge[8]
+        let l0 = edge[9]
+        let l1 = edge[10]
+        let l2 = edge[11]
+        let l3 = edge[12]
+        if mode == 0 {
+            // B_DC_PRED
+            let dc = (a0 + a1 + a2 + a3 + l0 + l1 + l2 + l3 + 4) >> 3
+            put4(at, dc, dc, dc, dc)
+            put4(at + s, dc, dc, dc, dc)
+            put4(at + 2 * s, dc, dc, dc, dc)
+            put4(at + 3 * s, dc, dc, dc, dc)
+        } else if mode == 1 {
+            // B_TM_PRED
+            let ls = [l0, l1, l2, l3]
+            for r in 0..4 {
+                let l = ls[r] - p
+                put4(at + r * s, vp8Clip(l + a0), vp8Clip(l + a1), vp8Clip(l + a2), vp8Clip(l + a3))
+            }
+        } else if mode == 2 {
+            // B_VE_PRED
+            let v0 = (p + 2 * a0 + a1 + 2) >> 2
+            let v1 = (a0 + 2 * a1 + a2 + 2) >> 2
+            let v2 = (a1 + 2 * a2 + a3 + 2) >> 2
+            let v3 = (a2 + 2 * a3 + a4 + 2) >> 2
+            for r in 0..4 {
+                put4(at + r * s, v0, v1, v2, v3)
+            }
+        } else if mode == 3 {
+            // B_HE_PRED
+            let h0 = (p + 2 * l0 + l1 + 2) >> 2
+            let h1 = (l0 + 2 * l1 + l2 + 2) >> 2
+            let h2 = (l1 + 2 * l2 + l3 + 2) >> 2
+            let h3 = (l2 + 2 * l3 + l3 + 2) >> 2
+            put4(at, h0, h0, h0, h0)
+            put4(at + s, h1, h1, h1, h1)
+            put4(at + 2 * s, h2, h2, h2, h2)
+            put4(at + 3 * s, h3, h3, h3, h3)
+        } else if mode == 4 {
+            // B_LD_PRED
+            let q0 = (a0 + 2 * a1 + a2 + 2) >> 2
+            let q1 = (a1 + 2 * a2 + a3 + 2) >> 2
+            let q2 = (a2 + 2 * a3 + a4 + 2) >> 2
+            let q3 = (a3 + 2 * a4 + a5 + 2) >> 2
+            let q4 = (a4 + 2 * a5 + a6 + 2) >> 2
+            let q5 = (a5 + 2 * a6 + a7 + 2) >> 2
+            let q6 = (a6 + 2 * a7 + a7 + 2) >> 2
+            put4(at, q0, q1, q2, q3)
+            put4(at + s, q1, q2, q3, q4)
+            put4(at + 2 * s, q2, q3, q4, q5)
+            put4(at + 3 * s, q3, q4, q5, q6)
+        } else if mode == 5 {
+            // B_RD_PRED
+            let q0 = (l0 + 2 * p + a0 + 2) >> 2
+            let q1 = (p + 2 * a0 + a1 + 2) >> 2
+            let q2 = (a0 + 2 * a1 + a2 + 2) >> 2
+            let q3 = (a1 + 2 * a2 + a3 + 2) >> 2
+            let q4 = (l1 + 2 * l0 + p + 2) >> 2
+            let q5 = (l2 + 2 * l1 + l0 + 2) >> 2
+            let q6 = (l3 + 2 * l2 + l1 + 2) >> 2
+            put4(at, q0, q1, q2, q3)
+            put4(at + s, q4, q0, q1, q2)
+            put4(at + 2 * s, q5, q4, q0, q1)
+            put4(at + 3 * s, q6, q5, q4, q0)
+        } else if mode == 6 {
+            // B_VR_PRED
+            let q0 = (p + a0 + 1) >> 1
+            let q1 = (a0 + a1 + 1) >> 1
+            let q2 = (a1 + a2 + 1) >> 1
+            let q3 = (a2 + a3 + 1) >> 1
+            let q4 = (l0 + 2 * p + a0 + 2) >> 2
+            let q5 = (p + 2 * a0 + a1 + 2) >> 2
+            let q6 = (a0 + 2 * a1 + a2 + 2) >> 2
+            let q7 = (a1 + 2 * a2 + a3 + 2) >> 2
+            let q8 = (l1 + 2 * l0 + p + 2) >> 2
+            let q9 = (l2 + 2 * l1 + l0 + 2) >> 2
+            put4(at, q0, q1, q2, q3)
+            put4(at + s, q4, q5, q6, q7)
+            put4(at + 2 * s, q8, q0, q1, q2)
+            put4(at + 3 * s, q9, q4, q5, q6)
+        } else if mode == 7 {
+            // B_VL_PRED
+            let q0 = (a0 + a1 + 1) >> 1
+            let q1 = (a1 + a2 + 1) >> 1
+            let q2 = (a2 + a3 + 1) >> 1
+            let q3 = (a3 + a4 + 1) >> 1
+            let q4 = (a0 + 2 * a1 + a2 + 2) >> 2
+            let q5 = (a1 + 2 * a2 + a3 + 2) >> 2
+            let q6 = (a2 + 2 * a3 + a4 + 2) >> 2
+            let q7 = (a3 + 2 * a4 + a5 + 2) >> 2
+            let q8 = (a4 + 2 * a5 + a6 + 2) >> 2
+            let q9 = (a5 + 2 * a6 + a7 + 2) >> 2
+            put4(at, q0, q1, q2, q3)
+            put4(at + s, q4, q5, q6, q7)
+            put4(at + 2 * s, q1, q2, q3, q8)
+            put4(at + 3 * s, q5, q6, q7, q9)
+        } else if mode == 8 {
+            // B_HD_PRED
+            let q0 = (l0 + p + 1) >> 1
+            let q1 = (l0 + 2 * p + a0 + 2) >> 2
+            let q2 = (p + 2 * a0 + a1 + 2) >> 2
+            let q3 = (a0 + 2 * a1 + a2 + 2) >> 2
+            let q4 = (l1 + l0 + 1) >> 1
+            let q5 = (l1 + 2 * l0 + p + 2) >> 2
+            let q6 = (l2 + l1 + 1) >> 1
+            let q7 = (l2 + 2 * l1 + l0 + 2) >> 2
+            let q8 = (l3 + l2 + 1) >> 1
+            let q9 = (l3 + 2 * l2 + l1 + 2) >> 2
+            put4(at, q0, q1, q2, q3)
+            put4(at + s, q4, q5, q0, q1)
+            put4(at + 2 * s, q6, q7, q4, q5)
+            put4(at + 3 * s, q8, q9, q6, q7)
+        } else {
+            // B_HU_PRED
+            let q0 = (l0 + l1 + 1) >> 1
+            let q1 = (l0 + 2 * l1 + l2 + 2) >> 2
+            let q2 = (l1 + l2 + 1) >> 1
+            let q3 = (l1 + 2 * l2 + l3 + 2) >> 2
+            let q4 = (l2 + l3 + 1) >> 1
+            let q5 = (l2 + 2 * l3 + l3 + 2) >> 2
+            let q6 = l3
+            put4(at, q0, q1, q2, q3)
+            put4(at + s, q2, q3, q4, q5)
+            put4(at + 2 * s, q4, q5, q6, q6)
+            put4(at + 3 * s, q6, q6, q6, q6)
+        }
+    }
+
+    // 18 luma motion compensation: one 16×16 block, or for SPLITMV each
+    // 8×8 quarter whose four vectors agree as one block, else 4×4 blocks.
+    fn lumaInter(_ b: Int, _ at: Int, _ stride: Int, _ x: Int, _ y: Int, _ pw: Int, _ ph: Int, _ rbase: Int) {
+        if mbs[b] != 9 {
+            let mv = mbs[b + 6]
+            mc(at, stride, x, y, 16, 16, vp8MvX(mv), vp8MvY(mv), pw, ph, rbase)
+            return
+        }
+        for q in 0..4 {
+            let k = (q >> 1) * 8 + (q & 1) * 2
+            let m0 = mbs[b + 8 + k]
+            let qx = x + (q & 1) * 8
+            let qy = y + (q >> 1) * 8
+            let qat = at + (q >> 1) * 8 * stride + (q & 1) * 8
+            if mbs[b + 8 + k + 1] == m0 && mbs[b + 8 + k + 4] == m0 && mbs[b + 8 + k + 5] == m0 {
+                mc(qat, stride, qx, qy, 8, 8, vp8MvX(m0), vp8MvY(m0), pw, ph, rbase)
+            } else {
+                for s in 0..4 {
+                    let kk = k + (s >> 1) * 4 + (s & 1)
+                    let m = mbs[b + 8 + kk]
+                    mc(qat + (s >> 1) * 4 * stride + (s & 1) * 4, stride, qx + (s & 1) * 4, qy + (s >> 1) * 4, 4, 4,
+                       vp8MvX(m), vp8MvY(m), pw, ph, rbase)
+                }
+            }
+        }
+    }
+
+    // Chroma motion compensation: the luma vector rounded to chroma
+    // eighths (one 8×8 block), or for SPLITMV the rounded average of each
+    // 2×2 group of luma vectors (four 4×4 blocks); full-sample vectors
+    // in version 3.
+    fn chromaInter(_ b: Int, _ at: Int, _ stride: Int, _ x: Int, _ y: Int, _ pw: Int, _ ph: Int, _ rbase: Int) {
+        let full = hdr.version == 3
+        if mbs[b] != 9 {
+            let mv = mbs[b + 6]
+            let mx = vp8MvX(mv)
+            let my = vp8MvY(mv)
+            var ux = (mx + 1 + (if mx < 0 { -2 } else { 0 })) / 2
+            var uy = (my + 1 + (if my < 0 { -2 } else { 0 })) / 2
+            if full {
+                ux = ux & (-8)
+                uy = uy & (-8)
+            }
+            mc(at, stride, x, y, 8, 8, ux, uy, pw, ph, rbase)
+            return
+        }
+        for q in 0..4 {
+            let k = (q >> 1) * 8 + (q & 1) * 2
+            let m0 = mbs[b + 8 + k]
+            let m1 = mbs[b + 8 + k + 1]
+            let m2 = mbs[b + 8 + k + 4]
+            let m3 = mbs[b + 8 + k + 5]
+            var tx = vp8MvX(m0) + vp8MvX(m1) + vp8MvX(m2) + vp8MvX(m3)
+            var ty = vp8MvY(m0) + vp8MvY(m1) + vp8MvY(m2) + vp8MvY(m3)
+            tx = if tx < 0 { (tx - 4) / 8 } else { (tx + 4) / 8 }
+            ty = if ty < 0 { (ty - 4) / 8 } else { (ty + 4) / 8 }
+            if full {
+                tx = tx & (-8)
+                ty = ty & (-8)
+            }
+            mc(at + (q >> 1) * 4 * stride + (q & 1) * 4, stride, x + (q & 1) * 4, y + (q >> 1) * 4, 4, 4, tx, ty, pw, ph, rbase)
+        }
+    }
+
+    // A bw×bh block predicted from rp (whose (0, 0) is at rbase, same
+    // stride as pl) with vector (mx, my) in eighth samples, written to pl
+    // at dst. Blocks that reach outside the pw×ph frame read a clamped
+    // copy (emu, stride 32).
+    fn mc(_ dst: Int, _ stride: Int, _ x: Int, _ y: Int, _ bw: Int, _ bh: Int, _ mx: Int, _ my: Int, _ pw: Int, _ ph: Int, _ rbase: Int) {
+        let ix = x + (mx >> 3)
+        let iy = y + (my >> 3)
+        let fx = mx & 7
+        let fy = my & 7
+        var src = rbase + iy * stride + ix
+        var ss = stride
+        var swapped = false
+        if ix < 2 || iy < 2 || ix + bw + 3 > pw || iy + bh + 3 > ph {
+            for r in 0..(bh + 5) {
+                let sy = max(0, min(ph - 1, iy - 2 + r))
+                let rowAt = rbase + sy * stride
+                for c in 0..(bw + 5) {
+                    let sx = max(0, min(pw - 1, ix - 2 + c))
+                    emu[r * 32 + c] = rp[rowAt + sx]
+                }
+            }
+            let t = rp
+            rp = emu
+            emu = t
+            src = 2 * 32 + 2
+            ss = 32
+            swapped = true
+        }
+        if fx == 0 && fy == 0 {
+            for r in 0..bh {
+                let s0 = src + r * ss
+                let d0 = dst + r * stride
+                for c in 0..bw {
+                    pl[d0 + c] = rp[s0 + c]
+                }
+            }
+        } else if fy == 0 {
+            filterH(dst, stride, src, ss, bw, bh, fx)
+        } else if fx == 0 {
+            filterV(dst, stride, src, ss, bw, bh, fy)
+        } else {
+            filterHV(dst, stride, src, ss, bw, bh, fx, fy)
+        }
+        if swapped {
+            let t = rp
+            rp = emu
+            emu = t
+        }
+    }
+
+    // Six-tap (or bilinear) horizontal filter from rp into pl.
+    fn filterH(_ dst: Int, _ ds: Int, _ src: Int, _ ss: Int, _ bw: Int, _ bh: Int, _ fx: Int) {
+        let f = filters
+        let t0 = f[fx * 6]
+        let t1 = f[fx * 6 + 1]
+        let t2 = f[fx * 6 + 2]
+        let t3 = f[fx * 6 + 3]
+        let t4 = f[fx * 6 + 4]
+        let t5 = f[fx * 6 + 5]
+        for r in 0..bh {
+            let s0 = src + r * ss
+            let d0 = dst + r * ds
+            for c in 0..bw {
+                let s = s0 + c
+                let v = (rp[s - 2] * t0 + rp[s - 1] * t1 + rp[s] * t2 + rp[s + 1] * t3 + rp[s + 2] * t4 + rp[s + 3] * t5 + 64) >> 7
+                pl[d0 + c] = vp8Clip(v)
+            }
+        }
+    }
+
+    // Six-tap (or bilinear) vertical filter from rp into pl.
+    fn filterV(_ dst: Int, _ ds: Int, _ src: Int, _ ss: Int, _ bw: Int, _ bh: Int, _ fy: Int) {
+        let f = filters
+        let t0 = f[fy * 6]
+        let t1 = f[fy * 6 + 1]
+        let t2 = f[fy * 6 + 2]
+        let t3 = f[fy * 6 + 3]
+        let t4 = f[fy * 6 + 4]
+        let t5 = f[fy * 6 + 5]
+        for r in 0..bh {
+            let s0 = src + r * ss
+            let d0 = dst + r * ds
+            for c in 0..bw {
+                let s = s0 + c
+                let v = (rp[s - 2 * ss] * t0 + rp[s - ss] * t1 + rp[s] * t2 + rp[s + ss] * t3 + rp[s + 2 * ss] * t4 + rp[s + 3 * ss] * t5 + 64) >> 7
+                pl[d0 + c] = vp8Clip(v)
+            }
+        }
+    }
+
+    // Both: horizontal over bh + 5 rows into tmp (clamped), then vertical.
+    fn filterHV(_ dst: Int, _ ds: Int, _ src: Int, _ ss: Int, _ bw: Int, _ bh: Int, _ fx: Int, _ fy: Int) {
+        let f = filters
+        var t0 = f[fx * 6]
+        var t1 = f[fx * 6 + 1]
+        var t2 = f[fx * 6 + 2]
+        var t3 = f[fx * 6 + 3]
+        var t4 = f[fx * 6 + 4]
+        var t5 = f[fx * 6 + 5]
+        for r in 0..(bh + 5) {
+            let s0 = src + (r - 2) * ss
+            let d0 = r * 16
+            for c in 0..bw {
+                let s = s0 + c
+                let v = (rp[s - 2] * t0 + rp[s - 1] * t1 + rp[s] * t2 + rp[s + 1] * t3 + rp[s + 2] * t4 + rp[s + 3] * t5 + 64) >> 7
+                tmp[d0 + c] = vp8Clip(v)
+            }
+        }
+        t0 = f[fy * 6]
+        t1 = f[fy * 6 + 1]
+        t2 = f[fy * 6 + 2]
+        t3 = f[fy * 6 + 3]
+        t4 = f[fy * 6 + 4]
+        t5 = f[fy * 6 + 5]
+        for r in 0..bh {
+            let s0 = (r + 2) * 16
+            let d0 = dst + r * ds
+            for c in 0..bw {
+                let s = s0 + c
+                let v = (tmp[s - 32] * t0 + tmp[s - 16] * t1 + tmp[s] * t2 + tmp[s + 16] * t3 + tmp[s + 32] * t4 + tmp[s + 48] * t5 + 64) >> 7
+                pl[d0 + c] = vp8Clip(v)
+            }
+        }
+    }
+
+    // 15.4 the interior limit and high edge variance threshold of every
+    // filter level, for this frame's sharpness and type.
+    fn setupFilter() {
+        let sh = hdr.sharpness
+        for lv in 0..64 {
+            var il = lv
+            if sh > 0 {
+                il = il >> (if sh > 4 { 2 } else { 1 })
+                if il > 9 - sh {
+                    il = 9 - sh
+                }
+            }
+            if il < 1 {
+                il = 1
+            }
+            lfI[lv] = il
+            var hv = 0
+            if lv >= 15 {
+                hv += 1
+            }
+            if lv >= 40 {
+                hv += 1
+            }
+            if lv >= 20 && !hdr.keyframe {
+                hv += 1
+            }
+            lfH[lv] = hv
+        }
+    }
+
+    // 15.3 the normal loop filter over plane p, macroblock by macroblock
+    // in raster order: left edge, inner vertical edges, top edge, inner
+    // horizontal edges.
+    fn filterPlane(_ p: Int) {
+        let cols = mbCols
+        let rows = mbRows
+        let R = vp8MbSize
+        let stride = if p == 0 { yStride } else { cStride }
+        let base = if p == 0 { yBase } else { cBase }
+        let n = if p == 0 { 16 } else { 8 }
+        for row in 0..rows {
+            for col in 0..cols {
+                let b = (row * cols + col) * R
+                let lv = mbs[b + 3]
+                if lv == 0 {
+                    continue
+                }
+                let il = lfI[lv]
+                let hev = lfH[lv]
+                let mbE = (lv + 2) * 2 + il
+                let subE = lv * 2 + il
+                let inner = mbs[b + 4] == 1
+                let at = base + row * n * stride + col * n
+                if col > 0 {
+                    edgeMb(at, 1, stride, n, mbE, il, hev)
+                }
+                if inner {
+                    var e = 4
+                    while e < n {
+                        edgeSub(at + e, 1, stride, n, subE, il, hev)
+                        e += 4
+                    }
+                }
+                if row > 0 {
+                    edgeMb(at, stride, 1, n, mbE, il, hev)
+                }
+                if inner {
+                    var e = 4
+                    while e < n {
+                        edgeSub(at + e * stride, stride, 1, n, subE, il, hev)
+                        e += 4
+                    }
+                }
+            }
+        }
+    }
+
+    // A macroblock edge: n positions along `along`, samples across the
+    // edge `step` apart (1 for a vertical edge, the stride for a
+    // horizontal one). filter_mb_edge, or the common filter when the edge
+    // variance is high.
+    fn edgeMb(_ at: Int, _ step: Int, _ along: Int, _ n: Int, _ e: Int, _ il: Int, _ hev: Int) {
+        var q = at
+        for _ in 0..n {
+            let p3 = pl[q - 4 * step]
+            let p2 = pl[q - 3 * step]
+            let p1 = pl[q - 2 * step]
+            let p0 = pl[q - step]
+            let q0 = pl[q]
+            let q1 = pl[q + step]
+            let q2 = pl[q + 2 * step]
+            let q3 = pl[q + 3 * step]
+            if vp8Abs(p0 - q0) * 2 + (vp8Abs(p1 - q1) >> 1) <= e && vp8Abs(p3 - p2) <= il && vp8Abs(p2 - p1) <= il &&
+                vp8Abs(p1 - p0) <= il && vp8Abs(q3 - q2) <= il && vp8Abs(q2 - q1) <= il && vp8Abs(q1 - q0) <= il {
+                if vp8Abs(p1 - p0) > hev || vp8Abs(q1 - q0) > hev {
+                    let a = vp8S8(vp8S8(p1 - q1) + 3 * (q0 - p0))
+                    let f1 = min(a + 4, 127) >> 3
+                    let f2 = min(a + 3, 127) >> 3
+                    pl[q - step] = vp8Clip(p0 + f2)
+                    pl[q] = vp8Clip(q0 - f1)
+                } else {
+                    let w = vp8S8(vp8S8(p1 - q1) + 3 * (q0 - p0))
+                    var a = (27 * w + 63) >> 7
+                    pl[q - step] = vp8Clip(p0 + a)
+                    pl[q] = vp8Clip(q0 - a)
+                    a = (18 * w + 63) >> 7
+                    pl[q - 2 * step] = vp8Clip(p1 + a)
+                    pl[q + step] = vp8Clip(q1 - a)
+                    a = (9 * w + 63) >> 7
+                    pl[q - 3 * step] = vp8Clip(p2 + a)
+                    pl[q + 2 * step] = vp8Clip(q2 - a)
+                }
+            }
+            q += along
+        }
+    }
+
+    // A subblock edge (filter_common, with the outer taps only when the
+    // edge variance is high).
+    fn edgeSub(_ at: Int, _ step: Int, _ along: Int, _ n: Int, _ e: Int, _ il: Int, _ hev: Int) {
+        var q = at
+        for _ in 0..n {
+            let p3 = pl[q - 4 * step]
+            let p2 = pl[q - 3 * step]
+            let p1 = pl[q - 2 * step]
+            let p0 = pl[q - step]
+            let q0 = pl[q]
+            let q1 = pl[q + step]
+            let q2 = pl[q + 2 * step]
+            let q3 = pl[q + 3 * step]
+            if vp8Abs(p0 - q0) * 2 + (vp8Abs(p1 - q1) >> 1) <= e && vp8Abs(p3 - p2) <= il && vp8Abs(p2 - p1) <= il &&
+                vp8Abs(p1 - p0) <= il && vp8Abs(q3 - q2) <= il && vp8Abs(q2 - q1) <= il && vp8Abs(q1 - q0) <= il {
+                let hv = vp8Abs(p1 - p0) > hev || vp8Abs(q1 - q0) > hev
+                var a = 3 * (q0 - p0)
+                if hv {
+                    a += vp8S8(p1 - q1)
+                }
+                a = vp8S8(a)
+                let f1 = min(a + 4, 127) >> 3
+                let f2 = min(a + 3, 127) >> 3
+                pl[q - step] = vp8Clip(p0 + f2)
+                pl[q] = vp8Clip(q0 - f1)
+                if !hv {
+                    let a2 = (f1 + 1) >> 1
+                    pl[q - 2 * step] = vp8Clip(p1 + a2)
+                    pl[q + step] = vp8Clip(q1 - a2)
+                }
+            }
+            q += along
+        }
+    }
+
+    // 15.2 the simple loop filter (luma only).
+    fn filterSimple() {
+        let cols = mbCols
+        let rows = mbRows
+        let R = vp8MbSize
+        let stride = yStride
+        for row in 0..rows {
+            for col in 0..cols {
+                let b = (row * cols + col) * R
+                let lv = mbs[b + 3]
+                if lv == 0 {
+                    continue
+                }
+                let il = lfI[lv]
+                let mbE = (lv + 2) * 2 + il
+                let subE = lv * 2 + il
+                let inner = mbs[b + 4] == 1
+                let at = yBase + row * 16 * stride + col * 16
+                if col > 0 {
+                    edgeSimple(at, 1, stride, mbE)
+                }
+                if inner {
+                    edgeSimple(at + 4, 1, stride, subE)
+                    edgeSimple(at + 8, 1, stride, subE)
+                    edgeSimple(at + 12, 1, stride, subE)
+                }
+                if row > 0 {
+                    edgeSimple(at, stride, 1, mbE)
+                }
+                if inner {
+                    edgeSimple(at + 4 * stride, stride, 1, subE)
+                    edgeSimple(at + 8 * stride, stride, 1, subE)
+                    edgeSimple(at + 12 * stride, stride, 1, subE)
+                }
+            }
+        }
+    }
+
+    fn edgeSimple(_ at: Int, _ step: Int, _ along: Int, _ e: Int) {
+        var q = at
+        for _ in 0..16 {
+            let p1 = pl[q - 2 * step]
+            let p0 = pl[q - step]
+            let q0 = pl[q]
+            let q1 = pl[q + step]
+            if vp8Abs(p0 - q0) * 2 + (vp8Abs(p1 - q1) >> 1) <= e {
+                let a = vp8S8(vp8S8(p1 - q1) + 3 * (q0 - p0))
+                let f1 = min(a + 4, 127) >> 3
+                let f2 = min(a + 3, 127) >> 3
+                pl[q - step] = vp8Clip(p0 + f2)
+                pl[q] = vp8Clip(q0 - f1)
+            }
+            q += along
+        }
+    }
+}
+
+fn vp8Clip(_ v: Int) -> Int {
+    if v < 0 {
+        return 0
+    }
+    if v > 255 {
+        return 255
+    }
+    v
+}
+
+fn vp8S8(_ v: Int) -> Int {
+    if v < -128 {
+        return -128
+    }
+    if v > 127 {
+        return 127
+    }
+    v
+}
+
+fn vp8S16(_ v: Int) -> Int {
+    ((v + 32768) & 65535) - 32768
+}
+
+fn vp8Abs(_ v: Int) -> Int {
+    if v < 0 {
+        return -v
+    }
+    v
+}

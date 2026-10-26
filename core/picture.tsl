@@ -1,0 +1,170 @@
+// A decoded video picture, as every video decoder hands it on, and the
+// colour facts the renderer needs to turn it into screen pixels.
+//
+// Samples are Ints from 0 to 2^depth - 1, one per list item, in planes
+// with a stride (items per row) that may be wider than the picture, and
+// an offset to the visible top left corner (decoders keep padding and
+// cropped edges). For 4:2:0 the chroma planes are half the size each way
+// (rounded up); for 4:2:2 half the width; for 4:4:4 full size; `gray` has
+// no chroma planes (u and v empty).
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+public enum Chroma {
+    yuv420, yuv422, yuv444, gray
+}
+
+// How Y'CbCr maps to R'G'B'. `rgb`: the planes aren't Y'CbCr but G, B, R
+// in y, u, v (4:4:4, full range), as DNxHR 444 RGB comes out.
+public enum ColorMatrix {
+    bt601, bt709, bt2020, unknown, rgb
+}
+
+public struct Picture {
+    // Visible size in samples.
+    width: Int
+    height: Int
+    chroma: Chroma = .yuv420
+    depth: Int = 8
+    y: [Int] = []
+    u: [Int] = []
+    v: [Int] = []
+    yStride: Int = 0
+    cStride: Int = 0
+    // Index of the visible top-left sample in y, and in u and v.
+    yOffset: Int = 0
+    cOffset: Int = 0
+    matrix: ColorMatrix = .unknown
+    // Full-range (0…255) samples rather than video range (16…235).
+    fullRange: Bool = false
+    // Ticks of the track's clock (core.noTime when not known).
+    pts: Int = -9223372036854775807
+    duration: Int = 0
+    key: Bool = false
+    sarNum: Int = 1
+    sarDen: Int = 1
+    // Interlaced content (two fields woven into one picture) as the
+    // stream says, when the decoder knows; `topFieldFirst` gives the
+    // field order. Deinterlacing (vfx) uses them.
+    interlaced: Bool = false
+    topFieldFirst: Bool = true
+
+    // The luma sample at x, y of the visible picture.
+    fn luma(_ x: Int, _ y0: Int) -> Int {
+        y[yOffset + y0 * yStride + x]
+    }
+
+    // The chroma samples at x, y of the chroma planes' visible area.
+    fn cb(_ x: Int, _ y0: Int) -> Int {
+        u[cOffset + y0 * cStride + x]
+    }
+
+    fn cr(_ x: Int, _ y0: Int) -> Int {
+        v[cOffset + y0 * cStride + x]
+    }
+
+    // Size of the visible chroma planes.
+    chromaWidth: Int {
+        match chroma {
+            .yuv420 -> (width + 1) / 2
+            .yuv422 -> (width + 1) / 2
+            .yuv444 -> width
+            .gray -> 0
+        }
+    }
+
+    chromaHeight: Int {
+        match chroma {
+            .yuv420 -> (height + 1) / 2
+            .yuv422 -> height
+            .yuv444 -> height
+            .gray -> 0
+        }
+    }
+}
+
+// The matrix to use when the stream doesn't say: BT.709 for HD sizes,
+// BT.601 below.
+public fn guessMatrix(width: Int, height: Int) -> ColorMatrix {
+    if width >= 1280 || height > 576 {
+        return .bt709
+    }
+    ColorMatrix.bt601
+}
+
+// A list of n zeros (planes start this way).
+public fn zeros(_ n: Int) -> [Int] {
+    var out: [Int] = []
+    var i = 0
+    while i < n {
+        out.append(0)
+        i += 1
+    }
+    out
+}
+
+// A list of n copies of v.
+public fn filled(_ n: Int, _ v: Int) -> [Int] {
+    var out: [Int] = []
+    var i = 0
+    while i < n {
+        out.append(v)
+        i += 1
+    }
+    out
+}
+
+// A blank picture (black, video range) with tight planes.
+public fn blankPicture(width: Int, height: Int, chroma: Chroma = .yuv420, depth: Int = 8) -> Picture {
+    var p = Picture(width: width, height: height, chroma: chroma, depth: depth)
+    p.yStride = width
+    p.y = filled(width * height, 16 << (depth - 8))
+    if chroma != .gray {
+        p.cStride = p.chromaWidth
+        let n = p.chromaWidth * p.chromaHeight
+        p.u = filled(n, 128 << (depth - 8))
+        p.v = filled(n, 128 << (depth - 8))
+    }
+    p.matrix = guessMatrix(width: width, height: height)
+    p
+}
+
+// The visible samples as bytes, Y then U then V, row by row, as ffmpeg's
+// `-f framemd5` hashes 8-bit pictures (16-bit little-endian samples for
+// depth > 8). Tests compare `pictureBytes(p).hash("md5").hex` with it.
+public fn pictureBytes(_ p: Picture) -> Data {
+    var bytes: [Int] = []
+    let wide = p.depth > 8
+    for row in 0..p.height {
+        let base = p.yOffset + row * p.yStride
+        for x in 0..p.width {
+            let s = p.y[base + x]
+            if wide {
+                bytes.append(s & 255)
+                bytes.append(s >> 8)
+            } else {
+                bytes.append(s)
+            }
+        }
+    }
+    if p.chroma != .gray {
+        let cw = p.chromaWidth
+        let ch = p.chromaHeight
+        for plane in 0..2 {
+            for row in 0..ch {
+                let base = p.cOffset + row * p.cStride
+                for x in 0..cw {
+                    let s = if plane == 0 { p.u[base + x] } else { p.v[base + x] }
+                    if wide {
+                        bytes.append(s & 255)
+                        bytes.append(s >> 8)
+                    } else {
+                        bytes.append(s)
+                    }
+                }
+            }
+        }
+    }
+    Data(bytes: bytes)
+}

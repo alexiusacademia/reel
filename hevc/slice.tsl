@@ -1,0 +1,383 @@
+// HEVC slice segment headers (ITU-T H.265 7.3.6.1, semantics 7.4.7.1),
+// with long-term reference pictures, reference picture list modification
+// (7.3.6.2), the prediction weight table (7.3.6.3) and entry points.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+let sliceB = 0
+let sliceP = 1
+let sliceI = 2
+
+struct HevcSlice {
+    valid: Bool = false
+    nalType: Int = 0
+    temporalId: Int = 0
+    firstSliceInPic: Bool = true
+    noOutputOfPriorPics: Bool = false
+    ppsId: Int = 0
+    dependent: Bool = false
+    segmentAddress: Int = 0
+    sliceType: Int = 2
+    picOutput: Bool = true
+    pocLsb: Int = 0
+    rps: HevcRps = HevcRps()
+    // Long-term pictures: POC LSBs (or full POCs when msbPresent), used by
+    // the current picture, whether the MSB part was given.
+    ltPoc: [Int] = []
+    ltUsed: [Int] = []
+    ltMsbPresent: [Int] = []
+    ltMsbCycle: [Int] = []
+    temporalMvp: Bool = false
+    saoLuma: Bool = false
+    saoChroma: Bool = false
+    numRefIdx0: Int = 0
+    numRefIdx1: Int = 0
+    listEntry0: [Int] = []
+    listEntry1: [Int] = []
+    modList0: Bool = false
+    modList1: Bool = false
+    mvdL1Zero: Bool = false
+    cabacInit: Bool = false
+    collocatedFromL0: Bool = true
+    collocatedRefIdx: Int = 0
+    // Weighted prediction: per reference, luma weight and offset, Cb
+    // weight/offset, Cr weight/offset (offsets in 8-bit units).
+    weighted: Bool = false
+    lumaDenom: Int = 0
+    chromaDenom: Int = 0
+    wt0: [Int] = []
+    wt1: [Int] = []
+    maxNumMergeCand: Int = 5
+    sliceQp: Int = 26
+    cbQpOffset: Int = 0
+    crQpOffset: Int = 0
+    deblockingDisabled: Bool = false
+    betaOffsetDiv2: Int = 0
+    tcOffsetDiv2: Int = 0
+    loopFilterAcrossSlices: Bool = false
+    // Entry points as RBSP byte offsets of each substream after the first,
+    // and where the slice data starts in the RBSP.
+    entryPoints: [Int] = []
+    dataOffset: Int = 0
+    numPicTotalCurr: Int = 0
+
+    isIntra: Bool { sliceType == 2 }
+}
+
+// Reads a slice segment header; `prev` is the last independent slice
+// segment header of the picture (dependent segments copy it). sps and pps
+// are the active ones for the header's PPS id (checked by the caller).
+fn hevcParseSliceHeader(_ ps: HevcPs, _ rbsp: HevcRbsp, nalType: Int, temporalId: Int, spsList: [HevcSps], ppsList: [HevcPps], prev: HevcSlice) -> HevcSlice {
+    var p = ps
+    var h = HevcSlice()
+    h.nalType = nalType
+    h.temporalId = temporalId
+    h.firstSliceInPic = p.flag()
+    if nalType >= 16 && nalType <= 23 {
+        h.noOutputOfPriorPics = p.flag()
+    }
+    h.ppsId = p.ue()
+    if h.ppsId > 63 || !ppsList[h.ppsId].valid {
+        return h
+    }
+    let pps = ppsList[h.ppsId]
+    let sps = spsList[pps.spsId]
+    if !sps.valid {
+        return h
+    }
+    let picSizeInCtbs = sps.picWidthInCtbs * sps.picHeightInCtbs
+    if !h.firstSliceInPic {
+        if pps.dependentSliceSegments {
+            h.dependent = p.flag()
+        }
+        h.segmentAddress = p.bits(hevcCeilLog2(picSizeInCtbs))
+        if h.segmentAddress >= picSizeInCtbs {
+            return h
+        }
+    }
+    if h.dependent {
+        // Everything but the segment's own fields comes from the slice.
+        let first = h.firstSliceInPic
+        let addr = h.segmentAddress
+        let nopp = h.noOutputOfPriorPics
+        h = prev
+        h.valid = false
+        h.nalType = nalType
+        h.temporalId = temporalId
+        h.firstSliceInPic = first
+        h.segmentAddress = addr
+        h.noOutputOfPriorPics = nopp
+        h.dependent = true
+        h.entryPoints = []
+    } else {
+        p.r.skip(pps.numExtraSliceHeaderBits)
+        h.sliceType = p.ue()
+        if h.sliceType > 2 {
+            return h
+        }
+        if pps.outputFlagPresent {
+            h.picOutput = p.flag()
+        }
+        if nalType != nalIdrWRadl && nalType != nalIdrNLp {
+            h.pocLsb = p.bits(sps.log2MaxPocLsb)
+            let fromSps = p.flag()
+            if !fromSps {
+                h.rps = p.parseStRps(sps.stRps.count, sps.stRps, inSlice: true)
+            } else {
+                var idx = 0
+                if sps.stRps.count > 1 {
+                    idx = p.bits(hevcCeilLog2(sps.stRps.count))
+                }
+                if idx >= sps.stRps.count {
+                    return h
+                }
+                h.rps = sps.stRps[idx]
+            }
+            if sps.longTermPresent {
+                var numLtSps = 0
+                if sps.ltPocLsbSps.count > 0 {
+                    numLtSps = p.ue()
+                }
+                let numLtPics = p.ue()
+                if numLtSps > sps.ltPocLsbSps.count || numLtSps + numLtPics > 32 {
+                    return h
+                }
+                for i in 0..(numLtSps + numLtPics) {
+                    if i < numLtSps {
+                        var idx = 0
+                        if sps.ltPocLsbSps.count > 1 {
+                            idx = p.bits(hevcCeilLog2(sps.ltPocLsbSps.count))
+                        }
+                        h.ltPoc.append(sps.ltPocLsbSps[min(idx, sps.ltPocLsbSps.count - 1)])
+                        h.ltUsed.append(sps.ltUsedSps[min(idx, sps.ltPocLsbSps.count - 1)])
+                    } else {
+                        h.ltPoc.append(p.bits(sps.log2MaxPocLsb))
+                        h.ltUsed.append(p.bits(1))
+                    }
+                    let present = p.bits(1)
+                    h.ltMsbPresent.append(present)
+                    var cycle = 0
+                    if present == 1 {
+                        cycle = p.ue()
+                    }
+                    // DeltaPocMsbCycleLt (7-52) accumulates within each group.
+                    if i != 0 && i != numLtSps {
+                        cycle += h.ltMsbCycle[i - 1]
+                    }
+                    h.ltMsbCycle.append(cycle)
+                }
+            }
+            if sps.temporalMvp {
+                h.temporalMvp = p.flag()
+            }
+        }
+        if sps.saoEnabled {
+            h.saoLuma = p.flag()
+            if sps.chromaFormatIdc != 0 {
+                h.saoChroma = p.flag()
+            }
+        }
+        var total = 0
+        for u in h.rps.used0 {
+            total += u
+        }
+        for u in h.rps.used1 {
+            total += u
+        }
+        for u in h.ltUsed {
+            total += u
+        }
+        h.numPicTotalCurr = total
+        if h.sliceType != sliceI {
+            h.numRefIdx0 = pps.numRefIdxL0Default
+            if h.sliceType == sliceB {
+                h.numRefIdx1 = pps.numRefIdxL1Default
+            }
+            if p.flag() {
+                h.numRefIdx0 = p.ue() + 1
+                if h.sliceType == sliceB {
+                    h.numRefIdx1 = p.ue() + 1
+                }
+            }
+            if h.numRefIdx0 > 16 || h.numRefIdx1 > 16 {
+                return h
+            }
+            if pps.listsModification && h.numPicTotalCurr > 1 {
+                let n = hevcCeilLog2(h.numPicTotalCurr)
+                h.modList0 = p.flag()
+                if h.modList0 {
+                    for _ in 0..h.numRefIdx0 {
+                        h.listEntry0.append(p.bits(n))
+                    }
+                }
+                if h.sliceType == sliceB {
+                    h.modList1 = p.flag()
+                    if h.modList1 {
+                        for _ in 0..h.numRefIdx1 {
+                            h.listEntry1.append(p.bits(n))
+                        }
+                    }
+                }
+            }
+            if h.sliceType == sliceB {
+                h.mvdL1Zero = p.flag()
+            }
+            if pps.cabacInitPresent {
+                h.cabacInit = p.flag()
+            }
+            if h.temporalMvp {
+                if h.sliceType == sliceB {
+                    h.collocatedFromL0 = p.flag()
+                }
+                if (h.collocatedFromL0 && h.numRefIdx0 > 1) || (!h.collocatedFromL0 && h.numRefIdx1 > 1) {
+                    h.collocatedRefIdx = p.ue()
+                }
+            }
+            if (pps.weightedPred && h.sliceType == sliceP) || (pps.weightedBipred && h.sliceType == sliceB) {
+                hevcParseWeights(p, h, sps.chromaFormatIdc != 0)
+            }
+            h.maxNumMergeCand = 5 - p.ue()
+            if h.maxNumMergeCand < 1 || h.maxNumMergeCand > 5 {
+                return h
+            }
+        }
+        h.sliceQp = pps.initQp + p.se()
+        if h.sliceQp < -6 * (sps.bitDepth - 8) || h.sliceQp > 51 {
+            return h
+        }
+        if pps.sliceChromaQpOffsetsPresent {
+            h.cbQpOffset = p.se()
+            h.crQpOffset = p.se()
+        }
+        h.deblockingDisabled = pps.deblockingDisabled
+        h.betaOffsetDiv2 = pps.betaOffsetDiv2
+        h.tcOffsetDiv2 = pps.tcOffsetDiv2
+        var override = false
+        if pps.deblockingOverrideEnabled {
+            override = p.flag()
+        }
+        if override {
+            h.deblockingDisabled = p.flag()
+            if !h.deblockingDisabled {
+                h.betaOffsetDiv2 = p.se()
+                h.tcOffsetDiv2 = p.se()
+            }
+        }
+        h.loopFilterAcrossSlices = pps.loopFilterAcrossSlices
+        if pps.loopFilterAcrossSlices && (h.saoLuma || h.saoChroma || !h.deblockingDisabled) {
+            h.loopFilterAcrossSlices = p.flag()
+        }
+    }
+    if pps.tiles || pps.entropySync {
+        let n = p.ue()
+        if n > picSizeInCtbs {
+            return h
+        }
+        if n > 0 {
+            let len = p.ue() + 1
+            if len > 32 {
+                return h
+            }
+            var offs: [Int] = []
+            for _ in 0..n {
+                offs.append(p.r.long(len) + 1)
+            }
+            h.entryPoints = offs
+        }
+    }
+    if pps.sliceHeaderExtension {
+        let len = p.ue()
+        p.r.skip(len * 8)
+    }
+    // byte_alignment(): a 1 bit and zeros up to the byte boundary.
+    p.bits(1)
+    p.r.alignToByte()
+    if p.r.overrun {
+        return h
+    }
+    h.dataOffset = p.r.bytePosition
+    // Entry point offsets count slice data bytes of the NAL payload, which
+    // still has its emulation prevention bytes: map them to the RBSP.
+    if !h.entryPoints.isEmpty {
+        // Payload offset of the slice data: the RBSP offset plus the
+        // removed bytes before it (+2 for the NAL header, which the RBSP
+        // keeps).
+        var payload = h.dataOffset
+        var k = 0
+        while k < rbsp.removed.count && rbsp.removed[k] <= payload {
+            payload += 1
+            k += 1
+        }
+        var out: [Int] = []
+        for off in h.entryPoints {
+            payload += off
+            out.append(rbsp.rbspOffset(payload))
+        }
+        h.entryPoints = out
+    }
+    h.valid = true
+    h
+}
+
+// pred_weight_table() (7.3.6.3) into h.wt0 / h.wt1: six values per
+// reference (luma weight, luma offset, Cb weight, Cb offset, Cr weight, Cr
+// offset), offsets in 8-bit units.
+fn hevcParseWeights(_ p: bind HevcPs, _ h: bind HevcSlice, _ chroma: Bool) {
+    h.weighted = true
+    h.lumaDenom = p.ue()
+    if h.lumaDenom > 7 {
+        p.r.overrun = true
+        return
+    }
+    h.chromaDenom = h.lumaDenom
+    if chroma {
+        h.chromaDenom = h.lumaDenom + p.se()
+        if h.chromaDenom < 0 || h.chromaDenom > 7 {
+            p.r.overrun = true
+            return
+        }
+    }
+    for list in 0..2 {
+        let n = if list == 0 { h.numRefIdx0 } else { h.numRefIdx1 }
+        if list == 1 && h.sliceType != sliceB {
+            break
+        }
+        var lumaFlags: [Int] = []
+        var chromaFlags: [Int] = []
+        for _ in 0..n {
+            lumaFlags.append(p.bits(1))
+        }
+        for _ in 0..n {
+            chromaFlags.append(if chroma { p.bits(1) } else { 0 })
+        }
+        var wt: [Int] = []
+        for i in 0..n {
+            var lw = 1 << h.lumaDenom
+            var lo = 0
+            if lumaFlags[i] == 1 {
+                lw += p.se()
+                lo = p.se()
+            }
+            wt.append(lw)
+            wt.append(lo)
+            for _ in 0..2 {
+                var cw = 1 << h.chromaDenom
+                var co = 0
+                if chromaFlags[i] == 1 {
+                    cw += p.se()
+                    let delta = p.se()
+                    // ChromaOffset (7-56) with wpOffsetHalfRangeC = 128.
+                    co = max(-128, min(127, (128 - ((128 * cw) >> h.chromaDenom)) + delta))
+                }
+                wt.append(cw)
+                wt.append(co)
+            }
+        }
+        if list == 0 {
+            h.wt0 = wt
+        } else {
+            h.wt1 = wt
+        }
+    }
+}

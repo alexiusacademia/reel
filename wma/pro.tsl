@@ -1,0 +1,1289 @@
+// Windows Media Audio 9 Professional (WAVE format tag 0x162): the decoder
+// engine, following the bitstream as the FFmpeg project documented it
+// (libavcodec/wmaprodec.c), whose output it matches.
+//
+// Setup (WAVEFORMATEX extra, 18 bytes): bits per sample, channel mask,
+// decode flags (frame size, subframe count, length prefix, DRC).
+// A packet (nBlockAlign bytes) starts with a sequence number and the
+// number of bits that finish the frame begun in the previous packet;
+// frames run across packets through a bit reservoir. A frame ("tile")
+// splits each channel into subframes of power-of-two sizes; channels with
+// a subframe at the same place are decoded together: channel transforms
+// (M/S, rotation matrices for groups of channels, per band), vector and
+// run-level Huffman coefficients, DPCM or run-level scale factors per
+// band, quantization step, then a half-length inverse MDCT and sine-window
+// overlap-add per channel. Up to 8 channels; output in the channel mask's
+// (WAV) order.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../core"
+
+let proMaxChannels = 8
+let proMaxSubframes = 32
+let proMaxBands = 29
+let proBlockMinBits = 6
+let proBlockMaxBits = 13
+let proBlockMax = 8192
+let proOutStride = 12288
+let proMaxFrame = 32768
+
+struct WmaPro {
+    nbChannels: Int = 0
+    rate: Int = 0
+    blockAlign: Int = 0
+    decodeFlags: Int = 0
+    channelMask: Int = 0
+    bitsPerSample: Int = 16
+    lenPrefix: Bool = false
+    drc: Bool = false
+    samplesPerFrame: Int = 2048
+    log2FrameSize: Int = 0
+    lfeChannel: Int = -1
+    maxNumSubframes: Int = 1
+    subframeLenBits: Int = 0
+    maxSubframeLenBit: Bool = false
+    minSamplesPerSubframe: Int = 0
+    numSfb: [Int] = []
+    // [block size][band] (29 a size), and [size][size][band].
+    sfbOffsets: [Int] = []
+    sfOffsets: [Int] = []
+    subwooferCutoffs: [Int] = []
+
+    // Huffman tables.
+    sfVlc: [Int] = []
+    sfRlVlc: [Int] = []
+    coefVlc0: [Int] = []
+    coefVlc1: [Int] = []
+    vec4Vlc: [Int] = []
+    vec2Vlc: [Int] = []
+    vec1Vlc: [Int] = []
+    coef0Run: [Int] = []
+    coef1Run: [Int] = []
+    coef0Level: [Float] = []
+    coef1Level: [Float] = []
+    rlRun: [Int] = []
+    rlLevel: [Int] = []
+    sin64: [Float] = []
+    windows: [[Float]] = []
+    mdct: WmaMdct = WmaMdct()
+    tmp: [Float] = []
+
+    // Packet state.
+    pbr: core.BitReader = core.bitReader(Data())
+    packetBits: Int = 0
+    packetSequenceNumber: Int = 0
+    packetLoss: Bool = true
+    packetDone: Bool = false
+    // The bit reservoir: frame data written bit by bit.
+    frameData: [Int] = []
+    pbBits: Int = 0
+    numSavedBits: Int = 0
+    frameOffset: Int = 0
+    br: core.BitReader = core.bitReader(Data())
+
+    // Frame state.
+    skipFrame: Bool = true
+    trimStart: Int = 0
+    trimEnd: Int = 0
+    parsedAllSubframes: Bool = false
+    subframeLen: Int = 0
+    channelsForCurSubframe: Int = 0
+    channelIndexes: [Int] = []
+    numBands: Int = 0
+    transmitNumVecCoeffs: Bool = false
+    tableIdx: Int = 0
+    escLen: Int = 0
+
+    // Per channel.
+    prevBlockLen: [Int] = []
+    transmitCoefs: [Bool] = []
+    numSubframes: [Int] = []
+    chSubframeLen: [Int] = []
+    chSubframeOffset: [Int] = []
+    curSubframe: [Int] = []
+    decodedSamples: [Int] = []
+    grouped: [Bool] = []
+    quantStep: [Int] = []
+    reuseSf: [Bool] = []
+    scaleFactorStep: [Int] = []
+    maxScaleFactor: [Int] = []
+    // [channel][2][band].
+    savedScaleFactors: [Int] = []
+    scaleFactorIdx: [Int] = []
+    // Which saved buffer the scale factors in use are (0 or 1).
+    sfBuf: [Int] = []
+    chTableIdx: [Int] = []
+    numVecCoeffs: [Int] = []
+    // Where the subframe's coefficients are in the channel's `out`.
+    coeffsAt: [Int] = []
+    out: [Float] = []
+
+    // Channel groups.
+    numChgroups: Int = 0
+    grpNumChannels: [Int] = []
+    grpTransform: [Bool] = []
+    grpTransformBand: [Bool] = []
+    grpMatrix: [Float] = []
+    grpChannels: [Int] = []
+
+    // Decoded samples of this packet, interleaved.
+    samples: [Float] = []
+    warnings: [String] = []
+
+    fn readVlc(_ t: [Int], _ bits: Int) -> Int {
+        var e = t[br.peek(bits)]
+        if e > 0 {
+            br.bits(e & 31)
+            return e >> 5
+        }
+        var nb = bits
+        while e < 0 {
+            br.bits(nb)
+            let p = -e
+            nb = p & 31
+            e = t[(p >> 5) + br.peek(nb)]
+        }
+        if e == 0 {
+            return -1
+        }
+        br.bits(e & 31)
+        e >> 5
+    }
+
+    // ff_wma_get_large_val: an uncompressed value of 8, 16, 24 or 31 bits.
+    fn largeVal() -> Int {
+        var n = 8
+        if br.flag() {
+            n += 8
+            if br.flag() {
+                n += 8
+                if br.flag() {
+                    n += 7
+                }
+            }
+        }
+        br.long(n)
+    }
+
+    // Bits read of the frame data.
+    count: Int {
+        br.position
+    }
+
+    // ---- Bit reservoir (save_bits) ----
+
+    fn putBits(_ v: Int, _ n: Int) {
+        var k = n - 1
+        while k >= 0 {
+            let bit = (v >> k) & 1
+            let byte = pbBits >> 3
+            while frameData.count <= byte {
+                frameData.append(0)
+            }
+            if bit == 1 {
+                frameData[byte] = frameData[byte] | (0x80 >> (pbBits & 7))
+            }
+            pbBits += 1
+            k -= 1
+        }
+    }
+
+    // Copies `n` bits from the packet reader into the frame data.
+    fn copyBits(_ n: Int) {
+        var left = n
+        while left > 0 {
+            let k = min(left, 24)
+            putBits(pbr.bits(k), k)
+            left -= k
+        }
+    }
+
+    // save_bits: `len` bits of the packet at its reader into the frame
+    // data, appended or starting afresh.
+    fn saveBits(_ len: Int, append: Bool) {
+        var buflen = 0
+        let pos = pbr.position
+        if !append {
+            frameOffset = pos & 7
+            numSavedBits = frameOffset
+            frameData = []
+            pbBits = 0
+            buflen = (numSavedBits + len + 7) >> 3
+        } else {
+            buflen = (pbBits + len + 7) >> 3
+        }
+        if len <= 0 || buflen > proMaxFrame {
+            packetLoss = true
+            return
+        }
+        numSavedBits += len
+        if !append {
+            // Copy from the start of the byte holding the reader, then the
+            // first frame_offset bits are skipped when reading.
+            let back = pbr
+            pbr.seek(toBit: pos - frameOffset)
+            copyBits(numSavedBits)
+            pbr = back
+            pbr.skip(len)
+        } else {
+            copyBits(len)
+        }
+        var bytes = frameData
+        let need = (numSavedBits + 7) >> 3
+        while bytes.count < need {
+            bytes.append(0)
+        }
+        br = core.bitReaderRange(Data(bytes: bytes), from: 0, to: need)
+        br.bits(frameOffset)
+    }
+
+    // ---- Packets (decode_packet) ----
+
+    // One packet of nBlockAlign bytes; decoded frames go to `samples`.
+    fn decodePacket(_ buf: Data) {
+        packetDone = false
+        packetBits = buf.count * 8
+        pbr = core.bitReader(buf)
+        let seq = pbr.bits(4)
+        pbr.bits(2)
+        var prevBits = pbr.bits(log2FrameSize)
+        if !packetLoss && ((packetSequenceNumber + 1) & 15) != seq {
+            packetLoss = true
+            note("WMA Pro: packet loss (sequence {packetSequenceNumber} then {seq})")
+        }
+        packetSequenceNumber = seq
+        if prevBits > 0 {
+            let remaining = packetBits - pbr.position
+            if prevBits >= remaining {
+                prevBits = remaining
+                packetDone = true
+            }
+            saveBits(prevBits, append: true)
+            if !packetLoss {
+                decodeFrame()
+            }
+        }
+        if packetLoss {
+            numSavedBits = 0
+            packetLoss = false
+        }
+        afterCall()
+        // Further frames in this packet, one a call as ffmpeg does.
+        // (A frame takes at least a few bits, so this ends; the count is a
+        // guard against damaged data that doesn't move on.)
+        var guardCount = 0
+        while !packetDone && guardCount < 100000 {
+            guardCount += 1
+            let remaining = packetBits - pbr.position
+            if lenPrefix && remaining > log2FrameSize {
+                let frameSize = pbr.peek(log2FrameSize)
+                if frameSize > 0 && frameSize <= remaining {
+                    saveBits(frameSize, append: false)
+                    if !packetLoss {
+                        packetDone = !decodeFrame()
+                    }
+                } else {
+                    packetDone = true
+                }
+            } else if !lenPrefix && numSavedBits > count {
+                packetDone = !decodeFrame()
+            } else {
+                packetDone = true
+            }
+            afterCall()
+            if packetLoss {
+                return
+            }
+        }
+    }
+
+    // The end of each decode_packet call: an overread loses the packet;
+    // when done, what's left is saved for the next packet.
+    fn afterCall() {
+        let remaining = packetBits - pbr.position
+        if remaining < 0 {
+            packetLoss = true
+            packetDone = true
+        }
+        if packetDone && !packetLoss && remaining > 0 {
+            saveBits(remaining, append: false)
+        }
+    }
+
+    fn note(_ w: String) {
+        if warnings.count < 20 && !warnings.contains(w) {
+            warnings.append(w)
+        }
+    }
+
+    // ---- Frames (decode_frame) ----
+
+    // One frame; returns whether more frames follow in the packet.
+    fn decodeFrame() -> Bool {
+        var len = 0
+        if lenPrefix {
+            len = br.bits(log2FrameSize)
+        }
+        if !decodeTileHeader() {
+            note("WMA Pro: a damaged frame (tile header) was skipped")
+            packetLoss = true
+            return false
+        }
+        // Post-processing transform.
+        if nbChannels > 1 && br.flag() {
+            if br.flag() {
+                for _ in 0..(nbChannels * nbChannels) {
+                    br.bits(4)
+                }
+            }
+        }
+        if drc {
+            br.bits(8)
+        }
+        if br.flag() {
+            let tb = wmaLog2(samplesPerFrame * 2)
+            if br.flag() {
+                trimStart = br.bits(tb)
+            }
+            if br.flag() {
+                trimEnd = br.bits(tb)
+            }
+        } else {
+            trimStart = 0
+            trimEnd = 0
+        }
+        parsedAllSubframes = false
+        for i in 0..nbChannels {
+            decodedSamples[i] = 0
+            curSubframe[i] = 0
+            reuseSf[i] = false
+        }
+        while !parsedAllSubframes {
+            if !decodeSubframe() {
+                note("WMA Pro: a damaged frame (subframe) was skipped")
+                packetLoss = true
+                return false
+            }
+        }
+        // Output: the first samples_per_frame of each channel, trimmed.
+        if skipFrame {
+            skipFrame = false
+        } else {
+            var from = 0
+            var to = samplesPerFrame
+            if trimStart > 0 {
+                if trimStart < to {
+                    from = trimStart
+                } else {
+                    to = 0
+                }
+            }
+            if trimEnd > 0 {
+                if trimEnd < to - from {
+                    to -= trimEnd
+                } else {
+                    to = from
+                }
+            }
+            let c = nbChannels
+            let o = samples.count
+            if to > from {
+                for _ in 0..((to - from) * c) {
+                    samples.append(0.0)
+                }
+                for ch in 0..c {
+                    let base = ch * proOutStride
+                    var k = o + ch
+                    for i in from..to {
+                        samples[k] = out[base + i]
+                        k += c
+                    }
+                }
+            }
+        }
+        trimStart = 0
+        trimEnd = 0
+        let half = samplesPerFrame / 2
+        for ch in 0..nbChannels {
+            let base = ch * proOutStride
+            for i in 0..half {
+                out[base + i] = out[base + samplesPerFrame + i]
+            }
+        }
+        if lenPrefix {
+            if len != (count - frameOffset) + 2 {
+                note("WMA Pro: a frame's length doesn't match")
+                packetLoss = true
+                return false
+            }
+            br.skip(len - (count - frameOffset) - 1)
+        } else {
+            while count < numSavedBits && br.bits(1) == 0 {
+            }
+        }
+        br.flag()
+    }
+
+    // decode_tilehdr: how the frame splits into subframes per channel.
+    fn decodeTileHeader() -> Bool {
+        var numSamples: [Int] = []
+        var contains: [Bool] = []
+        for c in 0..nbChannels {
+            numSubframes[c] = 0
+            numSamples.append(0)
+            contains.append(false)
+        }
+        var channelsForCur = nbChannels
+        var fixedLayout = false
+        var minChannelLen = 0
+        if maxNumSubframes == 1 || br.flag() {
+            fixedLayout = true
+        }
+        while true {
+            for c in 0..nbChannels {
+                if numSamples[c] == minChannelLen {
+                    if fixedLayout || channelsForCur == 1 || minChannelLen == samplesPerFrame - minSamplesPerSubframe {
+                        contains[c] = true
+                    } else {
+                        contains[c] = br.flag()
+                    }
+                } else {
+                    contains[c] = false
+                }
+            }
+            let len = subframeLength(minChannelLen)
+            if len <= 0 {
+                return false
+            }
+            minChannelLen += len
+            for c in 0..nbChannels {
+                if contains[c] {
+                    if numSubframes[c] >= proMaxSubframes {
+                        return false
+                    }
+                    chSubframeLen[c * proMaxSubframes + numSubframes[c]] = len
+                    numSamples[c] += len
+                    numSubframes[c] += 1
+                    if numSamples[c] > samplesPerFrame {
+                        return false
+                    }
+                } else if numSamples[c] <= minChannelLen {
+                    if numSamples[c] < minChannelLen {
+                        channelsForCur = 0
+                        minChannelLen = numSamples[c]
+                    }
+                    channelsForCur += 1
+                }
+            }
+            if minChannelLen >= samplesPerFrame {
+                break
+            }
+            if br.overrun {
+                return false
+            }
+        }
+        for c in 0..nbChannels {
+            var offset = 0
+            for i in 0..numSubframes[c] {
+                chSubframeOffset[c * proMaxSubframes + i] = offset
+                offset += chSubframeLen[c * proMaxSubframes + i]
+            }
+        }
+        true
+    }
+
+    fn subframeLength(_ offset: Int) -> Int {
+        if offset == samplesPerFrame - minSamplesPerSubframe {
+            return minSamplesPerSubframe
+        }
+        if br.left < 1 {
+            return -1
+        }
+        var shift = 0
+        if maxSubframeLenBit {
+            if br.flag() {
+                shift = 1 + br.bits(subframeLenBits - 1)
+            }
+        } else {
+            shift = br.bits(subframeLenBits)
+        }
+        let len = samplesPerFrame >> shift
+        if len < minSamplesPerSubframe || len > samplesPerFrame {
+            return -1
+        }
+        len
+    }
+
+    // ---- Subframes (decode_subframe) ----
+
+    fn decodeSubframe() -> Bool {
+        var offset = samplesPerFrame
+        var len = samplesPerFrame
+        var totalSamples = samplesPerFrame * nbChannels
+        var transmit = false
+        for i in 0..nbChannels {
+            grouped[i] = false
+            if offset > decodedSamples[i] {
+                offset = decodedSamples[i]
+                len = chSubframeLen[i * proMaxSubframes + curSubframe[i]]
+            }
+        }
+        channelsForCurSubframe = 0
+        for i in 0..nbChannels {
+            let cur = curSubframe[i]
+            totalSamples -= decodedSamples[i]
+            if offset == decodedSamples[i] && len == chSubframeLen[i * proMaxSubframes + cur] {
+                totalSamples -= chSubframeLen[i * proMaxSubframes + cur]
+                decodedSamples[i] += chSubframeLen[i * proMaxSubframes + cur]
+                channelIndexes[channelsForCurSubframe] = i
+                channelsForCurSubframe += 1
+            }
+        }
+        if totalSamples == 0 {
+            parsedAllSubframes = true
+        }
+        tableIdx = wmaLog2(samplesPerFrame / len)
+        numBands = numSfb[tableIdx]
+        let sfbBase = tableIdx * proMaxBands
+        offset += samplesPerFrame >> 1
+        for i in 0..channelsForCurSubframe {
+            coeffsAt[channelIndexes[i]] = offset
+        }
+        subframeLen = len
+        escLen = wmaLog2(len - 1) + 1
+        // Extended header (skipped).
+        if br.flag() {
+            var fill = br.bits(2)
+            if fill == 0 {
+                let l = br.bits(4)
+                fill = br.long(l) + 1
+            }
+            if fill >= 0 {
+                if count + fill > numSavedBits {
+                    return false
+                }
+                br.skip(fill)
+            }
+        }
+        if br.flag() {
+            note("WMA Pro: reserved bit set")
+            return false
+        }
+        if !decodeChannelTransform() {
+            return false
+        }
+        for i in 0..channelsForCurSubframe {
+            let c = channelIndexes[i]
+            transmitCoefs[c] = br.flag()
+            if transmitCoefs[c] {
+                transmit = true
+            }
+        }
+        if transmit {
+            var qstep = (90 * bitsPerSample) >> 4
+            transmitNumVecCoeffs = br.flag()
+            if transmitNumVecCoeffs {
+                let numBits = wmaLog2((len + 3) / 4) + 1
+                for i in 0..channelsForCurSubframe {
+                    let c = channelIndexes[i]
+                    let n = br.bits(numBits) << 2
+                    if n > len {
+                        return false
+                    }
+                    numVecCoeffs[c] = n
+                }
+            } else {
+                for i in 0..channelsForCurSubframe {
+                    numVecCoeffs[channelIndexes[i]] = len
+                }
+            }
+            var step = br.signed(6)
+            qstep += step
+            if step == -32 || step == 31 {
+                let negative = step != 31
+                var quant = 0
+                while count + 5 < numSavedBits {
+                    step = br.bits(5)
+                    if step != 31 {
+                        break
+                    }
+                    quant += 31
+                }
+                qstep += if negative { -(quant + step) } else { quant + step }
+            }
+            if channelsForCurSubframe == 1 {
+                quantStep[channelIndexes[0]] = qstep
+            } else {
+                let modLen = br.bits(3)
+                for i in 0..channelsForCurSubframe {
+                    let c = channelIndexes[i]
+                    quantStep[c] = qstep
+                    if br.flag() {
+                        if modLen > 0 {
+                            quantStep[c] += br.bits(modLen) + 1
+                        } else {
+                            quantStep[c] += 1
+                        }
+                    }
+                }
+            }
+            if !decodeScaleFactors() {
+                return false
+            }
+        }
+        // Coefficients.
+        for i in 0..channelsForCurSubframe {
+            let c = channelIndexes[i]
+            let at = c * proOutStride + coeffsAt[c]
+            if transmitCoefs[c] && count < numSavedBits {
+                if !decodeCoeffs(c) {
+                    // (ffmpeg goes on with what it has.)
+                }
+            } else {
+                for k in 0..len {
+                    out[at + k] = 0.0
+                }
+            }
+        }
+        if transmit {
+            inverseChannelTransform(sfbBase)
+            let n = len
+            let scale = 1.0 / Float(n / 2) / Float(1 << (bitsPerSample - 1))
+            for i in 0..channelsForCurSubframe {
+                let c = channelIndexes[i]
+                let at = c * proOutStride + coeffsAt[c]
+                let sfAt = (c * 2 + sfBuf[c]) * proMaxBands
+                for b in 0..numBands {
+                    let end = min(sfbOffsets[sfbBase + b + 1], n)
+                    let e = quantStep[c] - (maxScaleFactor[c] - savedScaleFactors[sfAt + b]) * scaleFactorStep[c]
+                    let quant = pow(10.0, Float(e) / 20.0)
+                    for k in sfbOffsets[sfbBase + b]..end {
+                        mdct.inp[k] = out[at + k] * quant
+                    }
+                }
+                mdct.inverseHalf(n, scale)
+                for k in 0..n {
+                    out[at + k] = mdct.out[k]
+                }
+            }
+        }
+        window()
+        for i in 0..channelsForCurSubframe {
+            let c = channelIndexes[i]
+            if curSubframe[c] >= numSubframes[c] {
+                return false
+            }
+            curSubframe[c] += 1
+        }
+        true
+    }
+
+    // Sine-window overlap-add (ffmpeg's vector_fmul_window).
+    fn window() {
+        for i in 0..channelsForCurSubframe {
+            let c = channelIndexes[i]
+            var winlen = prevBlockLen[c]
+            var start = c * proOutStride + coeffsAt[c] - (winlen >> 1)
+            if subframeLen < winlen {
+                start += (winlen - subframeLen) >> 1
+                winlen = subframeLen
+            }
+            let w = windows[wmaLog2(winlen) - proBlockMinBits]
+            let len = winlen >> 1
+            // dst = src0 = start, src1 = start + len, over 2 len samples.
+            var k = 0
+            while k < len {
+                let ii = len - 1 - k
+                let jj = len + k
+                let s0 = out[start + ii]
+                let s1 = out[start + len + (len - 1 - ii)]
+                let wi = w[ii]
+                let wj = w[jj]
+                out[start + ii] = s0 * wj - s1 * wi
+                out[start + jj] = s0 * wi + s1 * wj
+                k += 1
+            }
+            prevBlockLen[c] = subframeLen
+        }
+    }
+
+    // ---- Channel transforms ----
+
+    fn decodeChannelTransform() -> Bool {
+        numChgroups = 0
+        if nbChannels <= 1 {
+            return true
+        }
+        var remaining = channelsForCurSubframe
+        if br.flag() {
+            note("WMA Pro: channel transform bit set")
+            return false
+        }
+        while remaining > 0 && numChgroups < channelsForCurSubframe {
+            let g = numChgroups
+            var nch = 0
+            grpTransform[g] = false
+            if remaining > 2 {
+                for i in 0..channelsForCurSubframe {
+                    let ci = channelIndexes[i]
+                    if !grouped[ci] && br.flag() {
+                        grpChannels[g * proMaxChannels + nch] = ci
+                        nch += 1
+                        grouped[ci] = true
+                    }
+                }
+            } else {
+                nch = remaining
+                var k = 0
+                for i in 0..channelsForCurSubframe {
+                    let ci = channelIndexes[i]
+                    if !grouped[ci] {
+                        grpChannels[g * proMaxChannels + k] = ci
+                        k += 1
+                    }
+                    grouped[ci] = true
+                }
+            }
+            grpNumChannels[g] = nch
+            let m = g * 64
+            if nch == 2 {
+                if br.flag() {
+                    if br.flag() {
+                        note("WMA Pro: unknown channel transform type")
+                        return false
+                    }
+                } else {
+                    grpTransform[g] = true
+                    if nbChannels == 2 {
+                        grpMatrix[m] = 1.0
+                        grpMatrix[m + 1] = -1.0
+                        grpMatrix[m + 2] = 1.0
+                        grpMatrix[m + 3] = 1.0
+                    } else {
+                        grpMatrix[m] = 0.70703125
+                        grpMatrix[m + 1] = -0.70703125
+                        grpMatrix[m + 2] = 0.70703125
+                        grpMatrix[m + 3] = 0.70703125
+                    }
+                }
+            } else if nch > 2 {
+                if br.flag() {
+                    grpTransform[g] = true
+                    if br.flag() {
+                        decodeDecorrelationMatrix(g)
+                    } else if nch <= 6 {
+                        let starts = [0, 0, 1, 5, 14, 30, 55]
+                        let d = wmaProDefaultDecorrelationMatrices
+                        for k in 0..(nch * nch) {
+                            grpMatrix[m + k] = d[starts[nch] + k]
+                        }
+                    } else {
+                        note("WMA Pro: more than 6 coupled channels")
+                    }
+                }
+            }
+            if grpTransform[g] {
+                if !br.flag() {
+                    for b in 0..numBands {
+                        grpTransformBand[g * proMaxBands + b] = br.flag()
+                    }
+                } else {
+                    for b in 0..numBands {
+                        grpTransformBand[g * proMaxBands + b] = true
+                    }
+                }
+            }
+            remaining -= nch
+            numChgroups += 1
+        }
+        true
+    }
+
+    fn decodeDecorrelationMatrix(_ g: Int) {
+        let n = grpNumChannels[g]
+        let m = g * 64
+        for k in 0..(nbChannels * nbChannels) {
+            grpMatrix[m + k] = 0.0
+        }
+        var rot: [Int] = []
+        for _ in 0..((n * (n - 1)) >> 1) {
+            rot.append(br.bits(6))
+        }
+        for i in 0..n {
+            grpMatrix[m + n * i + i] = if br.flag() { 1.0 } else { -1.0 }
+        }
+        var offset = 0
+        for i in 1..n {
+            for x in 0..i {
+                for y in 0..(i + 1) {
+                    let v1 = grpMatrix[m + x * n + y]
+                    let v2 = grpMatrix[m + i * n + y]
+                    let r = rot[offset + x]
+                    var sinv = 0.0
+                    var cosv = 0.0
+                    if r < 32 {
+                        sinv = sin64[r]
+                        cosv = sin64[32 - r]
+                    } else {
+                        sinv = sin64[64 - r]
+                        cosv = -sin64[r - 32]
+                    }
+                    grpMatrix[m + y + x * n] = wmaF32(v1 * sinv - v2 * cosv)
+                    grpMatrix[m + y + i * n] = wmaF32(v1 * cosv + v2 * sinv)
+                }
+            }
+            offset += i
+        }
+    }
+
+    fn inverseChannelTransform(_ sfbBase: Int) {
+        var data: [Float] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        for g in 0..numChgroups {
+            if !grpTransform[g] {
+                continue
+            }
+            let n = grpNumChannels[g]
+            let m = g * 64
+            for b in 0..numBands {
+                let from = sfbOffsets[sfbBase + b]
+                let to = min(sfbOffsets[sfbBase + b + 1], subframeLen)
+                if grpTransformBand[g * proMaxBands + b] {
+                    for y in from..to {
+                        for k in 0..n {
+                            let c = grpChannels[g * proMaxChannels + k]
+                            data[k] = out[c * proOutStride + coeffsAt[c] + y]
+                        }
+                        var mi = m
+                        for k in 0..n {
+                            var sum = 0.0
+                            for j in 0..n {
+                                sum += data[j] * grpMatrix[mi]
+                                mi += 1
+                            }
+                            let c = grpChannels[g * proMaxChannels + k]
+                            out[c * proOutStride + coeffsAt[c] + y] = sum
+                        }
+                    }
+                } else if nbChannels == 2 {
+                    for k in 0..2 {
+                        let c = grpChannels[g * proMaxChannels + k]
+                        let at = c * proOutStride + coeffsAt[c]
+                        for y in from..to {
+                            out[at + y] = out[at + y] * (181.0 / 128.0)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ---- Scale factors ----
+
+    fn decodeScaleFactors() -> Bool {
+        for i in 0..channelsForCurSubframe {
+            let c = channelIndexes[i]
+            let cur = 1 - scaleFactorIdx[c]
+            sfBuf[c] = cur
+            let sf = (c * 2 + cur) * proMaxBands
+            let saved = (c * 2 + scaleFactorIdx[c]) * proMaxBands
+            if reuseSf[c] {
+                let so = (tableIdx * 8 + chTableIdx[c]) * proMaxBands
+                for b in 0..numBands {
+                    savedScaleFactors[sf + b] = savedScaleFactors[saved + sfOffsets[so + b]]
+                }
+            }
+            if curSubframe[c] == 0 || br.flag() {
+                if !reuseSf[c] {
+                    scaleFactorStep[c] = br.bits(2) + 1
+                    var val = 45 / scaleFactorStep[c]
+                    for b in 0..numBands {
+                        let d = readVlc(sfVlc, 8)
+                        if d < 0 {
+                            return false
+                        }
+                        val += d - 60
+                        savedScaleFactors[sf + b] = val
+                    }
+                } else {
+                    var b = 0
+                    while b < numBands {
+                        let idx = readVlc(sfRlVlc, 9)
+                        var skip = 0
+                        var val = 0
+                        var positive = true
+                        if idx == 0 {
+                            let code = br.bits(14)
+                            val = code >> 6
+                            positive = (code & 1) == 1
+                            skip = (code & 0x3f) >> 1
+                        } else if idx == 1 {
+                            break
+                        } else if idx < 0 {
+                            return false
+                        } else {
+                            skip = rlRun[idx]
+                            val = rlLevel[idx]
+                            positive = br.flag()
+                        }
+                        b += skip
+                        if b >= numBands {
+                            note("WMA Pro: invalid scale factor coding")
+                            return false
+                        }
+                        savedScaleFactors[sf + b] += if positive { val } else { -val }
+                        b += 1
+                    }
+                }
+                scaleFactorIdx[c] = cur
+                chTableIdx[c] = tableIdx
+                reuseSf[c] = true
+            }
+            var mx = savedScaleFactors[sf]
+            for b in 1..max(numBands, 1) {
+                mx = max(mx, savedScaleFactors[sf + b])
+            }
+            maxScaleFactor[c] = mx
+        }
+        true
+    }
+
+    // ---- Coefficients ----
+
+    fn decodeCoeffs(_ c: Int) -> Bool {
+        let table = br.bits(1)
+        let at = c * proOutStride + coeffsAt[c]
+        var rlMode = false
+        var cur = 0
+        var numZeros = 0
+        var vals = [0.0, 0.0, 0.0, 0.0]
+        let nvec = numVecCoeffs[c]
+        let zeroLimit = subframeLen >> 8
+        while (transmitNumVecCoeffs || !rlMode) && cur + 3 < nvec {
+            let idx = readVlc(vec4Vlc, 9) - 1
+            if idx < 0 {
+                var i = 0
+                while i < 4 {
+                    let idx2 = readVlc(vec2Vlc, 9) - 1
+                    if idx2 < 0 {
+                        var v0 = readVlc(vec1Vlc, 9)
+                        if v0 == 100 {
+                            v0 += largeVal()
+                        }
+                        var v1 = readVlc(vec1Vlc, 9)
+                        if v1 == 100 {
+                            v1 += largeVal()
+                        }
+                        vals[i] = Float(v0)
+                        vals[i + 1] = Float(v1)
+                    } else {
+                        vals[i] = Float(idx2 >> 4)
+                        vals[i + 1] = Float(idx2 & 15)
+                    }
+                    i += 2
+                }
+            } else {
+                vals[0] = Float(idx >> 12)
+                vals[1] = Float((idx >> 8) & 15)
+                vals[2] = Float((idx >> 4) & 15)
+                vals[3] = Float(idx & 15)
+            }
+            for i in 0..4 {
+                if vals[i] != 0.0 {
+                    out[at + cur] = if br.flag() { vals[i] } else { -vals[i] }
+                    numZeros = 0
+                } else {
+                    out[at + cur] = 0.0
+                    numZeros += 1
+                    if numZeros > zeroLimit {
+                        rlMode = true
+                    }
+                }
+                cur += 1
+            }
+            if br.overrun {
+                return false
+            }
+        }
+        if cur < subframeLen {
+            for k in cur..subframeLen {
+                out[at + k] = 0.0
+            }
+            let vlc = if table == 1 { coefVlc1 } else { coefVlc0 }
+            let runs = if table == 1 { coef1Run } else { coef0Run }
+            let levels = if table == 1 { coef1Level } else { coef0Level }
+            let mask = subframeLen - 1
+            var offset = cur
+            while offset < subframeLen {
+                let code = readVlc(vlc, 9)
+                if code > 1 {
+                    offset += runs[code]
+                    let l = levels[code]
+                    out[at + (offset & mask)] = if br.flag() { l } else { -l }
+                } else if code == 1 {
+                    break
+                } else if code == 0 {
+                    let level = largeVal()
+                    if br.flag() {
+                        if br.flag() {
+                            if br.flag() {
+                                note("WMA Pro: broken escape sequence")
+                                return false
+                            }
+                            offset += br.bits(escLen) + 4
+                        } else {
+                            offset += br.bits(2) + 1
+                        }
+                    }
+                    out[at + (offset & mask)] = if br.flag() { Float(level) } else { -Float(level) }
+                } else {
+                    return false
+                }
+                if br.overrun {
+                    return false
+                }
+                offset += 1
+            }
+            if offset > subframeLen {
+                note("WMA Pro: run-level coding overflows the subframe")
+                return false
+            }
+        }
+        true
+    }
+
+    // End of stream: the second half of the last overlap, then silence
+    // (a frame of samples_per_frame).
+    fn flushSamples() -> [Float] {
+        var res: [Float] = []
+        let half = samplesPerFrame / 2
+        for i in 0..samplesPerFrame {
+            for ch in 0..nbChannels {
+                res.append(if i < half { out[ch * proOutStride + i] } else { 0.0 })
+            }
+        }
+        res
+    }
+
+    fn resetState() {
+        packetLoss = true
+        packetDone = false
+        numSavedBits = 0
+        frameOffset = 0
+        skipFrame = true
+        for i in 0..out.count {
+            out[i] = 0.0
+        }
+    }
+}
+
+// The channel names of a WAVE_FORMAT_EXTENSIBLE-style mask.
+fn wmaMaskLayout(_ mask: Int) -> [String] {
+    let names = ["FL", "FR", "FC", "LFE", "BL", "BR", "FLC", "FRC", "BC", "SL", "SR", "TC", "TFL", "TFC", "TFR", "TBL", "TBC", "TBR"]
+    var out: [String] = []
+    for b in 0..18 {
+        if (mask >> b) & 1 == 1 {
+            out.append(names[b])
+        }
+    }
+    out
+}
+
+fn wmaPopCount(_ v: Int) -> Int {
+    var n = 0
+    var x = v
+    while x != 0 {
+        n += x & 1
+        x = x >> 1
+    }
+    n
+}
+
+// Sets up a WMA Pro engine (ffmpeg's decode_init).
+fn wmaNewPro(channels: Int, rate: Int, blockAlign: Int, extra: Data) -> Result<WmaPro> {
+    if extra.count < 18 {
+        return Result.failure(error: Error("WMA Pro: the setup bytes are missing"))
+    }
+    if blockAlign <= 0 {
+        return Result.failure(error: Error("WMA Pro: the packet size (nBlockAlign) isn't known"))
+    }
+    var s = WmaPro(rate: rate, blockAlign: blockAlign)
+    s.decodeFlags = extra.uint16(at: 14)
+    s.channelMask = extra.uint32(at: 2)
+    s.bitsPerSample = extra.uint16(at: 0)
+    s.nbChannels = if s.channelMask != 0 { wmaPopCount(s.channelMask) } else { channels }
+    if s.bitsPerSample > 32 || s.bitsPerSample < 1 {
+        return Result.failure(error: Error("WMA Pro: {s.bitsPerSample} bits per sample"))
+    }
+    s.log2FrameSize = wmaLog2(blockAlign) + 4
+    if s.log2FrameSize > 25 {
+        return Result.failure(error: Error("WMA Pro: the packets are too large"))
+    }
+    s.lenPrefix = (s.decodeFlags & 0x40) != 0
+    let bits = wmaFrameLenBits(rate, 3, s.decodeFlags)
+    if bits > proBlockMaxBits {
+        return Result.failure(error: Error("WMA Pro: 14-bit block sizes aren't supported"))
+    }
+    s.samplesPerFrame = 1 << bits
+    let log2Max = (s.decodeFlags & 0x38) >> 3
+    s.maxNumSubframes = 1 << log2Max
+    if s.maxNumSubframes == 16 || s.maxNumSubframes == 4 {
+        s.maxSubframeLenBit = true
+    }
+    s.subframeLenBits = wmaLog2(log2Max) + 1
+    let numSizes = log2Max + 1
+    s.minSamplesPerSubframe = s.samplesPerFrame / s.maxNumSubframes
+    s.drc = (s.decodeFlags & 0x80) != 0
+    if s.maxNumSubframes > proMaxSubframes || s.minSamplesPerSubframe < (1 << proBlockMinBits) {
+        return Result.failure(error: Error("WMA Pro: bad subframe setup"))
+    }
+    if s.nbChannels <= 0 || s.nbChannels > proMaxChannels || s.nbChannels > max(channels, 1) {
+        return Result.failure(error: Error("WMA Pro: {s.nbChannels} channels aren't supported"))
+    }
+    for _ in 0..s.nbChannels {
+        s.prevBlockLen.append(s.samplesPerFrame)
+    }
+    if (s.channelMask & 8) != 0 {
+        var mask = 1
+        while mask < 16 {
+            if (s.channelMask & mask) != 0 {
+                s.lfeChannel += 1
+            }
+            mask = mask << 1
+        }
+    }
+    // Scale factor bands per block size.
+    for _ in 0..(8 * proMaxBands) {
+        s.sfbOffsets.append(0)
+    }
+    for _ in 0..(8 * 8 * proMaxBands) {
+        s.sfOffsets.append(0)
+    }
+    for _ in 0..8 {
+        s.numSfb.append(0)
+        s.subwooferCutoffs.append(0)
+    }
+    let crit = wmaProCriticalFreq
+    for i in 0..numSizes {
+        let len = s.samplesPerFrame >> i
+        var band = 1
+        let b0 = i * proMaxBands
+        s.sfbOffsets[b0] = 0
+        var x = 0
+        while x < proMaxBands - 1 && s.sfbOffsets[b0 + band - 1] < len {
+            var off = (len * 2 * crit[x]) / rate + 2
+            off = off & ~3
+            if off > s.sfbOffsets[b0 + band - 1] {
+                s.sfbOffsets[b0 + band] = off
+                band += 1
+            }
+            if off >= len {
+                break
+            }
+            x += 1
+        }
+        s.sfbOffsets[b0 + band - 1] = len
+        s.numSfb[i] = band - 1
+        if s.numSfb[i] <= 0 {
+            return Result.failure(error: Error("WMA Pro: no scale factor bands"))
+        }
+    }
+    for i in 0..numSizes {
+        for b in 0..s.numSfb[i] {
+            let off = ((s.sfbOffsets[i * proMaxBands + b] + s.sfbOffsets[i * proMaxBands + b + 1] - 1) << i) >> 1
+            for x in 0..numSizes {
+                var v = 0
+                while (s.sfbOffsets[x * proMaxBands + v + 1] << x) < off && v + 2 < proMaxBands {
+                    v += 1
+                }
+                s.sfOffsets[(i * 8 + x) * proMaxBands + b] = v
+            }
+        }
+    }
+    for i in 0..numSizes {
+        let bs = s.samplesPerFrame >> i
+        let cutoff = (440 * bs + 3 * (rate >> 1) - 1) / rate
+        s.subwooferCutoffs[i] = min(max(cutoff, 4), bs)
+    }
+    // Windows: a sine window per size 2^6 .. 2^13.
+    for k in 0..(proBlockMaxBits - proBlockMinBits + 1) {
+        s.windows.append(wmaSineWindow(1 << (k + proBlockMinBits)))
+    }
+    for i in 0..33 {
+        s.sin64.append(wmaF32(sin(Float(i) * pi / 64.0)))
+    }
+    // Huffman tables (wmaprodata: [symbol, length] pairs in code order).
+    s.sfVlc = wmaProPairs(wmaProScaleTable, bits: 8, offset: 0)
+    s.sfRlVlc = wmaProPairs(wmaProScaleRlTable, bits: 9, offset: 0)
+    s.coefVlc0 = wmaVlcFromLengths(wmaProCoef0Lens, wmaProCoef0Syms, bits: 9)
+    s.coefVlc1 = wmaProPairs(wmaProCoef1Table, bits: 9, offset: 0)
+    // (Symbols get 1 added here and taken off when read, so the escape,
+    // symbol 0 in the tables, stays a leaf.)
+    s.vec4Vlc = wmaVlcFromLengths(wmaProVec4Lens, wmaProVec4Syms, bits: 9)
+    s.vec2Vlc = wmaProPairs(wmaProVec2Table, bits: 9, offset: 0)
+    s.vec1Vlc = wmaProPairs(wmaProVec1Table, bits: 9, offset: 0)
+    s.coef0Run = wmaProCoef0Run
+    s.coef1Run = wmaProCoef1Run
+    s.coef0Level = wmaProCoef0Level
+    s.coef1Level = wmaProCoef1Level
+    s.rlRun = wmaProScaleRlRun
+    s.rlLevel = wmaProScaleRlLevel
+    // Buffers.
+    let nc = s.nbChannels
+    for _ in 0..nc {
+        s.transmitCoefs.append(false)
+        s.numSubframes.append(0)
+        s.curSubframe.append(0)
+        s.decodedSamples.append(0)
+        s.grouped.append(false)
+        s.quantStep.append(0)
+        s.reuseSf.append(false)
+        s.scaleFactorStep.append(1)
+        s.maxScaleFactor.append(0)
+        s.scaleFactorIdx.append(0)
+        s.sfBuf.append(0)
+        s.chTableIdx.append(0)
+        s.numVecCoeffs.append(0)
+        s.coeffsAt.append(0)
+        s.channelIndexes.append(0)
+    }
+    for _ in 0..(nc * proMaxSubframes) {
+        s.chSubframeLen.append(0)
+        s.chSubframeOffset.append(0)
+    }
+    for _ in 0..(nc * 2 * proMaxBands) {
+        s.savedScaleFactors.append(0)
+    }
+    for _ in 0..(nc * proOutStride) {
+        s.out.append(0.0)
+    }
+    for _ in 0..proMaxChannels {
+        s.grpNumChannels.append(0)
+        s.grpTransform.append(false)
+    }
+    for _ in 0..(proMaxChannels * proMaxBands) {
+        s.grpTransformBand.append(false)
+    }
+    for _ in 0..(proMaxChannels * 64) {
+        s.grpMatrix.append(0.0)
+    }
+    for _ in 0..(proMaxChannels * proMaxChannels) {
+        s.grpChannels.append(0)
+    }
+    s.mdct = wmaNewMdct()
+    Result.ok(value: s)
+}
+
+// A table from [symbol, length] pairs in code order.
+fn wmaProPairs(_ pairs: [Int], bits: Int, offset: Int) -> [Int] {
+    var lens: [Int] = []
+    var syms: [Int] = []
+    var i = 0
+    while i + 1 < pairs.count {
+        syms.append(pairs[i] + offset)
+        lens.append(pairs[i + 1])
+        i += 2
+    }
+    wmaVlcFromLengths(lens, syms, bits: bits)
+}

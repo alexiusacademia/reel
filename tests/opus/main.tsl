@@ -1,0 +1,370 @@
+// Tests for the opus module: the RFC 8251 conformance vectors (every
+// packet's final range must equal the encoder's, and the output is
+// compared with the reference decoder's), the fixtures made by
+// tools/make_fixtures.sh (compared with ffmpeg's output), extra fixtures
+// made with ffmpeg's libopus encoder (tests/opus/fixtures), and the
+// OpusHead / packet parsing.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../../opus"
+import "../../core"
+import "../../testkit"
+
+let vectorDir = "build/conformance/opus/opus_newvectors"
+
+// The packets of an Ogg stream (RFC 3533): each packet's bytes, gathered
+// from the pages' lacing values. Only the first logical stream is read.
+fn oggPackets(_ d: Data) -> [Data] {
+    var out: [Data] = []
+    var pos = 0
+    var current = Data()
+    var serial = -1
+    while pos + 27 <= d.count {
+        if d.slice(from: pos, to: pos + 4).latin1 != "OggS" {
+            break
+        }
+        let s = d.uint32(at: pos + 14)
+        let nseg = d[pos + 26]
+        var p = pos + 27 + nseg
+        if serial < 0 {
+            serial = s
+        }
+        for i in 0..nseg {
+            let len = d[pos + 27 + i]
+            if s == serial {
+                current += d.slice(from: p, to: p + len)
+                if len < 255 {
+                    out.append(current)
+                    current = Data()
+                }
+            }
+            p += len
+        }
+        pos = p
+    }
+    out
+}
+
+// The lead's SNR helper, but trying every alignment from -maxShift to
+// maxShift frames on a part of the signal first. Returns (snr, shift).
+fn bestSnr(_ got: [Float], _ want: [Float], channels: Int, maxShift: Int) -> (Float, Int) {
+    let frames = min(got.count, want.count) / channels
+    let mid = frames / 2
+    var best = -1000.0
+    var bestShift = 0
+    var shift = -maxShift
+    while shift <= maxShift {
+        var sig = 0.0
+        var noise = 0.0
+        var f = mid
+        while f < min(mid + 600, frames) {
+            let w = f + shift
+            if w >= 0 && w * channels + channels <= want.count {
+                for c in 0..channels {
+                    let a = got[f * channels + c]
+                    let b = want[w * channels + c]
+                    sig += b * b
+                    noise += (a - b) * (a - b)
+                }
+            }
+            f += 3
+        }
+        let v = if noise == 0.0 { 150.0 } else if sig == 0.0 { 0.0 } else { 10.0 * log10(sig / noise) }
+        if v > best {
+            best = v
+            bestShift = shift
+        }
+        shift += 1
+    }
+    // The full SNR at that alignment.
+    var g: [Float] = []
+    var w: [Float] = []
+    for f in 0..frames {
+        let wf = f + bestShift
+        if wf >= 0 && wf * channels + channels <= want.count {
+            for c in 0..channels {
+                g.append(got[f * channels + c])
+                w.append(want[wf * channels + c])
+            }
+        }
+    }
+    (testkit.snr(g, w), bestShift)
+}
+
+struct VectorResult {
+    packets: Int = 0
+    rangeOk: Int = 0
+    firstBad: Int = -1
+    snr: Float = 0.0
+    seconds: Float = 0.0
+    ms: Int = 0
+}
+
+// Decodes an opus_demo .bit file (per packet: 4-byte big-endian length,
+// 4-byte big-endian final range, the packet) with `channels` outputs.
+fn runVector(_ name: String, channels: Int) -> VectorResult {
+    var r = VectorResult()
+    let bits = readData(joinPath(vectorDir, name + ".bit")) ?? Data()
+    var st = opus.newOpusStream(channels: channels)
+    var out: [Float] = []
+    var pos = 0
+    let t0 = now()
+    while pos + 8 <= bits.count {
+        let len = bits.uint32(at: pos, bigEndian: true)
+        let rng = bits.uint32(at: pos + 4, bigEndian: true)
+        pos += 8
+        let (pcm, _) = st.decodePacket(bits, from: pos, to: pos + len, lostFrames: st.lastPacketDuration)
+        out += pcm
+        r.packets += 1
+        if st.rangeFinal == rng {
+            r.rangeOk += 1
+        } else if r.firstBad < 0 {
+            r.firstBad = r.packets - 1
+        }
+        pos += len
+    }
+    r.ms = Int((now() - t0) * 1000.0)
+    r.seconds = Float(out.count / channels) / 48000.0
+    // The reference output: 16-bit little-endian stereo.
+    let dec = readData(joinPath(vectorDir, name + ".dec")) ?? Data()
+    var want: [Float] = []
+    var i = 0
+    while i + 4 <= dec.count {
+        let l = Float(dec.int16(at: i)) / 32768.0
+        let rr = Float(dec.int16(at: i + 2)) / 32768.0
+        if channels == 2 {
+            want.append(l)
+            want.append(rr)
+        } else {
+            want.append(0.5 * (l + rr))
+        }
+        i += 4
+    }
+    // Our output rounded to 16 bits as opus_demo writes it.
+    var got: [Float] = []
+    for v in out {
+        let s = max(-32768.0, min(32767.0, round(v * 32768.0)))
+        got.append(s / 32768.0)
+    }
+    r.snr = testkit.snr(got, want)
+    r
+}
+
+// 16-bit little-endian samples as Floats.
+fn readS16(_ path: String) -> [Float] {
+    let d = readData(path) ?? Data()
+    var out: [Float] = []
+    var i = 0
+    while i + 2 <= d.count {
+        out.append(Float(d.int16(at: i)) / 32768.0)
+        i += 2
+    }
+    out
+}
+
+// Decodes every packet with a fresh decoder and drops the pre-skip.
+fn decodeAll(_ track: core.Track, _ packets: [Data]) -> (opus.Decoder, [Float], Int) {
+    var dec = opus.newDecoder(track).valueOr(opus.Decoder())
+    var out: [Float] = []
+    let t0 = now()
+    for p in packets {
+        let s = dec.decode(p, pts: 0)
+        out += s.data
+    }
+    let ms = Int((now() - t0) * 1000.0)
+    let skip = min(out.count, dec.delay * dec.channels)
+    (dec, out.slice(from: skip, to: out.count), ms)
+}
+
+// An Ogg Opus file's track (from its OpusHead) and audio packets.
+fn oggOpus(_ path: String) -> (core.Track, [Data]) {
+    let pk = oggPackets(readData(path) ?? Data())
+    var t = core.Track(index: 0, kind: .audio, codec: "opus")
+    if pk.count < 2 {
+        return (t, [])
+    }
+    t.extra = pk[0]
+    t.channels = pk[0][9]
+    t.sampleRate = 48000
+    (t, pk.slice(from: 2, to: pk.count))
+}
+
+// A track's packets from a fixture through ffmpeg's byte positions. For
+// Matroska, ffprobe's pos is the start of the SimpleBlock body, so the
+// block header (track number, timecode, flags) is skipped here (see
+// build/NEEDED.md).
+fn refPackets(_ name: String, track: Int) -> (core.Track, [Data]) {
+    let file = testkit.fixture(name)
+    let ref = testkit.loadRef(name)
+    let media = testkit.mediaFromRef(file, ref)
+    let mkv = ref.format.hasPrefix("matroska")
+    var out: [Data] = []
+    for p in media.packets {
+        if p.track == track {
+            if mkv {
+                var vint = 1
+                while vint < 8 && file[p.offset] & (0x80 >> (vint - 1)) == 0 {
+                    vint += 1
+                }
+                let at = p.offset + vint + 3
+                out.append(file.slice(from: at, to: at + p.size))
+            } else {
+                out.append(core.packetBytes(file, media, p))
+            }
+        }
+    }
+    if track < media.tracks.count {
+        return (media.tracks[track], out)
+    }
+    (core.Track(index: 0, kind: .audio, codec: "opus"), out)
+}
+
+fn main() {
+    var passed = 0
+    var total = 0
+    fn check(_ ok: Bool, _ what: String) {
+        total += 1
+        if ok { passed += 1 } else { print("FAIL: {what}") }
+    }
+
+    // --- Packet parsing (RFC 6716 section 3) ---
+    // Code 3, CBR, padding flag, 3 frames, 2 bytes of padding at the end.
+    let code3 = Data(bytes: [0x7b, 0x43, 0x02, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 0, 0])
+    if let p = opus.opusParsePacket(code3, from: 0, to: code3.count) {
+        check(p.sizes.count == 3 && p.sizes[0] == 4 && p.sizes[2] == 4 && p.offsets[1] == 7, "code 3 CBR with padding: sizes")
+    } else {
+        check(false, "code 3 CBR packet parses")
+    }
+    // Code 3, VBR, 2 frames: the first is 5 bytes, the second the rest.
+    let vbr = Data(bytes: [0x7b, 0x82, 0x05, 1, 2, 3, 4, 5, 6, 7, 8])
+    if let p = opus.opusParsePacket(vbr, from: 0, to: vbr.count) {
+        check(p.sizes.count == 2 && p.sizes[0] == 5 && p.sizes[1] == 3, "code 3 VBR: sizes")
+        check(p.mode == opus.OpusMode.hybrid && p.frameSize == 960, "TOC config 15 is hybrid FB 20 ms")
+    } else {
+        check(false, "code 3 packet parses")
+    }
+    check(opus.opusParsePacket(Data(bytes: [0x01, 1, 2, 3]), from: 0, to: 4) == nil, "code 1 with an odd length is invalid")
+    check(opus.opusTocFrameSize(0x18) == 2880 && opus.opusTocFrameSize(0xe0) == 120, "frame sizes from the TOC")
+
+    // --- RFC 8251 test vectors ---
+    var vecTime = 0
+    var vecSeconds = 0.0
+    for v in 1..13 {
+        let name = if v < 10 { "testvector0{v}" } else { "testvector{v}" }
+        if !fileExists(joinPath(vectorDir, name + ".bit")) {
+            print("note: {name}.bit not found (download opus_testvectors-rfc8251 into {vectorDir})")
+            continue
+        }
+        let r = runVector(name, channels: 2)
+        vecTime += r.ms
+        vecSeconds += r.seconds
+        check(r.rangeOk == r.packets, "{name}: final range matches in {r.rangeOk} of {r.packets} packets (first bad {r.firstBad})")
+        check(r.snr >= 40.0, "{name}: SNR {r.snr.formatted(decimals: 1)} dB vs the reference")
+        print("vector {name}: range {r.rangeOk}/{r.packets}, SNR {r.snr.formatted(decimals: 1)} dB, {(r.seconds * 1000.0 / Float(max(1, r.ms))).formatted(decimals: 0)}x real time")
+    }
+    print("time opus vectors: {vecTime} ms for {vecSeconds.formatted(decimals: 1)} s of audio ({(vecSeconds * 1000.0 / Float(max(1, vecTime))).formatted(decimals: 0)}x real time)")
+
+
+    // --- Fixtures ---
+    // Shared fixtures against ffmpeg's own Opus decoder (.a.f32), and
+    // libopus's decode where the test has one (fixtures/*.s16).
+    var totalMs = 0
+    var totalSec = 0.0
+    fn report(_ what: String, _ got: [Float], _ want: [Float], _ channels: Int, _ minSnr: Float, _ ms: Int) {
+        let (v, shift) = bestSnr(got, want, channels: channels, maxShift: 4096)
+        let sec = Float(got.count / max(1, channels)) / 48000.0
+        let speed = if ms > 0 { (sec * 1000.0 / Float(ms)).formatted(decimals: 0) } else { "-" }
+        print("snr {what}: {v.formatted(decimals: 1)} dB at shift {shift} ({speed}x real time)")
+        check(v >= minSnr, "{what}: SNR {v.formatted(decimals: 1)} dB (want {minSnr})")
+        check(shift == 0, "{what}: aligned at {shift}, not 0, after dropping the pre-skip")
+    }
+    let fx = "tests/opus/fixtures"
+    // CELT-only stereo 96 kb/s, Ogg.
+    let (t1, p1) = oggOpus(testkit.fixturePath("opus.opus"))
+    let (d1, o1, ms1) = decodeAll(t1, p1)
+    check(d1.channels == 2 && d1.delay == 312 && d1.layout == ["FL", "FR"], "opus.opus setup: 2 channels, pre-skip 312")
+    report("opus.opus vs ffmpeg", o1, testkit.referenceSamples("opus.opus"), 2, 60.0, ms1)
+    totalMs += ms1
+    totalSec += Float(o1.count / 2) / 48000.0
+    // SILK/hybrid/CELT mono 24 kb/s, Ogg. ffmpeg's own decoder resamples
+    // SILK with a different filter than the reference's, so only libopus's
+    // output is expected to match closely.
+    let (t2, p2) = oggOpus(testkit.fixturePath("opus_mono.ogg"))
+    let (d2, o2, ms2) = decodeAll(t2, p2)
+    check(d2.channels == 1 && d2.layout == ["FC"], "opus_mono.ogg setup: mono")
+    report("opus_mono.ogg vs libopus", o2, readS16(joinPath(fx, "opus_mono_1s.s16")), 1, 75.0, ms2)
+    let (v2, _) = bestSnr(o2, testkit.referenceSamples("opus_mono.ogg"), channels: 1, maxShift: 4096)
+    print("snr opus_mono.ogg vs ffmpeg: {v2.formatted(decimals: 1)} dB (ffmpeg's SILK resampler differs from the reference's)")
+    check(v2 >= 20.0, "opus_mono.ogg vs ffmpeg: {v2.formatted(decimals: 1)} dB")
+    totalMs += ms2
+    totalSec += Float(o2.count) / 48000.0
+    // The Opus track of a WebM file.
+    let (t3, p3) = refPackets("vp9.webm", track: 1)
+    let (_, o3, ms3) = decodeAll(t3, p3)
+    report("vp9.webm audio vs ffmpeg", o3, testkit.referenceSamples("vp9.webm"), 2, 60.0, ms3)
+    totalMs += ms3
+    totalSec += Float(o3.count / 2) / 48000.0
+    // multi.mkv's second audio track (mono Opus).
+    let (t4, p4) = refPackets("multi.mkv", track: 2)
+    let (d4, o4, ms4) = decodeAll(t4, p4)
+    check(t4.codec == "opus" && d4.channels == 1, "multi.mkv track 2 is mono opus")
+    report("multi.mkv opus track vs libopus", o4, readS16(joinPath(fx, "multi_opus_1s.s16")), 1, 75.0, ms4)
+    totalMs += ms4
+    totalSec += Float(o4.count) / 48000.0
+    // Our own clips (tests/opus/make_fixtures.sh) against libopus.
+    for name in ["silk_nb", "silk_mb40", "silk_wb60_stereo", "hybrid_swb", "hybrid_fb_stereo", "celt_2_5ms", "celt_5ms", "celt_10ms", "surround51"] {
+        let path = joinPath(fx, name + ".opus")
+        if !fileExists(path) {
+            check(false, "{path} is missing (run tests/opus/make_fixtures.sh)")
+            continue
+        }
+        let (t, p) = oggOpus(path)
+        let (d, o, ms) = decodeAll(t, p)
+        report("{name} vs libopus", o, readS16(joinPath(fx, name + ".s16")), d.channels, 75.0, ms)
+        totalMs += ms
+        totalSec += Float(o.count / max(1, d.channels)) / 48000.0
+        if name == "surround51" {
+            check(d.channels == 6 && d.layout == ["FL", "FR", "FC", "LFE", "BL", "BR"] && d.streams.count == 4 && d.coupled == 2, "5.1: family 1, 4 streams (2 coupled), WAV order")
+        }
+    }
+    print("time opus fixtures: {totalMs} ms for {totalSec.formatted(decimals: 1)} s of audio ({(totalSec * 1000.0 / Float(max(1, totalMs))).formatted(decimals: 0)}x real time)")
+
+    // --- Setup errors ---
+    var bad = core.Track(index: 0, kind: .audio, codec: "opus")
+    bad.extra = Data(text: "NotOpusHeadxxxxxxxxxxx")
+    check(!opus.newDecoder(bad).isOk(), "a setup that isn't OpusHead is refused")
+    bad.extra = Data(bytes: [0x4f, 0x70, 0x75, 0x73, 0x48, 0x65, 0x61, 0x64, 1, 6, 0x38, 1, 0x80, 0xbb, 0, 0, 0, 0, 0])
+    check(!opus.newDecoder(bad).isOk(), "family 0 with 6 channels is refused")
+    let plain = opus.newDecoder(core.Track(index: 0, kind: .audio, codec: "opus", channels: 1))
+    check(plain.isOk() && (plain.value()?.channels ?? 0) == 1, "no OpusHead: a mono single stream")
+
+    // --- Packet loss and damage ---
+    // Drop every 7th packet of opus.opus: the output keeps its length and
+    // stays bounded, and the decoder recovers.
+    var lossy = opus.newDecoder(t1).valueOr(opus.Decoder())
+    var lossOut: [Float] = []
+    var peak = 0.0
+    for (i, p) in p1.enumerated() {
+        let s = lossy.decode(if i % 7 == 3 { Data() } else { p }, pts: i * 960)
+        for v in s.data {
+            peak = max(peak, abs(v))
+        }
+        lossOut += s.data
+    }
+    check(lossOut.count == o1.count + 312 * 2, "lost packets are concealed with a packet's worth of samples ({lossOut.count} vs {o1.count + 624})")
+    check(peak < 2.0, "concealment stays bounded (peak {peak.formatted(decimals: 2)})")
+    // Garbage bytes: no crash, a warning, output of the TOC's length.
+    var junk = opus.newDecoder(t1).valueOr(opus.Decoder())
+    let g = junk.decode(Data(bytes: [0xfc, 0x01, 0xff, 0x13, 0x77, 0x00, 0x42]), pts: 0)
+    check(g.frames == 960, "a damaged frame still gives its 960 samples")
+    let g2 = junk.decode(Data(bytes: [0x03]), pts: 0)
+    check(g2.frames == 0 && !junk.warnings.isEmpty, "an invalid packet gives nothing and a warning")
+    // reset() after a seek: decoding goes on.
+    junk.reset()
+    let g3 = junk.decode(p1[10], pts: 0)
+    check(g3.frames == 960 && g3.channels == 2, "decoding after reset")
+
+    print("opus: {passed} of {total} passed")
+}

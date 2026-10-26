@@ -1,0 +1,883 @@
+// The Library window's content (`LibraryView`): a sidebar of groups
+// (Movies, TV Shows, Music, Other, History, Playlists) with counts, a bar
+// with Back, the title, sort, grid/list and a search field, and the
+// group's content: a grid of posters or a list of files; TV shows →
+// a show's seasons and episodes (watched marks, progress bars, the next
+// one marked); Music → artists → albums → tracks; the history; saved
+// playlists. Every file, show and album has a context menu (Play, Play
+// Next, Add to Playlist, Show in Finder, Mark as Watched/Unwatched,
+// Forget). Click selects, a second click on the selection (a double
+// click) plays or opens it; the arrow keys, Return and Backspace work
+// too.
+//
+// The view reads from a `library.Library` through `LibraryModel` (which
+// caches what the level shows, so a list of thousands scrolls without
+// queries: rows are built lazily); it writes only watched marks and
+// Forget, and tells the app with `onChanged`. Pictures come from the app
+// (`posters`, asked for with `onNeedPoster`). System colours, so it
+// follows light and dark mode; the orange accent marks the selection.
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+import "../library"
+
+// Grid geometry (points).
+let libCellMin = 160.0
+let libCellGap = 14.0
+let libPad = 12.0
+
+public view LibraryView(model: bind LibraryModel, lib: library.Library, posters: [String: LibThumb] = [:], playlists: [String] = [], onPlay: fn([library.MediaItem]), onPlayNext: fn([library.MediaItem]) = { _ in }, onAddToPlaylist: fn([library.MediaItem], String) = { _, _ in }, onShowInFinder: fn(String) = { _ in }, onOpenPlaylist: fn(String) = { _ in }, onNeedPoster: fn(library.MediaItem) = { _ in }, onChanged: fn() = {}) {
+    state sidebarWidth = 190.0
+    state contentWidth = 640.0
+    state showSort = false
+    state lastTapKey = ""
+    state lastTapTime = -100.0
+
+    HSplit(size: sidebarWidth) {
+        libSidebar().frame(minWidth: 150)
+        VStack(spacing: 0) {
+            // Reads again whenever what to show changes (group, search,
+            // sort, show, album…): a new key makes this view appear anew.
+            Spacer()
+                .frame(width: 0, height: 0)
+                .id(model.queryKey())
+                .onAppear { model.update(lib) }
+            libToolbar()
+            Divider()
+            if model.shownCount() == 0 && model.level() != "playlists" {
+                libEmpty()
+            } else {
+                match model.level() {
+                    "shows" -> libShowsGrid()
+                    "episodes" -> libEpisodes()
+                    "artists" -> libArtists()
+                    "albums" -> libAlbumsGrid()
+                    "tracks" -> libTracks()
+                    "history" -> libItemsList()
+                    "playlists" -> libPlaylists()
+                    _ -> if model.layout == "list" { libItemsList() } else { libItemsGrid() }
+                }
+            }
+        }
+        .onResize { w, h in contentWidth = w }
+    }
+    .onKeyEvent { e in libKey(e) }
+
+    // --- Sidebar ---
+
+    fn libSidebar() -> View {
+        VStack(spacing: 2, alignment: .leading) {
+            Text("LIBRARY")
+                .font(size: 11, weight: .semibold)
+                .color(.secondary)
+                .padding(top: 8, leading: 8, bottom: 4)
+            for g in libGroups {
+                libSidebarRow(g)
+            }
+            Spacer()
+        }
+        .padding(6)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(.sidebar)
+    }
+
+    fn libSidebarRow(_ g: String) -> View {
+        let on = model.group == g
+        let n = libGroupCount(g)
+        HStack(spacing: 8) {
+            Svg(libGroupSvg(g))
+                .color(if on { libAccent } else { .secondary })
+                .frame(width: 16, height: 16)
+            Text(libGroupTitle(g))
+                .font(size: 13, weight: if on { .semibold } else { .regular })
+                .lineLimit(1)
+            Spacer()
+            Text("{n}").font(size: 11).color(.secondary)
+        }
+        .padding(horizontal: 8, vertical: 5)
+        .background(if on { libAccentSoft } else { .clear }, radius: 6)
+        .hoverBackground(.lightGray, radius: 6)
+        .onTap { libChooseGroup(g) }
+        .accessibilityLabel("{libGroupTitle(g)}, {n}")
+    }
+
+    fn libGroupCount(_ g: String) -> Int {
+        match g {
+            "history" -> model.historyCount
+            "playlists" -> playlists.count
+            _ -> model.counts[g] ?? 0
+        }
+    }
+
+    fn libChooseGroup(_ g: String) {
+        if model.group == g && !model.canGoBack {
+            return
+        }
+        model.choose(g)
+    }
+
+    // --- Toolbar ---
+
+    fn libToolbar() -> View {
+        let level = model.level()
+        let sorts = level == "items" || level == "history"
+        HStack(spacing: 6) {
+            if model.canGoBack {
+                LibButton(svg: svgLibChevronLeft(), tip: "Back") { model.back() }
+            }
+            Text(model.title())
+                .font(size: 15, weight: .semibold)
+                .lineLimit(1)
+            Text(libCountText())
+                .font(size: 12)
+                .color(.secondary)
+                .lineLimit(1)
+            Spacer()
+            if sorts && level != "history" {
+                Button("Sort: {libSortTitle(model.group, model.sort)}") { showSort = true }
+                    .popover(isPresented: showSort) { libSortMenu() }
+                LibButton(svg: if model.descending { svgLibSortDown() } else { svgLibSortUp() }, tip: if model.descending { "Descending (click for ascending)" } else { "Ascending (click for descending)" }) {
+                    model.descending = !model.descending
+                }
+                LibButton(svg: svgLibGrid(), tip: "Show as grid", on: model.layout == "grid") { model.layout = "grid" }
+                LibButton(svg: svgLibList(), tip: "Show as list", on: model.layout == "list") { model.layout = "list" }
+            }
+            SearchField("Search {libGroupTitle(model.group)}", text: model.query)
+                .frame(width: 210)
+        }
+        .padding(horizontal: 10, vertical: 7)
+    }
+
+    fn libSortMenu() -> View {
+        VStack(spacing: 0, alignment: .leading) {
+            for (k, t) in libSortOptions(model.group) {
+                HStack(spacing: 6) {
+                    Svg(svgLibCheck())
+                        .color(libAccent)
+                        .frame(width: 12, height: 12)
+                        .opacity(if model.sort == k { 1.0 } else { 0.0 })
+                    Text(t).font(size: 13)
+                    Spacer()
+                }
+                .padding(horizontal: 8, vertical: 4)
+                .frame(width: 170)
+                .hoverBackground(.lightGray, radius: 4)
+                .onTap {
+                    model.sort = k
+                    showSort = false
+                }
+            }
+        }
+        .padding(4)
+    }
+
+    fn libCountText() -> String {
+        let n = model.shownCount()
+        match model.level() {
+            "shows" -> if n == 1 { "1 show" } else { "{n} shows" }
+            "artists" -> if n - 1 == 1 { "1 artist" } else { "{n - 1} artists" }
+            "albums" -> if n == 1 { "1 album" } else { "{n} albums" }
+            "playlists" -> if playlists.count == 1 { "1 playlist" } else { "{playlists.count} playlists" }
+            "episodes" -> if n == 1 { "1 episode" } else { "{n} episodes" }
+            "tracks" -> if n == 1 { "1 track" } else { "{n} tracks" }
+            _ -> if n == 1 { "1 item" } else { "{n} items" }
+        }
+    }
+
+    fn libEmpty() -> View {
+        VStack(spacing: 10) {
+            Spacer()
+            Svg(libGroupSvg(model.group))
+                .color(.secondary)
+                .frame(width: 40, height: 40)
+                .opacity(0.6)
+            Text(libEmptyText())
+                .font(size: 14)
+                .color(.secondary)
+                .textAlignment(.center)
+            Spacer()
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    fn libEmptyText() -> String {
+        if !model.query.trim().isEmpty {
+            return "Nothing matches “{model.query.trim()}”."
+        }
+        match model.group {
+            "history" -> "Nothing played yet."
+            "tv" -> "No TV shows yet.\nFiles named like “Show S01E02” are shown here."
+            "music" -> "No music yet."
+            _ -> "Nothing here yet.\nAdd a folder in Preferences ▸ Library."
+        }
+    }
+
+    // --- Movies, Other, search results: a grid or a list ---
+
+    // The width the grid's cells share (the scroll bar keeps 10 points).
+    fn libGridWidth() -> Float {
+        contentWidth - 2.0 * libPad - 10.0
+    }
+
+    fn libColumns() -> Int {
+        libGridColumns(width: libGridWidth(), cell: libCellMin, spacing: libCellGap)
+    }
+
+    fn libItemsGrid() -> View {
+        let cols = libColumns()
+        let cw = libCellWidth(width: libGridWidth(), columns: cols, spacing: libCellGap)
+        let th = floor(cw * 9.0 / 16.0)
+        Scroll {
+            LazyVStack(count: libGridRows(count: model.items.count, columns: cols) + 1, rowHeight: th + 58.0) { r in
+                let range = libGridRowRange(row: r, columns: cols, count: model.items.count)
+                HStack(spacing: libCellGap, alignment: .top) {
+                    for i in range.0..range.1 {
+                        libItemCell(i, width: cw, height: th)
+                    }
+                    Spacer()
+                }
+                .padding(top: 10, leading: libPad)
+            }
+        }
+    }
+
+    fn libItemCell(_ i: Int, width: Float, height: Float) -> View {
+        let it = model.items[i]
+        let sel = model.selected == it.path
+        VStack(spacing: 3, alignment: .leading) {
+            ZStack(alignment: .bottom) {
+                LibThumbView(thumb: posters[it.path] ?? LibThumb(), placeholder: libKindSvg(kind: it.kind, group: it.group), width: width, height: height, key: it.id, back: .lightGray, iconColor: .gray)
+                if it.position > 0.0 && !it.finished {
+                    LibProgressBar(fraction: libProgress(position: it.position, duration: it.duration), track: .rgba(0, 0, 0, 0.45))
+                        .frame(width: width - 12.0)
+                        .padding(bottom: 6)
+                }
+            }
+            .border(if sel { libAccent } else { .clear }, width: 3, radius: 6)
+            HStack(spacing: 4) {
+                if it.finished {
+                    Svg(svgLibCheck()).color(libAccent).frame(width: 12, height: 12).tooltip("Watched")
+                }
+                Text(it.displayTitle)
+                    .font(size: 13, weight: .medium)
+                    .color(if sel { libAccent } else { .primary })
+                    .lineLimit(1)
+            }
+            .frame(width: width, alignment: .leading)
+            Text(libItemSubtitle(it, level: model.level(), now: model.loadedAt))
+                .font(size: 11)
+                .color(.secondary)
+                .lineLimit(1)
+                .frame(width: width, alignment: .leading)
+        }
+        .frame(width: width)
+        .onTap { libTapped(it.path, i) }
+        .onAppear { libWantPoster(it) }
+        .contextMenu { libMenuFor([it]) }
+        .accessibilityLabel(it.displayTitle)
+    }
+
+    fn libItemsList() -> View {
+        let level = model.level()
+        Scroll {
+            LazyVStack(count: model.items.count, rowHeight: 52) { i in
+                libItemRow(i, level: level)
+            }
+        }
+    }
+
+    fn libItemRow(_ i: Int, level: String) -> View {
+        let it = model.items[i]
+        let sel = model.selected == it.path
+        HStack(spacing: 10) {
+            LibThumbView(thumb: posters[it.path] ?? LibThumb(), placeholder: libKindSvg(kind: it.kind, group: it.group), width: 64, height: 36, key: it.id, back: .lightGray, iconColor: .gray, radius: 4)
+            VStack(spacing: 2, alignment: .leading) {
+                Text(it.displayTitle)
+                    .font(size: 13, weight: .medium)
+                    .color(if sel { libAccent } else { .primary })
+                    .lineLimit(1)
+                Text(libItemSubtitle(it, level: level, now: model.loadedAt))
+                    .font(size: 11)
+                    .color(.secondary)
+                    .lineLimit(1)
+            }
+            Spacer()
+            libWatchMark(it)
+        }
+        .padding(horizontal: 10, vertical: 4)
+        .background(if sel { libAccentSoft } else { .clear }, radius: 6)
+        .hoverBackground(.lightGray, radius: 6)
+        .padding(horizontal: 6)
+        .onTap { libTapped(it.path, i) }
+        .onAppear { libWantPoster(it) }
+        .contextMenu { libMenuFor([it]) }
+        .accessibilityLabel(it.displayTitle)
+    }
+
+    // A watched mark, or a progress bar with the time left.
+    fn libWatchMark(_ it: library.MediaItem) -> View {
+        HStack(spacing: 6) {
+            if it.finished {
+                Svg(svgLibCheck()).color(libAccent).frame(width: 15, height: 15).tooltip(if it.kind == "audio" { "Played" } else { "Watched" })
+            } else if it.position > 0.0 && it.duration > 0.0 {
+                VStack(spacing: 2, alignment: .trailing) {
+                    LibProgressBar(fraction: libProgress(position: it.position, duration: it.duration), track: .lightGray).frame(width: 80)
+                    Text(libTimeLeftText(position: it.position, duration: it.duration)).font(size: 10).color(.secondary)
+                }
+            }
+        }
+    }
+
+    // --- TV shows ---
+
+    fn libShowsGrid() -> View {
+        let cols = libColumns()
+        let cw = libCellWidth(width: libGridWidth(), columns: cols, spacing: libCellGap)
+        let th = floor(cw * 9.0 / 16.0)
+        Scroll {
+            LazyVStack(count: libGridRows(count: model.shows.count, columns: cols) + 1, rowHeight: th + 58.0) { r in
+                let range = libGridRowRange(row: r, columns: cols, count: model.shows.count)
+                HStack(spacing: libCellGap, alignment: .top) {
+                    for i in range.0..range.1 {
+                        libShowCell(i, width: cw, height: th)
+                    }
+                    Spacer()
+                }
+                .padding(top: 10, leading: libPad)
+            }
+        }
+    }
+
+    fn libShowCell(_ i: Int, width: Float, height: Float) -> View {
+        let s = model.shows[i]
+        let sel = model.selected == s.key
+        let first = model.showFirst[s.key]
+        let thumb = if let f = first { posters[f.path] ?? LibThumb() } else { LibThumb() }
+        VStack(spacing: 3, alignment: .leading) {
+            ZStack(alignment: .topTrailing) {
+                LibThumbView(thumb: thumb, placeholder: svgLibTv(), width: width, height: height, key: first?.id ?? (i + 1) * 7919, back: .lightGray, iconColor: .gray)
+                if s.unwatched > 0 {
+                    HStack {
+                        Text("{s.unwatched}")
+                            .font(size: 11, weight: .bold)
+                            .color(.white)
+                            .padding(horizontal: 6, vertical: 2)
+                            .background(libAccent, radius: 8)
+                            .tooltip("{s.unwatched} unwatched")
+                    }
+                    .padding(6)
+                }
+            }
+            .border(if sel { libAccent } else { .clear }, width: 3, radius: 6)
+            Text(if s.name.isEmpty { "Unknown Show" } else { s.name })
+                .font(size: 13, weight: .medium)
+                .color(if sel { libAccent } else { .primary })
+                .lineLimit(1)
+                .frame(width: width, alignment: .leading)
+            Text(libShowSubtitle(s))
+                .font(size: 11)
+                .color(.secondary)
+                .lineLimit(1)
+                .frame(width: width, alignment: .leading)
+        }
+        .frame(width: width)
+        .onTap { libTapped(s.key, i) }
+        .onAppear {
+            if let f = first {
+                libWantPoster(f)
+            }
+        }
+        .contextMenu {
+            LibItemMenu(title: "Play Next Episode", playlists: playlists, watchedLabel: "Mark All as Watched", unwatchedLabel: "Mark All as Unwatched", showWatched: s.unwatched > 0, showUnwatched: s.unwatched < s.episodes, reveal: true, forget: false, onPlay: { libPlayShow(s.key, all: false) }, onPlayNext: { onPlayNext(libShowEpisodes(s.key)) }, onAdd: { pl in onAddToPlaylist(libShowEpisodes(s.key), pl) }, onReveal: { if let f = first { onShowInFinder(f.path) } }, onWatched: { w in libMark(libShowEpisodes(s.key), w) }, onForget: {})
+        }
+        .accessibilityLabel(s.name)
+    }
+
+    fn libEpisodes() -> View {
+        VStack(spacing: 0) {
+            HStack(spacing: 6) {
+                if model.seasons.count > 1 {
+                    libChip("All", on: model.season == -2) { model.season = -2 }
+                }
+                for s in model.seasons {
+                    libChip(libSeasonTitle(s), on: model.season == s || model.seasons.count == 1) { model.season = s }
+                }
+                Spacer()
+                if let next = libNextEpisode() {
+                    Button("Play {libEpisodeLabel(next)}") { onPlay([next]) }
+                        .tooltip("Play the next unwatched episode")
+                }
+            }
+            .padding(horizontal: 12, vertical: 8)
+            Divider()
+            Scroll {
+                LazyVStack(count: model.items.count, rowHeight: 62) { i in
+                    libEpisodeRow(i)
+                }
+            }
+        }
+    }
+
+    fn libNextEpisode() -> library.MediaItem? {
+        model.nextEpisode
+    }
+
+    fn libEpisodeLabel(_ e: library.MediaItem) -> String {
+        let code = libEpisodeCode(season: e.season, episode: e.episode, date: e.episodeDate)
+        if code.isEmpty { e.displayTitle } else { code }
+    }
+
+    fn libChip(_ title: String, on: Bool, action: fn()) -> View {
+        Text(title)
+            .font(size: 12, weight: if on { .semibold } else { .regular })
+            .color(if on { libAccent } else { .primary })
+            .padding(horizontal: 10, vertical: 4)
+            .background(if on { libAccentSoft } else { .lightGray }, radius: 11)
+            .onTap { action() }
+            .accessibilityLabel(title)
+    }
+
+    fn libEpisodeRow(_ i: Int) -> View {
+        let e = model.items[i]
+        let sel = model.selected == e.path
+        let code = libEpisodeCode(season: e.season, episode: e.episode, date: e.episodeDate)
+        let next = e.path == model.nextEpisodePath
+        HStack(spacing: 10) {
+            LibThumbView(thumb: posters[e.path] ?? LibThumb(), placeholder: svgLibTv(), width: 80, height: 45, key: e.id, back: .lightGray, iconColor: .gray, radius: 4)
+            VStack(spacing: 2, alignment: .leading) {
+                HStack(spacing: 6) {
+                    Text(code).font(size: 11, weight: .semibold).color(.secondary)
+                    if next {
+                        Text("UP NEXT")
+                            .font(size: 9, weight: .bold)
+                            .color(.white)
+                            .padding(horizontal: 5, vertical: 1)
+                            .background(libAccent, radius: 4)
+                    }
+                }
+                Text(e.displayTitle)
+                    .font(size: 13, weight: .medium)
+                    .color(if sel { libAccent } else { .primary })
+                    .lineLimit(1)
+                Text(libDurationText(e.duration)).font(size: 11).color(.secondary)
+            }
+            Spacer()
+            libWatchMark(e)
+        }
+        .padding(horizontal: 10, vertical: 4)
+        .background(if sel { libAccentSoft } else { .clear }, radius: 6)
+        .hoverBackground(.lightGray, radius: 6)
+        .padding(horizontal: 6)
+        .opacity(if e.finished && !sel { 0.75 } else { 1.0 })
+        .onTap { libTapped(e.path, i) }
+        .onAppear { libWantPoster(e) }
+        .contextMenu { libMenuFor([e]) }
+        .accessibilityLabel("{code} {e.displayTitle}{if e.finished { ", watched" } else { "" }}")
+    }
+
+    // --- Music ---
+
+    fn libArtists() -> View {
+        Scroll {
+            LazyVStack(count: model.artists.count + 1, rowHeight: 34) { i in
+                libArtistRow(i)
+            }
+        }
+    }
+
+    fn libArtistRow(_ i: Int) -> View {
+        let name = if i == 0 { "" } else { model.artists[i - 1] }
+        let key = model.keyAt(i)
+        let sel = model.selected == key
+        let title = if i == 0 { "All Albums" } else if name.isEmpty { "Unknown Artist" } else { name }
+        HStack(spacing: 10) {
+            Svg(if i == 0 { svgLibDisc() } else { svgLibUser() })
+                .color(if sel { libAccent } else { .secondary })
+                .frame(width: 16, height: 16)
+            Text(title)
+                .font(size: 13, weight: if i == 0 { .semibold } else { .regular })
+                .color(if sel { libAccent } else { .primary })
+                .lineLimit(1)
+            Spacer()
+            Svg(svgLibChevronRight()).color(.secondary).frame(width: 12, height: 12)
+        }
+        .padding(horizontal: 10, vertical: 4)
+        .background(if sel { libAccentSoft } else { .clear }, radius: 6)
+        .hoverBackground(.lightGray, radius: 6)
+        .padding(horizontal: 6)
+        .onTap { libTapped(key, i) }
+        .contextMenu {
+            LibItemMenu(title: "Play All", playlists: playlists, showWatched: false, showUnwatched: false, reveal: false, forget: false, onPlay: { onPlay(libArtistTracks(name, all: i == 0)) }, onPlayNext: { onPlayNext(libArtistTracks(name, all: i == 0)) }, onAdd: { pl in onAddToPlaylist(libArtistTracks(name, all: i == 0), pl) }, onReveal: {}, onWatched: { _ in }, onForget: {})
+        }
+        .accessibilityLabel(title)
+    }
+
+    fn libAlbumsGrid() -> View {
+        let cols = libColumns()
+        let cw = libCellWidth(width: libGridWidth(), columns: cols, spacing: libCellGap)
+        Scroll {
+            LazyVStack(count: libGridRows(count: model.albums.count, columns: cols) + 1, rowHeight: cw + 58.0) { r in
+                let range = libGridRowRange(row: r, columns: cols, count: model.albums.count)
+                HStack(spacing: libCellGap, alignment: .top) {
+                    for i in range.0..range.1 {
+                        libAlbumCell(i, side: cw)
+                    }
+                    Spacer()
+                }
+                .padding(top: 10, leading: libPad)
+            }
+        }
+    }
+
+    fn libAlbumCell(_ i: Int, side: Float) -> View {
+        let a = model.albums[i]
+        let key = "{a.album}|{a.artist}"
+        let sel = model.selected == key
+        let first = model.albumFirst[key]
+        let thumb = if let f = first { posters[f.path] ?? LibThumb() } else { LibThumb() }
+        VStack(spacing: 3, alignment: .leading) {
+            LibThumbView(thumb: thumb, placeholder: svgMusic(), width: side, height: side, key: first?.id ?? (i + 1) * 7919, back: .lightGray, iconColor: .gray)
+                .border(if sel { libAccent } else { .clear }, width: 3, radius: 6)
+            Text(if a.album.isEmpty { "Unknown Album" } else { a.album })
+                .font(size: 13, weight: .medium)
+                .color(if sel { libAccent } else { .primary })
+                .lineLimit(1)
+                .frame(width: side, alignment: .leading)
+            Text(if model.artist.isEmpty { a.artist } else { libAlbumSubtitle(a) })
+                .font(size: 11)
+                .color(.secondary)
+                .lineLimit(1)
+                .frame(width: side, alignment: .leading)
+        }
+        .frame(width: side)
+        .onTap { libTapped(key, i) }
+        .onAppear {
+            if let f = first {
+                libWantPoster(f)
+            }
+        }
+        .contextMenu {
+            LibItemMenu(title: "Play Album", playlists: playlists, showWatched: false, showUnwatched: false, reveal: true, forget: false, onPlay: { onPlay(lib.albumTracks(album: a.album, artist: a.artist)) }, onPlayNext: { onPlayNext(lib.albumTracks(album: a.album, artist: a.artist)) }, onAdd: { pl in onAddToPlaylist(lib.albumTracks(album: a.album, artist: a.artist), pl) }, onReveal: { if let f = first { onShowInFinder(f.path) } }, onWatched: { _ in }, onForget: {})
+        }
+        .accessibilityLabel("{a.album} by {a.artist}")
+    }
+
+    fn libTracks() -> View {
+        let first = model.items.first
+        VStack(spacing: 0) {
+            HStack(spacing: 12) {
+                LibThumbView(thumb: if let f = first { posters[f.path] ?? LibThumb() } else { LibThumb() }, placeholder: svgMusic(), width: 72, height: 72, key: first?.id ?? 1, back: .lightGray, iconColor: .gray)
+                VStack(spacing: 3, alignment: .leading) {
+                    Text(model.title()).font(size: 17, weight: .bold).lineLimit(1)
+                    Text(if model.albumArtist.isEmpty { "Unknown Artist" } else { model.albumArtist }).font(size: 13).color(.secondary)
+                    Text(libTracksSummary()).font(size: 11).color(.secondary)
+                }
+                Spacer()
+                Button("Play Album") { onPlay(model.items) }
+            }
+            .padding(12)
+            Divider()
+            Scroll {
+                LazyVStack(count: model.items.count, rowHeight: 32) { i in
+                    libTrackRow(i)
+                }
+            }
+        }
+    }
+
+    fn libTracksSummary() -> String {
+        var d: [Float] = []
+        var year = 0
+        for t in model.items {
+            d.append(t.duration)
+            year = max(year, t.year)
+        }
+        let (total, _) = libTotalDuration(d)
+        var parts: [String] = []
+        if year > 0 {
+            parts.append("{year}")
+        }
+        parts.append(if model.items.count == 1 { "1 track" } else { "{model.items.count} tracks" })
+        if total > 0.0 {
+            parts.append(libDurationText(total))
+        }
+        parts.joined(separator: " · ")
+    }
+
+    fn libTrackRow(_ i: Int) -> View {
+        let t = model.items[i]
+        let sel = model.selected == t.path
+        let showArtist = !t.artist.isEmpty && t.artist != model.albumArtist
+        HStack(spacing: 10) {
+            Text(if t.track > 0 { "{t.track}" } else { "" })
+                .font(size: 12)
+                .color(.secondary)
+                .frame(width: 26, alignment: .trailing)
+            Text(t.displayTitle)
+                .font(size: 13)
+                .color(if sel { libAccent } else { .primary })
+                .lineLimit(1)
+            if showArtist {
+                Text(t.artist).font(size: 12).color(.secondary).lineLimit(1)
+            }
+            Spacer()
+            if t.finished {
+                Svg(svgLibCheck()).color(libAccent).frame(width: 13, height: 13).tooltip("Played")
+            }
+            Text(libDurationText(t.duration)).font(size: 12).color(.secondary)
+        }
+        .padding(horizontal: 10, vertical: 3)
+        .background(if sel { libAccentSoft } else { .clear }, radius: 6)
+        .hoverBackground(.lightGray, radius: 6)
+        .padding(horizontal: 6)
+        .onTap { libTapped(t.path, i) }
+        .contextMenu { libMenuFor([t]) }
+        .accessibilityLabel("Track {t.track}, {t.displayTitle}")
+    }
+
+    // --- Playlists ---
+
+    fn libPlaylists() -> View {
+        if playlists.isEmpty {
+            VStack(spacing: 10) {
+                Spacer()
+                Svg(svgLibListMusic()).color(.secondary).frame(width: 40, height: 40).opacity(0.6)
+                Text("No saved playlists.\nSave the playing list from the Playlist panel.")
+                    .font(size: 14)
+                    .color(.secondary)
+                    .textAlignment(.center)
+                Spacer()
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else {
+            Scroll {
+                LazyVStack(count: playlists.count, rowHeight: 44) { i in
+                    libPlaylistRow(i)
+                }
+            }
+        }
+    }
+
+    fn libPlaylistRow(_ i: Int) -> View {
+        let p = playlists[i]
+        let sel = model.selected == p
+        HStack(spacing: 10) {
+            Svg(svgLibListMusic()).color(if sel { libAccent } else { .secondary }).frame(width: 18, height: 18)
+            VStack(spacing: 1, alignment: .leading) {
+                Text(libStem(p.fileName)).font(size: 13, weight: .medium).color(if sel { libAccent } else { .primary }).lineLimit(1)
+                Text(p.folder).font(size: 11).color(.secondary).lineLimit(1)
+            }
+            Spacer()
+        }
+        .padding(horizontal: 10, vertical: 4)
+        .background(if sel { libAccentSoft } else { .clear }, radius: 6)
+        .hoverBackground(.lightGray, radius: 6)
+        .padding(horizontal: 6)
+        .onTap { libTapped(p, i) }
+        .contextMenu {
+            MenuItem("Open") { onOpenPlaylist(p) }
+            MenuItem("Show in Finder") { onShowInFinder(p) }
+        }
+        .accessibilityLabel(libStem(p.fileName))
+    }
+
+    // --- Menus and actions ---
+
+    fn libMenuFor(_ items: [library.MediaItem]) -> View {
+        let it = items[0]
+        let audio = it.kind == "audio"
+        LibItemMenu(title: "Play", playlists: playlists, watchedLabel: if audio { "Mark as Played" } else { "Mark as Watched" }, unwatchedLabel: if audio { "Mark as Not Played" } else { "Mark as Unwatched" }, showWatched: !it.finished, showUnwatched: it.finished || it.position > 0.0, reveal: !library.isURL(it.path), forget: it.lastPlayed > 0.0 || it.position > 0.0 || it.finished || model.level() == "history", onPlay: { libPlay(it) }, onPlayNext: { onPlayNext(items) }, onAdd: { pl in onAddToPlaylist(items, pl) }, onReveal: { onShowInFinder(it.path) }, onWatched: { w in libMark(items, w) }, onForget: { libForget(items) })
+    }
+
+    fn libWantPoster(_ it: library.MediaItem) {
+        if posters[it.path] == nil {
+            onNeedPoster(it)
+        }
+    }
+
+    // A click: selects; a second click on the selection soon after opens
+    // or plays it (a double click).
+    fn libTapped(_ key: String, _ index: Int) {
+        let t = now()
+        if lastTapKey == key && t - lastTapTime < 0.45 {
+            lastTapKey = ""
+            libActivate(index)
+            return
+        }
+        lastTapKey = key
+        lastTapTime = t
+        model.selected = key
+    }
+
+    // Return or a double click on the thing at `index` of the level.
+    fn libActivate(_ index: Int) {
+        if index < 0 {
+            return
+        }
+        match model.level() {
+            "shows" -> {
+                if index < model.shows.count {
+                    model.openShow(model.shows[index])
+                }
+            }
+            "artists" -> {
+                if index == 0 {
+                    model.openArtist("")
+                } else if index - 1 < model.artists.count {
+                    model.openArtist(model.artists[index - 1])
+                }
+            }
+            "albums" -> {
+                if index < model.albums.count {
+                    model.openAlbum(model.albums[index])
+                }
+            }
+            "playlists" -> {
+                if index < playlists.count {
+                    onOpenPlaylist(playlists[index])
+                }
+            }
+            _ -> {
+                if index < model.items.count {
+                    libPlay(model.items[index])
+                }
+            }
+        }
+    }
+
+    // Plays a file: an album's track with the rest of the album after it.
+    fn libPlay(_ it: library.MediaItem) {
+        if model.level() == "tracks" {
+            var rest: [library.MediaItem] = []
+            var on = false
+            for t in model.items {
+                if t.path == it.path {
+                    on = true
+                }
+                if on {
+                    rest.append(t)
+                }
+            }
+            onPlay(if rest.isEmpty { [it] } else { rest })
+            return
+        }
+        onPlay([it])
+    }
+
+    fn libShowEpisodes(_ key: String) -> [library.MediaItem] {
+        lib.episodes(key: key)
+    }
+
+    fn libPlayShow(_ key: String, all: Bool) {
+        if all {
+            onPlay(lib.episodes(key: key))
+        } else if let n = lib.nextUnwatched(key: key) {
+            onPlay([n])
+        } else {
+            let eps = lib.episodes(key: key)
+            if !eps.isEmpty {
+                onPlay([eps[0]])
+            }
+        }
+    }
+
+    fn libArtistTracks(_ name: String, all: Bool) -> [library.MediaItem] {
+        var out: [library.MediaItem] = []
+        for a in lib.albums(artist: if all { "" } else { name }) {
+            out.appendAll(lib.albumTracks(album: a.album, artist: a.artist))
+        }
+        out
+    }
+
+    fn libMark(_ items: [library.MediaItem], _ watched: Bool) {
+        var l = lib
+        for it in items {
+            l.setFinished(it.path, size: it.size, watched)
+        }
+        model.reload(lib)
+        onChanged()
+    }
+
+    fn libForget(_ items: [library.MediaItem]) {
+        var l = lib
+        for it in items {
+            l.forget(it.path, size: it.size)
+        }
+        model.reload(lib)
+        onChanged()
+    }
+
+    // --- Keys ---
+
+    fn libKey(_ e: KeyEvent) {
+        let level = model.level()
+        let cols = if level == "shows" || level == "albums" || (level == "items" && model.layout == "grid") { libColumns() } else { 1 }
+        match e.key {
+            "left", "right", "up", "down", "home", "end", "pageup", "pagedown" -> {
+                if cols == 1 && (e.key == "left" || e.key == "right") {
+                    if e.key == "left" && model.canGoBack {
+                        model.back()
+                    } else if e.key == "right" && level != "items" && level != "history" && level != "episodes" && level != "tracks" {
+                        libActivate(model.selectedIndex())
+                    }
+                    return
+                }
+                let n = if level == "playlists" { playlists.count } else { model.shownCount() }
+                let cur = if level == "playlists" { playlists.index(of: model.selected) ?? -1 } else { model.selectedIndex() }
+                let to = libMoveSelection(cur, key: e.key, count: n, columns: cols)
+                if to >= 0 {
+                    model.selected = if level == "playlists" { playlists[to] } else { model.keyAt(to) }
+                    scrollTo(to / cols)
+                }
+            }
+            "enter" -> {
+                let cur = if level == "playlists" { playlists.index(of: model.selected) ?? -1 } else { model.selectedIndex() }
+                libActivate(cur)
+            }
+            "backspace", "escape" -> {
+                if model.canGoBack {
+                    model.back()
+                } else if e.key == "escape" && !model.query.isEmpty {
+                    model.query = ""
+                }
+            }
+            _ -> {}
+        }
+    }
+}
+
+// The context menu of a file, show, artist or album. `title` is the first
+// item (Play, Play Next Episode, Play Album…); `onAdd` gets "" for the
+// playing list or a saved playlist's path; `onWatched` true / false.
+public view LibItemMenu(title: String = "Play", playlists: [String] = [], watchedLabel: String = "Mark as Watched", unwatchedLabel: String = "Mark as Unwatched", showWatched: Bool = true, showUnwatched: Bool = true, reveal: Bool = true, forget: Bool = true, onPlay: fn(), onPlayNext: fn(), onAdd: fn(String), onReveal: fn(), onWatched: fn(Bool), onForget: fn()) {
+    MenuItem(title) { onPlay() }
+    MenuItem("Play Next") { onPlayNext() }
+    Menu("Add to Playlist") {
+        MenuItem("Playing List") { onAdd("") }
+        if !playlists.isEmpty {
+            MenuDivider()
+            for p in playlists {
+                MenuItem(libStem(p.fileName)) { onAdd(p) }
+            }
+        }
+    }
+    if showWatched || showUnwatched {
+        MenuDivider()
+    }
+    if showWatched {
+        MenuItem(watchedLabel) { onWatched(true) }
+    }
+    if showUnwatched {
+        MenuItem(unwatchedLabel) { onWatched(false) }
+    }
+    if reveal || forget {
+        MenuDivider()
+    }
+    if reveal {
+        MenuItem("Show in Finder") { onReveal() }
+    }
+    if forget {
+        MenuItem("Forget Play History") { onForget() }
+    }
+}

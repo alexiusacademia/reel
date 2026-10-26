@@ -1,0 +1,1140 @@
+// DTS-HD Master Audio lossless extension (XLL), as carried in the
+// extension substream: the lossless frame's common header, channel set
+// sub-headers, the NAVI table of segment sizes, the entropy coded
+// residuals (linear, Rice and hybrid Rice codes), inverse fixed and
+// adaptive (lattice) prediction, pairwise channel decorrelation, MSB/LSB
+// assembly, the two-band decimator for 192 kHz, hierarchical downmix
+// undoing, and adding the lossy core's output to residual-coded channels.
+//
+// It follows FFmpeg's dca_xll.c (DTS-HD specification v1.x; the ETSI
+// document doesn't cover XLL) so that output is bit-exact with it.
+//
+// Sample buffers are flat lists: msb[((set × 2 + band) × 8 + slot) ×
+// stride + 8 + n], where 8 history samples come first for the decimator.
+// Decorrelation reorders channels by permuting `slot` (channel → buffer
+// slot), as FFmpeg permutes its buffer pointers.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../core"
+
+// Error kinds, as FFmpeg's: damaged data, "no sync here, try the next
+// packet" (EAGAIN), and unsupported or inconsistent streams.
+let dtsErrInvalid = -1
+let dtsErrAgain = -2
+let dtsErrUnsupported = -3
+
+public struct DtsXll {
+    br: core.BitReader = core.bitReader(Data())
+    brStart: Int = 0
+    error: String = ""
+    reflTable: [Int] = dtsXllReflCoeff
+    bandCoeff: [Int] = dtsXllBandCoeff
+
+    // Common header.
+    frameSize: Int = 0
+    nchsets: Int = 0
+    nframesegs: Int = 0
+    nsegsamplesLog2: Int = 0
+    nsegsamples: Int = 0
+    nframesamples: Int = 0
+    segSizeNbits: Int = 0
+    bandCrcPresent: Int = 0
+    scalableLsbs: Bool = false
+    chMaskNbits: Int = 0
+    fixedLsbWidth: Int = 0
+
+    // Per channel set (3).
+    nch: [Int] = core.zeros(3)
+    residualEncode: [Int] = core.zeros(3)
+    pcmBitRes: [Int] = core.zeros(3)
+    storageBitRes: [Int] = core.zeros(3)
+    freq: [Int] = core.zeros(3)
+    primary: [Int] = core.zeros(3)
+    dmixCoeffsPresent: [Int] = core.zeros(3)
+    dmixEmbedded: [Int] = core.zeros(3)
+    dmixType: [Int] = core.zeros(3)
+    hier: [Int] = core.zeros(3)
+    hierOfs: [Int] = core.zeros(3)
+    dmixCoeff: [Int] = core.zeros(3 * 128)
+    dmixScale: [Int] = core.zeros(3 * 16)
+    dmixScaleInv: [Int] = core.zeros(3 * 16)
+    chMask: [Int] = core.zeros(3)
+    chRemap: [Int] = core.zeros(24)
+    nfreqbandsOf: [Int] = core.zeros(3)
+    nabits: [Int] = core.zeros(3)
+    segCommon: [Int] = core.zeros(3)
+
+    // Per set × band (6).
+    decorEnabled: [Int] = core.zeros(6)
+    highestPredOrder: [Int] = core.zeros(6)
+    bandDmixEmbedded: [Int] = core.zeros(6)
+    lsbSectionSize: [Int] = core.zeros(6)
+    // Per set × band × channel (48).
+    origOrder: [Int] = core.zeros(48)
+    adaptPredOrder: [Int] = core.zeros(48)
+    fixedPredOrder: [Int] = core.zeros(48)
+    nscalablelsbs: [Int] = core.zeros(48)
+    bitWidthAdjust: [Int] = core.zeros(48)
+    decorCoeff: [Int] = core.zeros(24)
+    reflCoeff: [Int] = core.zeros(48 * 16)
+    slot: [Int] = core.zeros(48)
+    // Per set × channel coding parameters (24).
+    riceCodeFlag: [Int] = core.zeros(24)
+    hybridLinear: [Int] = core.zeros(24)
+    partABits: [Int] = core.zeros(24)
+    partBBits: [Int] = core.zeros(24)
+    partASamples: [Int] = core.zeros(24)
+    // Decimator history, set × channel × 8.
+    deciHistory: [Int] = core.zeros(3 * 8 * 8)
+
+    navi: [Int] = []
+    nfreqbands: Int = 0
+    nchannels: Int = 0
+    nreschsets: Int = 0
+    nactivechsets: Int = 0
+    hdStreamId: Int = -1
+
+    // Sample buffers.
+    stride: Int = 0
+    msb: [Int] = []
+    lsb: [Int] = []
+    asmBuf: [Int] = []
+    coeff: [Int] = core.zeros(16)
+
+    // Output: for each speaker, 0 none, 1 an msb buffer, 2 the band
+    // assembly buffer; and where its samples start.
+    outKind: [Int] = core.zeros(32)
+    outBase: [Int] = core.zeros(32)
+    outputMask: Int = 0
+
+    // Peak bit rate smoothing buffer (frames split over packets).
+    pbr: Data = Data()
+    pbrDelay: Int = 0
+
+    xSyncword: Bool = false
+    xImaxSyncword: Bool = false
+
+    fn fail(_ code: Int, _ text: String) -> Int {
+        if error.isEmpty {
+            error = text
+        }
+        code
+    }
+
+    pos: Int {
+        br.position - brStart
+    }
+
+    fn seekBits(_ p: Int) -> Bool {
+        let now = pos
+        if p < now || brStart + p > br.end * 8 {
+            return false
+        }
+        br.skip(p - now)
+        true
+    }
+
+    fn linear(_ n: Int) -> Int {
+        let v = br.bits(n)
+        (v >> 1) ^ (-(v & 1))
+    }
+
+    fn rice(_ k: Int) -> Int {
+        var v = 0
+        let left = br.left
+        if left > 0 {
+            v = br.zerosBeforeOne(limit: left)
+        }
+        v = (v << k) | br.bits(k)
+        (v >> 1) ^ (-(v & 1))
+    }
+
+    fn msbAt(_ c: Int, _ band: Int, _ s: Int) -> Int {
+        ((c * 2 + band) * 8 + s) * stride + 8
+    }
+
+    // --- Headers ---
+
+    fn parseDmixCoeffs(_ c: Int) -> Int {
+        let m = if primary[c] != 0 { dtsDmixPrimaryNch[dmixType[c]] } else { hierOfs[c] }
+        var cp = c * 128
+        for i in 0..m {
+            var scaleInv = 0
+            if primary[c] == 0 {
+                let code = br.bits(9)
+                let neg = (code >> 8) == 0
+                let index = (code & 0xff) - 41
+                if index < 0 || index >= 201 {
+                    return fail(dtsErrInvalid, "invalid XLL downmix scale index")
+                }
+                let scale = dtsDmixTable[index + 41]
+                scaleInv = dtsInvDmixTable[index]
+                if i < 16 {
+                    dmixScale[c * 16 + i] = if neg { -scale } else { scale }
+                    dmixScaleInv[c * 16 + i] = if neg { -scaleInv } else { scaleInv }
+                }
+            }
+            for _ in 0..nch[c] {
+                let code = br.bits(9)
+                let neg = (code >> 8) == 0
+                let index = code & 0xff
+                if index >= 242 {
+                    return fail(dtsErrInvalid, "invalid XLL downmix coefficient index")
+                }
+                var v = dtsDmixTable[index]
+                if primary[c] == 0 {
+                    v = dtsWrap32((scaleInv * v + 32768) >> 16)
+                }
+                if cp < c * 128 + 128 {
+                    dmixCoeff[cp] = if neg { -v } else { v }
+                }
+                cp += 1
+            }
+        }
+        0
+    }
+
+    fn parseChsetHeader(_ c: Int, _ asset: DtsAsset) -> Int {
+        let headerPos = pos
+        let headerSize = br.bits(10) + 1
+        nch[c] = br.bits(4) + 1
+        if nch[c] > 8 {
+            return fail(dtsErrUnsupported, "{nch[c]} XLL channels")
+        }
+        residualEncode[c] = br.bits(nch[c])
+        pcmBitRes[c] = br.bits(5) + 1
+        storageBitRes[c] = br.bits(5) + 1
+        if storageBitRes[c] != 16 && storageBitRes[c] != 20 && storageBitRes[c] != 24 {
+            return fail(dtsErrUnsupported, "{storageBitRes[c]}-bit XLL storage")
+        }
+        if pcmBitRes[c] > storageBitRes[c] {
+            return fail(dtsErrInvalid, "invalid XLL PCM bit resolution")
+        }
+        freq[c] = dtsSamplingFreqs[br.bits(4)]
+        if freq[c] > 192000 {
+            return fail(dtsErrUnsupported, "{freq[c]} Hz XLL sampling frequency")
+        }
+        if br.bits(2) != 0 {
+            return fail(dtsErrUnsupported, "XLL sampling frequency modifier")
+        }
+        if br.bits(2) != 0 {
+            return fail(dtsErrUnsupported, "XLL replacement set")
+        }
+        if asset.oneToOneMap {
+            primary[c] = br.bits(1)
+            if (primary[c] != 0) != (c == 0) {
+                return fail(dtsErrInvalid, "the first XLL channel set must be the primary one")
+            }
+            dmixCoeffsPresent[c] = br.bits(1)
+            dmixEmbedded[c] = if dmixCoeffsPresent[c] != 0 { br.bits(1) } else { 0 }
+            if dmixCoeffsPresent[c] != 0 && primary[c] != 0 {
+                dmixType[c] = br.bits(3)
+                if dmixType[c] >= 7 {
+                    return fail(dtsErrInvalid, "invalid XLL downmix type")
+                }
+            }
+            hier[c] = br.bits(1)
+            if hier[c] == 0 && nchsets != 1 {
+                return fail(dtsErrUnsupported, "XLL channel set outside of the hierarchy")
+            }
+            if dmixCoeffsPresent[c] != 0 && parseDmixCoeffs(c) < 0 {
+                return dtsErrInvalid
+            }
+            if !br.flag() {
+                return fail(dtsErrUnsupported, "disabled XLL channel mask")
+            }
+            chMask[c] = br.long(chMaskNbits)
+            if dtsPopcount(chMask[c]) != nch[c] {
+                return fail(dtsErrInvalid, "invalid XLL channel mask")
+            }
+            var j = 0
+            for i in 0..chMaskNbits {
+                if (chMask[c] & (1 << i)) != 0 {
+                    chRemap[c * 8 + j] = i
+                    j += 1
+                }
+            }
+        } else {
+            if nch[c] != 2 || nchsets != 1 || br.flag() {
+                return fail(dtsErrUnsupported, "custom XLL channel to speaker mapping")
+            }
+            primary[c] = 1
+            dmixCoeffsPresent[c] = 0
+            dmixEmbedded[c] = 0
+            hier[c] = 0
+            chMask[c] = 0x6
+            chRemap[c * 8] = dtsSpkL
+            chRemap[c * 8 + 1] = dtsSpkR
+        }
+        if freq[c] > 96000 {
+            if br.flag() {
+                return fail(dtsErrUnsupported, "extra XLL frequency bands")
+            }
+            nfreqbandsOf[c] = 2
+        } else {
+            nfreqbandsOf[c] = 1
+        }
+        freq[c] = freq[c] >> (nfreqbandsOf[c] - 1)
+        if c != 0 && (nfreqbandsOf[c] != nfreqbandsOf[0] || freq[c] != freq[0] || pcmBitRes[c] != pcmBitRes[0] || storageBitRes[c] != storageBitRes[0]) {
+            return fail(dtsErrUnsupported, "different XLL audio characteristics")
+        }
+        nabits[c] = if storageBitRes[c] > 16 { 5 } else if storageBitRes[c] > 8 { 4 } else { 3 }
+        if (nchsets > 1 || nfreqbandsOf[c] > 1) && nabits[c] < 5 {
+            nabits[c] += 1
+        }
+        let n = nch[c]
+        for band in 0..nfreqbandsOf[c] {
+            let cb = c * 2 + band
+            decorEnabled[cb] = br.bits(1)
+            if decorEnabled[cb] != 0 && n > 1 {
+                var chBits = 0
+                while (1 << chBits) < n {
+                    chBits += 1
+                }
+                for i in 0..n {
+                    origOrder[cb * 8 + i] = br.bits(chBits)
+                    if origOrder[cb * 8 + i] >= n {
+                        return fail(dtsErrInvalid, "invalid XLL original channel order")
+                    }
+                }
+                for i in 0..(n / 2) {
+                    decorCoeff[cb * 4 + i] = if br.flag() { linear(7) } else { 0 }
+                }
+            } else {
+                for i in 0..n {
+                    origOrder[cb * 8 + i] = i
+                }
+                for i in 0..(n / 2) {
+                    decorCoeff[cb * 4 + i] = 0
+                }
+            }
+            highestPredOrder[cb] = 0
+            for i in 0..n {
+                adaptPredOrder[cb * 8 + i] = br.bits(4)
+                highestPredOrder[cb] = max(highestPredOrder[cb], adaptPredOrder[cb * 8 + i])
+            }
+            if highestPredOrder[cb] > nsegsamples {
+                return fail(dtsErrInvalid, "invalid XLL adaptive prediction order")
+            }
+            for i in 0..n {
+                fixedPredOrder[cb * 8 + i] = if adaptPredOrder[cb * 8 + i] != 0 { 0 } else { br.bits(2) }
+            }
+            for i in 0..n {
+                for j in 0..adaptPredOrder[cb * 8 + i] {
+                    let k = linear(8)
+                    if k == -128 {
+                        return fail(dtsErrInvalid, "invalid XLL reflection coefficient index")
+                    }
+                    reflCoeff[(cb * 8 + i) * 16 + j] = if k < 0 { -reflTable[-k] } else { reflTable[k] }
+                }
+            }
+            bandDmixEmbedded[cb] = if dmixEmbedded[c] != 0 && (band == 0 || br.flag()) { 1 } else { 0 }
+            if (band == 0 && scalableLsbs) || (band != 0 && br.flag()) {
+                lsbSectionSize[cb] = br.long(segSizeNbits)
+                if lsbSectionSize[cb] < 0 || lsbSectionSize[cb] > frameSize {
+                    return fail(dtsErrInvalid, "invalid XLL LSB section size")
+                }
+                if lsbSectionSize[cb] != 0 && (bandCrcPresent > 2 || (band == 0 && bandCrcPresent > 1)) {
+                    lsbSectionSize[cb] += 2
+                }
+                for i in 0..n {
+                    nscalablelsbs[cb * 8 + i] = br.bits(4)
+                    if nscalablelsbs[cb * 8 + i] != 0 && lsbSectionSize[cb] == 0 {
+                        return fail(dtsErrInvalid, "XLL LSB section missing")
+                    }
+                }
+            } else {
+                lsbSectionSize[cb] = 0
+                for i in 0..n {
+                    nscalablelsbs[cb * 8 + i] = 0
+                }
+            }
+            if (band == 0 && scalableLsbs) || (band != 0 && br.flag()) {
+                for i in 0..n {
+                    bitWidthAdjust[cb * 8 + i] = br.bits(4)
+                }
+            } else {
+                for i in 0..n {
+                    bitWidthAdjust[cb * 8 + i] = 0
+                }
+            }
+        }
+        if !seekBits(headerPos + headerSize * 8) {
+            return fail(dtsErrInvalid, "read past the end of an XLL channel set header")
+        }
+        0
+    }
+
+    fn parseCommonHeader() -> Int {
+        if br.long(32) != 0x41A29547 {
+            return fail(dtsErrAgain, "no XLL sync word")
+        }
+        let version = br.bits(4) + 1
+        if version > 1 {
+            return fail(dtsErrUnsupported, "XLL stream version {version}")
+        }
+        let headerSize = br.bits(8) + 1
+        let sizeBits = br.bits(5) + 1
+        frameSize = br.long(sizeBits)
+        if frameSize < 0 || frameSize >= 240 * 1024 {
+            return fail(dtsErrInvalid, "invalid XLL frame size")
+        }
+        frameSize += 1
+        nchsets = br.bits(4) + 1
+        if nchsets > 3 {
+            return fail(dtsErrUnsupported, "{nchsets} XLL channel sets")
+        }
+        let segsLog2 = br.bits(4)
+        nframesegs = 1 << segsLog2
+        if nframesegs > 1024 {
+            return fail(dtsErrInvalid, "too many XLL segments")
+        }
+        nsegsamplesLog2 = br.bits(4)
+        if nsegsamplesLog2 == 0 {
+            return fail(dtsErrInvalid, "too few samples per XLL segment")
+        }
+        nsegsamples = 1 << nsegsamplesLog2
+        if nsegsamples > 512 {
+            return fail(dtsErrInvalid, "too many samples per XLL segment")
+        }
+        nframesamples = 1 << (nsegsamplesLog2 + segsLog2)
+        if nframesamples > 65536 {
+            return fail(dtsErrInvalid, "too many samples per XLL frame")
+        }
+        segSizeNbits = br.bits(5) + 1
+        bandCrcPresent = br.bits(2)
+        scalableLsbs = br.flag()
+        chMaskNbits = br.bits(5) + 1
+        fixedLsbWidth = if scalableLsbs { br.bits(4) } else { 0 }
+        if !seekBits(headerSize * 8) {
+            return fail(dtsErrInvalid, "read past the end of the XLL common header")
+        }
+        0
+    }
+
+    fn isHierDmix(_ c: Int) -> Bool {
+        primary[c] == 0 && dmixEmbedded[c] != 0 && hier[c] != 0
+    }
+
+    // The next channel set in the hierarchy that carries an embedded
+    // downmix, or −1.
+    fn nextHierDmix(_ c: Int) -> Int {
+        if hier[c] != 0 {
+            var o = c + 1
+            while o < nchsets {
+                if isHierDmix(o) {
+                    return o
+                }
+                o += 1
+            }
+        }
+        -1
+    }
+
+    fn prescaleDownMix(_ c: Int, _ o: Int) {
+        var cp = c * 128
+        for i in 0..hierOfs[c] {
+            let scale = dmixScale[o * 16 + i]
+            let scaleInv = dmixScaleInv[o * 16 + i]
+            dmixScale[c * 16 + i] = dtsWrap32((dmixScale[c * 16 + i] * scale + 16384) >> 15)
+            dmixScaleInv[c * 16 + i] = dtsWrap32((dmixScaleInv[c * 16 + i] * scaleInv + 32768) >> 16)
+            for j in 0..nch[c] {
+                let v = dtsWrap32((dmixCoeff[cp] * scaleInv + 32768) >> 16)
+                dmixCoeff[cp] = dtsWrap32((v * dmixScale[o * 16 + hierOfs[c] + j] + 16384) >> 15)
+                cp += 1
+            }
+        }
+    }
+
+    fn parseSubHeaders(_ asset: DtsAsset) -> Int {
+        nfreqbands = 0
+        nchannels = 0
+        nreschsets = 0
+        for c in 0..nchsets {
+            hierOfs[c] = nchannels
+            let r = parseChsetHeader(c, asset)
+            if r < 0 {
+                return r
+            }
+            nfreqbands = max(nfreqbands, nfreqbandsOf[c])
+            if hier[c] != 0 {
+                nchannels += nch[c]
+            }
+            if residualEncode[c] != (1 << nch[c]) - 1 {
+                nreschsets += 1
+            }
+        }
+        var c = nchsets - 1
+        while c > 0 {
+            if isHierDmix(c) {
+                let o = nextHierDmix(c)
+                if o >= 0 {
+                    prescaleDownMix(c, o)
+                }
+            }
+            c -= 1
+        }
+        nactivechsets = nchsets
+        0
+    }
+
+    fn parseNaviTable() -> Int {
+        let n = nfreqbands * nframesegs * nchsets
+        if n > 1024 {
+            return fail(dtsErrInvalid, "too many XLL NAVI entries")
+        }
+        navi = []
+        for band in 0..nfreqbands {
+            for _ in 0..nframesegs {
+                for c in 0..nchsets {
+                    var size = 0
+                    if nfreqbandsOf[c] > band {
+                        size = br.long(segSizeNbits)
+                        if size < 0 || size >= frameSize {
+                            return fail(dtsErrInvalid, "invalid XLL NAVI segment size")
+                        }
+                        size += 1
+                    }
+                    navi.append(size)
+                }
+            }
+        }
+        br.skip((-pos) & 7)
+        br.skip(16)
+        0
+    }
+
+    fn allocBuffers() {
+        stride = nframesamples + 8
+        let need = 3 * 2 * 8 * stride
+        if msb.count < need {
+            msb = core.zeros(need)
+        }
+        let needLsb = 3 * 2 * 8 * nframesamples
+        if lsb.count < needLsb {
+            lsb = core.zeros(needLsb)
+        }
+        for i in 0..48 {
+            slot[i] = i % 8
+        }
+    }
+
+    fn lsbAt(_ c: Int, _ band: Int, _ ch: Int) -> Int {
+        ((c * 2 + band) * 8 + ch) * nframesamples
+    }
+
+    fn parseBandData() -> Int {
+        allocBuffers()
+        var naviPos = pos
+        var ni = 0
+        for band in 0..nfreqbands {
+            for seg in 0..nframesegs {
+                for c in 0..nchsets {
+                    if nfreqbandsOf[c] > band {
+                        naviPos += navi[ni] * 8
+                        if brStart + naviPos > br.end * 8 {
+                            return fail(dtsErrInvalid, "invalid XLL NAVI position")
+                        }
+                        if c < nactivechsets {
+                            let r = chsParseBandData(c, band, seg, naviPos)
+                            if r < 0 {
+                                bandWarnings += 1
+                                chsClearBandData(c, band, seg)
+                            }
+                        }
+                        br.seek(toBit: brStart + naviPos)
+                    }
+                    ni += 1
+                }
+            }
+        }
+        0
+    }
+    bandWarnings: Int = 0
+
+    fn chsParseBandData(_ c: Int, _ band: Int, _ seg: Int, _ bandDataEnd: Int) -> Int {
+        let cb = c * 2 + band
+        let n = nch[c]
+        if !(seg != 0 && br.flag()) {
+            segCommon[c] = br.bits(1)
+            let k = if segCommon[c] != 0 { 1 } else { n }
+            for i in 0..k {
+                riceCodeFlag[c * 8 + i] = br.bits(1)
+                if segCommon[c] == 0 && riceCodeFlag[c * 8 + i] != 0 && br.flag() {
+                    hybridLinear[c * 8 + i] = br.bits(nabits[c]) + 1
+                } else {
+                    hybridLinear[c * 8 + i] = 0
+                }
+            }
+            for i in 0..k {
+                let q = c * 8 + i
+                if seg == 0 {
+                    partABits[q] = br.bits(nabits[c])
+                    if riceCodeFlag[q] == 0 && partABits[q] != 0 {
+                        partABits[q] += 1
+                    }
+                    partASamples[q] = if segCommon[c] == 0 { adaptPredOrder[cb * 8 + i] } else { highestPredOrder[cb] }
+                } else {
+                    partABits[q] = 0
+                    partASamples[q] = 0
+                }
+                partBBits[q] = br.bits(nabits[c])
+                if riceCodeFlag[q] == 0 && partBBits[q] != 0 {
+                    partBBits[q] += 1
+                }
+            }
+        }
+        for i in 0..n {
+            let q = c * 8 + (if segCommon[c] != 0 { 0 } else { i })
+            let a = msbAt(c, band, i) + seg * nsegsamples
+            let na = partASamples[q]
+            let b = a + na
+            let nb = nsegsamples - na
+            if br.left < 0 {
+                return fail(dtsErrInvalid, "XLL band data past the end")
+            }
+            if riceCodeFlag[q] == 0 {
+                let ka = partABits[q]
+                for j in 0..na {
+                    msb[a + j] = if ka == 0 { 0 } else { linear(ka) }
+                }
+                let kb = partBBits[q]
+                for j in 0..nb {
+                    msb[b + j] = if kb == 0 { 0 } else { linear(kb) }
+                }
+            } else {
+                let ka = partABits[q]
+                for j in 0..na {
+                    if br.left <= ka {
+                        return fail(dtsErrInvalid, "XLL Rice codes past the end")
+                    }
+                    msb[a + j] = rice(ka)
+                }
+                let kb = partBBits[q]
+                if hybridLinear[q] != 0 {
+                    let niso = br.bits(nsegsamplesLog2)
+                    for j in 0..nb {
+                        msb[b + j] = 0
+                    }
+                    for _ in 0..niso {
+                        let loc = br.bits(nsegsamplesLog2)
+                        if loc >= nb {
+                            return fail(dtsErrInvalid, "invalid XLL isolated sample location")
+                        }
+                        msb[b + loc] = -1
+                    }
+                    let kh = hybridLinear[q]
+                    for j in 0..nb {
+                        if msb[b + j] != 0 {
+                            msb[b + j] = linear(kh)
+                        } else {
+                            msb[b + j] = rice(kb)
+                        }
+                    }
+                } else {
+                    for j in 0..nb {
+                        if br.left <= kb {
+                            return fail(dtsErrInvalid, "XLL Rice codes past the end")
+                        }
+                        msb[b + j] = rice(kb)
+                    }
+                }
+            }
+        }
+        if seg == 0 && band == 1 {
+            let nbits = br.bits(5) + 1
+            for i in 0..n {
+                for j in 1..8 {
+                    deciHistory[(c * 8 + i) * 8 + j] = br.signed(nbits)
+                }
+            }
+        }
+        if lsbSectionSize[cb] != 0 {
+            if !seekBits(bandDataEnd - lsbSectionSize[cb] * 8) {
+                return fail(dtsErrInvalid, "read past the end of XLL band data")
+            }
+            for i in 0..n {
+                let w = nscalablelsbs[cb * 8 + i]
+                if w != 0 {
+                    let l = lsbAt(c, band, i) + seg * nsegsamples
+                    for j in 0..nsegsamples {
+                        lsb[l + j] = br.bits(w)
+                    }
+                }
+            }
+        }
+        if !seekBits(bandDataEnd) {
+            return fail(dtsErrInvalid, "read past the end of XLL band data")
+        }
+        0
+    }
+
+    // Zeroes one segment (seg ≥ 0) or the whole frame (seg < 0) of a band.
+    fn chsClearBandData(_ c: Int, _ band: Int, _ seg: Int) {
+        let cb = c * 2 + band
+        let offset = if seg < 0 { 0 } else { seg * nsegsamples }
+        let count = if seg < 0 { nframesamples } else { nsegsamples }
+        for i in 0..nch[c] {
+            let a = msbAt(c, band, slot[cb * 8 + i]) + offset
+            for j in 0..count {
+                msb[a + j] = 0
+            }
+            if lsbSectionSize[cb] != 0 {
+                let l = lsbAt(c, band, i) + offset
+                for j in 0..count {
+                    lsb[l + j] = 0
+                }
+            }
+        }
+        if seg <= 0 && band != 0 {
+            for i in 0..deciHistory.count {
+                deciHistory[i] = 0
+            }
+        }
+        if seg < 0 {
+            for i in 0..8 {
+                nscalablelsbs[cb * 8 + i] = 0
+                bitWidthAdjust[cb * 8 + i] = 0
+            }
+        }
+    }
+
+    // Inverse prediction and decorrelation of one band (chs_filter_band_data).
+    fn chsFilterBandData(_ c: Int, _ band: Int) {
+        let cb = c * 2 + band
+        let ns = nframesamples
+        for i in 0..nch[c] {
+            let buf = msbAt(c, band, slot[cb * 8 + i])
+            let order = adaptPredOrder[cb * 8 + i]
+            if order > 0 {
+                // Reflection coefficients to direct form.
+                for j in 0..order {
+                    let rc = reflCoeff[(cb * 8 + i) * 16 + j]
+                    for k in 0..((j + 1) / 2) {
+                        let t1 = coeff[k]
+                        let t2 = coeff[j - k - 1]
+                        coeff[k] = dtsWrap32(t1 + ((rc * t2 + 32768) >> 16))
+                        coeff[j - k - 1] = dtsWrap32(t2 + ((rc * t1 + 32768) >> 16))
+                    }
+                    coeff[j] = rc
+                }
+                for j in 0..(ns - order) {
+                    var err = 0
+                    for k in 0..order {
+                        err += msb[buf + j + k] * coeff[order - k - 1]
+                    }
+                    let p = dtsClip23(dtsWrap32((err + 32768) >> 16))
+                    msb[buf + j + order] = dtsWrap32(msb[buf + j + order] - p)
+                }
+            } else {
+                for _ in 0..fixedPredOrder[cb * 8 + i] {
+                    for k in 1..ns {
+                        msb[buf + k] = dtsWrap32(msb[buf + k] + msb[buf + k - 1])
+                    }
+                }
+            }
+        }
+        if decorEnabled[cb] != 0 {
+            for i in 0..(nch[c] / 2) {
+                let co = decorCoeff[cb * 4 + i]
+                if co != 0 {
+                    let dst = msbAt(c, band, slot[cb * 8 + i * 2 + 1])
+                    let src = msbAt(c, band, slot[cb * 8 + i * 2])
+                    for n in 0..ns {
+                        let t = dtsWrap32(msb[src + n] * co + 4) >> 3
+                        msb[dst + n] = dtsWrap32(msb[dst + n] + t)
+                    }
+                }
+            }
+            var tmp: [Int] = []
+            for i in 0..nch[c] {
+                tmp.append(slot[cb * 8 + i])
+            }
+            for i in 0..nch[c] {
+                slot[cb * 8 + origOrder[cb * 8 + i]] = tmp[i]
+            }
+        }
+        if nfreqbandsOf[c] == 1 {
+            for i in 0..nch[c] {
+                let spkr = chRemap[c * 8 + i]
+                outKind[spkr] = 1
+                outBase[spkr] = msbAt(c, band, slot[cb * 8 + i])
+            }
+        }
+    }
+
+    fn lsbWidth(_ c: Int, _ band: Int, _ ch: Int) -> Int {
+        let q = (c * 2 + band) * 8 + ch
+        let adj = bitWidthAdjust[q]
+        var shift = nscalablelsbs[q]
+        if fixedLsbWidth != 0 {
+            shift = fixedLsbWidth
+        } else if shift != 0 && adj != 0 {
+            shift += adj - 1
+        } else {
+            shift += adj
+        }
+        shift
+    }
+
+    fn assembleMsbsLsbs(_ c: Int, _ band: Int) {
+        let cb = c * 2 + band
+        for ch in 0..nch[c] {
+            let shift = lsbWidth(c, band, ch)
+            if shift != 0 {
+                let m = msbAt(c, band, slot[cb * 8 + ch])
+                if nscalablelsbs[cb * 8 + ch] != 0 {
+                    let l = lsbAt(c, band, ch)
+                    let adj = bitWidthAdjust[cb * 8 + ch]
+                    for n in 0..nframesamples {
+                        msb[m + n] = dtsWrap32((msb[m + n] << shift) + (lsb[l + n] << adj))
+                    }
+                } else {
+                    for n in 0..nframesamples {
+                        msb[m + n] = dtsWrap32(msb[m + n] << shift)
+                    }
+                }
+            }
+        }
+    }
+
+    // Joins the two frequency bands of a 192 kHz channel set
+    // (assemble_freq_bands: a lattice of 2-tap filters, then interleaving).
+    fn assembleFreqBands(_ c: Int) {
+        let ns = nframesamples
+        if asmBuf.count < 3 * 8 * 2 * ns {
+            asmBuf = core.zeros(3 * 8 * 2 * ns)
+        }
+        let bc = bandCoeff
+        for ch in 0..nch[c] {
+            let b0 = msbAt(c, 0, slot[(c * 2) * 8 + ch])
+            let b1 = msbAt(c, 1, slot[(c * 2 + 1) * 8 + ch])
+            for k in 0..8 {
+                msb[b0 - 8 + k] = deciHistory[(c * 8 + ch) * 8 + k]
+            }
+            filter22(b0, b1, bc[0], ns)
+            filter22(b1, b0, bc[1], ns)
+            filter22(b0, b1, bc[2], ns)
+            filter22(b1, b0, bc[3], ns)
+            for i in 0..8 {
+                let s0 = b0 - i
+                filter23(s0, b1, bc[i + 4], ns)
+                filter23(b1, s0, bc[i + 12], ns)
+                filter23(s0, b1, bc[i + 4], ns)
+            }
+            let d = (c * 8 + ch) * 2 * ns
+            for i in 0..ns {
+                asmBuf[d + 2 * i] = msb[b1 + i]
+                asmBuf[d + 2 * i + 1] = msb[b0 - 7 + i]
+            }
+            let spkr = chRemap[c * 8 + ch]
+            outKind[spkr] = 2
+            outBase[spkr] = d
+        }
+    }
+
+    fn filter22(_ dst: Int, _ src: Int, _ co: Int, _ len: Int) {
+        for i in 0..len {
+            msb[dst + i] = dtsWrap32(msb[dst + i] - dtsWrap32((msb[src + i] * co + 2097152) >> 22))
+        }
+    }
+
+    fn filter23(_ dst: Int, _ src: Int, _ co: Int, _ len: Int) {
+        for i in 0..len {
+            msb[dst + i] = dtsWrap32(msb[dst + i] - dtsWrap32((msb[src + i] * co + 4194304) >> 23))
+        }
+    }
+
+    // dst −= mul15(src, coeff) over msb buffers (or decimator history).
+    fn dmixSub(_ dst: Int, _ src: Int, _ co: Int, _ len: Int) {
+        for i in 0..len {
+            msb[dst + i] = dtsWrap32(msb[dst + i] - dtsWrap32((msb[src + i] * co + 16384) >> 15))
+        }
+    }
+
+    fn undoDownMix(_ o: Int, _ band: Int) {
+        var cp = o * 128
+        var count = 0
+        for c in 0..nactivechsets {
+            if hier[c] == 0 {
+                continue
+            }
+            for j in 0..nch[c] {
+                for k in 0..nch[o] {
+                    let co = dmixCoeff[cp]
+                    cp += 1
+                    if co != 0 {
+                        let dst = msbAt(c, band, slot[(c * 2 + band) * 8 + j])
+                        let src = msbAt(o, band, slot[(o * 2 + band) * 8 + k])
+                        dmixSub(dst, src, co, nframesamples)
+                        if band != 0 {
+                            for i in 0..8 {
+                                let d = (c * 8 + j) * 8 + i
+                                let s = (o * 8 + k) * 8 + i
+                                deciHistory[d] = dtsWrap32(deciHistory[d] - dtsWrap32((deciHistory[s] * co + 16384) >> 15))
+                            }
+                        }
+                    }
+                }
+            }
+            count += nch[c]
+            if count >= hierOfs[o] {
+                break
+            }
+        }
+    }
+
+    // --- Parsing a frame, with the peak bit rate smoothing buffer ---
+
+    fn parseFrame(_ data: Data, _ from: Int, _ to: Int, _ asset: DtsAsset) -> Int {
+        error = ""
+        br = core.bitReaderRange(data, from: from, to: to)
+        brStart = from * 8
+        var r = parseCommonHeader()
+        if r < 0 {
+            return r
+        }
+        r = parseSubHeaders(asset)
+        if r < 0 {
+            return r
+        }
+        r = parseNaviTable()
+        if r < 0 {
+            return r
+        }
+        r = parseBandData()
+        if r < 0 {
+            return r
+        }
+        if frameSize * 8 > ((pos + 31) & ~31) {
+            br.skip((-pos) & 31)
+            let w = br.peek(32)
+            if w == 0x02000850 {
+                xSyncword = true
+            } else if (w >> 1) == (0xF14000D0 >> 1) {
+                xImaxSyncword = true
+            }
+        }
+        if !seekBits(frameSize * 8) {
+            return fail(dtsErrInvalid, "read past the end of the XLL frame")
+        }
+        0
+    }
+
+    // ff_dca_xll_parse: the XLL data of the asset at data[exss + offset …].
+    fn parse(_ data: Data, exss: Int, asset: DtsAsset) -> Int {
+        bandWarnings = 0
+        if hdStreamId != asset.hdStreamId {
+            pbr = Data()
+            pbrDelay = 0
+            hdStreamId = asset.hdStreamId
+        }
+        let from = exss + asset.xllOffset
+        let size = asset.xllSize
+        if !pbr.isEmpty {
+            return parsePbr(data.slice(from: from, to: from + size), asset)
+        }
+        var start = from
+        var len = size
+        var r = parseFrame(data, start, start + len, asset)
+        if r == dtsErrAgain && asset.xllSyncPresent && asset.xllSyncOffset < len {
+            start += asset.xllSyncOffset
+            len -= asset.xllSyncOffset
+            if asset.xllDelayFrames > 0 {
+                pbr = data.slice(from: start, to: start + len)
+                pbrDelay = asset.xllDelayFrames
+                return dtsErrAgain
+            }
+            r = parseFrame(data, start, start + len, asset)
+        }
+        if r < 0 {
+            return r
+        }
+        if frameSize > len {
+            return fail(dtsErrUnsupported, "XLL frame larger than its packet")
+        }
+        if frameSize < len {
+            pbr = data.slice(from: start + frameSize, to: start + len)
+            pbrDelay = 0
+        }
+        0
+    }
+
+    fn parsePbr(_ piece: Data, _ asset: DtsAsset) -> Int {
+        if pbr.count + piece.count > 240 * 1024 {
+            pbr = Data()
+            pbrDelay = 0
+            return fail(dtsErrUnsupported, "XLL smoothing buffer overflow")
+        }
+        pbr = pbr + piece
+        if pbrDelay > 0 {
+            pbrDelay -= 1
+            if pbrDelay > 0 {
+                return dtsErrAgain
+            }
+        }
+        let buf = pbr
+        let r = parseFrame(buf, 0, buf.count, asset)
+        if r < 0 {
+            pbr = Data()
+            pbrDelay = 0
+            return r
+        }
+        if frameSize > buf.count {
+            pbr = Data()
+            pbrDelay = 0
+            return fail(dtsErrUnsupported, "XLL frame larger than the smoothing buffer")
+        }
+        if frameSize == buf.count {
+            pbr = Data()
+            pbrDelay = 0
+        } else {
+            pbr = buf.slice(from: frameSize, to: buf.count)
+        }
+        0
+    }
+
+    // --- Turning a parsed frame into PCM (ff_dca_xll_filter_frame) ---
+
+    // Clears band data and drops residual coding where the core has the
+    // channel (force_lossy_output), for recovery after a sync error.
+    fn forceLossyOutput(_ c: Int, _ coreMap: [Int]) {
+        for band in 0..nfreqbandsOf[c] {
+            chsClearBandData(c, band, -1)
+        }
+        for ch in 0..nch[c] {
+            if (residualEncode[c] & (1 << ch)) == 0 {
+                continue
+            }
+            if coreMap[chRemap[c * 8 + ch]] < 0 {
+                continue
+            }
+            residualEncode[c] = residualEncode[c] & ~(1 << ch)
+        }
+    }
+
+    // Adds the core's fixed point output to the residual coded channels.
+    fn combineResidual(_ c: Int, _ pcm: [Int], _ coreMap: [Int], _ coreRate: Int, _ coreSamples: Int, _ haveCore: Bool) -> Int {
+        if !haveCore {
+            return fail(dtsErrUnsupported, "residual encoded channels without a core")
+        }
+        if freq[c] != coreRate {
+            return fail(dtsErrInvalid, "sample rate of the core ({coreRate} Hz) and XLL ({freq[c]} Hz) differ")
+        }
+        if nframesamples != coreSamples {
+            return fail(dtsErrInvalid, "samples per frame of the core ({coreSamples}) and XLL ({nframesamples}) differ")
+        }
+        let o = nextHierDmix(c)
+        for ch in 0..nch[c] {
+            if (residualEncode[c] & (1 << ch)) != 0 {
+                continue
+            }
+            let spkr = coreMap[chRemap[c * 8 + ch]]
+            if spkr < 0 {
+                return fail(dtsErrInvalid, "residual channel without its core channel")
+            }
+            let shift = 24 - pcmBitRes[c] + lsbWidth(c, 0, ch)
+            if shift > 24 {
+                return fail(dtsErrInvalid, "invalid core shift")
+            }
+            let round = if shift > 0 { 1 << (shift - 1) } else { 0 }
+            let src = spkr * dtsMaxFrameSamples
+            let dst = msbAt(c, 0, slot[(c * 2) * 8 + ch])
+            if o >= 0 {
+                let scaleInv = dmixScaleInv[o * 16 + hierOfs[c] + ch]
+                for n in 0..nframesamples {
+                    let v = dtsWrap32((pcm[src + n] * scaleInv + 32768) >> 16)
+                    msb[dst + n] = dtsWrap32(msb[dst + n] + dtsClip23((v + round) >> shift))
+                }
+            } else {
+                for n in 0..nframesamples {
+                    msb[dst + n] = dtsWrap32(msb[dst + n] + ((pcm[src + n] + round) >> shift))
+                }
+            }
+        }
+        0
+    }
+
+    // Filters the parsed frame; the output speakers are in outputMask,
+    // their samples at outKind/outBase. Returns 0 or an error kind.
+    fn filterFrame(recovery: Bool, pcm: [Int], coreMap: [Int], coreRate: Int, coreSamples: Int, haveCore: Bool) -> Int {
+        error = ""
+        if recovery {
+            for c in 0..nchsets {
+                if c < nactivechsets {
+                    forceLossyOutput(c, coreMap)
+                }
+                if primary[c] == 0 {
+                    dmixEmbedded[c] = 0
+                }
+            }
+            scalableLsbs = false
+            fixedLsbWidth = 0
+        }
+        outputMask = 0
+        for i in 0..32 {
+            outKind[i] = 0
+        }
+        for c in 0..nactivechsets {
+            chsFilterBandData(c, 0)
+            if residualEncode[c] != (1 << nch[c]) - 1 {
+                let r = combineResidual(c, pcm, coreMap, coreRate, coreSamples, haveCore)
+                if r < 0 {
+                    return r
+                }
+            }
+            if scalableLsbs {
+                assembleMsbsLsbs(c, 0)
+            }
+            if nfreqbandsOf[c] > 1 {
+                chsFilterBandData(c, 1)
+                assembleMsbsLsbs(c, 1)
+            }
+            outputMask = outputMask | chMask[c]
+        }
+        for c in 1..max(nchsets, 1) {
+            if !isHierDmix(c) {
+                continue
+            }
+            for j in 0..nfreqbandsOf[c] {
+                if bandDmixEmbedded[c * 2 + j] != 0 {
+                    undoDownMix(c, j)
+                }
+            }
+        }
+        if nfreqbands > 1 {
+            for c in 0..nactivechsets {
+                assembleFreqBands(c)
+            }
+        }
+        0
+    }
+
+    // Output samples per channel and the shift to full scale.
+    outputSamples: Int {
+        nframesamples << (nfreqbands - 1)
+    }
+
+    outputRate: Int {
+        freq[0] << (nfreqbands - 1)
+    }
+
+    // The sample of speaker `spkr` at n, as a 24-bit (or 16-bit) value.
+    fn sample(_ spkr: Int, _ n: Int) -> Int {
+        let k = outKind[spkr]
+        if k == 1 {
+            return msb[outBase[spkr] + n]
+        }
+        if k == 2 {
+            return asmBuf[outBase[spkr] + n]
+        }
+        0
+    }
+
+    fn flushState() {
+        pbr = Data()
+        pbrDelay = 0
+    }
+}

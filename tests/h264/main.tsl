@@ -1,0 +1,313 @@
+// Tests for the H.264 decoder: every picture of the H.264 fixtures must
+// match ffmpeg's framemd5 bit for bit (also through the pipeline's split
+// reconstructors and after a reset); damaged data; timings for 720p and
+// 1080p, whole and per stage.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../../h264"
+import "../../core"
+import "../../testkit"
+
+fn main() {
+    var passed = 0
+    var total = 0
+    let names = ["h264_baseline.mp4", "h264_cavlc_slices.mp4", "h264_intra.mp4", "h264_main_bframes.mp4", "h264_high.mkv", "h264_crop.mp4", "h264_weighted.mp4", "h264_fragmented.mp4", "multi.mkv", "multi.mp4", "mov.mov", "rotated.mp4", "subs_ass.mkv", "subs_srt.mkv", "subs_tx3g.mp4", "h264_720p.mp4", "h264_1080p.mp4"]
+    for name in names {
+        let file = testkit.fixture(name)
+        let ref = testkit.loadRef(name)
+        let media = testkit.mediaFromRef(file, ref)
+        let md5s = testkit.frameMd5s(name)
+        var vt = -1
+        for t in media.tracks {
+            if t.kind == .video && vt < 0 {
+                vt = t.index
+            }
+        }
+        var dec = try h264.newDecoder(media.tracks[vt])
+        var pics: [core.Picture] = []
+        let t0 = now()
+        for p in media.packets {
+            if p.track != vt {
+                continue
+            }
+            var data = core.packetBytes(file, media, p)
+            if name.hasSuffix(".mkv") {
+                data = h264TestMkvFrame(file, p.offset, p.size)
+            }
+            pics += dec.decode(data, pts: p.pts, dts: p.dts, key: p.key)
+        }
+        pics += dec.flush()
+        let ms = (now() - t0) * 1000.0
+        var good = 0
+        var firstBad = -1
+        for i in 0..min(pics.count, md5s.count) {
+            if testkit.pictureMd5(pics[i]) == md5s[i] {
+                good += 1
+            } else if firstBad < 0 {
+                firstBad = i
+            }
+        }
+        total += 1
+        if good == md5s.count && pics.count == md5s.count {
+            passed += 1
+        } else {
+            print("FAIL: {name}: {good} of {md5s.count} pictures match ({pics.count} decoded, first bad {firstBad})")
+        }
+        print("time {name}: {Int(ms)} ms")
+        if name == "h264_720p.mp4" || name == "h264_1080p.mp4" {
+            let res = if name == "h264_720p.mp4" { "720p" } else { "1080p" }
+            print("time h264 {res}: {Int(ms / Float(max(1, pics.count)) + 0.5)} ms per picture")
+            // The stages on their own (each can run in a job of its own).
+            let pl = try h264.newPipeline(media.tracks[vt])
+            var parser = pl.parser
+            var parsed: [h264.ParsedPicture] = []
+            let tp = now()
+            for p in media.packets {
+                if p.track == vt {
+                    parsed += parser.parse(core.packetBytes(file, media, p), pts: p.pts, dts: p.dts, key: p.key)
+                }
+            }
+            parsed += parser.flush()
+            let n = Float(max(1, pics.count))
+            print("time h264 {res} parse: {Int((now() - tp) * 1000.0 / n + 0.5)} ms per picture")
+            for planes in [h264.Planes.all, h264.Planes.luma, h264.Planes.chroma] {
+                var r = h264.newReconstructor(planes)
+                let tr = now()
+                for pp in parsed {
+                    r.reconstruct(pp)
+                }
+                let what = match planes {
+                    .all -> "reconstruct"
+                    .luma -> "reconstruct luma"
+                    .chroma -> "reconstruct chroma"
+                }
+                print("time h264 {res} {what}: {Int((now() - tr) * 1000.0 / n + 0.5)} ms per picture")
+            }
+        }
+        // The track description and the avcC of the first file of each kind.
+        if name == "h264_high.mkv" || name == "h264_1080p.mp4" {
+            let info = h264.spsInfo(media.tracks[vt])
+            let a = h264.parseAvcC(media.tracks[vt].extra)
+            total += 1
+            if info.hasPrefix("High ") && info.contains("4:2:0 8-bit") && a.valid && a.sps.count == 1 && a.pps.count >= 1 && a.lengthSize == 4 {
+                passed += 1
+            } else {
+                print("FAIL: {name}: spsInfo \"{info}\", avcC valid {a.valid}, {a.sps.count} SPS, {a.pps.count} PPS, length size {a.lengthSize}")
+            }
+        }
+        for w in dec.warnings.prefix(5) {
+            print("  warning: {w}")
+        }
+    }
+    for name in ["h264.ts", "h264_interlaced.ts"] {
+        let es = h264TestTsVideo(testkit.fixture(name))
+        let md5s = testkit.frameMd5s(name)
+        var dec = try h264.newDecoder(core.Track(index: 0, kind: .video, codec: "h264"))
+        var pics: [core.Picture] = []
+        var n = 0
+        for au in h264TestAccessUnits(es) {
+            pics += dec.decode(au, pts: n, dts: n, key: n == 0)
+            n += 1
+        }
+        pics += dec.flush()
+        var good = 0
+        for i in 0..min(pics.count, md5s.count) {
+            if testkit.pictureMd5(pics[i]) == md5s[i] {
+                good += 1
+            }
+        }
+        total += 1
+        if good == md5s.count && pics.count == md5s.count {
+            passed += 1
+        } else {
+            print("FAIL: {name}: {good} of {md5s.count} pictures match ({pics.count} decoded)")
+        }
+    }
+    // The pipeline with the planes split over two reconstructors, and a
+    // reset (decoding again from the start after one gives the same
+    // pictures).
+    for name in ["h264_main_bframes.mp4", "h264_high.mkv", "h264_weighted.mp4"] {
+        let file = testkit.fixture(name)
+        let media = testkit.mediaFromRef(file, testkit.loadRef(name))
+        let md5s = testkit.frameMd5s(name)
+        let pl = try h264.newPipeline(media.tracks[0])
+        var parser = pl.parser
+        var luma = h264.newReconstructor(.luma)
+        var chroma = h264.newReconstructor(.chroma)
+        var dec = try h264.newDecoder(media.tracks[0])
+        var pics: [core.Picture] = []
+        var again: [core.Picture] = []
+        for round in 0..2 {
+            for p in media.packets {
+                if p.track != 0 {
+                    continue
+                }
+                let data = if name.hasSuffix(".mkv") { h264TestMkvFrame(file, p.offset, p.size) } else { core.packetBytes(file, media, p) }
+                if round == 0 {
+                    for pp in parser.parse(data, pts: p.pts, dts: p.dts, key: p.key) {
+                        pics += h264.mergePlanes(luma.reconstruct(pp), chroma.reconstruct(pp))
+                    }
+                    dec.decode(data, pts: p.pts, dts: p.dts, key: p.key)
+                } else {
+                    again += dec.decode(data, pts: p.pts, dts: p.dts, key: p.key)
+                }
+            }
+            if round == 0 {
+                for pp in parser.flush() {
+                    pics += h264.mergePlanes(luma.reconstruct(pp), chroma.reconstruct(pp))
+                }
+                dec.reset()
+            } else {
+                again += dec.flush()
+            }
+        }
+        var good = 0
+        var goodAgain = 0
+        for i in 0..md5s.count {
+            if i < pics.count && testkit.pictureMd5(pics[i]) == md5s[i] {
+                good += 1
+            }
+            if i < again.count && testkit.pictureMd5(again[i]) == md5s[i] {
+                goodAgain += 1
+            }
+        }
+        total += 2
+        if good == md5s.count && pics.count == md5s.count {
+            passed += 1
+        } else {
+            print("FAIL: {name} with split planes: {good} of {md5s.count} pictures match ({pics.count} decoded)")
+        }
+        if goodAgain == md5s.count && again.count == md5s.count {
+            passed += 1
+        } else {
+            print("FAIL: {name} after reset: {goodAgain} of {md5s.count} pictures match ({again.count} decoded)")
+        }
+    }
+    // Damaged data: corrupted and cut packets of a CABAC and a CAVLC stream
+    // must decode without stopping, with warnings.
+    for name in ["h264_main_bframes.mp4", "h264_cavlc_slices.mp4", "h264_high.mkv"] {
+        let file = testkit.fixture(name)
+        let media = testkit.mediaFromRef(file, testkit.loadRef(name))
+        var dec = try h264.newDecoder(media.tracks[0])
+        var seed = 7
+        var n = 0
+        var pics = 0
+        for p in media.packets {
+            if p.track != 0 {
+                continue
+            }
+            var bytes = (if name.hasSuffix(".mkv") { h264TestMkvFrame(file, p.offset, p.size) } else { core.packetBytes(file, media, p) }).bytes
+            n += 1
+            if n % 3 == 1 && bytes.count > 40 {
+                for _ in 0..8 {
+                    seed = (seed * 1103515245 + 12345) & 0x7fffffff
+                    let at = 8 + (seed >> 8) % (bytes.count - 8)
+                    bytes[at] = (seed >> 3) & 255
+                }
+            } else if n % 3 == 2 {
+                bytes = bytes.slice(from: 0, to: bytes.count / 2)
+            }
+            pics += dec.decode(Data(bytes: bytes), pts: p.pts, dts: p.dts, key: p.key).count
+        }
+        pics += dec.flush().count
+        total += 1
+        if pics > 0 && !dec.warnings.isEmpty {
+            passed += 1
+        } else {
+            print("FAIL: damaged {name}: {pics} pictures, {dec.warnings.count} warnings")
+        }
+    }
+    print("h264: {passed} of {total} passed")
+}
+
+// ffprobe's byte positions for Matroska point at the SimpleBlock body:
+// the track number (an EBML vint), a 2-byte timecode and a flags byte
+// come before the frame, whose size is the packet's. (testkit's
+// mediaFromRef takes the position as the frame's.)
+fn h264TestMkvFrame(_ file: Data, _ at: Int, _ size: Int) -> Data {
+    var len = 1
+    while len < 8 && (file[at] & (0x80 >> (len - 1))) == 0 {
+        len += 1
+    }
+    file.slice(from: at + len + 3, to: at + len + 3 + size)
+}
+
+// The H.264 elementary stream of an MPEG-TS file: payloads of the PID
+// whose PMT stream_type is 0x1B, PES headers removed (ISO/IEC 13818-1).
+fn h264TestTsVideo(_ ts: Data) -> Data {
+    var pmtPid = -1
+    var videoPid = -1
+    var out = Data()
+    var p = 0
+    while p + 188 <= ts.count {
+        if ts[p] != 0x47 {
+            p += 1
+            continue
+        }
+        let pid = ((ts[p + 1] & 31) << 8) | ts[p + 2]
+        let start = (ts[p + 1] & 0x40) != 0
+        let afc = (ts[p + 3] >> 4) & 3
+        var q = p + 4
+        if afc == 2 || afc == 0 {
+            p += 188
+            continue
+        }
+        if afc == 3 {
+            q += 1 + ts[q]
+        }
+        if pid == 0 && start && pmtPid < 0 {
+            let t = q + 1 + ts[q]
+            pmtPid = ((ts[t + 10] & 31) << 8) | ts[t + 11]
+        } else if pid == pmtPid && start && videoPid < 0 {
+            let t = q + 1 + ts[q]
+            let infoLen = ((ts[t + 10] & 15) << 8) | ts[t + 11]
+            var k = t + 12 + infoLen
+            let sectionEnd = t + 3 + (((ts[t + 1] & 15) << 8) | ts[t + 2]) - 4
+            while k + 5 <= sectionEnd {
+                let st = ts[k]
+                let epid = ((ts[k + 1] & 31) << 8) | ts[k + 2]
+                if st == 0x1B && videoPid < 0 {
+                    videoPid = epid
+                }
+                k += 5 + (((ts[k + 3] & 15) << 8) | ts[k + 4])
+            }
+        } else if pid == videoPid {
+            if start {
+                q += 9 + ts[q + 8]
+            }
+            if q < p + 188 {
+                out += ts.slice(from: q, to: p + 188)
+            }
+        }
+        p += 188
+    }
+    out
+}
+
+// Splits an Annex B stream at access unit delimiters (nal_unit_type 9).
+fn h264TestAccessUnits(_ es: Data) -> [Data] {
+    var out: [Data] = []
+    var last = 0
+    var i = 0
+    while i + 3 < es.count {
+        if es[i] == 0 && es[i + 1] == 0 && es[i + 2] == 1 && (es[i + 3] & 31) == 9 {
+            var s = i
+            if s > 0 && es[s - 1] == 0 {
+                s -= 1
+            }
+            if s > last {
+                out.append(es.slice(from: last, to: s))
+            }
+            last = s
+            i += 3
+        } else {
+            i += 1
+        }
+    }
+    if last < es.count {
+        out.append(es.slice(from: last, to: es.count))
+    }
+    out
+}

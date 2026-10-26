@@ -1,0 +1,66 @@
+// A small Ogg page reader for the Vorbis tests (RFC 3533): it gathers the
+// packets of every logical stream in file order, so the test can feed a
+// decoder without the demux module. No CRC check; a page cut short at the
+// end of the file is dropped.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+struct OggPacket {
+    data: Data
+    serial: Int = 0
+    // The granule position of the page this packet ends on, when it is
+    // the last packet ending there; else -1.
+    granule: Int = -1
+    // First packet of its logical stream.
+    bos: Bool = false
+}
+
+fn oggPackets(_ file: Data) -> [OggPacket] {
+    var out: [OggPacket] = []
+    // Unfinished packet of each serial.
+    var partial: [Int: Data] = [:]
+    var started: Set<Int> = []
+    var pos = 0
+    while pos + 27 <= file.count {
+        if !(file[pos] == 0x4f && file[pos + 1] == 0x67 && file[pos + 2] == 0x67 && file[pos + 3] == 0x53) {
+            pos += 1
+            continue
+        }
+        let granule = file.int64(at: pos + 6)
+        let serial = file.uint32(at: pos + 14)
+        let nsegs = file[pos + 26]
+        if pos + 27 + nsegs > file.count {
+            break
+        }
+        var bodySize = 0
+        for i in 0..nsegs {
+            bodySize += file[pos + 27 + i]
+        }
+        let bodyStart = pos + 27 + nsegs
+        if bodyStart + bodySize > file.count {
+            break
+        }
+        var at = bodyStart
+        var current = partial[serial] ?? Data()
+        var ended: [Int] = []
+        for i in 0..nsegs {
+            let len = file[pos + 27 + i]
+            current += file.slice(from: at, to: at + len)
+            at += len
+            if len < 255 {
+                let bos = !started.contains(serial)
+                started.insert(serial)
+                out.append(OggPacket(data: current, serial: serial, granule: -1, bos: bos))
+                ended.append(out.count - 1)
+                current = Data()
+            }
+        }
+        partial[serial] = current
+        if let last = ended.last {
+            out[last].granule = granule
+        }
+        pos = bodyStart + bodySize
+    }
+    out
+}

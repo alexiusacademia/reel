@@ -1,0 +1,361 @@
+// Apple ProRes decoding (SMPTE RDD 36): 422 Proxy, LT, Standard and HQ,
+// 4444 and 4444 XQ, progressive and interlaced frames (two field
+// pictures, top or bottom first). Every frame is a keyframe, so the
+// decoder hands each picture back as soon as its packet is decoded.
+//
+// A packet is one frame (§5): a 4-byte size, "icpf", the frame header
+// (§5.1: size, chroma format, interlace mode, colour, quantisation
+// matrices), then one picture (two for interlaced frames). A picture
+// (§5.2) has a header, a table of slice sizes and the slices: rows of
+// macroblocks split into slices of 8, 4, 2 or 1 macroblocks (prores/slice.tsl).
+//
+// Output follows ffmpeg: 10-bit samples for the 4:2:2 profiles, 12-bit
+// for 4444 and 4444 XQ (chosen by the codec tag as ffmpeg does; when the
+// container gives no tag, 4:4:4 frames are taken as 4444). An alpha plane
+// is skipped (core.Picture has none).
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../core"
+
+public struct Decoder {
+    // Every ProRes frame is a keyframe; there is nothing to skip.
+    skipNonReference: Bool = false
+    warnings: [String] = []
+    // The last frame's facts, for an info window.
+    width: Int = 0
+    height: Int = 0
+    chroma: core.Chroma = .yuv422
+    depth: Int = 10
+    interlaced: Bool = false
+    topFieldFirst: Bool = true
+    hasAlpha: Bool = false
+    // "Lavc", "apl0", … (the encoder's vendor code).
+    vendor: String = ""
+
+    tag: String = ""
+    timescale: Int = 1000
+    frameDur: Int = 0
+    trackSarNum: Int = 1
+    trackSarDen: Int = 1
+    trackMatrix: core.ColorMatrix = .unknown
+    eng: PrEngine = PrEngine()
+    // Plane geometry the engine's planes were made for.
+    planeW: Int = 0
+    planeH: Int = 0
+    planeFull: Bool = false
+    haveFrame: Bool = false
+
+    // Decodes one packet (a whole frame) into its picture.
+    fn decode(_ packet: Data, pts: Int, dts: Int, key: Bool) -> [core.Picture] {
+        let n = packet.count
+        if n < 28 || packet.slice(from: 4, to: 8).latin1 != "icpf" {
+            return conceal(pts, "prores: not a ProRes frame ({n} bytes)")
+        }
+        let h = 8
+        let hdrSize = packet.uint16(at: h, bigEndian: true)
+        let version = packet.uint16(at: h + 2, bigEndian: true)
+        if hdrSize < 20 || h + hdrSize > n || version > 1 {
+            return conceal(pts, "prores: bad frame header (size {hdrSize}, version {version})")
+        }
+        vendor = packet.slice(from: h + 4, to: h + 8).latin1
+        let w = packet.uint16(at: h + 8, bigEndian: true)
+        let ht = packet.uint16(at: h + 10, bigEndian: true)
+        let b12 = packet[h + 12]
+        let frameType = (b12 >> 2) & 3
+        let full = (b12 & 0xC0) == 0xC0
+        let alpha = packet[h + 17] & 15
+        if w == 0 || ht == 0 || w > 16384 || ht > 16384 || alpha > 2 {
+            return conceal(pts, "prores: bad frame size {w}×{ht}")
+        }
+        // Bit depth as ffmpeg picks it: from the codec tag.
+        var deep = full
+        if tag == "ap4h" || tag == "ap4x" {
+            deep = true
+        } else if tag.count == 4 {
+            deep = false
+        }
+        width = w
+        height = ht
+        interlaced = frameType != 0
+        topFieldFirst = frameType != 2
+        hasAlpha = alpha != 0
+        chroma = if full { .yuv444 } else { .yuv422 }
+        depth = if deep { 12 } else { 10 }
+        let matrixCode = packet[h + 16]
+        let flags = packet[h + 19]
+        var at = h + 20
+        if (flags & 2) != 0 {
+            if at + 64 > h + hdrSize {
+                return conceal(pts, "prores: frame header too short for its matrices")
+            }
+            for i in 0..64 {
+                eng.qmat[i] = packet[at + i]
+            }
+            at += 64
+        } else {
+            for i in 0..64 {
+                eng.qmat[i] = 4
+            }
+        }
+        if (flags & 1) != 0 {
+            if at + 64 > h + hdrSize {
+                return conceal(pts, "prores: frame header too short for its matrices")
+            }
+            for i in 0..64 {
+                eng.qmat[64 + i] = packet[at + i]
+            }
+        } else {
+            for i in 0..64 {
+                eng.qmat[64 + i] = eng.qmat[i]
+            }
+        }
+        eng.deep = deep
+        eng.full = full
+        eng.setScan(interlaced)
+        let mbW = (w + 15) >> 4
+        let mbH = if interlaced { (ht + 31) >> 5 } else { (ht + 15) >> 4 }
+        let rowsH = if interlaced { mbH * 32 } else { mbH * 16 }
+        makePlanes(mbW * 16, rowsH, full)
+        // Write into the other set of planes: the previous picture (which
+        // the player may still show) keeps its own, and two frames on
+        // they are usually free again, so nothing is copied.
+        eng.rotate()
+
+        // The picture(s): one, or a field each for interlaced frames.
+        var p = h + hdrSize
+        var firstField = true
+        var damaged = 0
+        while true {
+            var field = -1
+            if interlaced {
+                let bottom = firstField != topFieldFirst
+                field = if bottom { 1 } else { 0 }
+            }
+            let size = picture(packet, p, mbW, mbH, field)
+            if size < 0 {
+                damaged += 1
+                break
+            }
+            if size >= 1000000000 {
+                damaged += 1
+                p += size - 1000000000
+            } else {
+                p += size
+            }
+            if !interlaced || !firstField || p >= n {
+                break
+            }
+            firstField = false
+        }
+        if damaged > 0 {
+            addWarning("prores: damaged picture data (pts {pts})")
+        }
+        haveFrame = true
+        var pic = core.Picture(width: w, height: ht, chroma: chroma, depth: depth)
+        pic.y = eng.y
+        pic.u = eng.u
+        pic.v = eng.v
+        pic.yStride = eng.yStride
+        pic.cStride = eng.cStride
+        pic.matrix = prMatrix(matrixCode, trackMatrix, w, ht)
+        pic.pts = pts
+        pic.duration = frameDur
+        pic.key = true
+        pic.sarNum = trackSarNum
+        pic.sarDen = trackSarDen
+        [pic]
+    }
+
+    // Decodes one picture (§5.2) at packet[p…]. Returns its size, or that
+    // plus 1e9 when some slices were damaged, or -1 when the picture
+    // header itself is unusable.
+    fn picture(_ d: Data, _ p: Int, _ mbW: Int, _ mbH: Int, _ field: Int) -> Int {
+        let n = d.count
+        if p + 8 > n {
+            return -1
+        }
+        let hdr = d[p] >> 3
+        let size = d.uint32(at: p + 1, bigEndian: true)
+        let log2W = d[p + 7] >> 4
+        let log2H = d[p + 7] & 15
+        if hdr < 8 || p + hdr > n || size > n - p || log2W > 3 || log2H != 0 {
+            return -1
+        }
+        let sliceMbs = 1 << log2W
+        // The slice count is worked out, as QuickTime and ffmpeg do,
+        // rather than read: whole slices across, then the remainder split
+        // into powers of two.
+        let perRow = (mbW >> log2W) + prPopcount(mbW & (sliceMbs - 1))
+        let count = mbH * perRow
+        let index = p + hdr
+        if index + count * 2 > n {
+            return -1
+        }
+        var data = index + count * 2
+        var mbX = 0
+        var mbY = 0
+        var span = sliceMbs
+        var bad = 0
+        for i in 0..count {
+            let sz = d.uint16(at: index + i * 2, bigEndian: true)
+            while mbW - mbX < span {
+                span = span >> 1
+            }
+            if sz < 6 || data + sz > n {
+                return -1
+            }
+            if !eng.slice(d, data, sz, mbX, mbY, span, field) {
+                // Damaged: show the previous frame's macroblocks there.
+                eng.concealSlice(mbX, mbY, span, field)
+                bad += 1
+            }
+            data += sz
+            mbX += span
+            if mbX == mbW {
+                span = sliceMbs
+                mbX = 0
+                mbY += 1
+            }
+        }
+        if bad > 0 {
+            return size + 1000000000
+        }
+        size
+    }
+
+    // Two sets of planes of the coded size, used in turn.
+    fn makePlanes(_ pw: Int, _ ph: Int, _ full: Bool) {
+        if pw == planeW && ph == planeH && full == planeFull && !eng.y.isEmpty {
+            return
+        }
+        planeW = pw
+        planeH = ph
+        planeFull = full
+        let cw = if full { pw } else { pw / 2 }
+        eng.yStride = pw
+        eng.cStride = cw
+        eng.y = prFilled(pw * ph, 64)
+        eng.u = prFilled(cw * ph, 512)
+        eng.v = prFilled(cw * ph, 512)
+        eng.sy = eng.y
+        eng.su = eng.u
+        eng.sv = eng.v
+        haveFrame = false
+    }
+
+    // A damaged packet: the previous picture again (or nothing yet).
+    fn conceal(_ pts: Int, _ why: String) -> [core.Picture] {
+        addWarning(why)
+        if !haveFrame || width == 0 {
+            return []
+        }
+        var pic = core.Picture(width: width, height: height, chroma: chroma, depth: depth)
+        pic.y = eng.y
+        pic.u = eng.u
+        pic.v = eng.v
+        pic.yStride = eng.yStride
+        pic.cStride = eng.cStride
+        pic.matrix = if trackMatrix != .unknown { trackMatrix } else { core.guessMatrix(width: width, height: height) }
+        pic.pts = pts
+        pic.duration = frameDur
+        pic.key = true
+        pic.sarNum = trackSarNum
+        pic.sarDen = trackSarDen
+        [pic]
+    }
+
+    fn addWarning(_ w: String) {
+        if warnings.count < 200 {
+            warnings.append(w)
+        }
+    }
+
+    // Intra-only: nothing is held back.
+    fn flush() -> [core.Picture] {
+        []
+    }
+
+    fn reset() {
+        haveFrame = false
+    }
+}
+
+// A decoder for a "prores" track.
+public fn newDecoder(_ track: core.Track) -> Result<Decoder> {
+    if track.codec != "prores" {
+        return .failure(error: Error("prores: not a ProRes track ({track.codec})"))
+    }
+    var d = Decoder()
+    d.tag = track.tag
+    if track.tag.isEmpty && track.extra.count == 4 {
+        // Matroska's V_PRORES keeps the fourcc as CodecPrivate.
+        d.tag = track.extra.latin1
+    }
+    d.timescale = track.timescale
+    if track.fpsNum > 0 && track.fpsDen > 0 {
+        d.frameDur = (track.timescale * track.fpsDen) / track.fpsNum
+    }
+    d.trackSarNum = max(1, track.sarNum)
+    d.trackSarDen = max(1, track.sarDen)
+    d.trackMatrix = track.matrix
+    d.width = track.width
+    d.height = track.height
+    d.eng.setup()
+    Result.ok(value: d)
+}
+
+// "ProRes 422 HQ, 1920×1080, 10-bit" from what the container says.
+public fn streamInfo(_ track: core.Track) -> String {
+    var tag = track.tag
+    if tag.isEmpty && track.extra.count == 4 {
+        tag = track.extra.latin1
+    }
+    let name = match tag {
+        "apco" -> "ProRes 422 Proxy"
+        "apcs" -> "ProRes 422 LT"
+        "apcn" -> "ProRes 422"
+        "apch" -> "ProRes 422 HQ"
+        "ap4h" -> "ProRes 4444"
+        "ap4x" -> "ProRes 4444 XQ"
+        _ -> "ProRes"
+    }
+    var s = name
+    if track.width > 0 && track.height > 0 {
+        s += ", {track.width}×{track.height}"
+    }
+    if tag == "ap4h" || tag == "ap4x" {
+        s += ", 12-bit 4:4:4"
+    } else if tag.count == 4 {
+        s += ", 10-bit 4:2:2"
+    }
+    s
+}
+
+// The frame header's matrix_coefficients (ISO/IEC 23001-8 codes).
+fn prMatrix(_ code: Int, _ fromTrack: core.ColorMatrix, _ w: Int, _ h: Int) -> core.ColorMatrix {
+    if code == 1 {
+        return .bt709
+    }
+    if code == 5 || code == 6 {
+        return .bt601
+    }
+    if code == 9 || code == 10 {
+        return .bt2020
+    }
+    if fromTrack != .unknown {
+        return fromTrack
+    }
+    core.guessMatrix(width: w, height: h)
+}
+
+fn prPopcount(_ v: Int) -> Int {
+    var n = 0
+    var x = v
+    while x > 0 {
+        n += x & 1
+        x = x >> 1
+    }
+    n
+}

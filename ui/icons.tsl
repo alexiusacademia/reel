@@ -1,0 +1,70 @@
+// Icons for the player's controls, shared by the app and the ui module's
+// panels. Where Tessel has a built-in icon
+// (Icon(.name)) the app uses it; the media icons Tessel lacks (pause,
+// previous, next, volume, full screen, repeat, shuffle…) are drawn here as
+// SVG from the same Lucide set (ISC license), in currentColor, so they
+// match the built-in ones.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+// SVG markup on Lucide's 24 × 24 grid: outlined (like the built-in icons)
+// or filled (the transport buttons).
+public fn lucide(_ body: String) -> String {
+    "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' width='24' height='24' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'>" + body + "</svg>"
+}
+
+public fn lucideFilled(_ body: String) -> String {
+    "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' width='24' height='24' fill='currentColor' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'>" + body + "</svg>"
+}
+
+public fn svgPlay() -> String { lucideFilled("<polygon points='6 3 20 12 6 21 6 3'/>") }
+public fn svgPause() -> String { lucideFilled("<rect x='14' y='4' width='4' height='16' rx='1'/><rect x='6' y='4' width='4' height='16' rx='1'/>") }
+public fn svgStop() -> String { lucideFilled("<rect x='5' y='5' width='14' height='14' rx='2'/>") }
+public fn svgPrevious() -> String { lucideFilled("<polygon points='19 20 9 12 19 4 19 20'/><line x1='5' x2='5' y1='19' y2='5'/>") }
+public fn svgNext() -> String { lucideFilled("<polygon points='5 4 15 12 5 20 5 4'/><line x1='19' x2='19' y1='5' y2='19'/>") }
+
+public fn svgVolumeHigh() -> String { lucide("<polygon points='11 5 6 9 2 9 2 15 6 15 11 19 11 5'/><path d='M15.54 8.46a5 5 0 0 1 0 7.07'/><path d='M19.07 4.93a10 10 0 0 1 0 14.14'/>") }
+public fn svgVolumeLow() -> String { lucide("<polygon points='11 5 6 9 2 9 2 15 6 15 11 19 11 5'/><path d='M15.54 8.46a5 5 0 0 1 0 7.07'/>") }
+public fn svgVolumeOff() -> String { lucide("<polygon points='11 5 6 9 2 9 2 15 6 15 11 19 11 5'/><line x1='22' x2='16' y1='9' y2='15'/><line x1='16' x2='22' y1='9' y2='15'/>") }
+
+public fn svgFullScreen() -> String { lucide("<path d='M8 3H5a2 2 0 0 0-2 2v3'/><path d='M21 8V5a2 2 0 0 0-2-2h-3'/><path d='M3 16v3a2 2 0 0 0 2 2h3'/><path d='M16 21h3a2 2 0 0 0 2-2v-3'/>") }
+public fn svgExitFullScreen() -> String { lucide("<path d='M8 3v3a2 2 0 0 1-2 2H3'/><path d='M21 8h-3a2 2 0 0 1-2-2V3'/><path d='M3 16h3a2 2 0 0 1 2 2v3'/><path d='M16 21v-3a2 2 0 0 1 2-2h3'/>") }
+public fn svgRepeat() -> String { lucide("<path d='m17 2 4 4-4 4'/><path d='M3 11v-1a4 4 0 0 1 4-4h14'/><path d='m7 22-4-4 4-4'/><path d='M21 13v1a4 4 0 0 1-4 4H3'/>") }
+public fn svgRepeatOne() -> String { lucide("<path d='m17 2 4 4-4 4'/><path d='M3 11v-1a4 4 0 0 1 4-4h14'/><path d='m7 22-4-4 4-4'/><path d='M21 13v1a4 4 0 0 1-4 4H3'/><path d='M11 10h1v4'/>") }
+public fn svgShuffle() -> String { lucide("<path d='m18 14 4 4-4 4'/><path d='m18 2 4 4-4 4'/><path d='M2 18h1.973a4 4 0 0 0 3.3-1.7l5.454-8.6a4 4 0 0 1 3.3-1.7H22'/><path d='M2 6h1.972a4 4 0 0 1 3.27 1.7l.65.9'/><path d='M22 18h-6.041a4 4 0 0 1-3.3-1.8l-.359-.45'/>") }
+public fn svgPlaylist() -> String { lucide("<path d='M12 12H3'/><path d='M16 6H3'/><path d='M12 18H3'/><path d='m16 12 5 3-5 3v-6Z'/>") }
+public fn svgSubtitles() -> String { lucide("<rect width='18' height='14' x='3' y='5' rx='2' ry='2'/><path d='M7 15h4'/><path d='M15 15h2'/><path d='M7 11h2'/><path d='M13 11h4'/>") }
+
+// Large pictures for the screen (drawn on the canvas).
+public fn svgFilm() -> String { lucide("<rect width='18' height='18' x='3' y='3' rx='2'/><path d='M7 3v18'/><path d='M3 7.5h4'/><path d='M3 12h18'/><path d='M3 16.5h4'/><path d='M17 3v18'/><path d='M17 7.5h4'/><path d='M17 16.5h4'/>") }
+public fn svgMusic() -> String { lucide("<path d='M9 18V5l12-2v13'/><circle cx='6' cy='18' r='3'/><circle cx='18' cy='16' r='3'/>") }
+public fn svgVideoOff() -> String { lucide("<path d='M10.66 6H14a2 2 0 0 1 2 2v2.5l5.248-3.062A.5.5 0 0 1 22 7.87v8.196'/><path d='M16 16a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h2'/><path d='m2 2 20 20'/>") }
+
+// The control bar's colors.
+public let iconColor = Color.rgb(217, 217, 217)
+public let iconOnColor = Color.rgb(242, 140, 26)
+public let iconHover = Color.rgb(64, 64, 64)
+
+// A clickable icon drawn from SVG markup, with a tooltip. `on` shows it in
+// the accent color (a toggle that's turned on).
+public view SvgButton(svg: String, tip: String, size: Float = 20, on: Bool = false, action: fn()) {
+    Svg(svg)
+        .color(if on { iconOnColor } else { iconColor })
+        .frame(width: size, height: size)
+        .padding(5)
+        .hoverBackground(iconHover, radius: 5)
+        .onTap { action() }
+        .tooltip(tip)
+}
+
+// The same for one of Tessel's built-in icons.
+public view IconButton(icon: IconName, tip: String, size: Float = 18, action: fn()) {
+    Icon(icon)
+        .font(size: size)
+        .color(iconColor)
+        .padding(5)
+        .hoverBackground(iconHover, radius: 5)
+        .onTap { action() }
+        .tooltip(tip)
+}

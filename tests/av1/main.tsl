@@ -1,0 +1,514 @@
+// Tests of the AV1 decoder (module av1): every picture of every clip must
+// have the md5 the reference decoders (libaom, dav1d) give it.
+//
+//   tests/fixtures/av1.mkv, t.av1.ivf  the shared fixtures (Matroska
+//                                    through demux.open; IVF)
+//   tests/av1/fixtures/*.ivf         SVT-AV1 and aomenc clips (8/10/12-bit,
+//                                    4:4:4, 4:2:2, monochrome, film grain,
+//                                    tiles, 128x128 superblocks, odd and
+//                                    tiny sizes, superres, resizing with
+//                                    scaled references, screen content
+//                                    (palette, intra block copy), lossless,
+//                                    error resilience, segmentation, delta
+//                                    q/lf, quantizer matrices, OBMC, warped
+//                                    and global motion, compound masks …)
+//                                    with libdav1d framemd5s (make.sh)
+//   build/conformance/av1/           the libaom test vectors with their
+//                                    .md5 files (fetch.sh downloads them):
+//                                    all of them, or a representative set
+//                                    with AV1_CONFORMANCE=some
+// plus damaged packets (must never stop the program), reset after a seek,
+// skipNonReference, the two-stage pipeline, streamInfo, and timings of
+// the parser and reconstructor at 720p and 1080p, 8 and 10 bit
+// (build/scratch/av1/clips, made by make.sh).
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../../av1"
+import "../../core"
+import "../../demux"
+import "../../testkit"
+
+struct T {
+    passed: Int = 0
+    total: Int = 0
+
+    fn check(_ ok: Bool, _ what: String) {
+        total += 1
+        if ok {
+            passed += 1
+        } else {
+            print("FAIL: {what}")
+        }
+    }
+}
+
+// A file's AV1 track and its packets.
+struct Clip {
+    ok: Bool = false
+    track: core.Track = core.Track(index: 0, kind: .video, codec: "av1")
+    packets: [Data] = []
+    pts: [Int] = []
+    keys: [Bool] = []
+}
+
+fn openClip(_ path: String) -> Clip {
+    var c = Clip()
+    let file = readData(path) ?? Data()
+    if file.isEmpty {
+        return c
+    }
+    let media = demux.open(file, name: path).value() ?? core.Media()
+    for t in media.tracks {
+        if t.codec == "av1" {
+            c.track = t
+            c.ok = true
+        }
+    }
+    for p in media.packets {
+        if p.track == c.track.index {
+            c.packets.append(core.packetBytes(file, media, p))
+            c.pts.append(p.pts)
+            c.keys.append(p.key)
+        }
+    }
+    c
+}
+
+// md5s from an ffmpeg framemd5 file, or a libaom .md5 file.
+fn readMd5s(_ path: String) -> [String] {
+    var out: [String] = []
+    for line in (readFile(path) ?? "").lines() {
+        if line.hasPrefix("#") {
+            continue
+        }
+        if line.contains(",") {
+            let parts = line.split(",")
+            if parts.count >= 6 {
+                out.append(parts[5].trim())
+            }
+            continue
+        }
+        let parts = line.trim().split(" ")
+        if parts.count >= 1 && parts[0].count == 32 {
+            out.append(parts[0])
+        }
+    }
+    out
+}
+
+// The md5 of a picture: as ffmpeg hashes it (monochrome: Y only), or as
+// libaom's test vectors do (I420 always, grey chroma for monochrome).
+fn md5Of(_ p: core.Picture, _ libaom: Bool) -> String {
+    if p.chroma != .gray || !libaom {
+        return testkit.pictureMd5(p)
+    }
+    var q = p
+    q.chroma = .yuv420
+    let cw = (p.width + 1) / 2
+    let ch = (p.height + 1) / 2
+    q.cStride = cw
+    q.cOffset = 0
+    q.u = core.filled(cw * ch, 1 << (p.depth - 1))
+    q.v = q.u
+    testkit.pictureMd5(q)
+}
+
+struct Seen {
+    pictures: Int = 0
+    mismatches: Int = 0
+    firstBad: Int = -1
+    stats: [Int] = []
+    warnings: Int = 0
+    depth: Int = 0
+}
+
+// Decodes a clip through the two stages (as background jobs would run
+// them), comparing each picture's md5.
+fn decodeAll(_ c: Clip, _ want: [String], _ libaom: Bool) -> Seen {
+    var s = Seen()
+    var pl = av1.newPipeline(c.track).value() ?? av1.Pipeline()
+    for (i, pk) in c.packets.enumerated() {
+        let step = av1.parseStep(pl.parser, pk, pts: c.pts[i], dts: c.pts[i], key: c.keys[i])
+        pl.parser = step.parser
+        let rs = av1.reconstructStep(pl.reconstructor, step.frames)
+        pl.reconstructor = rs.reconstructor
+        for p in rs.pictures {
+            let got = md5Of(p, libaom)
+            if s.pictures >= want.count || got != want[s.pictures] {
+                s.mismatches += 1
+                if s.firstBad < 0 {
+                    s.firstBad = s.pictures
+                }
+            }
+            s.depth = p.depth
+            s.pictures += 1
+        }
+    }
+    s.stats = pl.parser.stats
+    s.warnings = pl.parser.warnings.count + pl.reconstructor.warnings.count
+    s
+}
+
+fn stat(_ s: Seen, _ name: String) -> Int {
+    let names = av1.av1StatNames
+    for (i, n) in names.enumerated() {
+        if n == name && i < s.stats.count {
+            return s.stats[i]
+        }
+    }
+    0
+}
+
+let someVectors: [String] = [
+    "av1-1-b8-00-quantizer-00.ivf", "av1-1-b8-00-quantizer-31.ivf", "av1-1-b8-00-quantizer-63.ivf",
+    "av1-1-b10-00-quantizer-00.ivf", "av1-1-b10-00-quantizer-40.ivf",
+    "av1-1-b8-01-size-16x16.ivf", "av1-1-b8-01-size-66x66.ivf", "av1-1-b8-01-size-196x198.ivf",
+    "av1-1-b8-01-size-226x226.ivf", "av1-1-b8-02-allintra.ivf", "av1-1-b8-03-sizeup.mkv",
+    "av1-1-b8-04-cdfupdate.ivf", "av1-1-b8-05-mv.ivf", "av1-1-b8-06-mfmv.ivf",
+    "av1-1-b8-16-intra_only-intrabc-extreme-dv.ivf", "av1-1-b8-22-svc-L2T2-2.ivf",
+    "av1-1-b8-23-film_grain-50.ivf", "av1-1-b10-23-film_grain-50.ivf", "av1-1-b8-24-monochrome.ivf",
+]
+
+fn main() {
+    var t = T()
+
+    // ---- the shared fixtures ----
+    let mkv = openClip(testkit.fixturePath("av1.mkv"))
+    t.check(mkv.ok, "av1.mkv has an av1 track")
+    if mkv.ok {
+        let want = testkit.frameMd5s("av1.mkv")
+        let s = decodeAll(mkv, want, false)
+        t.check(s.pictures == want.count && s.mismatches == 0, "av1.mkv: {s.pictures} pictures, {s.mismatches} md5 mismatches (first {s.firstBad}) of {want.count}")
+        let info = av1.streamInfo(mkv.track)
+        t.check(info == "AV1 Main, 320×240, 8-bit", "streamInfo from av1C: \"{info}\"")
+        // The ordinary Decoder gives the same pictures with their pts.
+        var d = av1.newDecoder(mkv.track).value() ?? av1.Decoder()
+        var same = 0
+        var n = 0
+        for (i, pk) in mkv.packets.enumerated() {
+            for p in d.decode(pk, pts: mkv.pts[i], dts: mkv.pts[i], key: mkv.keys[i]) {
+                if n < want.count && testkit.pictureMd5(p) == want[n] && p.pts == mkv.pts[i] {
+                    same += 1
+                }
+                if n == 0 {
+                    t.check(p.key && p.depth == 8 && p.chroma == .yuv420 && p.width == 320 && p.height == 240, "first picture: key, 8-bit 4:2:0 320×240")
+                    t.check(p.matrix != .unknown, "matrix set")
+                }
+                n += 1
+            }
+        }
+        t.check(same == want.count, "Decoder: {same} of {want.count} pictures right with their pts")
+        // Reset: a seek to the middle (no keyframe follows: nothing is
+        // shown), then back to the start.
+        d.reset()
+        var afterReset = 0
+        for (i, pk) in mkv.packets.enumerated() {
+            if i >= 5 {
+                afterReset += d.decode(pk, pts: mkv.pts[i], dts: mkv.pts[i], key: false).count
+            }
+        }
+        t.check(afterReset == 0, "after reset nothing is shown before a keyframe ({afterReset})")
+        d.reset()
+        var again = 0
+        for (i, pk) in mkv.packets.enumerated() {
+            for p in d.decode(pk, pts: mkv.pts[i], dts: mkv.pts[i], key: mkv.keys[i]) {
+                if again < want.count && testkit.pictureMd5(p) == want[again] {
+                    again += 1
+                }
+            }
+        }
+        t.check(again == want.count, "after reset, decoding from the keyframe: {again} of {want.count} right")
+    }
+    let ivf = openClip(testkit.fixturePath("t.av1.ivf"))
+    t.check(ivf.ok, "t.av1.ivf opens")
+    if ivf.ok {
+        let want = readMd5s("tests/av1/fixtures/t.av1.ivf.framemd5")
+        let s = decodeAll(ivf, want, false)
+        t.check(s.pictures == want.count && s.mismatches == 0 && want.count > 0, "t.av1.ivf: {s.pictures} pictures, {s.mismatches} md5 mismatches (first {s.firstBad}) of {want.count}")
+        let info = av1.streamInfo(ivf.track)
+        t.check(info == "AV1, 320×240", "streamInfo without av1C: \"{info}\"")
+        let fi = av1.frameInfo(ivf.packets[0])
+        t.check(fi == "AV1 Main, 320×240, 8-bit", "frameInfo: \"{fi}\"")
+        let c10 = openClip(joinPath("tests/av1/fixtures", "aom_422_10.ivf"))
+        if c10.ok {
+            let f10 = av1.frameInfo(c10.packets[0])
+            t.check(f10 == "AV1 Professional, 176×144, 10-bit 4:2:2", "frameInfo 4:2:2: \"{f10}\"")
+        }
+    }
+
+    // ---- the clips made by tests/av1/fixtures/make.sh ----
+    let fx = "tests/av1/fixtures"
+    let clips = ["av1_8bit", "av1_10bit", "av1_grain", "av1_grain10", "av1_tiles", "av1_odd",
+                 "aom_screen", "aom_superres", "aom_444", "aom_422_10", "aom_12bit", "aom_lossless",
+                 "aom_errres", "aom_resize", "aom_mono", "aom_sframe", "aom_fwdkf", "aom_tools",
+                 "aom_sb128", "aom_tilesizes", "aom_seg", "aom_qm", "aom_tiny", "aom_cdfoff",
+                 "aom_422_8", "aom_444_odd", "aom_superres10", "aom_grain444", "aom_mono10"]
+    for name in clips {
+        let path = joinPath(fx, name + ".ivf")
+        if !fileExists(path) {
+            t.check(false, "{name}.ivf is missing: run tests/av1/fixtures/make.sh")
+            continue
+        }
+        let c = openClip(path)
+        let w = readMd5s(path + ".framemd5")
+        let s = decodeAll(c, w, false)
+        t.check(s.pictures == w.count && s.mismatches == 0 && w.count > 0, "{name}: {s.pictures} pictures, {s.mismatches} md5 mismatches (first {s.firstBad}) of {w.count}")
+        if name == "av1_10bit" || name == "aom_422_10" || name == "av1_grain10" {
+            t.check(s.depth == 10, "{name} is 10-bit ({s.depth})")
+        }
+        if name == "aom_12bit" {
+            t.check(s.depth == 12, "{name} is 12-bit ({s.depth})")
+        }
+        if name == "av1_grain" || name == "av1_grain10" || name == "aom_grain444" {
+            t.check(stat(s, "filmGrain") > 0, "{name} applies film grain")
+            // The same with the grain added afterwards (deferGrain).
+            var pl = av1.newPipeline(c.track).value() ?? av1.Pipeline()
+            pl.reconstructor.deferGrain = true
+            var n = 0
+            var good = 0
+            for (i, pk) in c.packets.enumerated() {
+                let fs = pl.parser.parse(pk, pts: i, dts: i, key: i == 0)
+                let rs = av1.reconstructStep(pl.reconstructor, fs)
+                pl.reconstructor = rs.reconstructor
+                for (j, p) in rs.pictures.enumerated() {
+                    let q = av1.applyFilmGrain(p, rs.grains[j])
+                    if n < w.count && testkit.pictureMd5(q) == w[n] {
+                        good += 1
+                    }
+                    n += 1
+                }
+            }
+            t.check(good == w.count, "{name} with deferGrain + applyFilmGrain: {good} of {w.count}")
+        }
+        if name == "av1_tiles" || name == "aom_tilesizes" {
+            t.check(stat(s, "maxTiles") >= 4, "{name} has tiles ({stat(s, "maxTiles")})")
+        }
+        if name == "aom_screen" {
+            t.check(stat(s, "palette") > 0, "{name} uses palette")
+        }
+        if name == "aom_superres" {
+            t.check(stat(s, "superres") > 0, "{name} uses superres")
+        }
+        if name == "aom_lossless" {
+            t.check(stat(s, "lossless") > 0, "{name} is lossless")
+        }
+        if name == "aom_seg" {
+            t.check(stat(s, "segmentation") > 0 && stat(s, "deltaQ") > 0 && stat(s, "deltaLf") > 0, "{name} uses segmentation, delta q and delta lf")
+        }
+        if name == "aom_qm" {
+            t.check(stat(s, "qmatrix") > 0, "{name} uses quantizer matrices")
+        }
+        if name == "aom_sb128" {
+            t.check(stat(s, "sb128") > 0, "{name} uses 128x128 superblocks")
+        }
+        if name == "aom_tools" {
+            t.check(stat(s, "obmc") > 0 && stat(s, "localWarp") > 0 && stat(s, "compWedge") > 0 && stat(s, "interintra") > 0, "{name} uses OBMC, local warp, wedges, interintra")
+        }
+        if name == "aom_mono" {
+            t.check(stat(s, "mono") > 0, "{name} is monochrome")
+        }
+        if name == "aom_444" {
+            t.check(stat(s, "444") > 0, "{name} is 4:4:4")
+        }
+        if name == "aom_fwdkf" {
+            t.check(stat(s, "showExisting") > 0 && stat(s, "key") > 1, "{name} shows forward keyframes")
+        }
+    }
+
+    // ---- Annex B: temporal units of length-delimited OBUs ----
+    let abPath = joinPath(fx, "aom_annexb.obu")
+    let ab = readData(abPath) ?? Data()
+    if ab.isEmpty {
+        t.check(false, "aom_annexb.obu is missing: run tests/av1/fixtures/make.sh")
+    } else {
+        var c = Clip()
+        c.ok = true
+        c.track.tag = "annexb"
+        var at = 0
+        while at < ab.count {
+            // temporal_unit_size (leb128), then the unit.
+            var size = 0
+            var i = 0
+            while at < ab.count && i < 8 {
+                let b = ab[at]
+                at += 1
+                size |= (b & 0x7f) << (7 * i)
+                i += 1
+                if (b & 0x80) == 0 {
+                    break
+                }
+            }
+            if size <= 0 || at + size > ab.count {
+                break
+            }
+            c.packets.append(ab.slice(from: at, to: at + size))
+            c.pts.append(c.packets.count - 1)
+            c.keys.append(c.packets.count == 1)
+            at += size
+        }
+        let w = readMd5s(abPath + ".framemd5")
+        let s = decodeAll(c, w, false)
+        t.check(s.pictures == w.count && s.mismatches == 0 && w.count > 0, "aom_annexb.obu (Annex B): {s.pictures} pictures, {s.mismatches} md5 mismatches (first {s.firstBad}) of {w.count}")
+    }
+
+    // ---- damage never stops the program ----
+    let basePath = joinPath(fx, "aom_tools.ivf")
+    let base = openClip(basePath)
+    if base.packets.count > 10 {
+        var d = av1.newDecoder(base.track).value() ?? av1.Decoder()
+        var shown = 0
+        var seed = 12345
+        for (i, pk) in base.packets.enumerated() {
+            var bytes = pk.bytes
+            if i % 3 == 1 {
+                for _ in 0..8 {
+                    seed = (seed * 1103515245 + 12345) & 0x7fffffff
+                    let at = 3 + seed % max(1, bytes.count - 3)
+                    if at < bytes.count {
+                        bytes[at] = (bytes[at] ^ (seed >> 8)) & 255
+                    }
+                }
+            }
+            if i % 7 == 3 {
+                bytes = bytes.prefix(bytes.count / 3)
+            }
+            if i % 11 == 5 {
+                bytes = []
+            }
+            shown += d.decode(Data(bytes: bytes), pts: i, dts: i, key: false).count
+        }
+        t.check(shown > 0 && !d.warnings.isEmpty, "damaged packets: decoding went on ({shown} pictures, {d.warnings.count} warnings)")
+        // Random garbage of every size, some looking like OBUs.
+        var g = av1.Decoder()
+        for n in 0..300 {
+            var b: [Int] = []
+            for _ in 0..(n * 7 % 400) {
+                seed = (seed * 1103515245 + 12345) & 0x7fffffff
+                b.append((seed >> 7) & 255)
+            }
+            if n % 5 == 0 && b.count > 2 {
+                b[0] = 0x32
+                b[1] = b.count - 2
+            }
+            g.decode(Data(bytes: b), pts: n, dts: n, key: false)
+        }
+        // Garbage after a good sequence header and keyframe.
+        var g2 = av1.newDecoder(base.track).value() ?? av1.Decoder()
+        g2.decode(base.packets[0], pts: 0, dts: 0, key: true)
+        for n in 0..200 {
+            var b = base.packets[1 + n % 5].bytes
+            for _ in 0..(1 + n % 16) {
+                seed = (seed * 1103515245 + 12345) & 0x7fffffff
+                let at = 2 + seed % max(1, b.count - 2)
+                if at < b.count {
+                    b[at] = (seed >> 9) & 255
+                }
+            }
+            g2.decode(Data(bytes: b), pts: n, dts: n, key: false)
+        }
+        t.check(true, "random packets: no crash")
+        // A truncated keyframe, then the rest: concealed, no crash.
+        var k = av1.newDecoder(base.track).value() ?? av1.Decoder()
+        var kp = 0
+        for (i, pk) in base.packets.enumerated() {
+            let b = if i == 0 { pk.slice(from: 0, to: pk.count / 2) } else { pk }
+            kp += k.decode(b, pts: i, dts: i, key: i == 0).count
+        }
+        t.check(true, "truncated keyframe: {kp} pictures, no crash")
+    }
+
+    // ---- skipNonReference: frames nothing refers to aren't reconstructed ----
+    let sk = openClip(joinPath(fx, "av1_8bit.ivf"))
+    if sk.ok {
+        var d = av1.newDecoder(sk.track).value() ?? av1.Decoder()
+        d.skipNonReference = true
+        var full = av1.newDecoder(sk.track).value() ?? av1.Decoder()
+        var a = 0
+        var b = 0
+        var sameRef = true
+        for (i, pk) in sk.packets.enumerated() {
+            let pa = d.decode(pk, pts: i, dts: i, key: false)
+            let pb = full.decode(pk, pts: i, dts: i, key: false)
+            a += pa.count
+            b += pb.count
+            if pa.count == 1 && pb.count == 1 && testkit.pictureMd5(pa[0]) != testkit.pictureMd5(pb[0]) {
+                sameRef = false
+            }
+        }
+        t.check(a < b && sameRef, "skipNonReference: {a} of {b} pictures, the rest unchanged")
+    }
+
+    // ---- libaom test vectors ----
+    let conf = "build/conformance/av1"
+    if !fileExists(joinPath(conf, "av1-1-b8-01-size-16x16.ivf")) {
+        print("note: {conf} not found (build/conformance/av1/fetch.sh); test vectors skipped")
+    } else {
+        let some = environment("AV1_CONFORMANCE") ?? "" == "some"
+        var names: [String] = []
+        if some {
+            names = someVectors
+        } else {
+            for n in listFolder(conf) ?? [] {
+                if (n.hasSuffix(".ivf") || n.hasSuffix(".mkv")) && fileExists(joinPath(conf, n + ".md5")) {
+                    names.append(n)
+                }
+            }
+        }
+        var ok = 0
+        let tc = now()
+        for n in names {
+            let w = readMd5s(joinPath(conf, n + ".md5"))
+            let c = openClip(joinPath(conf, n))
+            let s = decodeAll(c, w, true)
+            let good = s.pictures == w.count && s.mismatches == 0 && w.count > 0
+            if good {
+                ok += 1
+            }
+            t.check(good, "test vector {n}: {s.pictures} pictures, {s.mismatches} mismatches (first {s.firstBad}) of {w.count}")
+        }
+        print("test vectors: {ok} of {names.count} bit-exact")
+        print("time av1 test vectors: {Int((now() - tc) * 1000.0)} ms")
+    }
+
+    // ---- timings ----
+    let clipDir = "build/scratch/av1/clips"
+    for (name, what) in [("t720", "720p 8-bit"), ("t1080", "1080p 8-bit"), ("t720_10", "720p 10-bit"), ("t1080_10", "1080p 10-bit")] {
+        let path = joinPath(clipDir, name + ".ivf")
+        if !fileExists(path) {
+            print("note: {path} not found (tests/av1/fixtures/make.sh); timing skipped")
+            continue
+        }
+        let c = openClip(path)
+        let w = readMd5s(joinPath(clipDir, name + ".framemd5"))
+        var pl = av1.newPipeline(c.track).value() ?? av1.Pipeline()
+        var tp = 0.0
+        var tr = 0.0
+        var n = 0
+        var bad = 0
+        for (i, pk) in c.packets.enumerated() {
+            let t0 = now()
+            let fs = pl.parser.parse(pk, pts: i, dts: i, key: false)
+            let t1 = now()
+            var pics: [core.Picture] = []
+            for f in fs {
+                pics += pl.reconstructor.reconstruct(f)
+            }
+            tp += t1 - t0
+            tr += now() - t1
+            if !pics.isEmpty {
+                if n >= w.count || testkit.pictureMd5(pics[pics.count - 1]) != w[n] {
+                    bad += 1
+                }
+                n += 1
+            }
+        }
+        t.check(bad == 0 && n == w.count, "{name}: {n} pictures, {bad} md5 mismatches")
+        let pn = Float(max(n, 1))
+        print("time av1 {what} parse: {(tp * 1000.0 / pn).formatted(decimals: 1)} ms per picture")
+        print("time av1 {what} reconstruct: {(tr * 1000.0 / pn).formatted(decimals: 1)} ms per picture")
+    }
+
+    print("av1: {t.passed} of {t.total} passed")
+}

@@ -1,0 +1,339 @@
+// Vorbis codebooks (Vorbis I section 3): how they are read from the setup
+// header, turned into fast Huffman decode tables, and how their VQ value
+// vectors are unpacked.
+//
+// A codebook maps variable-length codewords (a Huffman code given only by
+// each entry's codeword length) to entry numbers. In "VQ context" the entry
+// number then picks a vector of `dims` Floats from the book's value table.
+//
+// Decoding speed matters (every floor value and residue vector goes through
+// a codebook), so each book gets a lookup table indexed by the next
+// `tableBits` bits of the packet. Vorbis packs bits least significant first
+// and reads a codeword's bits one at a time from its first (leftmost) bit,
+// so the table is indexed by bit-reversed codewords. Codewords longer than
+// the table are rare and found by a short search.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../core"
+
+// The most bits a decode table looks at.
+let bookTableMax = 10
+
+// The largest value table (entries × dimensions) a book may unpack to;
+// real streams stay far below it, and damaged ones can't make us allocate
+// gigabytes.
+let bookMaxValues = 1 << 22
+
+struct Codebook {
+    dims: Int = 0
+    entries: Int = 0
+    lookupType: Int = 0
+    // Decode table of 2^tableBits items: entry number << 6 | codeword
+    // length, or 0 when no codeword of up to tableBits bits matches.
+    tableBits: Int = 0
+    table: [Int] = []
+    // Codewords longer than tableBits: bit-reversed code, length, entry.
+    longCodes: [Int] = []
+    longLens: [Int] = []
+    longEntries: [Int] = []
+    maxLen: Int = 0
+    // The entry of a single-entry book (section 3.2.1 errata), else -1.
+    single: Int = -1
+    // No codewords at all: any read is an error.
+    empty: Bool = true
+    // VQ vectors, entries × dims Floats (lookup types 1 and 2).
+    values: [Float] = []
+}
+
+// ilog (section 9.2.1): the position of the highest set bit, 0 for x <= 0.
+fn ilog(_ x: Int) -> Int {
+    var n = 0
+    var v = x
+    while v > 0 {
+        n += 1
+        v = v >> 1
+    }
+    n
+}
+
+// float32_unpack (section 9.2.2): Vorbis's own packed float format.
+fn float32Unpack(_ x: Int) -> Float {
+    var mantissa = Float(x & 0x1fffff)
+    let exponent = (x & 0x7fe00000) >> 21
+    if x & 0x80000000 != 0 {
+        mantissa = -mantissa
+    }
+    mantissa * pow(2.0, Float(exponent - 788))
+}
+
+// lookup1_values (section 9.2.3): the largest r with r^dims <= entries.
+fn lookup1Values(_ entries: Int, _ dims: Int) -> Int {
+    if dims <= 0 {
+        return 0
+    }
+    var r = Int(floor(pow(Float(entries), 1.0 / Float(dims))))
+    if r < 0 {
+        r = 0
+    }
+    // pow can be off by one either way; fix it with exact integer powers.
+    while r > 0 && intPowAbove(r, dims, entries) {
+        r -= 1
+    }
+    while !intPowAbove(r + 1, dims, entries) {
+        r += 1
+    }
+    r
+}
+
+// Whether base^exp > limit, without overflowing.
+fn intPowAbove(_ base: Int, _ exp: Int, _ limit: Int) -> Bool {
+    var acc = 1
+    for _ in 0..exp {
+        acc = acc * base
+        if acc > limit {
+            return true
+        }
+    }
+    false
+}
+
+// Reads one codebook from the setup header (section 3.2.1).
+fn readCodebook(_ r: bind core.LsbReader) -> Result<Codebook> {
+    if r.bits(24) != 0x564342 {
+        return .failure(error: Error("a Vorbis codebook doesn't start with its sync pattern"))
+    }
+    var book = Codebook()
+    book.dims = r.bits(16)
+    book.entries = r.bits(24)
+    let entries = book.entries
+    var lengths: [Int] = []
+    let ordered = r.flag()
+    if !ordered {
+        let sparse = r.flag()
+        for _ in 0..entries {
+            if sparse {
+                if r.flag() {
+                    lengths.append(r.bits(5) + 1)
+                } else {
+                    lengths.append(0)
+                }
+            } else {
+                lengths.append(r.bits(5) + 1)
+            }
+            if r.overrun {
+                return .failure(error: Error("the Vorbis setup header ends inside a codebook"))
+            }
+        }
+    } else {
+        var current = 0
+        var length = r.bits(5) + 1
+        while current < entries {
+            let number = r.bits(ilog(entries - current))
+            if current + number > entries || r.overrun {
+                return .failure(error: Error("a Vorbis codebook has too many codeword lengths"))
+            }
+            for _ in 0..number {
+                lengths.append(length)
+            }
+            current += number
+            length += 1
+            if length > 33 {
+                return .failure(error: Error("a Vorbis codebook has codewords over 32 bits"))
+            }
+        }
+    }
+
+    // The value lookup table (section 3.2.1, "lookup types").
+    book.lookupType = r.bits(4)
+    if book.lookupType == 1 || book.lookupType == 2 {
+        let minimum = float32Unpack(r.bits(32))
+        let delta = float32Unpack(r.bits(32))
+        let valueBits = r.bits(4) + 1
+        let sequenceP = r.flag()
+        let lookupValues = if book.lookupType == 1 { lookup1Values(entries, book.dims) } else { entries * book.dims }
+        if entries * book.dims > bookMaxValues || lookupValues > bookMaxValues {
+            return .failure(error: Error("a Vorbis codebook is too large"))
+        }
+        var mults: [Int] = []
+        for _ in 0..lookupValues {
+            mults.append(r.bits(valueBits))
+        }
+        if r.overrun {
+            return .failure(error: Error("the Vorbis setup header ends inside a codebook"))
+        }
+        book.values = unpackValues(book, mults, minimum: minimum, delta: delta, sequenceP: sequenceP, lookupValues: lookupValues)
+    } else if book.lookupType != 0 {
+        return .failure(error: Error("a Vorbis codebook has lookup type {book.lookupType}"))
+    }
+    if r.overrun {
+        return .failure(error: Error("the Vorbis setup header ends inside a codebook"))
+    }
+    if let e = buildDecodeTable(book, lengths) {
+        return .failure(error: e)
+    }
+    Result.ok(value: book)
+}
+
+// The VQ vectors of every entry (section 3.2.1, "vector value decode").
+// Entries are numbered as in the stream, used or not.
+fn unpackValues(_ book: Codebook, _ mults: [Int], minimum: Float, delta: Float, sequenceP: Bool, lookupValues: Int) -> [Float] {
+    var out: [Float] = []
+    let dims = book.dims
+    if lookupValues <= 0 {
+        for _ in 0..(book.entries * dims) {
+            out.append(0.0)
+        }
+        return out
+    }
+    for e in 0..book.entries {
+        var last = 0.0
+        if book.lookupType == 1 {
+            var divisor = 1
+            for _ in 0..dims {
+                let off = (e / divisor) % lookupValues
+                let v = Float(mults[off]) * delta + minimum + last
+                out.append(v)
+                if sequenceP {
+                    last = v
+                }
+                // Once divisor passes entries every later offset is 0;
+                // stop it growing so it can't overflow.
+                if divisor <= book.entries {
+                    divisor = divisor * lookupValues
+                }
+            }
+        } else {
+            var off = e * dims
+            for _ in 0..dims {
+                let v = Float(mults[off]) * delta + minimum + last
+                out.append(v)
+                if sequenceP {
+                    last = v
+                }
+                off += 1
+            }
+        }
+    }
+    out
+}
+
+// Assigns codewords to entries (section 3.2.1, "Huffman decision tree
+// representation": each used entry, in order, takes the lowest free
+// codeword of its length) and fills the book's decode table.
+fn buildDecodeTable(_ book: bind Codebook, _ lengths: [Int]) -> Error? {
+    var used = 0
+    var lastUsed = -1
+    var maxLen = 0
+    for i in 0..lengths.count {
+        if lengths[i] > 0 {
+            used += 1
+            lastUsed = i
+            maxLen = max(maxLen, lengths[i])
+        }
+    }
+    book.maxLen = maxLen
+    if used == 0 {
+        book.empty = true
+        return nil
+    }
+    book.empty = false
+    if used == 1 {
+        // A single-entry book: one codeword, read as one bit of either value.
+        book.single = lastUsed
+        return nil
+    }
+    // marker[len] is the next free codeword of each length, kept so that
+    // taking one also blocks every longer codeword it is a prefix of (the
+    // way the reference decoder builds its codes).
+    var marker: [Int] = []
+    for _ in 0..34 {
+        marker.append(0)
+    }
+    var codes: [Int] = []
+    for i in 0..lengths.count {
+        let len = lengths[i]
+        if len == 0 {
+            codes.append(0)
+            continue
+        }
+        var entry = marker[len]
+        if len < 32 && (entry >> len) != 0 {
+            return Error("a Vorbis codebook's codeword lengths overfill its code")
+        }
+        codes.append(entry)
+        var j = len
+        while j > 0 {
+            if marker[j] & 1 == 1 {
+                if j == 1 {
+                    marker[1] += 1
+                } else {
+                    marker[j] = marker[j - 1] << 1
+                }
+                break
+            }
+            marker[j] += 1
+            j -= 1
+        }
+        j = len + 1
+        while j < 33 {
+            if (marker[j] >> 1) == entry {
+                entry = marker[j]
+                marker[j] = marker[j - 1] << 1
+            } else {
+                break
+            }
+            j += 1
+        }
+    }
+    let bits = min(maxLen, bookTableMax)
+    book.tableBits = bits
+    let size = 1 << bits
+    var table: [Int] = []
+    for _ in 0..size {
+        table.append(0)
+    }
+    for i in 0..lengths.count {
+        let len = lengths[i]
+        if len == 0 {
+            continue
+        }
+        // The codeword read first-bit-first is the bit-reversed number.
+        let code = codes[i]
+        var rev = 0
+        for b in 0..len {
+            rev = (rev << 1) | ((code >> b) & 1)
+        }
+        if len <= bits {
+            var idx = rev
+            let step = 1 << len
+            while idx < size {
+                table[idx] = (i << 6) | len
+                idx += step
+            }
+        } else {
+            book.longCodes.append(rev)
+            book.longLens.append(len)
+            book.longEntries.append(i)
+        }
+    }
+    book.table = table
+    nil
+}
+
+// For tests: reads one codebook from `book` (packed as in a setup header)
+// and decodes `count` entries from `stream` with it. Gives the entries
+// (-1 for a failed read) and the book's VQ values, or a failure.
+public fn testCodebook(_ book: Data, _ stream: Data, count: Int) -> Result<([Int], [Float])> {
+    var r = core.lsbReader(book)
+    let b = try readCodebook(r)
+    var d = Decoder()
+    d.books = [b]
+    d.br = core.lsbReader(stream)
+    var entries: [Int] = []
+    for _ in 0..count {
+        entries.append(d.readEntry(0))
+    }
+    Result.ok(value: (entries, b.values))
+}

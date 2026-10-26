@@ -1,0 +1,1492 @@
+// Elementary streams: files that are just one codec's frames, one after
+// another, with no container around them.
+//
+//   MPEG audio (.mp3 .mp2 .mp1)  frames found by their sync word, each
+//                                checked against the next header
+//                                (ISO 11172-3 §2.4.1.3, ISO 13818-3);
+//                                ID3v2.2/2.3/2.4 and ID3v1 tags, APEv2
+//                                tags skipped, Xing/Info/VBRI frames
+//                                (frame count → duration) and the LAME
+//                                tag (encoder delay and padding → tags
+//                                "delay" and "padding", in samples)
+//   AAC ADTS (.aac)              ADTS frames (ISO 13818-7 §6.2)
+//   FLAC (.flac)                 metadata blocks (STREAMINFO, SEEKTABLE,
+//                                VORBIS_COMMENT, PICTURE) and frames found
+//                                by sync code and header CRC-8
+//                                (flac format spec, "FRAME_HEADER")
+//   AC-3 / E-AC-3 (.ac3 .eac3)   syncframes (ATSC A/52 §5.3, Annex E)
+//   H.264 / HEVC (.264 .h265)    Annex B byte streams split into access
+//                                units (H.264 §7.4.1.2.3, H.265 §7.4.2.4.4)
+//
+// Every packet's pts counts samples at the stream's sample rate (audio),
+// or frames at 90 kHz from the frame rate (video).
+//
+// This file also has the text and tag helpers the MP4 and WAV readers
+// share: UTF-8/UTF-16/Latin-1 text and the ID3v2 reader.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../core"
+
+public fn rawOpen(_ file: Data, format: String) -> Result<core.Media> {
+    var m = core.Media()
+    var start = 0
+    var end = file.count
+    // ID3v2 tags in front (ID3v2.4 §3.1); sometimes more than one.
+    while start + 10 <= end && file[start] == 0x49 && file[start + 1] == 0x44 && file[start + 2] == 0x33 {
+        let size = rawSyncsafe(file, start + 6)
+        let footer = if (file[start + 5] & 0x10) != 0 { 10 } else { 0 }
+        let tagEnd = min(end, start + 10 + size + footer)
+        rawId3(file, start, tagEnd, m)
+        start = tagEnd
+    }
+    end = rawTrailingTags(file, start, end, m)
+    // Some taggers pad with zeros after an ID3 tag (but zeros also begin
+    // an Annex B start code).
+    if start > 0 && format != "h264" && format != "hevc" {
+        var s = start
+        while s < end && file[s] == 0 && s - start < 65536 {
+            s += 1
+        }
+        if s < end && s - start < 65536 {
+            start = s
+        }
+    }
+    // The bytes say what the stream is; `format` (from the file name)
+    // breaks ties for video.
+    var kind = format
+    if start + 4 <= end && file.slice(from: start, to: start + 4).latin1 == "fLaC" {
+        kind = "flac"
+    } else if start + 2 <= end && file[start] == 0x0b && file[start + 1] == 0x77 {
+        kind = "ac3"
+    } else if start + 2 <= end && file[start] == 0xff && (file[start + 1] & 0xf6) == 0xf0 {
+        kind = "aac"
+    } else if start + 2 <= end && file[start] == 0xff && (file[start + 1] & 0xe0) == 0xe0 {
+        kind = "mp3"
+    }
+    match kind {
+        "mp3", "mp2", "mp1" -> rawMpegAudio(file, start, end, m)
+        "aac" -> rawAdts(file, start, end, m)
+        "flac" -> rawFlac(file, start, end, m)
+        "ac3", "eac3" -> rawAc3(file, start, end, m)
+        "h264", "hevc" -> rawAnnexB(file, start, end, kind, m)
+        _ -> Result.failure(error: Error("{format} files can't be read"))
+    }
+}
+
+// A 28-bit "syncsafe" number: four bytes of 7 bits (ID3v2.4 §6.2).
+fn rawSyncsafe(_ d: Data, _ p: Int) -> Int {
+    if p + 4 > d.count {
+        return 0
+    }
+    ((d[p] & 0x7f) << 21) | ((d[p + 1] & 0x7f) << 14) | ((d[p + 2] & 0x7f) << 7) | (d[p + 3] & 0x7f)
+}
+
+fn rawU32le(_ d: Data, _ p: Int) -> Int {
+    if p < 0 || p + 4 > d.count { 0 } else { d.uint32(at: p) }
+}
+
+// ID3v1 (the last 128 bytes, "TAG") and APEv2 (a 32-byte footer
+// "APETAGEX") at the end of the file: read ID3v1's fields when there are
+// no ID3v2 ones, and give the end of the audio before them.
+fn rawTrailingTags(_ d: Data, _ start: Int, _ end0: Int, _ m: bind core.Media) -> Int {
+    var end = end0
+    if end - start >= 128 && d.slice(from: end - 128, to: end - 125).latin1 == "TAG" {
+        let p = end - 128
+        fn field(_ from: Int, _ len: Int) -> String {
+            rawLatin1(d.slice(from: from, to: from + len)).trim()
+        }
+        let pairs = [("title", field(p + 3, 30)), ("artist", field(p + 33, 30)), ("album", field(p + 63, 30)), ("date", field(p + 93, 4)), ("comment", field(p + 97, if d[p + 125] == 0 && d[p + 126] != 0 { 28 } else { 30 }))]
+        for (k, v) in pairs {
+            if !v.isEmpty && m.tags[k] == nil {
+                m.tags[k] = v
+            }
+        }
+        // ID3v1.1: a zero byte, then the track number.
+        if d[p + 125] == 0 && d[p + 126] != 0 && m.tags["track"] == nil {
+            m.tags["track"] = "{d[p + 126]}"
+        }
+        let g = d[p + 127]
+        if g < rawGenres.count && m.tags["genre"] == nil {
+            m.tags["genre"] = rawGenres[g]
+        }
+        end -= 128
+    }
+    if end - start >= 32 && d.slice(from: end - 32, to: end - 24).latin1 == "APETAGEX" {
+        // APEv2 footer: version, size of items + footer, count, flags.
+        let size = rawU32le(d, end - 20)
+        let flags = rawU32le(d, end - 12)
+        let header = if (flags & 0x80000000) != 0 { 32 } else { 0 }
+        if size >= 32 && size + header <= end - start {
+            end -= size + header
+            m.warnings.append("an APEv2 tag was skipped")
+        }
+    }
+    end
+}
+
+// ---------------------------------------------------------------------------
+// ID3v2 (id3.org: ID3v2.2, ID3v2.3.0, ID3v2.4.0-structure and -frames).
+
+// Reads the tag in d[s..<e] into the media's tags and cover.
+fn rawId3(_ d: Data, _ s: Int, _ e: Int, _ m: bind core.Media) {
+    if e - s < 10 {
+        return
+    }
+    let version = d[s + 3]
+    let flags = d[s + 5]
+    if version < 2 || version > 4 {
+        m.warnings.append("an ID3v2.{version} tag was skipped")
+        return
+    }
+    var body = d.slice(from: s + 10, to: e)
+    // Unsynchronisation (v2.3 §5, v2.4 §6.1): every FF 00 was FF. In v2.3
+    // it covers the whole tag; in v2.4 the tag flag means every frame.
+    let tagUnsync = (flags & 0x80) != 0
+    if tagUnsync && version < 4 {
+        body = rawUnsync(body)
+    }
+    var p = 0
+    // Extended header (v2.3 §3.2: size excludes itself; v2.4 §3.2: size
+    // includes itself, syncsafe).
+    if (flags & 0x40) != 0 && version >= 3 {
+        if version == 3 {
+            p = 4 + (if body.count >= 4 { body.uint32(at: 0, bigEndian: true) } else { 0 })
+        } else {
+            p = rawSyncsafe(body, 0)
+        }
+    }
+    let idLen = if version == 2 { 3 } else { 4 }
+    let headLen = if version == 2 { 6 } else { 10 }
+    var cover = Data()
+    var coverType = -1
+    while p + headLen <= body.count {
+        if body[p] == 0 {
+            break
+        }
+        let id = body.slice(from: p, to: p + idLen).latin1
+        var size = 0
+        var fflags = 0
+        if version == 2 {
+            size = (body[p + 3] << 16) | (body[p + 4] << 8) | body[p + 5]
+        } else if version == 3 {
+            size = body.uint32(at: p + 4, bigEndian: true)
+            fflags = body.uint16(at: p + 8, bigEndian: true)
+        } else {
+            size = rawSyncsafe(body, p + 4)
+            fflags = body.uint16(at: p + 8, bigEndian: true)
+        }
+        let fs = p + headLen
+        let fe = min(body.count, fs + size)
+        p = fe
+        if size <= 0 {
+            continue
+        }
+        var frame = body.slice(from: fs, to: fe)
+        if version == 3 {
+            // v2.3 frame flags: 0x80 compressed (4-byte size, then zlib),
+            // 0x40 encrypted, 0x20 grouping (1 byte).
+            if (fflags & 0x40) != 0 {
+                continue
+            }
+            var skip = 0
+            if (fflags & 0x80) != 0 {
+                skip += 4
+            }
+            if (fflags & 0x20) != 0 {
+                skip += 1
+            }
+            frame = frame.slice(from: skip, to: frame.count)
+            if (fflags & 0x80) != 0 {
+                frame = frame.decompressed("zlib") ?? Data()
+            }
+        } else if version == 4 {
+            // v2.4 §4.1.2: 0x40 grouping (+1), 0x08 compressed, 0x04
+            // encrypted, 0x02 unsynchronised, 0x01 data length (+4).
+            if (fflags & 0x04) != 0 {
+                continue
+            }
+            var skip = 0
+            if (fflags & 0x40) != 0 {
+                skip += 1
+            }
+            if (fflags & 0x01) != 0 {
+                skip += 4
+            }
+            frame = frame.slice(from: skip, to: frame.count)
+            if (fflags & 0x02) != 0 || tagUnsync {
+                frame = rawUnsync(frame)
+            }
+            if (fflags & 0x08) != 0 {
+                frame = frame.decompressed("zlib") ?? Data()
+            }
+        }
+        if frame.isEmpty {
+            continue
+        }
+        if id == "APIC" || id == "PIC" {
+            // APIC: encoding, MIME type (Latin-1, ends in 0), picture type,
+            // description (ends in 0 or 00 00), picture data. PIC (v2.2):
+            // encoding, 3-letter format, picture type, description, data.
+            let enc = frame[0]
+            var q = 1
+            if id == "PIC" {
+                q = 4
+            } else {
+                while q < frame.count && frame[q] != 0 {
+                    q += 1
+                }
+                q += 1
+            }
+            if q >= frame.count {
+                continue
+            }
+            let ptype = frame[q]
+            q += 1
+            q = rawSkipText(frame, q, enc)
+            let pic = frame.slice(from: q, to: frame.count)
+            // The front cover (type 3) wins; else the first picture.
+            if !pic.isEmpty && (coverType < 0 || ptype == 3 && coverType != 3) {
+                cover = pic
+                coverType = ptype
+            }
+            continue
+        }
+        if id == "TXXX" || id == "TXX" {
+            // Encoding, description, value.
+            let enc = frame[0]
+            let q = rawSkipText(frame, 1, enc)
+            let key = rawId3Text(frame.slice(from: 1, to: q), enc).lowercase()
+            let value = rawId3Text(frame.slice(from: q, to: frame.count), enc)
+            if !key.isEmpty {
+                m.tags[key] = value
+            }
+            continue
+        }
+        if id == "COMM" || id == "COM" {
+            // Encoding, language (3), short description, text.
+            if frame.count < 5 {
+                continue
+            }
+            let enc = frame[0]
+            let q = rawSkipText(frame, 4, enc)
+            let text = rawId3Text(frame.slice(from: q, to: frame.count), enc)
+            if !text.isEmpty && m.tags["comment"] == nil {
+                m.tags["comment"] = text
+            }
+            continue
+        }
+        if id.hasPrefix("T") {
+            let key = rawId3Key(id)
+            if key.isEmpty {
+                continue
+            }
+            var text = rawId3Text(frame.slice(from: 1, to: frame.count), frame[0])
+            if key == "genre" {
+                text = rawGenre(text)
+            }
+            if !text.isEmpty {
+                m.tags[key] = text
+            }
+        }
+    }
+    if !cover.isEmpty && m.cover.isEmpty {
+        m.cover = cover
+    }
+}
+
+// Undoes unsynchronisation: drops the 00 after each FF.
+fn rawUnsync(_ d: Data) -> Data {
+    var out = Data()
+    var run = 0
+    var i = 0
+    let n = d.count
+    while i < n {
+        if d[i] == 0xff && i + 1 < n && d[i + 1] == 0 {
+            out += d.slice(from: run, to: i + 1)
+            i += 2
+            run = i
+        } else {
+            i += 1
+        }
+    }
+    out += d.slice(from: run, to: n)
+    out
+}
+
+// The position after a text that ends in a terminator (00, or 00 00 for
+// the UTF-16 encodings 1 and 2).
+fn rawSkipText(_ d: Data, _ from: Int, _ enc: Int) -> Int {
+    var q = from
+    if enc == 1 || enc == 2 {
+        while q + 1 < d.count && !(d[q] == 0 && d[q + 1] == 0) {
+            q += 2
+        }
+        return min(d.count, q + 2)
+    }
+    while q < d.count && d[q] != 0 {
+        q += 1
+    }
+    min(d.count, q + 1)
+}
+
+// Text in an ID3 encoding (0 Latin-1, 1 UTF-16 with BOM, 2 UTF-16BE,
+// 3 UTF-8), up to its terminator. Several values (v2.4) are joined by "/".
+fn rawId3Text(_ d: Data, _ enc: Int) -> String {
+    var parts: [String] = []
+    var q = 0
+    while q < d.count {
+        let next = rawSkipText(d, q, enc)
+        let piece = d.slice(from: q, to: next)
+        let text = if enc == 1 { rawUtf16(piece, bigEndian: false) } else if enc == 2 { rawUtf16(piece, bigEndian: true) } else if enc == 3 { rawUtf8(piece) } else { rawLatin1(piece) }
+        if !text.isEmpty {
+            parts.append(text)
+        }
+        if next <= q {
+            break
+        }
+        q = next
+    }
+    parts.joined(separator: "/")
+}
+
+// Reel's tag names for ID3 text frames (v2.2 three-letter and v2.3/2.4).
+fn rawId3Key(_ id: String) -> String {
+    match id {
+        "TIT2", "TT2" -> "title"
+        "TPE1", "TP1" -> "artist"
+        "TPE2", "TP2" -> "albumartist"
+        "TALB", "TAL" -> "album"
+        "TDRC", "TYER", "TYE", "TDRL" -> "date"
+        "TCON", "TCO" -> "genre"
+        "TRCK", "TRK" -> "track"
+        "TPOS", "TPA" -> "disc"
+        "TCOM", "TCM" -> "composer"
+        "TSSE", "TSS" -> "encoder"
+        "TENC", "TEN" -> "encoded_by"
+        "TCOP", "TCR" -> "copyright"
+        "TPUB", "TPB" -> "publisher"
+        "TLAN", "TLA" -> "language"
+        "TPE3", "TP3" -> "performer"
+        "TIT1", "TT1" -> "grouping"
+        "TIT3", "TT3" -> "subtitle"
+        "TBPM", "TBP" -> "bpm"
+        _ -> ""
+    }
+}
+
+// "(17)", "17" or "(17)Rock" as a genre name.
+fn rawGenre(_ text: String) -> String {
+    var t = text
+    if t.hasPrefix("(") {
+        if let close = t.find(")") {
+            let num = t.substring(from: 1, to: close)
+            let rest = t.substring(from: close + 1, to: t.count)
+            if !rest.isEmpty {
+                return rest
+            }
+            t = num
+        }
+    }
+    if let n = Int(t) {
+        if n >= 0 && n < rawGenres.count {
+            return rawGenres[n]
+        }
+    }
+    text
+}
+
+// ---------------------------------------------------------------------------
+// MPEG audio (ISO 11172-3 §2.4.2.3, ISO 13818-3 §2.4.2.3, MPEG 2.5).
+
+let rawMpaRates = [44100, 48000, 32000]
+let rawMpaBitrates = [
+    [0, 32, 64, 96, 128, 160, 192, 224, 256, 288, 320, 352, 384, 416, 448],
+    [0, 32, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384],
+    [0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320],
+    [0, 32, 48, 56, 64, 80, 96, 112, 128, 144, 160, 176, 192, 224, 256],
+    [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160],
+]
+
+// A frame header's facts; size 0 when the four bytes at p aren't one.
+struct RawMpa {
+    size: Int = 0
+    // 1 (MPEG-1), 2 (MPEG-2) or 3 (MPEG-2.5).
+    version: Int = 0
+    layer: Int = 0
+    rate: Int = 0
+    channels: Int = 0
+    samples: Int = 0
+    bitrate: Int = 0
+    mono: Bool = false
+}
+
+fn rawMpaHeader(_ d: Data, _ p: Int) -> RawMpa {
+    var h = RawMpa()
+    if p + 4 > d.count {
+        return h
+    }
+    let b1 = d[p + 1]
+    let b2 = d[p + 2]
+    if d[p] != 0xff || (b1 & 0xe0) != 0xe0 {
+        return h
+    }
+    let ver = (b1 >> 3) & 3
+    let layerBits = (b1 >> 1) & 3
+    let brIndex = b2 >> 4
+    let srIndex = (b2 >> 2) & 3
+    if ver == 1 || layerBits == 0 || brIndex == 15 || brIndex == 0 || srIndex == 3 {
+        return h
+    }
+    let version = if ver == 3 { 1 } else if ver == 2 { 2 } else { 3 }
+    let layer = 4 - layerBits
+    let table = if version == 1 { layer - 1 } else if layer == 1 { 3 } else { 4 }
+    let kbps = rawMpaBitrates[table][brIndex]
+    var rate = rawMpaRates[srIndex]
+    if version == 2 {
+        rate = rate / 2
+    } else if version == 3 {
+        rate = rate / 4
+    }
+    let pad = (b2 >> 1) & 1
+    var size = 0
+    var samples = 1152
+    if layer == 1 {
+        size = (12 * kbps * 1000 / rate + pad) * 4
+        samples = 384
+    } else if layer == 2 || version == 1 {
+        size = 144 * kbps * 1000 / rate + pad
+    } else {
+        size = 72 * kbps * 1000 / rate + pad
+        samples = 576
+    }
+    h.size = size
+    h.version = version
+    h.layer = layer
+    h.rate = rate
+    h.mono = (d[p + 3] >> 6) == 3
+    h.channels = if h.mono { 1 } else { 2 }
+    h.samples = samples
+    h.bitrate = kbps * 1000
+    h
+}
+
+fn rawMpegAudio(_ file: Data, _ start: Int, _ end: Int, _ m0: core.Media) -> Result<core.Media> {
+    var m = m0
+    m.format = "mp3"
+    // The first frame: a header whose next header follows where it says.
+    var p = start
+    var first = RawMpa()
+    while p + 4 <= end {
+        let h = rawMpaHeader(file, p)
+        if h.size > 0 {
+            let q = p + h.size
+            let h2 = rawMpaHeader(file, q)
+            if q >= end || h2.size > 0 && h2.layer == h.layer && h2.rate == h.rate && h2.version == h.version {
+                first = h
+                break
+            }
+        }
+        p += 1
+        if p - start > 1000000 {
+            break
+        }
+    }
+    if first.size == 0 {
+        return Result.failure(error: Error("no MPEG audio frames were found"))
+    }
+    if p > start {
+        m.warnings.append("{p - start} bytes before the first frame were skipped")
+    }
+    var track = core.Track(index: 0, kind: .audio, codec: if first.layer == 3 { "mp3" } else if first.layer == 2 { "mp2" } else { "mp1" })
+    track.timescale = first.rate
+    track.sampleRate = first.rate
+    track.channels = first.channels
+    // A Xing/Info or VBRI frame (LAME, Fraunhofer) carries the frame count
+    // and, from LAME, the encoder delay and padding. It holds no audio.
+    var totalFrames = -1
+    var delay = -1
+    var padding = -1
+    if first.layer == 3 {
+        let side = if first.version == 1 { if first.mono { 17 } else { 32 } } else { if first.mono { 9 } else { 17 } }
+        let x = p + 4 + side
+        let tag = if x + 4 <= end { file.slice(from: x, to: x + 4).latin1 } else { "" }
+        let v = p + 36
+        let vbri = if v + 4 <= end { file.slice(from: v, to: v + 4).latin1 } else { "" }
+        if tag == "Xing" || tag == "Info" {
+            let flags = mp4U32(file, x + 4)
+            var q = x + 8
+            if (flags & 1) != 0 {
+                totalFrames = mp4U32(file, q)
+                q += 4
+            }
+            if (flags & 2) != 0 {
+                q += 4
+            }
+            if (flags & 4) != 0 {
+                q += 100
+            }
+            if (flags & 8) != 0 {
+                q += 4
+            }
+            // LAME tag: 9-byte version string, then 12 bytes of fields,
+            // then 12 bits of delay and 12 of padding.
+            let lame = if q + 24 <= min(end, p + first.size) { file.slice(from: q, to: q + 4).latin1 } else { "" }
+            if lame == "LAME" || lame == "Lavc" || lame == "Lavf" {
+                let a = file[q + 21]
+                let b = file[q + 22]
+                let c = file[q + 23]
+                delay = (a << 4) | (b >> 4)
+                padding = ((b & 15) << 8) | c
+                if m.tags["encoder"] == nil {
+                    m.tags["encoder"] = rawLatin1(file.slice(from: q, to: q + 9)).trim()
+                }
+            }
+            p += first.size
+        } else if vbri == "VBRI" {
+            totalFrames = mp4U32(file, v + 14)
+            p += first.size
+        }
+    }
+    // The frames.
+    var pts = 0
+    var skipped = 0
+    var bytes = 0
+    while p + 4 <= end {
+        let h = rawMpaHeader(file, p)
+        var ok = h.size > 0 && h.layer == first.layer && h.rate == first.rate
+        if ok && p + h.size < end {
+            // Check the next header too, so a false sync inside a frame's
+            // data isn't taken (ISO 11172-3 §2.4.3.1 leaves this to the
+            // decoder).
+            let h2 = rawMpaHeader(file, p + h.size)
+            if h2.size == 0 && p + h.size + 4 <= end {
+                // The last frame before junk or a tag is still a frame.
+                ok = rawMpaNextNear(file, p + h.size, end, first)
+            }
+        }
+        if !ok {
+            p += 1
+            skipped += 1
+            continue
+        }
+        let size = min(h.size, end - p)
+        m.packets.append(core.PacketRef(track: 0, pts: pts, dts: pts, duration: h.samples, key: true, offset: p, size: size))
+        pts += h.samples
+        bytes += size
+        p += h.size
+    }
+    if skipped > 0 {
+        m.warnings.append("{skipped} bytes of damaged or unknown data between frames were skipped")
+    }
+    var samples = pts
+    if totalFrames > 0 {
+        samples = totalFrames * first.samples
+    }
+    if delay >= 0 {
+        m.tags["delay"] = "{delay}"
+        m.tags["padding"] = "{padding}"
+        samples = max(0, samples - delay - padding)
+    }
+    track.duration = samples
+    m.duration = Float(samples) / Float(first.rate)
+    track.bitrate = if m.duration > 0.0 { Int(Float(bytes) * 8.0 / m.duration) } else { first.bitrate }
+    m.tracks = [track]
+    Result.ok(value: m)
+}
+
+// Whether a frame header of the same stream starts within a few bytes of
+// p (or the data ends there): a frame followed by junk is still kept.
+fn rawMpaNextNear(_ d: Data, _ p: Int, _ end: Int, _ first: RawMpa) -> Bool {
+    if end - p < 128 {
+        return true
+    }
+    for k in 0..64 {
+        let h = rawMpaHeader(d, p + k)
+        if h.size > 0 && h.layer == first.layer && h.rate == first.rate {
+            return true
+        }
+    }
+    false
+}
+
+// ---------------------------------------------------------------------------
+// AAC in ADTS frames (ISO 13818-7 §6.2.1, ISO 14496-3 §1.A.2.2).
+
+let rawAacRates = [96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350]
+
+// The frame length at p, or 0 when there's no ADTS header there.
+fn rawAdtsLength(_ d: Data, _ p: Int) -> Int {
+    if p + 7 > d.count || d[p] != 0xff || (d[p + 1] & 0xf6) != 0xf0 {
+        return 0
+    }
+    if ((d[p + 2] >> 2) & 15) >= 13 {
+        return 0
+    }
+    let len = ((d[p + 3] & 3) << 11) | (d[p + 4] << 3) | (d[p + 5] >> 5)
+    if len < 7 { 0 } else { len }
+}
+
+fn rawAdts(_ file: Data, _ start: Int, _ end: Int, _ m0: core.Media) -> Result<core.Media> {
+    var m = m0
+    m.format = "aac"
+    var p = start
+    var rateIndex = -1
+    var channels = 0
+    var profile = 0
+    var pts = 0
+    var skipped = 0
+    var bytes = 0
+    while p + 7 <= end {
+        let len = rawAdtsLength(file, p)
+        var ok = len > 0
+        if ok && p + len + 7 <= end {
+            ok = rawAdtsLength(file, p + len) > 0
+        }
+        if ok && rateIndex >= 0 {
+            ok = ((file[p + 2] >> 2) & 15) == rateIndex
+        }
+        if !ok {
+            p += 1
+            skipped += 1
+            continue
+        }
+        if rateIndex < 0 {
+            profile = file[p + 2] >> 6
+            rateIndex = (file[p + 2] >> 2) & 15
+            channels = ((file[p + 2] & 1) << 2) | (file[p + 3] >> 6)
+        }
+        // number_of_raw_data_blocks_in_frame + 1 blocks of 1024 samples.
+        let blocks = (file[p + 6] & 3) + 1
+        let size = min(len, end - p)
+        m.packets.append(core.PacketRef(track: 0, pts: pts, dts: pts, duration: 1024 * blocks, key: true, offset: p, size: size))
+        pts += 1024 * blocks
+        bytes += size
+        p += len
+    }
+    if rateIndex < 0 {
+        return Result.failure(error: Error("no AAC (ADTS) frames were found"))
+    }
+    if skipped > 0 {
+        m.warnings.append("{skipped} bytes between ADTS frames were skipped")
+    }
+    if profile != 1 {
+        m.warnings.append("the ADTS profile is {profile + 1}, not AAC-LC")
+    }
+    let rate = rawAacRates[rateIndex]
+    var track = core.Track(index: 0, kind: .audio, codec: "aac")
+    track.timescale = rate
+    track.duration = pts
+    track.sampleRate = rate
+    // Channel configuration 0 means a PCE inside the stream says; 7 is 7.1.
+    track.channels = if channels == 7 { 8 } else if channels == 0 { 2 } else { channels }
+    track.adts = true
+    m.duration = Float(pts) / Float(rate)
+    track.bitrate = if m.duration > 0.0 { Int(Float(bytes) * 8.0 / m.duration) } else { 0 }
+    m.tracks = [track]
+    Result.ok(value: m)
+}
+
+// ---------------------------------------------------------------------------
+// FLAC (xiph.org/flac/format.html).
+
+fn rawFlac(_ file: Data, _ start: Int, _ end: Int, _ m0: core.Media) -> Result<core.Media> {
+    var m = m0
+    m.format = "flac"
+    var p = start + 4
+    var extra = Data(text: "fLaC")
+    var kept: [(Int, Int)] = []
+    var rate = 0
+    var channels = 0
+    var bits = 0
+    var totalSamples = 0
+    var minFrame = 0
+    var sawInfo = false
+    var cover = Data()
+    var coverType = -1
+    // METADATA_BLOCK_HEADER: last-block flag, type (7 bits), length (24).
+    while p + 4 <= end {
+        let head = file[p]
+        let type = head & 0x7f
+        let len = (file[p + 1] << 16) | (file[p + 2] << 8) | file[p + 3]
+        let bs = p + 4
+        let be = min(end, bs + len)
+        if type == 0 && len >= 34 && be - bs >= 34 {
+            // STREAMINFO: block sizes (16, 16), frame sizes (24, 24), rate
+            // (20), channels - 1 (3), bits - 1 (5), total samples (36), MD5.
+            minFrame = (file[bs + 4] << 16) | (file[bs + 5] << 8) | file[bs + 6]
+            rate = (file[bs + 10] << 12) | (file[bs + 11] << 4) | (file[bs + 12] >> 4)
+            channels = ((file[bs + 12] >> 1) & 7) + 1
+            bits = (((file[bs + 12] & 1) << 4) | (file[bs + 13] >> 4)) + 1
+            totalSamples = ((file[bs + 13] & 15) << 32) | file.uint32(at: bs + 14, bigEndian: true)
+            sawInfo = true
+        } else if type == 4 {
+            rawVorbisComments(file, bs, be, m)
+        } else if type == 6 {
+            // PICTURE: type, MIME, description, width, height, depth,
+            // colours, data length, data (all big-endian).
+            let ptype = mp4U32(file, bs)
+            var q = bs + 4
+            q += 4 + mp4U32(file, q)
+            q += 4 + mp4U32(file, q)
+            q += 16
+            let dlen = mp4U32(file, q)
+            let pic = file.slice(from: q + 4, to: min(be, q + 4 + dlen))
+            if !pic.isEmpty && (coverType < 0 || ptype == 3 && coverType != 3) {
+                cover = pic
+                coverType = ptype
+            }
+        }
+        // Setup bytes keep every block a decoder might want; padding and
+        // pictures stay out.
+        if type != 1 && type != 6 && type != 127 {
+            kept.append((p, be))
+        }
+        p = be
+        if (head & 0x80) != 0 {
+            break
+        }
+    }
+    if !sawInfo || rate <= 0 {
+        return Result.failure(error: Error("this FLAC file has no usable STREAMINFO block"))
+    }
+    for i in 0..kept.count {
+        let (s, e) = kept[i]
+        let last = i == kept.count - 1
+        extra.append(byte: (file[s] & 0x7f) | (if last { 0x80 } else { 0 }))
+        extra += file.slice(from: s + 1, to: e)
+    }
+    if !cover.isEmpty && m.cover.isEmpty {
+        m.cover = cover
+    }
+    // Frames: find each header by its sync code and check it (fields not
+    // reserved, CRC-8, the frame/sample number following on).
+    var frames: [Int] = []
+    var sizes: [Int] = []
+    var q = p
+    var expect = -1
+    var skipped = 0
+    let step = max(1, minFrame)
+    while q + 6 <= end {
+        let (ok, blockSize, number, variable) = rawFlacHeader(file, q, end)
+        var good = ok
+        if good && expect >= 0 {
+            good = number == expect
+        }
+        if !good {
+            q += 1
+            if frames.isEmpty {
+                skipped += 1
+            }
+            continue
+        }
+        frames.append(q)
+        sizes.append(blockSize)
+        expect = if variable { number + blockSize } else { number + 1 }
+        // A frame is at least the smallest size STREAMINFO gives.
+        q += min(step, 16)
+        // Jump ahead to the next sync code.
+        while q + 1 < end && !(file[q] == 0xff && (file[q + 1] & 0xfe) == 0xf8) {
+            q += 1
+        }
+    }
+    if frames.isEmpty {
+        return Result.failure(error: Error("no FLAC frames were found"))
+    }
+    if skipped > 0 {
+        m.warnings.append("{skipped} bytes before the first FLAC frame were skipped")
+    }
+    var pts = 0
+    for i in 0..frames.count {
+        let off = frames[i]
+        let next = if i + 1 < frames.count { frames[i + 1] } else { end }
+        m.packets.append(core.PacketRef(track: 0, pts: pts, dts: pts, duration: sizes[i], key: true, offset: off, size: next - off))
+        pts += sizes[i]
+    }
+    var track = core.Track(index: 0, kind: .audio, codec: "flac")
+    track.timescale = rate
+    track.duration = if totalSamples > 0 { totalSamples } else { pts }
+    track.sampleRate = rate
+    track.channels = channels
+    track.bitsPerSample = bits
+    track.extra = extra
+    m.duration = Float(track.duration) / Float(max(1, rate))
+    track.bitrate = if m.duration > 0.0 { Int(Float(end - frames[0]) * 8.0 / m.duration) } else { 0 }
+    m.tracks = [track]
+    Result.ok(value: m)
+}
+
+// CRC-8 with polynomial x^8 + x^2 + x + 1 (FLAC frame header).
+let rawCrc8Table: [Int] = rawMakeCrc8()
+
+fn rawMakeCrc8() -> [Int] {
+    var t: [Int] = []
+    for i in 0..256 {
+        var c = i
+        for _ in 0..8 {
+            c = if (c & 0x80) != 0 { ((c << 1) ^ 0x07) & 0xff } else { (c << 1) & 0xff }
+        }
+        t.append(c)
+    }
+    t
+}
+
+// A FLAC frame header at p: (valid, block size, frame or sample number,
+// variable block size).
+fn rawFlacHeader(_ d: Data, _ p: Int, _ end: Int) -> (Bool, Int, Int, Bool) {
+    if p + 6 > end || d[p] != 0xff || (d[p + 1] & 0xfe) != 0xf8 {
+        return (false, 0, 0, false)
+    }
+    let variable = (d[p + 1] & 1) == 1
+    let bsCode = d[p + 2] >> 4
+    let srCode = d[p + 2] & 15
+    let chan = d[p + 3] >> 4
+    let sizeCode = (d[p + 3] >> 1) & 7
+    if bsCode == 0 || srCode == 15 || chan > 10 || sizeCode == 3 || (d[p + 3] & 1) != 0 {
+        return (false, 0, 0, false)
+    }
+    // The frame or sample number, UTF-8 coded (up to 7 bytes).
+    var q = p + 4
+    let b0 = d[q]
+    var extraBytes = 0
+    var number = 0
+    if b0 < 0x80 {
+        number = b0
+    } else if b0 >= 0xc0 && b0 < 0xe0 {
+        extraBytes = 1
+        number = b0 & 0x1f
+    } else if b0 >= 0xe0 && b0 < 0xf0 {
+        extraBytes = 2
+        number = b0 & 0x0f
+    } else if b0 >= 0xf0 && b0 < 0xf8 {
+        extraBytes = 3
+        number = b0 & 0x07
+    } else if b0 >= 0xf8 && b0 < 0xfc {
+        extraBytes = 4
+        number = b0 & 0x03
+    } else if b0 >= 0xfc && b0 < 0xfe {
+        extraBytes = 5
+        number = b0 & 0x01
+    } else if b0 == 0xfe {
+        extraBytes = 6
+        number = 0
+    } else {
+        return (false, 0, 0, false)
+    }
+    q += 1
+    if q + extraBytes + 3 > end {
+        return (false, 0, 0, false)
+    }
+    for _ in 0..extraBytes {
+        let b = d[q]
+        if (b & 0xc0) != 0x80 {
+            return (false, 0, 0, false)
+        }
+        number = (number << 6) | (b & 0x3f)
+        q += 1
+    }
+    var blockSize = 0
+    if bsCode == 1 {
+        blockSize = 192
+    } else if bsCode >= 2 && bsCode <= 5 {
+        blockSize = 576 << (bsCode - 2)
+    } else if bsCode == 6 {
+        blockSize = d[q] + 1
+        q += 1
+    } else if bsCode == 7 {
+        blockSize = d.uint16(at: q, bigEndian: true) + 1
+        q += 2
+    } else {
+        blockSize = 256 << (bsCode - 8)
+    }
+    if srCode == 12 {
+        q += 1
+    } else if srCode == 13 || srCode == 14 {
+        q += 2
+    }
+    if q >= end {
+        return (false, 0, 0, false)
+    }
+    var crc = 0
+    for i in p..q {
+        crc = rawCrc8Table[crc ^ d[i]]
+    }
+    if crc != d[q] {
+        return (false, 0, 0, false)
+    }
+    (true, blockSize, number, variable)
+}
+
+// A Vorbis comment block (Vorbis I spec §5): vendor string, then
+// "NAME=value" strings, all with 32-bit little-endian lengths.
+fn rawVorbisComments(_ d: Data, _ s: Int, _ e: Int, _ m: bind core.Media) {
+    var p = s
+    let vlen = rawU32le(d, p)
+    let vendor = rawUtf8(d.slice(from: p + 4, to: min(e, p + 4 + vlen)))
+    p += 4 + vlen
+    let count = rawU32le(d, p)
+    p += 4
+    var sawEncoder = false
+    for _ in 0..count {
+        if p + 4 > e {
+            break
+        }
+        let len = rawU32le(d, p)
+        let text = rawUtf8(d.slice(from: p + 4, to: min(e, p + 4 + len)))
+        p += 4 + len
+        if let eq = text.find("=") {
+            let name = text.substring(from: 0, to: eq).uppercase()
+            let value = text.substring(from: eq + 1, to: text.count)
+            let key = match name {
+                "TITLE" -> "title"
+                "ARTIST" -> "artist"
+                "ALBUM" -> "album"
+                "ALBUMARTIST", "ALBUM ARTIST" -> "albumartist"
+                "DATE", "YEAR" -> "date"
+                "GENRE" -> "genre"
+                "TRACKNUMBER" -> "track"
+                "DISCNUMBER" -> "disc"
+                "COMMENT", "DESCRIPTION" -> "comment"
+                "COMPOSER" -> "composer"
+                "ENCODER" -> "encoder"
+                "COPYRIGHT" -> "copyright"
+                "METADATA_BLOCK_PICTURE" -> ""
+                _ -> name.lowercase()
+            }
+            if key == "encoder" {
+                sawEncoder = true
+            }
+            if !key.isEmpty && !value.isEmpty {
+                m.tags[key] = value
+            }
+        }
+    }
+    // ffmpeg shows the vendor string as the encoder when there's no tag.
+    if !sawEncoder && !vendor.isEmpty && m.tags["encoder"] == nil {
+        m.tags["encoder"] = vendor
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AC-3 and E-AC-3 syncframes (ATSC A/52:2018 §5.4.1, Annex E §2.3.1).
+
+// 16-bit words per frame for each frmsizecod / 2 at 48, 44.1, 32 kHz
+// (A/52 Table 5.18); 44.1 kHz frames add one word when frmsizecod is odd.
+let rawAc3Words48 = [64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384, 448, 512, 640, 768, 896, 1024, 1152, 1280]
+let rawAc3Words44 = [69, 87, 104, 121, 139, 174, 208, 243, 278, 348, 417, 487, 557, 696, 835, 975, 1114, 1253, 1393]
+let rawAc3Words32 = [96, 120, 144, 168, 192, 240, 288, 336, 384, 480, 576, 672, 768, 960, 1152, 1344, 1536, 1728, 1920]
+// Full-bandwidth channels for each acmod (A/52 Table 5.8).
+let rawAc3Channels = [2, 1, 2, 3, 3, 4, 4, 5]
+
+// A syncframe at p: (size in bytes, sample rate, samples, channels,
+// E-AC-3, dependent substream); size 0 when there's none.
+fn rawAc3Frame(_ d: Data, _ p: Int, _ end: Int) -> (Int, Int, Int, Int, Bool, Bool) {
+    if p + 8 > end || d[p] != 0x0b || d[p + 1] != 0x77 {
+        return (0, 0, 0, 0, false, false)
+    }
+    let bsid = d[p + 5] >> 3
+    if bsid <= 10 {
+        // AC-3: crc1 (16), fscod (2), frmsizecod (6), bsid (5), bsmod (3),
+        // acmod (3), then mix levels by acmod, then lfeon.
+        let fscod = d[p + 4] >> 6
+        let code = d[p + 4] & 0x3f
+        if fscod == 3 || code >= 38 {
+            return (0, 0, 0, 0, false, false)
+        }
+        let words = if fscod == 0 { rawAc3Words48[code / 2] } else if fscod == 1 { rawAc3Words44[code / 2] + (code & 1) } else { rawAc3Words32[code / 2] }
+        let rate = if fscod == 0 { 48000 } else if fscod == 1 { 44100 } else { 32000 }
+        var r = core.bitReaderRange(d, from: p + 6, to: min(end, p + 8))
+        let acmod = r.bits(3)
+        if (acmod & 1) != 0 && acmod != 1 {
+            r.skip(2)
+        }
+        if (acmod & 4) != 0 {
+            r.skip(2)
+        }
+        if acmod == 2 {
+            r.skip(2)
+        }
+        let lfe = r.bits(1)
+        return (words * 2, rate, 1536, rawAc3Channels[acmod] + lfe, false, false)
+    }
+    if bsid > 16 {
+        return (0, 0, 0, 0, false, false)
+    }
+    // E-AC-3: strmtyp (2), substreamid (3), frmsiz (11), fscod (2),
+    // fscod2 or numblkscod (2), acmod (3), lfeon (1), bsid (5).
+    var r = core.bitReaderRange(d, from: p + 2, to: min(end, p + 6))
+    let strmtyp = r.bits(2)
+    r.skip(3)
+    let frmsiz = r.bits(11)
+    let fscod = r.bits(2)
+    var rate = 48000
+    var blocks = 6
+    if fscod == 3 {
+        let fscod2 = r.bits(2)
+        rate = if fscod2 == 0 { 24000 } else if fscod2 == 1 { 22050 } else { 16000 }
+    } else {
+        let numblkscod = r.bits(2)
+        blocks = if numblkscod == 0 { 1 } else if numblkscod == 1 { 2 } else if numblkscod == 2 { 3 } else { 6 }
+        rate = if fscod == 0 { 48000 } else if fscod == 1 { 44100 } else { 32000 }
+    }
+    let acmod = r.bits(3)
+    let lfe = r.bits(1)
+    ((frmsiz + 1) * 2, rate, 256 * blocks, rawAc3Channels[acmod] + lfe, true, strmtyp == 1)
+}
+
+fn rawAc3(_ file: Data, _ start: Int, _ end: Int, _ m0: core.Media) -> Result<core.Media> {
+    var m = m0
+    var p = start
+    var rate = 0
+    var channels = 0
+    var eac3 = false
+    var pts = 0
+    var skipped = 0
+    while p + 8 <= end {
+        let (size, r, samples, ch, isE, dependent) = rawAc3Frame(file, p, end)
+        var ok = size > 0
+        if ok && p + size + 2 <= end {
+            ok = file[p + size] == 0x0b && file[p + size + 1] == 0x77
+        }
+        if !ok {
+            p += 1
+            skipped += 1
+            continue
+        }
+        let len = min(size, end - p)
+        if dependent && !m.packets.isEmpty {
+            // A dependent substream (more channels) goes with the
+            // independent frame before it, as one packet (A/52 Annex E §2.3).
+            m.packets[m.packets.count - 1].size += len
+        } else {
+            if rate == 0 {
+                rate = r
+                channels = ch
+                eac3 = isE
+            }
+            m.packets.append(core.PacketRef(track: 0, pts: pts, dts: pts, duration: samples, key: true, offset: p, size: len))
+            pts += samples
+        }
+        p += size
+    }
+    if rate == 0 {
+        return Result.failure(error: Error("no AC-3 frames were found"))
+    }
+    if skipped > 0 {
+        m.warnings.append("{skipped} bytes between AC-3 frames were skipped")
+    }
+    m.format = if eac3 { "eac3" } else { "ac3" }
+    var track = core.Track(index: 0, kind: .audio, codec: m.format)
+    track.timescale = rate
+    track.duration = pts
+    track.sampleRate = rate
+    track.channels = channels
+    m.duration = Float(pts) / Float(rate)
+    track.bitrate = if m.duration > 0.0 { Int(Float(end - start) * 8.0 / m.duration) } else { 0 }
+    m.tracks = [track]
+    Result.ok(value: m)
+}
+
+// ---------------------------------------------------------------------------
+// H.264 and HEVC Annex B byte streams.
+
+// Where each NAL unit starts (just after its 00 00 01) in d[s..<e].
+fn rawStartCodes(_ d: Data, _ s: Int, _ e: Int) -> [Int] {
+    var out: [Int] = []
+    var i = s
+    while i + 3 <= e {
+        if d[i + 2] > 1 {
+            i += 3
+        } else if d[i] == 0 && d[i + 1] == 0 && d[i + 2] == 1 {
+            out.append(i + 3)
+            i += 3
+        } else {
+            i += 1
+        }
+    }
+    out
+}
+
+fn rawAnnexB(_ file: Data, _ start: Int, _ end: Int, _ kind: String, _ m0: core.Media) -> Result<core.Media> {
+    var m = m0
+    m.format = kind
+    let hevc = kind == "hevc"
+    let nals = rawStartCodes(file, start, end)
+    if nals.isEmpty {
+        return Result.failure(error: Error("no {kind} NAL units were found"))
+    }
+    var track = core.Track(index: 0, kind: .video, codec: kind)
+    track.timescale = 90000
+    var fpsNum = 25
+    var fpsDen = 1
+    // Access units (H.264 §7.4.1.2.3, H.265 §7.4.2.4.4): a new one starts at
+    // an access unit delimiter, at parameter sets or SEI after a picture's
+    // slices, or at a slice that is the first of a new picture
+    // (first_mb_in_slice / first_slice_segment_in_pic_flag).
+    var auStarts: [Int] = []
+    var auKeys: [Bool] = []
+    var haveSlice = false
+    var key = false
+    var sawSps = false
+    for (i, n) in nals.enumerated() {
+        if n >= end {
+            continue
+        }
+        // The NAL's start code begins at n - 3, or n - 4 with a zero before.
+        let codeStart = if n - 4 >= start && file[n - 4] == 0 { n - 4 } else { n - 3 }
+        let nalEnd = if i + 1 < nals.count { nals[i + 1] - 3 } else { end }
+        var newAu = false
+        var isSlice = false
+        var isKey = false
+        if hevc {
+            let type = (file[n] >> 1) & 63
+            if type == 35 {
+                newAu = true
+            } else if type >= 32 && type <= 34 || type == 39 || type >= 41 && type <= 44 || type >= 48 && type <= 55 {
+                newAu = haveSlice
+                if type == 33 && !sawSps {
+                    sawSps = true
+                    rawHevcSpsInfo(file, n + 2, nalEnd, track)
+                }
+            } else if type < 32 {
+                isSlice = true
+                isKey = type >= 16 && type <= 23
+                if n + 2 < end && (file[n + 2] & 0x80) != 0 {
+                    newAu = haveSlice
+                }
+            }
+        } else {
+            let type = file[n] & 31
+            if type == 9 {
+                newAu = true
+            } else if type == 6 || type == 7 || type == 8 || type >= 14 && type <= 18 {
+                newAu = haveSlice
+                if type == 7 && !sawSps {
+                    sawSps = true
+                    rawSpsInfo(file, n + 1, nalEnd, track)
+                    if track.fpsNum > 0 {
+                        fpsNum = track.fpsNum
+                        fpsDen = track.fpsDen
+                    }
+                }
+            } else if type >= 1 && type <= 5 {
+                isSlice = true
+                isKey = type == 5
+                // first_mb_in_slice is ue(v): 0 is the single bit 1.
+                if n + 1 < end && (file[n + 1] & 0x80) != 0 {
+                    newAu = haveSlice
+                }
+            }
+        }
+        if newAu || auStarts.isEmpty {
+            if !auStarts.isEmpty {
+                auKeys.append(key)
+            }
+            auStarts.append(if auStarts.isEmpty { start } else { codeStart })
+            haveSlice = false
+            key = false
+        }
+        if isSlice {
+            haveSlice = true
+            key = key || isKey
+        }
+    }
+    auKeys.append(key)
+    track.fpsNum = fpsNum
+    track.fpsDen = fpsDen
+    let dur = 90000 * fpsDen / fpsNum
+    for i in 0..auStarts.count {
+        let s = auStarts[i]
+        let e = if i + 1 < auStarts.count { auStarts[i + 1] } else { end }
+        // Times are in decoding order: a raw stream doesn't say when each
+        // picture is shown; the decoder's reordering gives display order.
+        m.packets.append(core.PacketRef(track: 0, pts: i * dur, dts: i * dur, duration: dur, key: auKeys[i], offset: s, size: e - s))
+    }
+    track.duration = auStarts.count * dur
+    m.duration = Float(track.duration) / 90000.0
+    m.warnings.append("a raw {kind} stream has no timestamps: frames are timed at {fpsNum}/{fpsDen} per second in decoding order")
+    m.tracks = [track]
+    Result.ok(value: m)
+}
+
+// Size, pixel shape and frame rate from an H.264 sequence parameter set
+// (H.264 §7.3.2.1.1, VUI §E.1.1).
+fn rawSpsInfo(_ d: Data, _ s: Int, _ e: Int, _ t: bind core.Track) {
+    let rbsp = core.unescapeRbsp(d, from: s, to: e)
+    var r = core.bitReader(rbsp)
+    let profile = r.bits(8)
+    r.skip(16)
+    r.ue()
+    var chroma = 1
+    if profile == 100 || profile == 110 || profile == 122 || profile == 244 || profile == 44 || profile == 83 || profile == 86 || profile == 118 || profile == 128 || profile == 138 || profile == 139 || profile == 134 || profile == 135 {
+        chroma = r.ue()
+        if chroma == 3 {
+            r.skip(1)
+        }
+        r.ue()
+        r.ue()
+        r.skip(1)
+        if r.flag() {
+            let lists = if chroma == 3 { 12 } else { 8 }
+            for i in 0..lists {
+                if r.flag() {
+                    // scaling_list(): delta_scale until nextScale is 0.
+                    let size = if i < 6 { 16 } else { 64 }
+                    var last = 8
+                    var next = 8
+                    for _ in 0..size {
+                        if next != 0 {
+                            next = (last + r.se() + 256) % 256
+                        }
+                        last = if next == 0 { last } else { next }
+                    }
+                }
+            }
+        }
+    }
+    r.ue()
+    let pocType = r.ue()
+    if pocType == 0 {
+        r.ue()
+    } else if pocType == 1 {
+        r.skip(1)
+        r.se()
+        r.se()
+        let n = r.ue()
+        for _ in 0..min(n, 255) {
+            r.se()
+        }
+    }
+    r.ue()
+    r.skip(1)
+    let w = r.ue() + 1
+    let h = r.ue() + 1
+    let frameMbsOnly = r.bits(1)
+    if frameMbsOnly == 0 {
+        r.skip(1)
+    }
+    r.skip(1)
+    var cl = 0
+    var cr = 0
+    var ct = 0
+    var cb = 0
+    if r.flag() {
+        cl = r.ue()
+        cr = r.ue()
+        ct = r.ue()
+        cb = r.ue()
+    }
+    let cropX = if chroma == 1 || chroma == 2 { 2 } else { 1 }
+    let cropY = (if chroma == 1 { 2 } else { 1 }) * (2 - frameMbsOnly)
+    t.width = w * 16 - cropX * (cl + cr)
+    t.height = (2 - frameMbsOnly) * h * 16 - cropY * (ct + cb)
+    if r.overrun {
+        return
+    }
+    if r.flag() {
+        // VUI: aspect_ratio_idc (Table E-1), then skip to the timing info.
+        if r.flag() {
+            let idc = r.bits(8)
+            let sars = [0, 0, 1, 1, 12, 11, 10, 11, 16, 11, 40, 33, 24, 11, 20, 11, 32, 11, 80, 33, 18, 11, 15, 11, 64, 33, 160, 99, 4, 3, 3, 2, 2, 1]
+            if idc == 255 {
+                t.sarNum = r.bits(16)
+                t.sarDen = r.bits(16)
+            } else if idc >= 1 && idc <= 16 {
+                t.sarNum = sars[idc * 2]
+                t.sarDen = sars[idc * 2 + 1]
+            }
+            if t.sarNum == 0 || t.sarDen == 0 {
+                t.sarNum = 1
+                t.sarDen = 1
+            }
+        }
+        if r.flag() {
+            r.skip(1)
+        }
+        if r.flag() {
+            r.skip(4)
+            if r.flag() {
+                r.skip(24)
+            }
+        }
+        if r.flag() {
+            r.ue()
+            r.ue()
+        }
+        if r.flag() {
+            let units = r.bits(32)
+            let scale = r.bits(32)
+            if units > 0 && scale > 0 && !r.overrun {
+                // A frame is two ticks (fields) (§E.2.1).
+                var num = scale
+                var den = 2 * units
+                let g = mp4Gcd(num, den)
+                num = num / g
+                den = den / g
+                // Between 1/1000 and 300 frames a second, else ignored.
+                if num / den <= 300 && num * 1000 >= den {
+                    t.fpsNum = num
+                    t.fpsDen = den
+                }
+            }
+        }
+    }
+}
+
+// The picture size from an HEVC sequence parameter set (H.265 §7.3.2.2.1,
+// profile_tier_level §7.3.3).
+fn rawHevcSpsInfo(_ d: Data, _ s: Int, _ e: Int, _ t: bind core.Track) {
+    let rbsp = core.unescapeRbsp(d, from: s, to: e)
+    var r = core.bitReader(rbsp)
+    r.skip(4)
+    let maxSubLayers = r.bits(3)
+    r.skip(1)
+    // general_profile_space … general_level_idc: 96 bits.
+    r.skip(96)
+    var profilePresent: [Bool] = []
+    var levelPresent: [Bool] = []
+    for _ in 0..maxSubLayers {
+        profilePresent.append(r.flag())
+        levelPresent.append(r.flag())
+    }
+    if maxSubLayers > 0 {
+        for _ in maxSubLayers..8 {
+            r.skip(2)
+        }
+    }
+    for i in 0..maxSubLayers {
+        if profilePresent[i] {
+            r.skip(88)
+        }
+        if levelPresent[i] {
+            r.skip(8)
+        }
+    }
+    r.ue()
+    let chroma = r.ue()
+    if chroma == 3 {
+        r.skip(1)
+    }
+    let w = r.ue()
+    let h = r.ue()
+    var cl = 0
+    var cr = 0
+    var ct = 0
+    var cb = 0
+    if r.flag() {
+        cl = r.ue()
+        cr = r.ue()
+        ct = r.ue()
+        cb = r.ue()
+    }
+    if r.overrun || w <= 0 || h <= 0 {
+        return
+    }
+    let subW = if chroma == 1 || chroma == 2 { 2 } else { 1 }
+    let subH = if chroma == 1 { 2 } else { 1 }
+    t.width = w - subW * (cl + cr)
+    t.height = h - subH * (ct + cb)
+}
+
+// ---------------------------------------------------------------------------
+// Text helpers shared by Reel's MP4, WAV and raw stream readers.
+
+// Bytes that should be UTF-8, without trailing zero bytes; Latin-1 when
+// they aren't valid UTF-8 (old taggers wrote Latin-1 everywhere).
+fn rawUtf8(_ d: Data) -> String {
+    var end = d.count
+    while end > 0 && d[end - 1] == 0 {
+        end -= 1
+    }
+    let s = if end == d.count { d } else { d.slice(from: 0, to: end) }
+    s.text ?? rawLatin1(s)
+}
+
+// UTF-16 text (a byte order mark, when there is one, wins over
+// `bigEndian`), up to a zero character.
+fn rawUtf16(_ d: Data, bigEndian: Bool) -> String {
+    var out = Data()
+    var i = 0
+    var be = bigEndian
+    if d.count >= 2 {
+        if d[0] == 0xfe && d[1] == 0xff {
+            be = true
+            i = 2
+        } else if d[0] == 0xff && d[1] == 0xfe {
+            be = false
+            i = 2
+        }
+    }
+    while i + 1 < d.count {
+        var c = if be { d[i] * 256 + d[i + 1] } else { d[i + 1] * 256 + d[i] }
+        i += 2
+        if c == 0 {
+            break
+        }
+        // A surrogate pair (RFC 2781 §2.2) makes one character.
+        if c >= 0xd800 && c < 0xdc00 && i + 1 < d.count {
+            let c2 = if be { d[i] * 256 + d[i + 1] } else { d[i + 1] * 256 + d[i] }
+            if c2 >= 0xdc00 && c2 < 0xe000 {
+                c = 0x10000 + ((c - 0xd800) << 10) + (c2 - 0xdc00)
+                i += 2
+            }
+        }
+        rawAppendUtf8(out, c)
+    }
+    out.text ?? ""
+}
+
+// Adds a character's UTF-8 bytes (RFC 3629 §3).
+fn rawAppendUtf8(_ out: bind Data, _ c: Int) {
+    if c < 0x80 {
+        out.append(byte: c)
+    } else if c < 0x800 {
+        out.append(byte: 0xc0 | (c >> 6))
+        out.append(byte: 0x80 | (c & 0x3f))
+    } else if c < 0x10000 {
+        if c >= 0xd800 && c < 0xe000 {
+            // A lone surrogate: the replacement character.
+            out.append(byte: 0xef)
+            out.append(byte: 0xbf)
+            out.append(byte: 0xbd)
+            return
+        }
+        out.append(byte: 0xe0 | (c >> 12))
+        out.append(byte: 0x80 | ((c >> 6) & 0x3f))
+        out.append(byte: 0x80 | (c & 0x3f))
+    } else {
+        out.append(byte: 0xf0 | (c >> 18))
+        out.append(byte: 0x80 | ((c >> 12) & 0x3f))
+        out.append(byte: 0x80 | ((c >> 6) & 0x3f))
+        out.append(byte: 0x80 | (c & 0x3f))
+    }
+}
+
+// Latin-1 bytes as text, up to a zero byte.
+fn rawLatin1(_ d: Data) -> String {
+    var ascii = true
+    var n = d.count
+    for i in 0..d.count {
+        let b = d[i]
+        if b == 0 {
+            n = i
+            break
+        }
+        if b >= 0x80 {
+            ascii = false
+        }
+    }
+    if ascii {
+        return d.slice(from: 0, to: n).latin1
+    }
+    var out = Data()
+    for i in 0..n {
+        rawAppendUtf8(out, d[i])
+    }
+    out.text ?? ""
+}
+
+// The ID3v1 genres (ID3v1 and Winamp's extensions), used by ID3 "(n)"
+// genres and MP4 'gnre' items.
+let rawGenres = ["Blues", "Classic Rock", "Country", "Dance", "Disco", "Funk", "Grunge", "Hip-Hop", "Jazz", "Metal", "New Age", "Oldies", "Other", "Pop", "R&B", "Rap", "Reggae", "Rock", "Techno", "Industrial", "Alternative", "Ska", "Death Metal", "Pranks", "Soundtrack", "Euro-Techno", "Ambient", "Trip-Hop", "Vocal", "Jazz+Funk", "Fusion", "Trance", "Classical", "Instrumental", "Acid", "House", "Game", "Sound Clip", "Gospel", "Noise", "Alternative Rock", "Bass", "Soul", "Punk", "Space", "Meditative", "Instrumental Pop", "Instrumental Rock", "Ethnic", "Gothic", "Darkwave", "Techno-Industrial", "Electronic", "Pop-Folk", "Eurodance", "Dream", "Southern Rock", "Comedy", "Cult", "Gangsta", "Top 40", "Christian Rap", "Pop/Funk", "Jungle", "Native American", "Cabaret", "New Wave", "Psychedelic", "Rave", "Showtunes", "Trailer", "Lo-Fi", "Tribal", "Acid Punk", "Acid Jazz", "Polka", "Retro", "Musical", "Rock & Roll", "Hard Rock", "Folk", "Folk-Rock", "National Folk", "Swing", "Fast Fusion", "Bebop", "Latin", "Revival", "Celtic", "Bluegrass", "Avantgarde", "Gothic Rock", "Progressive Rock", "Psychedelic Rock", "Symphonic Rock", "Slow Rock", "Big Band", "Chorus", "Easy Listening", "Acoustic", "Humour", "Speech", "Chanson", "Opera", "Chamber Music", "Sonata", "Symphony", "Booty Bass", "Primus", "Porn Groove", "Satire", "Slow Jam", "Club", "Tango", "Samba", "Folklore", "Ballad", "Power Ballad", "Rhythmic Soul", "Freestyle", "Duet", "Punk Rock", "Drum Solo", "A Cappella", "Euro-House", "Dance Hall", "Goa", "Drum & Bass", "Club-House", "Hardcore Techno", "Terror", "Indie", "BritPop", "Afro-Punk", "Polsk Punk", "Beat", "Christian Gangsta Rap", "Heavy Metal", "Black Metal", "Crossover", "Contemporary Christian", "Christian Rock", "Merengue", "Salsa", "Thrash Metal", "Anime", "JPop", "Synthpop"]

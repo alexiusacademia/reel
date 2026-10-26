@@ -1,0 +1,176 @@
+// Picture transforms for the render module: rotating RGBA pixels by a
+// multiple of 90° (for tracks whose container says the camera was turned,
+// core.Track.rotation), and deinterlacing a decoded picture.
+//
+// Deinterlacing keeps the top field (the even rows) and rebuilds the odd
+// rows from the rows above and below with edge-directed interpolation
+// ("ELA", edge-based line average): for each missing sample it looks at
+// three directions through it (\ | /) and averages the pair of samples
+// that differ least, so diagonal edges stay smooth instead of turning into
+// stairs. The "blend" mode instead mixes each row with its neighbours
+// (1, 2, 1)/4, which keeps both fields' detail but ghosts motion.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../core"
+
+// The size of a picture after `rotate`: (width, height).
+public fn rotatedSize(width: Int, height: Int, degrees: Int) -> (Int, Int) {
+    let d = normalDegrees(degrees)
+    if d == 90 || d == 270 {
+        return (height, width)
+    }
+    (width, height)
+}
+
+// Degrees rounded to 0, 90, 180 or 270.
+fn normalDegrees(_ degrees: Int) -> Int {
+    var d = degrees % 360
+    if d < 0 {
+        d += 360
+    }
+    ((d + 45) / 90 % 4) * 90
+}
+
+// The pixels (width × height, row by row) turned clockwise by `degrees`
+// (a multiple of 90; others are rounded to one). For 90 and 270 the result
+// is height × width (see rotatedSize).
+public fn rotate(_ pixels: [Int], width: Int, height: Int, degrees: Int) -> [Int] {
+    let d = normalDegrees(degrees)
+    let n = width * height
+    if d == 0 || n <= 0 || pixels.count < n {
+        return pixels
+    }
+    // Start from a copy of the input (a memcpy) and overwrite every item.
+    var out = pixels
+    if d == 180 {
+        var i = 0
+        while i < n {
+            out[i] = pixels[n - 1 - i]
+            i += 1
+        }
+        return out
+    }
+    // 90° clockwise: new width = height; new (x, y) shows old
+    // (y, height − 1 − x). 270°: old (width − 1 − y, x).
+    let nw = height
+    for y in 0..width {
+        let o = y * nw
+        if d == 90 {
+            var x = 0
+            var src = (height - 1) * width + y
+            while x < nw {
+                out[o + x] = pixels[src]
+                src -= width
+                x += 1
+            }
+        } else {
+            var x = 0
+            var src = width - 1 - y
+            while x < nw {
+                out[o + x] = pixels[src]
+                src += width
+                x += 1
+            }
+        }
+    }
+    out
+}
+
+// The picture with its interlacing removed: the top field kept and the
+// bottom field's rows rebuilt from it (edge-directed), or with `blend`,
+// every row mixed with its neighbours. Planes keep their layout.
+public fn deinterlace(_ p: core.Picture, blend: Bool = false) -> core.Picture {
+    var out = p
+    if p.height < 3 || p.y.isEmpty {
+        return out
+    }
+    if blend {
+        out.y = blendPlane(p.y, p.yOffset, p.yStride, p.width, p.height)
+    } else {
+        out.y = bobPlane(p.y, p.yOffset, p.yStride, p.width, p.height)
+    }
+    if p.chroma != .gray && !p.u.isEmpty && !p.v.isEmpty {
+        let cw = p.chromaWidth
+        let ch = p.chromaHeight
+        if ch >= 3 {
+            // In interlaced 4:2:0 the chroma rows alternate between the
+            // fields too (MPEG-2 6.1.1.8), so the same treatment applies.
+            if blend {
+                out.u = blendPlane(p.u, p.cOffset, p.cStride, cw, ch)
+                out.v = blendPlane(p.v, p.cOffset, p.cStride, cw, ch)
+            } else {
+                out.u = bobPlane(p.u, p.cOffset, p.cStride, cw, ch)
+                out.v = bobPlane(p.v, p.cOffset, p.cStride, cw, ch)
+            }
+        }
+    }
+    out
+}
+
+// Rebuilds the odd rows of a plane from the even ones (ELA).
+fn bobPlane(_ plane: [Int], _ offset: Int, _ stride: Int, _ w: Int, _ h: Int) -> [Int] {
+    var out = plane
+    var row = 1
+    while row < h {
+        let o = offset + row * stride
+        let a = o - stride
+        if row + 1 >= h {
+            // The last row has no field row below: repeat the one above.
+            var x = 0
+            while x < w {
+                out[o + x] = plane[a + x]
+                x += 1
+            }
+            row += 2
+            continue
+        }
+        let b = o + stride
+        var x = 0
+        while x < w {
+            let up = plane[a + x]
+            let down = plane[b + x]
+            var best = abs(up - down)
+            var value = (up + down + 1) >> 1
+            if x > 0 && x + 1 < w {
+                // "\" : up-left with down-right; "/" : up-right with
+                // down-left. Take one only if it matches clearly better.
+                let d1 = abs(plane[a + x - 1] - plane[b + x + 1])
+                let d2 = abs(plane[a + x + 1] - plane[b + x - 1])
+                if d1 < best && d1 <= d2 {
+                    best = d1
+                    value = (plane[a + x - 1] + plane[b + x + 1] + 1) >> 1
+                } else if d2 < best {
+                    best = d2
+                    value = (plane[a + x + 1] + plane[b + x - 1] + 1) >> 1
+                }
+                // Keep the result between the vertical neighbours, so a
+                // wrong direction can't make a speck.
+                let lo = min(up, down)
+                let hi = max(up, down)
+                value = max(lo, min(value, hi))
+            }
+            out[o + x] = value
+            x += 1
+        }
+        row += 2
+    }
+    out
+}
+
+// Every row mixed (1, 2, 1)/4 with the rows above and below.
+fn blendPlane(_ plane: [Int], _ offset: Int, _ stride: Int, _ w: Int, _ h: Int) -> [Int] {
+    var out = plane
+    for row in 0..h {
+        let o = offset + row * stride
+        let a = offset + max(row - 1, 0) * stride
+        let b = offset + min(row + 1, h - 1) * stride
+        var x = 0
+        while x < w {
+            out[o + x] = (plane[a + x] + 2 * plane[o + x] + plane[b + x] + 2) >> 2
+            x += 1
+        }
+    }
+    out
+}

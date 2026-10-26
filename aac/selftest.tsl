@@ -1,0 +1,78 @@
+// Self-tests of the decoder's building blocks that have no bitstream of
+// their own (used by tests/aac): the IMDCT against its definition and the
+// SBR QMF analysis/synthesis pair's near-perfect reconstruction.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+// The largest difference between the fast DCT-IV and the direct formula,
+// for M = 128.
+public fn selfTestDct4() -> Float {
+    var d = aacNewDct4(128)
+    var x: [Float] = []
+    for i in 0..128 {
+        let v = sin(Float(i) * 0.37) + 0.25 * cos(Float(i * i) * 0.11)
+        x.append(v)
+        d.inp[i] = v
+    }
+    d.run()
+    var worst = 0.0
+    for j in 0..128 {
+        var s = 0.0
+        for k in 0..128 {
+            s += x[k] * cos(pi / 128.0 * (Float(j) + 0.5) * (Float(k) + 0.5))
+        }
+        worst = max(worst, abs(s - d.out[j]))
+    }
+    worst
+}
+
+// A tone through QMF analysis and synthesis (all 32 low bands kept, no
+// SBR): returns the SNR in dB of the output against the input delayed by
+// `delay` samples (the best delay is reported in the second value).
+public fn selfTestQmf() -> (Float, Int) {
+    var s = sbrNew(44100, psOn: false)
+    s.kx1 = 32
+    s.kx0 = 32
+    s.m1 = 0
+    s.m0 = 0
+    var input: [Float] = []
+    for i in 0..(1024 * 8) {
+        input.append(1000.0 * sin(Float(i) * 0.05) + 300.0 * sin(Float(i) * 0.31))
+    }
+    var output: [Float] = []
+    for f in 0..8 {
+        var frame: [Float] = []
+        for i in 0..1024 {
+            frame.append(input[f * 1024 + i])
+        }
+        s.apply(frame, 0, 1, 0)
+        for i in 0..2048 {
+            output.append(s.out[i])
+        }
+    }
+    // Output is at twice the rate: compare every other sample.
+    var best = -1000.0
+    var bestDelay = 0
+    for delay in 0..1200 {
+        var sig = 0.0
+        var err = 0.0
+        var n = 3000
+        while n < 7000 {
+            let o = 2 * n + delay
+            if o < output.count {
+                let want = input[n]
+                let d = output[o] - want
+                sig += want * want
+                err += d * d
+            }
+            n += 1
+        }
+        let snr = if err > 0.0 { 10.0 * log10(sig / err) } else { 200.0 }
+        if snr > best {
+            best = snr
+            bestDelay = delay
+        }
+    }
+    (best, bestDelay)
+}

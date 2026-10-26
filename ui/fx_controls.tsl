@@ -1,0 +1,171 @@
+// Small controls the "Effects and Filters" views are made of: a labelled
+// slider row with its value, an on/off switch and a row of choices that
+// call back when the user changes them, a choice list in a popover, and a
+// titled section box. Tessel's Toggle and Picker have no onChange, so the
+// switch and the choices are made of Buttons (Tab reaches them, Space and
+// Enter press them, screen readers call them by their titles), and every
+// change reaches the window's onChange.
+//
+// Separate windows use the system colours (they follow light and dark
+// mode) with Reel's orange accent for what is chosen.
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+// Reel's accent orange, and the text on it.
+let fxuAccent = Color.rgb(242, 140, 26)
+let fxuOnAccent = Color.white
+
+// Width of the label column in the slider rows and forms.
+let fxuLabelWidth = 132.0
+// Width of the value column.
+let fxuValueWidth = 78.0
+
+// A titled group of controls, in a thin rounded box.
+view FxuSection(title: String, content: View) {
+    VStack(spacing: 8, alignment: .leading) {
+        Text(title).font(size: 13, weight: .semibold)
+        content
+    }
+    .padding(12)
+    .frame(maxWidth: .infinity, alignment: .leading)
+    .border(.separator, width: 1, radius: 8)
+}
+
+// A section whose title row has a switch (and room for more controls
+// after it, such as a Reset button).
+view FxuSwitchSection(title: String, isOn: bind Bool, onChange: fn(), extra: View, content: View) {
+    VStack(spacing: 8, alignment: .leading) {
+        HStack(spacing: 8) {
+            Text(title)
+                .font(size: 13, weight: .semibold)
+                .onTap {
+                    isOn = !isOn
+                    onChange()
+                }
+            FxuSwitchButton(label: title, isOn: isOn, onChange: onChange)
+            Spacer()
+            extra
+        }
+        content
+    }
+    .padding(12)
+    .frame(maxWidth: .infinity, alignment: .leading)
+    .border(.separator, width: 1, radius: 8)
+}
+
+// The pill that flips a Bool: "On" in the accent colour, or "Off".
+view FxuSwitchButton(label: String, isOn: bind Bool, onChange: fn()) {
+    let said = if isOn { "on" } else { "off" }
+
+    Button(if isOn { "On" } else { "Off" }) {
+        isOn = !isOn
+        onChange()
+    }
+    .color(if isOn { fxuOnAccent } else { .secondary })
+    .background(if isOn { fxuAccent } else { .lightGray }, radius: 11)
+    .frame(minWidth: 46)
+    .font(size: 12, weight: .semibold)
+    .accessibilityLabel("{label}: {said}")
+}
+
+// A row: a label, then the switch. Clicking the label flips it too.
+view FxuSwitch(label: String, isOn: bind Bool, onChange: fn()) {
+    HStack(spacing: 8) {
+        Text(label)
+            .frame(width: fxuLabelWidth, alignment: .leading)
+            .onTap {
+                isOn = !isOn
+                onChange()
+            }
+        FxuSwitchButton(label: label, isOn: isOn, onChange: onChange)
+        Spacer()
+    }
+}
+
+// A label, a slider and the value as text (`text`, made by the caller).
+view FxuSliderRow(label: String, value: bind Float, from: Float, to: Float, step: Float = 0, text: String, onChange: fn()) {
+    HStack(spacing: 8) {
+        Text(label).frame(width: fxuLabelWidth, alignment: .leading)
+        Slider(value: value, from: from, to: to, step: step) { onChange() }
+            .accessibilityLabel(label)
+        Text(text)
+            .font(size: 12)
+            .color(.secondary)
+            .frame(width: fxuValueWidth, alignment: .trailing)
+    }
+}
+
+// One of a few choices, as a row of buttons; the chosen one in the
+// accent colour. `onPick` gets the option the user pressed.
+view FxuSegments(label: String, options: [String], selected: String, onPick: fn(String)) {
+    HStack(spacing: 8) {
+        Text(label).frame(width: fxuLabelWidth, alignment: .leading)
+        HStack(spacing: 2) {
+            for o in options {
+                Button(o) { onPick(o) }
+                    .color(if o == selected { fxuOnAccent } else { .primary })
+                    .background(if o == selected { fxuAccent } else { .lightGray }, radius: 5)
+                    .font(size: 12)
+            }
+        }
+        Spacer()
+    }
+}
+
+// A button showing the chosen option that opens the list of options in a
+// popover; choosing one calls `onPick` and closes it.
+view FxuChoiceMenu(label: String, options: [String], selected: String, width: Float = 150, speak: String = "", onPick: fn(String)) {
+    state open = false
+    let name = if speak != "" { speak } else { label }
+
+    HStack(spacing: 8) {
+        if label != "" {
+            Text(label).frame(width: fxuLabelWidth, alignment: .leading)
+        }
+        Button("{selected} ▾") { open = true }
+            .accessibilityLabel("{name}: {selected}")
+            .popover(isPresented: open) {
+                HStack(spacing: 4, alignment: .top) {
+                    for c in 0..fxuMenuColumns(options.count) {
+                        VStack(spacing: 2, alignment: .leading) {
+                            for o in fxuMenuColumn(options, c) {
+                                Button(o) {
+                                    open = false
+                                    onPick(o)
+                                }
+                                .color(if o == selected { fxuOnAccent } else { .primary })
+                                .background(if o == selected { fxuAccent } else { .clear }, radius: 4)
+                                .frame(width: width)
+                            }
+                        }
+                    }
+                }
+                .padding(6)
+            }
+        Spacer()
+    }
+}
+
+// A label and a value, for read-only rows (the meter).
+view FxuReadout(label: String, value: String, dim: Bool = false) {
+    HStack(spacing: 8) {
+        Text(label).color(.secondary).frame(width: fxuLabelWidth, alignment: .leading)
+        Text(value)
+            .font(size: 13, weight: .medium, family: "monospaced")
+            .color(if dim { .secondary } else { .primary })
+        Spacer()
+    }
+}
+
+// A choice list's popover shows at most this many options a column.
+let fxuMenuRows = 10
+
+fn fxuMenuColumns(_ n: Int) -> Int {
+    max(1, (n + fxuMenuRows - 1) / fxuMenuRows)
+}
+
+// The options in column c, top to bottom.
+fn fxuMenuColumn(_ options: [String], _ c: Int) -> [String] {
+    options.slice(from: c * fxuMenuRows, to: min(options.count, (c + 1) * fxuMenuRows))
+}

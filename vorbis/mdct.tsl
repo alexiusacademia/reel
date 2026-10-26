@@ -1,0 +1,157 @@
+// The inverse MDCT of Vorbis (Vorbis I section 4.3.7), computed with a
+// complex FFT of a quarter of the block size.
+//
+// For a block of N samples and N/2 coefficients X[k], the inverse MDCT is
+//   y[n] = sum over k of X[k] cos(2π/N (n + 1/2 + N/4)(k + 1/2)),  n < N.
+// With L = N/2 this is a DCT-IV of length L,
+//   u[m] = sum over k of X[k] cos(π/L (m + 1/2)(k + 1/2)),
+// read at m = n + N/4 and unfolded by the DCT-IV's symmetries
+// (u[-1-m] = u[m], u[2L-1-m] = -u[m]):
+//   y[n] =  u[n + N/4]          for n <  N/4
+//   y[n] = -u[3N/4 - 1 - n]     for N/4 <= n < 3N/4
+//   y[n] = -u[n - 3N/4]         for n >= 3N/4.
+// The DCT-IV comes from an L/2-point complex FFT: with
+//   z[j] = (X[2j] + i X[L-1-2j]) e^(-iπ j/L),  Z = FFT(z),
+//   c[p] = Z[p] e^(-iπ (p + 1/4)/L),
+// u[2p] = Re c[p] and u[L-1-2p] = -Im c[p].
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+struct Mdct {
+    // Block size N.
+    n: Int = 0
+    // FFT size M = N/4: bit reversal and twiddles e^(-2πik/M), k < M/2.
+    rev: [Int] = []
+    twRe: [Float] = []
+    twIm: [Float] = []
+    // Pre-twiddle e^(-iπ j/L) and post-twiddle e^(-iπ (p + 1/4)/L).
+    preC: [Float] = []
+    preS: [Float] = []
+    postC: [Float] = []
+    postS: [Float] = []
+    // Scratch.
+    re: [Float] = []
+    im: [Float] = []
+    u: [Float] = []
+    // The N output samples of the last inverse.
+    out: [Float] = []
+
+    // The inverse MDCT of x[from ..< from + N/2] into `out`.
+    fn inverse(_ x: [Float], from: Int) {
+        let m = n / 4
+        let l = n / 2
+        // Pre-twiddle into bit-reversed order.
+        for j in 0..m {
+            let a = x[from + 2 * j]
+            let b = x[from + l - 1 - 2 * j]
+            let c = preC[j]
+            let s = preS[j]
+            let k = rev[j]
+            re[k] = a * c + b * s
+            im[k] = b * c - a * s
+        }
+        // Radix-2 decimation-in-time FFT.
+        var size = 2
+        while size <= m {
+            let half = size / 2
+            let step = m / size
+            var start = 0
+            while start < m {
+                var t = 0
+                for k in 0..half {
+                    let wr = twRe[t]
+                    let wi = twIm[t]
+                    let p = start + k
+                    let q = p + half
+                    let tr = re[q] * wr - im[q] * wi
+                    let ti = re[q] * wi + im[q] * wr
+                    re[q] = re[p] - tr
+                    im[q] = im[p] - ti
+                    re[p] = re[p] + tr
+                    im[p] = im[p] + ti
+                    t += step
+                }
+                start += size
+            }
+            size *= 2
+        }
+        // Post-twiddle to the DCT-IV.
+        for p in 0..m {
+            let c = postC[p]
+            let s = postS[p]
+            let cr = re[p] * c + im[p] * s
+            let ci = im[p] * c - re[p] * s
+            u[2 * p] = cr
+            u[l - 1 - 2 * p] = -ci
+        }
+        // Unfold to N samples.
+        let q4 = n / 4
+        let q3 = 3 * n / 4
+        for i in 0..q4 {
+            out[i] = u[i + q4]
+        }
+        for i in q4..q3 {
+            out[i] = -u[q3 - 1 - i]
+        }
+        for i in q3..n {
+            out[i] = -u[i - q3]
+        }
+    }
+}
+
+fn newMdct(_ n: Int) -> Mdct {
+    var t = Mdct(n: n)
+    let m = n / 4
+    let l = Float(n / 2)
+    var bits = 0
+    while (1 << bits) < m {
+        bits += 1
+    }
+    for j in 0..m {
+        var r = 0
+        for b in 0..bits {
+            r = (r << 1) | ((j >> b) & 1)
+        }
+        t.rev.append(r)
+        t.re.append(0.0)
+        t.im.append(0.0)
+        t.preC.append(cos(pi * Float(j) / l))
+        t.preS.append(sin(pi * Float(j) / l))
+        t.postC.append(cos(pi * (Float(j) + 0.25) / l))
+        t.postS.append(sin(pi * (Float(j) + 0.25) / l))
+    }
+    for k in 0..(m / 2) {
+        t.twRe.append(cos(2.0 * pi * Float(k) / Float(m)))
+        t.twIm.append(-sin(2.0 * pi * Float(k) / Float(m)))
+    }
+    for _ in 0..(n / 2) {
+        t.u.append(0.0)
+    }
+    for _ in 0..n {
+        t.out.append(0.0)
+    }
+    t
+}
+
+// The plain O(N²) inverse MDCT, for checking the fast one.
+public fn slowImdct(_ x: [Float]) -> [Float] {
+    let half = x.count
+    let n = half * 2
+    var out: [Float] = []
+    for i in 0..n {
+        var s = 0.0
+        for k in 0..half {
+            s += x[k] * cos(2.0 * pi / Float(n) * (Float(i) + 0.5 + Float(n) / 4.0) * (Float(k) + 0.5))
+        }
+        out.append(s)
+    }
+    out
+}
+
+// The fast inverse MDCT of x (N/2 coefficients), for tests.
+public fn fastImdct(_ x: [Float]) -> [Float] {
+    var t = newMdct(x.count * 2)
+    t.inverse(x, from: 0)
+    t.out
+}

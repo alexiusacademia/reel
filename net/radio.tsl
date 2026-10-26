@@ -1,0 +1,553 @@
+// Internet radio (Icecast / SHOUTcast "ICY" streams): an endless HTTP
+// response of MP3 or AAC (sometimes Ogg) with the station's name in
+// icy-* headers and, when the client asks with "Icy-MetaData: 1", the
+// current song in metadata blocks every icy-metaint bytes.
+//
+// What Tessel 0.15 can do (measured, see build/TESSEL_ISSUES.md "net:"):
+// `request` only returns when the body ends, so it can't read a radio
+// stream; `download` writes the body to "<to>.part" as it arrives, and
+// that file can be read (whole) while it grows. So Reel plays radio by
+// downloading to a temporary file and reading the .part every half second
+// (`Radio.take`), turning newly arrived whole frames into StreamBuffer
+// chunks. `download` can't send request headers, so in-stream ICY
+// metadata never comes; the song title is polled from the server's status
+// pages instead (Icecast status-json.xsl, SHOUTcast v2 stats / v1 7.html),
+// and `IcyReader` parses in-stream metadata for streams that carry it
+// anyway (and for when Tessel gains streaming reads).
+//
+// The ICY protocol has no formal specification; this follows its plain
+// descriptions (the SHOUTcast and Icecast documentation of icy-metaint and
+// the StreamTitle='…'; block: one length byte ×16, then text padded with
+// zeros).
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+import "../core"
+import "../demux"
+
+public struct IcyInfo {
+    name: String = ""
+    genre: String = ""
+    url: String = ""
+    description: String = ""
+    // kbit/s, 0 when not given.
+    bitrate: Int = 0
+    // Bytes of audio between metadata blocks, 0 when there are none.
+    metaint: Int = 0
+    contentType: String = ""
+}
+
+// The station's details from response headers (names in lower case).
+public fn icyHeaders(_ h: [String: String]) -> IcyInfo {
+    var i = IcyInfo()
+    i.name = h["icy-name"] ?? h["ice-name"] ?? ""
+    i.genre = h["icy-genre"] ?? h["ice-genre"] ?? ""
+    i.url = h["icy-url"] ?? ""
+    i.description = h["icy-description"] ?? h["ice-description"] ?? ""
+    let br = (h["icy-br"] ?? h["ice-bitrate"] ?? "0").split(",")[0]
+    i.bitrate = parseInt(br.trim()).valueOr(0)
+    i.metaint = parseInt((h["icy-metaint"] ?? "0").trim()).valueOr(0)
+    i.contentType = httpMime(h["content-type"] ?? "")
+    i
+}
+
+// The fields of a metadata block: "StreamTitle='Artist - Song';StreamUrl='';"
+// → ["StreamTitle": "Artist - Song", "StreamUrl": ""]. Quotes inside a
+// value (common: "Guns N' Roses") are kept: a value ends at "';".
+public fn parseIcyMetadata(_ text: String) -> [String: String] {
+    var out: [String: String] = [:]
+    var rest = text
+    while let e = rest.find("='") {
+        let key = rest.substring(from: 0, to: e).trim()
+        let after = rest.substring(from: e + 2, to: rest.count)
+        var value = after
+        var next = ""
+        if let end = after.find("';") {
+            value = after.substring(from: 0, to: end)
+            next = after.substring(from: end + 2, to: after.count)
+        } else if after.hasSuffix("'") {
+            value = after.substring(from: 0, to: after.count - 1)
+        }
+        if !key.isEmpty {
+            out[key] = value
+        }
+        rest = next
+    }
+    out
+}
+
+// "Artist - Title" → ("Artist", "Title"); ("", text) when there's no " - ".
+public fn splitArtistTitle(_ streamTitle: String) -> (String, String) {
+    if let i = streamTitle.find(" - ") {
+        return (streamTitle.substring(from: 0, to: i).trim(), streamTitle.substring(from: i + 3, to: streamTitle.count).trim())
+    }
+    ("", streamTitle.trim())
+}
+
+// Removes ICY metadata blocks from stream bytes, fed in pieces as they
+// arrive (a block may be split between pieces).
+public struct IcyReader {
+    metaint: Int
+    // Audio bytes left before the next metadata length byte.
+    left: Int = -1
+    // A metadata block being read: its length and the bytes so far.
+    metaLength: Int = -1
+    meta: Data = Data()
+    title: String = ""
+    url: String = ""
+    // Titles in the order they came.
+    titles: [String] = []
+
+    // Gives the audio bytes of `piece`; titles go to `title`/`titles`.
+    fn feed(_ piece: Data) -> Data {
+        if metaint <= 0 {
+            return piece
+        }
+        if left < 0 {
+            left = metaint
+        }
+        var out = Data()
+        var i = 0
+        let n = piece.count
+        while i < n {
+            if metaLength >= 0 {
+                let need = metaLength - meta.count
+                let take = min(need, n - i)
+                meta.append(piece.slice(from: i, to: i + take))
+                i += take
+                if meta.count == metaLength {
+                    finishMeta()
+                }
+                continue
+            }
+            if left == 0 {
+                metaLength = piece[i] * 16
+                i += 1
+                meta = Data()
+                if metaLength == 0 {
+                    metaLength = -1
+                    left = metaint
+                }
+                continue
+            }
+            let take = min(left, n - i)
+            out.append(piece.slice(from: i, to: i + take))
+            i += take
+            left -= take
+        }
+        out
+    }
+
+    fn finishMeta() {
+        var end = meta.count
+        while end > 0 && meta[end - 1] == 0 {
+            end -= 1
+        }
+        let raw = meta.slice(from: 0, to: end)
+        let text = raw.text ?? netLatin1(raw)
+        let f = parseIcyMetadata(text)
+        if let t = f["StreamTitle"] {
+            title = t
+            if titles.isEmpty || titles[titles.count - 1] != t {
+                titles.append(t)
+            }
+        }
+        if let u = f["StreamUrl"] {
+            url = u
+        }
+        metaLength = -1
+        meta = Data()
+        left = metaint
+    }
+}
+
+// Status pages that may say the current song, for a stream URL: Icecast
+// 2.4 status-json.xsl, SHOUTcast 2 stats (JSON) and currentsong, SHOUTcast
+// 1 7.html.
+public fn radioStatusUrls(_ streamUrl: String) -> [String] {
+    let u = parseUrl(streamUrl)
+    let root = "{u.scheme}://{u.authority}"
+    [root + "/status-json.xsl", root + "/stats?sid=1&json=1", root + "/currentsong?sid=1", root + "/7.html"]
+}
+
+// The current title from any of the status pages' text ("" when it
+// doesn't say). `streamUrl` picks the Icecast mount.
+public fn radioStatusTitle(_ text: String, streamUrl: String = "") -> String {
+    let t = text.trim()
+    if t.contains("\"icestats\"") {
+        return radioIcecastTitle(t, parseUrl(streamUrl).path)
+    }
+    if t.contains("\"songtitle\"") {
+        return radioJsonString(t, "songtitle", 0)
+    }
+    // SHOUTcast 1 7.html: <html><body>listeners,status,peak,max,unique,bitrate,title</body></html>
+    if t.lowercase().contains("<body>") {
+        var body = t
+        if let b = body.lowercase().find("<body>") {
+            body = body.substring(from: b + 6, to: body.count)
+        }
+        if let e = body.lowercase().find("</body>") {
+            body = body.substring(from: 0, to: e)
+        }
+        let parts = body.split(",")
+        if parts.count >= 7 {
+            return unescapeHtml(parts.slice(from: 6, to: parts.count).joined(separator: ","))
+        }
+        return ""
+    }
+    // currentsong: the title as plain text.
+    if !t.contains("<") && !t.contains("\{") && t.count < 400 {
+        return t
+    }
+    ""
+}
+
+fn unescapeHtml(_ s: String) -> String {
+    htmlToText(s)
+}
+
+// Icecast's status-json.xsl: icestats.source is one object or a list;
+// the source whose listenurl ends with the mount wins, else the first
+// with a title.
+fn radioIcecastTitle(_ t: String, _ mount: String) -> String {
+    var at = 0
+    var first = ""
+    while true {
+        let k = radioFind(t, "\"listenurl\"", at)
+        if k < 0 {
+            break
+        }
+        // The enclosing object.
+        let (os, oe) = radioObject(t, k)
+        let obj = t.substring(from: os, to: oe)
+        let listen = radioJsonString(obj, "listenurl", 0)
+        let title = radioJsonString(obj, "title", 0)
+        let artist = radioJsonString(obj, "artist", 0)
+        let full = if !artist.isEmpty && !title.isEmpty { artist + " - " + title } else { title }
+        if !mount.isEmpty && mount != "/" && listen.hasSuffix(mount) {
+            return full
+        }
+        if first.isEmpty {
+            first = full
+        }
+        at = max(oe, k + 1)
+    }
+    first
+}
+
+fn radioFind(_ t: String, _ what: String, _ from: Int) -> Int {
+    let rest = t.substring(from: from, to: t.count)
+    if let i = rest.find(what) {
+        return from + i
+    }
+    -1
+}
+
+// The {…} object around character index k (string-aware).
+fn radioObject(_ t: String, _ k: Int) -> (Int, Int) {
+    let ch = t.characters
+    var depth = 0
+    var s = k
+    var inStr = false
+    var i = k
+    // Backwards to the opening brace (strings ignored roughly).
+    while i >= 0 {
+        let c = ch[i]
+        if c == "\}" {
+            depth += 1
+        } else if c == "\{" {
+            if depth == 0 {
+                s = i
+                break
+            }
+            depth -= 1
+        }
+        i -= 1
+    }
+    depth = 0
+    var e = ch.count
+    i = s
+    while i < ch.count {
+        let c = ch[i]
+        if inStr {
+            if c == "\\" {
+                i += 1
+            } else if c == "\"" {
+                inStr = false
+            }
+        } else if c == "\"" {
+            inStr = true
+        } else if c == "\{" {
+            depth += 1
+        } else if c == "\}" {
+            depth -= 1
+            if depth == 0 {
+                e = i + 1
+                break
+            }
+        }
+        i += 1
+    }
+    (s, e)
+}
+
+// The string value of "key": "…" in JSON text (first occurrence from
+// `from`), with \" \\ \/ \n \uXXXX escapes decoded; "" when missing.
+fn radioJsonString(_ t: String, _ key: String, _ from: Int) -> String {
+    let k = radioFind(t, "\"" + key + "\"", from)
+    if k < 0 {
+        return ""
+    }
+    let ch = t.substring(from: k + key.count + 2, to: t.count).characters
+    var i = 0
+    while i < ch.count && (ch[i] == " " || ch[i] == ":" || ch[i] == "\n" || ch[i] == "\t") {
+        i += 1
+    }
+    if i >= ch.count || ch[i] != "\"" {
+        return ""
+    }
+    i += 1
+    var out = ""
+    while i < ch.count {
+        let c = ch[i]
+        if c == "\"" {
+            break
+        }
+        if c == "\\" && i + 1 < ch.count {
+            let e = ch[i + 1]
+            i += 2
+            if e == "n" {
+                out += "\n"
+            } else if e == "t" {
+                out += "\t"
+            } else if e == "u" && i + 4 <= ch.count {
+                let code = xmlParseHexNet(ch.slice(from: i, to: i + 4).joined(separator: ""))
+                var d = Data()
+                netAppendUtf8(d, code)
+                out += d.text ?? ""
+                i += 4
+            } else {
+                out += e
+            }
+            continue
+        }
+        out += c
+        i += 1
+    }
+    out
+}
+
+fn xmlParseHexNet(_ s: String) -> Int {
+    var v = 0
+    for c in Data(text: s).bytes {
+        let h = urlHex(c)
+        if h < 0 {
+            return 0
+        }
+        v = v * 16 + h
+    }
+    v
+}
+
+fn netAppendUtf8(_ out: bind Data, _ c: Int) {
+    if c < 0x80 {
+        out.append(byte: c)
+    } else if c < 0x800 {
+        out.append(byte: 0xc0 | (c >> 6))
+        out.append(byte: 0x80 | (c & 0x3f))
+    } else if c < 0x10000 {
+        out.append(byte: 0xe0 | (c >> 12))
+        out.append(byte: 0x80 | ((c >> 6) & 0x3f))
+        out.append(byte: 0x80 | (c & 0x3f))
+    } else {
+        out.append(byte: 0xf0 | (c >> 18))
+        out.append(byte: 0x80 | ((c >> 12) & 0x3f))
+        out.append(byte: 0x80 | ((c >> 6) & 0x3f))
+        out.append(byte: 0x80 | (c & 0x3f))
+    }
+}
+
+// A radio stream being downloaded into a growing file: `take` turns the
+// newly arrived whole frames into chunks of a StreamBuffer (one timeline
+// per chunk, placed one after another), so the player plays it like any
+// live stream.
+public struct Radio {
+    url: String
+    // The file `download` writes; read path + ".part" while it runs.
+    path: String = ""
+    // The container from the first bytes ("mp3", "aac", "ogg", …).
+    format: String = ""
+    // Bytes of the current download consumed so far.
+    consumed: Int = 0
+    // Bytes carried to the next chunk (an incomplete frame).
+    pending: Data = Data()
+    // For Ogg: the header pages, put before every chunk.
+    header: Data = Data()
+    buffer: StreamBuffer = StreamBuffer()
+    // Seconds of audio produced so far (the end of the timeline).
+    time: Float = 0.0
+    chunks: Int = 0
+    // Chunks are made once this many bytes are waiting.
+    minChunk: Int = 16384
+    // Problems that didn't stop it.
+    warnings: [String] = []
+
+    // Takes the whole current content of the download (readData of the
+    // .part file, or of the finished file). Gives the seconds of audio
+    // added.
+    fn take(_ whole: Data) -> Float {
+        if whole.count < consumed {
+            // A new download started over.
+            consumed = 0
+        }
+        if whole.count == consumed {
+            return 0.0
+        }
+        pending.append(whole.slice(from: consumed, to: whole.count))
+        consumed = whole.count
+        return chunk(false)
+    }
+
+    // Takes bytes that arrived some other way (IcyReader output, a
+    // WebSocket).
+    fn takeBytes(_ bytes: Data) -> Float {
+        pending.append(bytes)
+        chunk(false)
+    }
+
+    // Uses up everything waiting, the last frame too (the stream ended).
+    fn finish() -> Float {
+        chunk(true)
+    }
+
+    fn chunk(_ all: Bool) -> Float {
+        if pending.count < minChunk && !all {
+            return 0.0
+        }
+        if format.isEmpty {
+            format = demux.sniff(pending, name: url)
+            if format.isEmpty {
+                format = "mp3"
+            }
+        }
+        let name = "radio.{format}"
+        let src = header + pending
+        var m = core.Media()
+        match demux.open(src, name: name) {
+            .ok(x) -> {
+                m = x
+            }
+            .failure(e) -> {
+                if pending.count > 4 * 1048576 {
+                    warnings.append("radio: {e.message}; dropped 4 MB")
+                    pending = Data()
+                }
+                return 0.0
+            }
+        }
+        if format == "ogg" && header.isEmpty && !m.packets.isEmpty {
+            // Keep the pages before the first audio packet: the headers.
+            header = pending.slice(from: 0, to: radioOggPageStart(pending, m.packets[0].offset))
+        }
+        // Cut before the last packet (it may be incomplete), unless all.
+        var audio = -1
+        for (i, t) in m.tracks.enumerated() {
+            if t.kind == core.TrackKind.audio && audio < 0 {
+                audio = i
+            }
+        }
+        if audio < 0 {
+            return 0.0
+        }
+        var last = -1
+        var lastEnd = 0
+        var count = 0
+        var dur = 0
+        for (i, p) in m.packets.enumerated() {
+            if p.track == audio {
+                last = i
+                count += 1
+            }
+        }
+        if count < 2 && !all {
+            return 0.0
+        }
+        var cut = src.count
+        if !all && last >= 0 {
+            cut = m.packets[last].offset
+            if !m.packets[last].parts.isEmpty {
+                cut = m.packets[last].parts[0]
+            }
+            if format == "ogg" {
+                cut = radioOggPageStart(src, cut)
+            }
+        }
+        let ts = m.tracks[audio].timescale
+        for (i, p) in m.packets.enumerated() {
+            if p.track == audio && (all || i != last) {
+                dur += p.duration
+                lastEnd = max(lastEnd, p.offset + p.size)
+            }
+        }
+        let secs = core.seconds(dur, ts)
+        let headerLen = header.count
+        let body = src.slice(from: headerLen, to: max(cut, headerLen))
+        if body.isEmpty || secs <= 0.0 {
+            return 0.0
+        }
+        let err = buffer.append(body, init: header, start: time, duration: secs, timeline: chunks, stream: 0, sequence: chunks, name: name)
+        if let e = err {
+            warnings.append("radio: {e.message}")
+        }
+        pending = src.slice(from: max(cut, headerLen), to: src.count)
+        time += secs
+        chunks += 1
+        secs
+    }
+}
+
+// The start of the Ogg page holding byte `at` ("OggS" capture pattern).
+fn radioOggPageStart(_ d: Data, _ at: Int) -> Int {
+    var i = min(at, d.count - 4)
+    while i >= 0 {
+        if d[i] == 0x4f && d[i + 1] == 0x67 && d[i + 2] == 0x67 && d[i + 3] == 0x53 {
+            return i
+        }
+        i -= 1
+    }
+    0
+}
+
+// Where the bytes of a new download of the same live stream continue an
+// old one: Icecast and SHOUTcast send a burst of recent audio on connect,
+// so the new download's start overlaps the old one's end. Gives the index
+// in `new` after the overlap, or -1 when no overlap is found (then just
+// append: a short skip in the audio).
+public fn spliceOffset(old: Data, new: Data, probe: Int = 2048) -> Int {
+    if old.count < probe || new.count < probe {
+        return -1
+    }
+    let needle = old.slice(from: old.count - probe, to: old.count)
+    let limit = new.count - probe
+    let b0 = needle[0]
+    var i = 0
+    while i <= limit {
+        if new[i] == b0 {
+            var ok = true
+            var k = 1
+            while k < probe {
+                if new[i + k] != needle[k] {
+                    ok = false
+                    break
+                }
+                k += 1
+            }
+            if ok {
+                return i + probe
+            }
+        }
+        i += 1
+    }
+    -1
+}

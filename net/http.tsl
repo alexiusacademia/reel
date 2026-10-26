@@ -1,0 +1,387 @@
+// HTTP access for the player: probing a URL (size, type, whether byte
+// ranges work), whole and ranged GETs with retries, and `Remote`, a
+// ranged reader with a block cache. Errors come back as values.
+//
+// HTTP semantics from RFC 9110 (§14 range requests: Range, 206 Partial
+// Content, Content-Range, Accept-Ranges) and RFC 9111 is not needed (no
+// caching beyond Remote's own blocks). Tessel's `request` follows
+// redirects itself (measured: a 302 comes back as the final 206/200), and
+// reads `file://` URLs whole (a Range header is ignored there), so ranges
+// of local files are cut here.
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+public struct Probe {
+    url: String
+    // HTTP status of the probe (200 for local files), 0 when unreachable.
+    status: Int = 0
+    // Bytes, -1 when the server doesn't say.
+    size: Int = -1
+    // Content-Type without parameters ("video/mp4"), "" when not given.
+    mime: String = ""
+    acceptsRanges: Bool = false
+    // Response headers (names in lower case).
+    headers: [String: String] = [:]
+}
+
+// Whole-response result of a GET.
+public struct Fetched {
+    data: Data = Data()
+    status: Int = 0
+    headers: [String: String] = [:]
+    // Wall seconds the request took (for throughput).
+    seconds: Float = 0.0
+}
+
+// Probes a URL: a HEAD request, and when that doesn't tell whether ranges
+// work, a GET of `Range: bytes=0-0`.
+public async fn probe(_ url: String) -> Result<Probe> {
+    if !isHttp(url) {
+        let path = filePath(url)
+        if path.isEmpty || !fileExists(path) {
+            return Result.failure(error: Error("can't open {url}"))
+        }
+        var p = Probe(url: url, status: 200, size: fileSize(path) ?? -1, acceptsRanges: true)
+        p.mime = mimeForName(path)
+        return Result.ok(value: p)
+    }
+    var p = Probe(url: url)
+    let head = await request(url: url, method: "HEAD")
+    if head.status == 0 {
+        return Result.failure(error: Error("can't reach {url}: {head.error}"))
+    }
+    p.status = head.status
+    p.headers = head.headers
+    if head.ok {
+        p.size = parseInt(head.headers["content-length"] ?? "-1").valueOr(-1)
+        p.mime = httpMime(head.headers["content-type"] ?? "")
+        p.acceptsRanges = (head.headers["accept-ranges"] ?? "").lowercase().contains("bytes")
+        if p.acceptsRanges && p.size >= 0 {
+            return Result.ok(value: p)
+        }
+    }
+    // HEAD refused (405) or unclear: ask for the first byte.
+    let r = await request(url: url, headers: ["Range": "bytes=0-0"])
+    if r.status == 0 {
+        return Result.failure(error: Error("can't reach {url}: {r.error}"))
+    }
+    p.status = r.status
+    p.headers = r.headers
+    if r.status == 206 {
+        p.acceptsRanges = true
+        let total = httpRangeTotal(r.headers["content-range"] ?? "")
+        if total >= 0 {
+            p.size = total
+        }
+    } else if r.ok {
+        p.acceptsRanges = false
+        p.size = r.data.count
+    } else {
+        return Result.failure(error: Error("{url}: the server said {r.status}"))
+    }
+    if p.mime.isEmpty {
+        p.mime = httpMime(r.headers["content-type"] ?? "")
+    }
+    Result.ok(value: p)
+}
+
+// GETs a URL (or `length` bytes from `offset`, when length ≥ 0), retrying
+// `retries` times on connection failures and on 5xx, 408 and 429 answers
+// (waiting 0.5, 1, 2 … s). A server that ignores the range (200 with the
+// whole body) is handled by cutting the range out.
+public async fn get(_ url: String, offset: Int = -1, length: Int = -1, retries: Int = 2, headers: [String: String] = [:]) -> Result<Fetched> {
+    let t0 = now()
+    if !isHttp(url) {
+        let path = filePath(url)
+        if let d = readData(path) {
+            var body = d
+            if length >= 0 {
+                let a = max(0, offset)
+                body = d.slice(from: a, to: a + length)
+            }
+            return Result.ok(value: Fetched(data: body, status: 200, seconds: now() - t0))
+        }
+        return Result.failure(error: Error("can't read {url}"))
+    }
+    var h = headers
+    if length >= 0 {
+        let a = max(0, offset)
+        h["Range"] = "bytes={a}-{a + length - 1}"
+    }
+    var attempt = 0
+    var wait = 0.5
+    while true {
+        let r = await request(url: url, headers: h)
+        let retryable = r.status == 0 || r.status >= 500 || r.status == 408 || r.status == 429
+        if r.ok {
+            var body = r.data
+            if length >= 0 && r.status == 200 {
+                let a = max(0, offset)
+                body = r.data.slice(from: a, to: a + length)
+            }
+            return Result.ok(value: Fetched(data: body, status: r.status, headers: r.headers, seconds: now() - t0))
+        }
+        if !retryable || attempt >= retries {
+            if r.status == 0 {
+                return Result.failure(error: Error("can't reach {url}: {r.error}"))
+            }
+            return Result.failure(error: Error("{url}: the server said {r.status}"))
+        }
+        attempt += 1
+        await after(seconds: wait)
+        wait = wait * 2.0
+    }
+    Result.failure(error: Error("unreachable"))
+}
+
+// GETs a URL as text (UTF-8, else Latin-1).
+public async fn getText(_ url: String, retries: Int = 2) -> Result<String> {
+    let f = try await get(url, retries: retries)
+    if let t = f.data.text {
+        return Result.ok(value: t)
+    }
+    Result.ok(value: netLatin1(f.data))
+}
+
+// "bytes 0-0/12345" → 12345 (-1 when unknown or "*").
+public fn httpRangeTotal(_ contentRange: String) -> Int {
+    if let s = contentRange.find("/") {
+        return parseInt(contentRange.substring(from: s + 1, to: contentRange.count).trim()).valueOr(-1)
+    }
+    -1
+}
+
+fn httpMime(_ ct: String) -> String {
+    var m = ct
+    if let s = m.find(";") {
+        m = m.substring(from: 0, to: s)
+    }
+    m.trim().lowercase()
+}
+
+// A MIME type from a file name or URL's extension.
+public fn mimeForName(_ name: String) -> String {
+    var n = urlFileName(name).lowercase()
+    if n.isEmpty {
+        n = name.lowercase()
+    }
+    let ext = n.fileExtension
+    match ext {
+        "m3u8" -> "application/vnd.apple.mpegurl"
+        "m3u" -> "audio/x-mpegurl"
+        "mpd" -> "application/dash+xml"
+        "ts" -> "video/mp2t"
+        "mp4" -> "video/mp4"
+        "m4s" -> "video/iso.segment"
+        "m4a" -> "audio/mp4"
+        "mkv" -> "video/x-matroska"
+        "webm" -> "video/webm"
+        "mp3" -> "audio/mpeg"
+        "aac" -> "audio/aac"
+        "ogg" -> "audio/ogg"
+        "opus" -> "audio/ogg"
+        "flac" -> "audio/flac"
+        "wav" -> "audio/wav"
+        "vtt" -> "text/vtt"
+        "srt" -> "application/x-subrip"
+        "xml" -> "application/xml"
+        "rss" -> "application/rss+xml"
+        "pls" -> "audio/x-scpls"
+        _ -> ""
+    }
+}
+
+// A remote file read in ranges, through a cache of fixed-size blocks
+// (least recently used blocks are evicted past `maxBlocks`).
+public struct Remote {
+    url: String
+    size: Int = -1
+    acceptsRanges: Bool = false
+    mime: String = ""
+    blockSize: Int = 1048576
+    maxBlocks: Int = 64
+    // Cached blocks: numbers, bytes, and when each was last used.
+    blocks: [Int] = []
+    data: [Data] = []
+    used: [Int] = []
+    clock: Int = 0
+    hits: Int = 0
+    misses: Int = 0
+    // Bytes and seconds downloaded (throughput).
+    bytesLoaded: Int = 0
+    secondsLoading: Float = 0.0
+
+    // Bits per second measured so far (0 before any download).
+    throughput: Float {
+        if secondsLoading <= 0.0 { 0.0 } else { Float(bytesLoaded) * 8.0 / secondsLoading }
+    }
+
+    // The bytes [from, to) when every block of them is cached, else nil.
+    fn cached(from: Int, to: Int) -> Data? {
+        let end = if size >= 0 { min(to, size) } else { to }
+        if end <= from {
+            return Data()
+        }
+        let b0 = from / blockSize
+        let b1 = (end - 1) / blockSize
+        var out = Data()
+        for b in b0..b1 + 1 {
+            let k = slot(b)
+            if k < 0 {
+                misses += 1
+                return nil
+            }
+            clock += 1
+            used[k] = clock
+            let bs = b * blockSize
+            let d = data[k]
+            out.append(d.slice(from: max(from, bs) - bs, to: min(end, bs + d.count) - bs))
+        }
+        hits += 1
+        out
+    }
+
+    // Block numbers of [from, to) that aren't cached, in order.
+    fn missing(from: Int, to: Int) -> [Int] {
+        var out: [Int] = []
+        let end = if size >= 0 { min(to, size) } else { to }
+        if end <= from {
+            return out
+        }
+        for b in from / blockSize..(end - 1) / blockSize + 1 {
+            if slot(b) < 0 {
+                out.append(b)
+            }
+        }
+        out
+    }
+
+    fn slot(_ block: Int) -> Int {
+        for (i, b) in blocks.enumerated() {
+            if b == block {
+                return i
+            }
+        }
+        -1
+    }
+
+    // Stores downloaded bytes starting at block `first` (whole blocks,
+    // the last may be short at the end of the file).
+    fn store(first: Int, _ bytes: Data) {
+        var b = first
+        var at = 0
+        while at < bytes.count {
+            let piece = bytes.slice(from: at, to: at + blockSize)
+            clock += 1
+            let k = slot(b)
+            if k >= 0 {
+                data[k] = piece
+                used[k] = clock
+            } else if blocks.count < maxBlocks {
+                blocks.append(b)
+                data.append(piece)
+                used.append(clock)
+            } else {
+                var old = 0
+                for i in 1..used.count {
+                    if used[i] < used[old] {
+                        old = i
+                    }
+                }
+                blocks[old] = b
+                data[old] = piece
+                used[old] = clock
+            }
+            at += blockSize
+            b += 1
+        }
+    }
+
+    // Empties the cache.
+    fn clear() {
+        blocks = []
+        data = []
+        used = []
+    }
+}
+
+// Probes a URL and gives a Remote for it.
+public async fn openRemote(_ url: String, blockSize: Int = 1048576, maxBlocks: Int = 64) -> Result<Remote> {
+    let p = try await probe(url)
+    var r = Remote(url: url, size: p.size, acceptsRanges: p.acceptsRanges, mime: p.mime, blockSize: blockSize, maxBlocks: maxBlocks)
+    if !p.acceptsRanges && p.size >= 0 {
+        // No ranges: the whole file in one block.
+        r.blockSize = max(p.size, 1)
+        r.maxBlocks = 1
+    }
+    Result.ok(value: r)
+}
+
+// Reads [from, to) of a Remote: cached blocks are used, the missing run
+// is downloaded in one ranged request. Gives the updated Remote (with the
+// new blocks cached) and the bytes. An async function can't change its
+// argument, so store the returned Remote: `(remote, bytes) = await …`.
+public async fn readRemote(_ r: Remote, from: Int, to: Int) -> (Remote, Result<Data>) {
+    var rr = r
+    if let d = rr.cached(from: from, to: to) {
+        return (rr, Result.ok(value: d))
+    }
+    let miss = rr.missing(from: from, to: to)
+    if miss.isEmpty {
+        return (rr, Result.ok(value: Data()))
+    }
+    let first = miss[0]
+    let last = miss[miss.count - 1]
+    let offset = first * rr.blockSize
+    var length = (last - first + 1) * rr.blockSize
+    if rr.size >= 0 {
+        length = min(length, rr.size - offset)
+    }
+    let ranged = rr.acceptsRanges || !isHttp(rr.url)
+    var got = Data()
+    match await get(rr.url, offset: offset, length: if ranged { length } else { -1 }) {
+        .ok(f) -> {
+            rr.bytesLoaded += f.data.count
+            rr.secondsLoading += f.seconds
+            got = f.data
+        }
+        .failure(e) -> {
+            return (rr, Result.failure(error: e))
+        }
+    }
+    // Put the answer together before caching (the cache may be smaller
+    // than the read): cached blocks before the run, the run, cached
+    // blocks after it.
+    let end = if rr.size >= 0 { min(to, rr.size) } else { to }
+    let runStart = if ranged { offset } else { 0 }
+    var out = Data()
+    if from < runStart {
+        out.append(rr.cached(from: from, to: runStart) ?? Data())
+    }
+    let runEnd = runStart + got.count
+    out.append(got.slice(from: max(from, runStart) - runStart, to: min(end, runEnd) - runStart))
+    if end > runEnd {
+        if let rest = rr.cached(from: runEnd, to: end) {
+            out.append(rest)
+        } else {
+            rr.store(first: if ranged { first } else { 0 }, got)
+            return (rr, Result.failure(error: Error("{rr.url}: the server sent fewer bytes than asked for")))
+        }
+    }
+    rr.store(first: if ranged { first } else { 0 }, got)
+    (rr, Result.ok(value: out))
+}
+
+fn netLatin1(_ d: Data) -> String {
+    var out = Data()
+    for b in d.bytes {
+        if b < 0x80 {
+            out.append(byte: b)
+        } else {
+            out.append(byte: 0xc0 | (b >> 6))
+            out.append(byte: 0x80 | (b & 0x3f))
+        }
+    }
+    out.text ?? ""
+}

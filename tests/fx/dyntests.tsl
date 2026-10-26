@@ -1,0 +1,193 @@
+// Compressor, limiter and stereo stage tests.
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+import "../../fx"
+import "../../core"
+
+fn dynamicsTests(_ t: bind Tally) {
+    // The static curve (Giannoulis et al.): T −20, R 4, knee 6.
+    var c = fx.Compressor()
+    c.threshold = -20.0
+    c.ratio = 4.0
+    c.knee = 6.0
+    t.near(c.curve(-40.0), 0.0, 1e-9, "compressor: no gain change well below the knee")
+    t.near(c.curve(0.0), -15.0, 1e-9, "compressor: 20 dB over at 4:1 gives −15 dB")
+    t.near(c.curve(-20.0), (0.25 - 1.0) * 9.0 / 12.0, 1e-9, "compressor: knee centre")
+    t.near(c.curve(-23.0), 0.0, 1e-9, "compressor: knee starts at T − W/2")
+    t.near(c.curve(-17.0), (-17.0 + 20.0) / 4.0 - 20.0 + 17.0, 1e-9, "compressor: knee ends at T + W/2")
+
+    // Steady state on a sine at −6 dBFS: T −20, R 4, no knee → the peak
+    // comes out near −20 + 14/4 = −16.5 dBFS.
+    var cs = fx.Compressor()
+    cs.setup(48000, 2)
+    cs.on = true
+    cs.threshold = -20.0
+    cs.ratio = 4.0
+    cs.knee = 0.0
+    cs.attackMs = 5.0
+    cs.releaseMs = 300.0
+    var x = sine(1000.0, amp: pow(10.0, -6.0 / 20.0), frames: 48000)
+    cs.process(x)
+    let tail = x.slice(from: 2 * 38400, to: x.count)
+    t.near(db(peakOf(tail)), -16.5, 0.35, "compressor: steady-state level of a sine")
+    t.check(cs.reduction > 10.0 && cs.reduction < 11.0, "compressor reports its gain reduction ({cs.reduction})")
+    // Turning it off fades back to unity, then it's idle (bit-exact).
+    cs.on = false
+    var y = sine(1000.0, amp: 0.5, frames: 4800)
+    cs.process(y)
+    t.check(cs.idle(), "compressor switched off returns to unity gain")
+    let y0 = sine(1000.0, amp: 0.5, frames: 4800)
+    var y1 = y0
+    cs.process(y1)
+    t.check(y1 == y0, "an idle compressor leaves the sound untouched")
+    // A threshold jump doesn't click.
+    var cc = fx.Compressor()
+    cc.setup(48000, 1)
+    cc.on = true
+    cc.threshold = 0.0
+    cc.ratio = 8.0
+    let amp = 0.5
+    var all = sine(440.0, amp: amp, frames: 24000, channels: 1)
+    var out: [Float] = []
+    var pos = 0
+    var blk = 0
+    while pos < all.count {
+        var b = all.slice(from: pos, to: min(all.count, pos + 1024))
+        if blk == 10 {
+            cc.threshold = -30.0
+        }
+        cc.process(b)
+        out.appendAll(b)
+        pos += 1024
+        blk += 1
+    }
+    let ck = clickiness(out, 440.0, rate: 48000, amp: amp)
+    t.check(ck < 0.02, "a compressor threshold jump doesn't click (residual {ck.formatted(decimals: 5)})")
+
+    // Limiter: noise with bursts far over full scale never passes the
+    // ceiling; quiet sound passes delayed by exactly the look-ahead.
+    var lim = fx.Limiter()
+    lim.setup(48000, 2, 5.0)
+    lim.ceiling = pow(10.0, -1.0 / 20.0)
+    let noise = lcgProgramme(channels: 2, levels: [-20.0, 12.0, -6.0, 18.0, -30.0, 6.0], seed: 5)
+    var lout: [Float] = []
+    pos = 0
+    while pos < noise.count {
+        var b = noise.slice(from: pos, to: min(noise.count, pos + 2 * 777))
+        lim.process(b)
+        lout.appendAll(b)
+        pos += 2 * 777
+    }
+    lout.appendAll(lim.drain())
+    t.check(peakOf(lout) <= lim.ceiling + 1e-12, "limiter output never passes the ceiling ({db(peakOf(lout)).formatted(decimals: 4)} dBFS)")
+    t.check(lout.count == noise.count + 2 * lim.look, "limiter gives every frame back after drain")
+    // Without the clamp's help: the gain itself keeps peaks under (the
+    // largest output is just under the ceiling, not flattened).
+    var flat = 0
+    for v in lout {
+        if abs(v) == lim.ceiling {
+            flat += 1
+        }
+    }
+    t.check(flat < 500, "limiter reaches the ceiling by gain: only the peaks themselves touch it ({flat} of {lout.count} samples)")
+    // The quiet first second comes out unchanged, `look` frames late.
+    var same = true
+    for i in 0..(2 * 40000) {
+        if lout[i + 2 * lim.look] != noise[i] {
+            same = false
+        }
+    }
+    t.check(same, "limiter is a plain delay of {lim.look} frames when nothing is near the ceiling")
+    // After the last loud part the gain recovers.
+    var lim2 = fx.Limiter()
+    lim2.setup(48000, 2, 5.0)
+    lim2.ceiling = 0.5
+    var burst = sine(1000.0, amp: 1.0, frames: 4800)
+    lim2.process(burst)
+    var quiet = sine(1000.0, amp: 0.25, frames: 48000)
+    lim2.process(quiet)
+    t.near(lim2.gain, 1.0, 1e-4, "limiter gain recovers after a burst")
+    t.near(peakOf(quiet.slice(from: 2 * 24000, to: quiet.count)), 0.25, 1e-4, "limiter: quiet sound after recovery is unchanged")
+}
+
+fn stereoTests(_ t: bind Tally) {
+    // The matrices.
+    t.check(fx.stereoMatrix(.stereo, 1.0, 0.0) == [1.0, 0.0, 0.0, 1.0], "stereo is the identity")
+    t.check(fx.stereoMatrix(.mono, 1.0, 0.0) == [0.5, 0.5, 0.5, 0.5], "mono averages")
+    t.check(fx.stereoMatrix(.swap, 1.0, 0.0) == [0.0, 1.0, 1.0, 0.0], "swap")
+    t.check(fx.stereoMatrix(.left, 1.0, 0.0) == [1.0, 0.0, 1.0, 0.0], "left on both")
+    t.check(fx.stereoMatrix(.right, 1.0, 0.0) == [0.0, 1.0, 0.0, 1.0], "right on both")
+    t.check(fx.stereoMatrix(.stereo, 0.0, 0.0) == [0.5, 0.5, 0.5, 0.5], "width 0 is mono")
+    t.check(fx.stereoMatrix(.stereo, 2.0, 0.0) == [1.5, -0.5, -0.5, 1.5], "width 2 doubles the side signal")
+    t.check(fx.stereoMatrix(.stereo, 1.0, -1.0) == [1.0, 0.0, 0.0, 0.0], "balance −1: right silent")
+    t.check(fx.stereoMatrix(.stereo, 1.0, 0.5) == [0.5, 0.0, 0.0, 1.0], "balance 0.5: left at half")
+
+    // Switching modes ramps: L = 440 Hz sine, R = 0, stereo → swap.
+    var st = fx.StereoStage()
+    st.setup(48000)
+    st.set(mode: .stereo, width: 1.0, balance: 0.0, crossfeed: false, 0.3, hz: 700.0)
+    st.snap()
+    var d: [Float] = []
+    for i in 0..19200 {
+        d.append(0.5 * sin(2.0 * pi * 440.0 * Float(i) / 48000.0))
+        d.append(0.0)
+    }
+    var out: [Float] = []
+    var pos = 0
+    var blk = 0
+    while pos < d.count {
+        var b = d.slice(from: pos, to: min(d.count, pos + 1024))
+        if blk == 8 {
+            st.set(mode: .swap, width: 1.0, balance: 0.0, crossfeed: false, 0.3, hz: 700.0)
+        }
+        st.process(b)
+        out.appendAll(b)
+        pos += 1024
+        blk += 1
+    }
+    let l = channel(out, 0, 2)
+    let r = channel(out, 1, 2)
+    t.check(clickiness(l, 440.0, rate: 48000, amp: 0.5) < 0.005 && clickiness(r, 440.0, rate: 48000, amp: 0.5) < 0.005, "a mode switch ramps without clicks")
+    t.check(peakOf(l.slice(from: 9600, to: 19200)) < 1e-12 && abs(peakOf(r.slice(from: 9600, to: 19200)) - 0.5) < 1e-3, "after the switch the channels are swapped")
+
+    // Crossfeed: centre sound almost unchanged, hard-panned bass shared.
+    var cf = fx.StereoStage()
+    cf.setup(48000)
+    cf.set(mode: .stereo, width: 1.0, balance: 0.0, crossfeed: true, 0.3, hz: 700.0)
+    cf.snap()
+    var mono = sine(100.0, amp: 0.5, frames: 48000)
+    cf.process(mono)
+    let ml = channel(mono, 0, 2)
+    t.near(db(amplitudeAt(ml, 100.0, rate: 48000, from: 24000, to: 48000) / 0.5), 0.0, 0.2, "crossfeed: centred 100 Hz keeps its level")
+    var cf2 = fx.StereoStage()
+    cf2.setup(48000)
+    cf2.set(mode: .stereo, width: 1.0, balance: 0.0, crossfeed: true, 0.3, hz: 700.0)
+    cf2.snap()
+    var hard: [Float] = []
+    var hardHi: [Float] = []
+    for i in 0..48000 {
+        hard.append(0.5 * sin(2.0 * pi * 100.0 * Float(i) / 48000.0))
+        hard.append(0.0)
+        hardHi.append(0.5 * sin(2.0 * pi * 10000.0 * Float(i) / 48000.0))
+        hardHi.append(0.0)
+    }
+    cf2.process(hard)
+    let bleed = db(amplitudeAt(channel(hard, 1, 2), 100.0, rate: 48000, from: 24000, to: 48000) / 0.5)
+    t.check(bleed > -12.0 && bleed < -9.0, "crossfeed: hard-left 100 Hz reaches the right at about −10 dB ({bleed.formatted(decimals: 2)})")
+    var cf3 = fx.StereoStage()
+    cf3.setup(48000)
+    cf3.set(mode: .stereo, width: 1.0, balance: 0.0, crossfeed: true, 0.3, hz: 700.0)
+    cf3.snap()
+    cf3.process(hardHi)
+    let bleedHi = db(amplitudeAt(channel(hardHi, 1, 2), 10000.0, rate: 48000, from: 24000, to: 48000) / 0.5)
+    t.check(bleedHi < -30.0, "crossfeed: hard-left 10 kHz stays on its side ({bleedHi.formatted(decimals: 2)} dB across)")
+    // Off and settled: untouched.
+    var idle = fx.StereoStage()
+    idle.setup(48000)
+    let z0 = sine(300.0, amp: 0.3, frames: 2000)
+    var z1 = z0
+    idle.process(z1)
+    t.check(z1 == z0, "an idle stereo stage leaves the sound untouched")
+}

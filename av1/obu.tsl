@@ -1,0 +1,1577 @@
+// AV1 high-level syntax: OBU headers (spec 5.3), the sequence header
+// (5.5) and the frame header (5.9: uncompressed_header and everything it
+// calls), with the header-level state kept per reference slot (7.20:
+// order hints, sizes, global motion, loop filter deltas, segmentation
+// features, film grain) and the set frame refs process (7.8).
+//
+// The block-level state (CDFs, segmentation maps, motion field) is the
+// parser's (parser.tsl); this file records what the header asks for
+// (primary_ref_frame, use_ref_frame_mvs …) and the parser acts on it.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../core"
+
+let obuSequenceHeader = 1
+let obuTemporalDelimiter = 2
+let obuFrameHeader = 3
+let obuTileGroup = 4
+let obuMetadata = 5
+let obuFrame = 6
+let obuRedundantFrameHeader = 7
+let obuTileList = 8
+let obuPadding = 15
+
+let av1KeyFrame = 0
+let av1InterFrame = 1
+let av1IntraOnlyFrame = 2
+let av1SwitchFrame = 3
+
+let av1PrimaryRefNone = 7
+
+// The sequence header (5.5).
+struct Av1Seq {
+    ok: Bool = false
+    profile: Int = 0
+    stillPicture: Bool = false
+    reducedStillPictureHeader: Bool = false
+    timingInfoPresent: Bool = false
+    decoderModelInfoPresent: Bool = false
+    equalPictureInterval: Bool = false
+    bufferRemovalTimeLength: Int = 0
+    framePresentationTimeLength: Int = 0
+    operatingPointsCount: Int = 1
+    operatingPointIdc: [Int] = [0]
+    decoderModelPresentForOp: [Int] = [0]
+    // The chosen operating point's idc (choose_operating_point: 0).
+    opIdc: Int = 0
+    levelIdx: Int = 0
+    tier: Int = 0
+    frameWidthBits: Int = 0
+    frameHeightBits: Int = 0
+    maxFrameWidth: Int = 0
+    maxFrameHeight: Int = 0
+    frameIdNumbersPresent: Bool = false
+    deltaFrameIdLength: Int = 0
+    additionalFrameIdLength: Int = 0
+    use128: Bool = false
+    enableFilterIntra: Bool = false
+    enableIntraEdgeFilter: Bool = false
+    enableInterintraCompound: Bool = false
+    enableMaskedCompound: Bool = false
+    enableWarpedMotion: Bool = false
+    enableDualFilter: Bool = false
+    enableOrderHint: Bool = false
+    enableJntComp: Bool = false
+    enableRefFrameMvs: Bool = false
+    seqForceScreenContentTools: Int = 2
+    seqForceIntegerMv: Int = 2
+    orderHintBits: Int = 0
+    enableSuperres: Bool = false
+    enableCdef: Bool = false
+    enableRestoration: Bool = false
+    bitDepth: Int = 8
+    monochrome: Bool = false
+    colorPrimaries: Int = 2
+    transferCharacteristics: Int = 2
+    matrixCoefficients: Int = 2
+    colorRange: Int = 0
+    subX: Int = 1
+    subY: Int = 1
+    chromaSamplePosition: Int = 0
+    separateUvDeltaQ: Bool = false
+    filmGrainParamsPresent: Bool = false
+}
+
+// uvlc() (4.10.3).
+fn av1Uvlc(_ r: core.BitReader) -> (Int, core.BitReader) {
+    var rd = r
+    var lz = 0
+    while rd.bits(1) == 0 {
+        lz += 1
+        if lz >= 32 || rd.overrun {
+            return (4294967295, rd)
+        }
+    }
+    let v = rd.bits(lz)
+    (v + (1 << lz) - 1, rd)
+}
+
+// sequence_header_obu( ) (5.5.1).
+fn av1ParseSequenceHeader(_ data: Data, _ from: Int, _ to: Int) -> Av1Seq {
+    var s = Av1Seq()
+    var r = core.bitReaderRange(data, from: from, to: to)
+    s.profile = r.bits(3)
+    s.stillPicture = r.flag()
+    s.reducedStillPictureHeader = r.flag()
+    if s.reducedStillPictureHeader {
+        s.levelIdx = r.bits(5)
+    } else {
+        s.timingInfoPresent = r.flag()
+        var bufferDelayLength = 0
+        if s.timingInfoPresent {
+            // timing_info( )
+            r.bits(32)
+            r.bits(32)
+            s.equalPictureInterval = r.flag()
+            if s.equalPictureInterval {
+                let (_, r2) = av1Uvlc(r)
+                r = r2
+            }
+            s.decoderModelInfoPresent = r.flag()
+            if s.decoderModelInfoPresent {
+                // decoder_model_info( )
+                bufferDelayLength = r.bits(5) + 1
+                r.bits(32)
+                s.bufferRemovalTimeLength = r.bits(5) + 1
+                s.framePresentationTimeLength = r.bits(5) + 1
+            }
+        }
+        let initialDisplayDelayPresent = r.flag()
+        s.operatingPointsCount = r.bits(5) + 1
+        s.operatingPointIdc = []
+        s.decoderModelPresentForOp = []
+        for i in 0..s.operatingPointsCount {
+            s.operatingPointIdc.append(r.bits(12))
+            let level = r.bits(5)
+            var tier = 0
+            if level > 7 {
+                tier = r.bit()
+            }
+            if i == 0 {
+                s.levelIdx = level
+                s.tier = tier
+            }
+            var present = 0
+            if s.decoderModelInfoPresent {
+                present = r.bit()
+                if present == 1 {
+                    // operating_parameters_info( i )
+                    r.bits(bufferDelayLength)
+                    r.bits(bufferDelayLength)
+                    r.bit()
+                }
+            }
+            s.decoderModelPresentForOp.append(present)
+            if initialDisplayDelayPresent {
+                if r.flag() {
+                    r.bits(4)
+                }
+            }
+        }
+    }
+    s.opIdc = s.operatingPointIdc[0]
+    s.frameWidthBits = r.bits(4) + 1
+    s.frameHeightBits = r.bits(4) + 1
+    s.maxFrameWidth = r.bits(s.frameWidthBits) + 1
+    s.maxFrameHeight = r.bits(s.frameHeightBits) + 1
+    if !s.reducedStillPictureHeader {
+        s.frameIdNumbersPresent = r.flag()
+    }
+    if s.frameIdNumbersPresent {
+        s.deltaFrameIdLength = r.bits(4) + 2
+        s.additionalFrameIdLength = r.bits(3) + 1
+    }
+    s.use128 = r.flag()
+    s.enableFilterIntra = r.flag()
+    s.enableIntraEdgeFilter = r.flag()
+    if !s.reducedStillPictureHeader {
+        s.enableInterintraCompound = r.flag()
+        s.enableMaskedCompound = r.flag()
+        s.enableWarpedMotion = r.flag()
+        s.enableDualFilter = r.flag()
+        s.enableOrderHint = r.flag()
+        if s.enableOrderHint {
+            s.enableJntComp = r.flag()
+            s.enableRefFrameMvs = r.flag()
+        }
+        if r.flag() {
+            s.seqForceScreenContentTools = 2
+        } else {
+            s.seqForceScreenContentTools = r.bit()
+        }
+        if s.seqForceScreenContentTools > 0 {
+            if r.flag() {
+                s.seqForceIntegerMv = 2
+            } else {
+                s.seqForceIntegerMv = r.bit()
+            }
+        } else {
+            s.seqForceIntegerMv = 2
+        }
+        if s.enableOrderHint {
+            s.orderHintBits = r.bits(3) + 1
+        }
+    }
+    s.enableSuperres = r.flag()
+    s.enableCdef = r.flag()
+    s.enableRestoration = r.flag()
+    // color_config( ) (5.5.2)
+    let highBitdepth = r.flag()
+    if s.profile == 2 && highBitdepth {
+        s.bitDepth = if r.flag() { 12 } else { 10 }
+    } else {
+        s.bitDepth = if highBitdepth { 10 } else { 8 }
+    }
+    if s.profile != 1 {
+        s.monochrome = r.flag()
+    }
+    if r.flag() {
+        s.colorPrimaries = r.bits(8)
+        s.transferCharacteristics = r.bits(8)
+        s.matrixCoefficients = r.bits(8)
+    }
+    if s.monochrome {
+        s.colorRange = r.bit()
+        s.subX = 1
+        s.subY = 1
+        s.separateUvDeltaQ = false
+    } else {
+        if s.colorPrimaries == 1 && s.transferCharacteristics == 13 && s.matrixCoefficients == 0 {
+            s.colorRange = 1
+            s.subX = 0
+            s.subY = 0
+        } else {
+            s.colorRange = r.bit()
+            if s.profile == 0 {
+                s.subX = 1
+                s.subY = 1
+            } else if s.profile == 1 {
+                s.subX = 0
+                s.subY = 0
+            } else {
+                if s.bitDepth == 12 {
+                    s.subX = r.bit()
+                    if s.subX == 1 {
+                        s.subY = r.bit()
+                    } else {
+                        s.subY = 0
+                    }
+                } else {
+                    s.subX = 1
+                    s.subY = 0
+                }
+            }
+            if s.subX == 1 && s.subY == 1 {
+                s.chromaSamplePosition = r.bits(2)
+            }
+        }
+        s.separateUvDeltaQ = r.flag()
+    }
+    s.filmGrainParamsPresent = r.flag()
+    s.ok = !r.overrun
+    s
+}
+
+// The header-level state saved with each reference slot (7.20).
+struct Av1Slot {
+    valid: Bool = false
+    frameId: Int = 0
+    frameType: Int = 0
+    orderHint: Int = 0
+    savedOrderHints: [Int] = [0, 0, 0, 0, 0, 0, 0, 0]
+    upscaledWidth: Int = 0
+    frameWidth: Int = 0
+    frameHeight: Int = 0
+    renderWidth: Int = 0
+    renderHeight: Int = 0
+    miCols: Int = 0
+    miRows: Int = 0
+    subX: Int = 1
+    subY: Int = 1
+    bitDepth: Int = 8
+    showableFrame: Bool = false
+    gmParams: [Int] = []
+    lfRefDeltas: [Int] = [1, 0, 0, 0, -1, 0, -1, -1]
+    lfModeDeltas: [Int] = [0, 0]
+    featureEnabled: [Int] = []
+    featureData: [Int] = []
+    grain: Av1Grain = Av1Grain()
+}
+
+// The frame header: what the reconstructor needs (h) and what only the
+// parser needs.
+struct Av1Fh {
+    h: Av1Hdr = Av1Hdr()
+    temporalId: Int = 0
+    spatialId: Int = 0
+    frameIsIntra: Bool = false
+    disableCdfUpdate: Bool = false
+    allowScreenContentTools: Bool = false
+    currentFrameId: Int = 0
+    frameSizeOverride: Bool = false
+    primaryRefFrame: Int = 7
+    disableFrameEndUpdateCdf: Bool = true
+    isMotionModeSwitchable: Bool = false
+    useRefFrameMvs: Bool = false
+    interpolationFilter: Int = 0
+    refFrameSignBias: [Int] = [0, 0, 0, 0, 0, 0, 0, 0]
+    reducedTxSet: Bool = false
+    txMode: Int = 0
+    referenceSelect: Bool = false
+    skipModePresent: Bool = false
+    skipModeFrame: [Int] = [0, 0]
+    // Tile info (5.9.15).
+    tileCols: Int = 1
+    tileRows: Int = 1
+    tileColsLog2: Int = 0
+    tileRowsLog2: Int = 0
+    miColStarts: [Int] = []
+    miRowStarts: [Int] = []
+    contextUpdateTileId: Int = 0
+    tileSizeBytes: Int = 4
+    // Quantization (5.9.12).
+    baseQIdx: Int = 0
+    deltaQYDc: Int = 0
+    deltaQUDc: Int = 0
+    deltaQUAc: Int = 0
+    deltaQVDc: Int = 0
+    deltaQVAc: Int = 0
+    usingQmatrix: Bool = false
+    qmY: Int = 15
+    qmU: Int = 15
+    qmV: Int = 15
+    // SegQMLevel[ plane ][ segment ] at plane * 8 + segment.
+    segQMLevel: [Int] = []
+    losslessArray: [Int] = [0, 0, 0, 0, 0, 0, 0, 0]
+    // Segmentation (5.9.14).
+    segmentationUpdateMap: Bool = false
+    segmentationTemporalUpdate: Bool = false
+    segmentationUpdateData: Bool = false
+    segIdPreSkip: Bool = false
+    lastActiveSegId: Int = 0
+    // Delta q / lf (5.9.17, 5.9.18).
+    deltaQPresent: Bool = false
+    deltaQRes: Int = 0
+    deltaLfRes: Int = 0
+    // PrevGmParams for reading global motion.
+    prevGmParams: [Int] = []
+    // Size of the header in bytes when it ends a frame OBU's header part.
+    headerBytes: Int = 0
+}
+
+// get_relative_dist( a, b ) (5.9.29 / 7.12…).
+fn av1RelDist(_ a: Int, _ b: Int, _ enable: Bool, _ bits: Int) -> Int {
+    if !enable {
+        return 0
+    }
+    let diff = a - b
+    let m = 1 << (bits - 1)
+    (diff & (m - 1)) - (diff & m)
+}
+
+fn av1DefaultGm() -> [Int] {
+    var g: [Int] = []
+    for _ in 0..8 {
+        g += [0, 0, 65536, 0, 0, 65536]
+    }
+    g
+}
+
+fn av1Zeros(_ n: Int) -> [Int] {
+    var out: [Int] = []
+    for _ in 0..n {
+        out.append(0)
+    }
+    out
+}
+
+// Header parsing with the slot state it needs.
+struct Av1Headers {
+    seq: Av1Seq = Av1Seq()
+    slots: [Av1Slot] = []
+    fh: Av1Fh = Av1Fh()
+    r: core.BitReader = core.bitReader(Data())
+    // State that persists from frame to frame.
+    lfRefDeltas: [Int] = [1, 0, 0, 0, -1, 0, -1, -1]
+    lfModeDeltas: [Int] = [0, 0]
+    featureEnabled: [Int] = []
+    featureData: [Int] = []
+    grain: Av1Grain = Av1Grain()
+    error: String = ""
+
+    fn setup() {
+        if slots.isEmpty {
+            for _ in 0..8 {
+                var s = Av1Slot()
+                s.gmParams = av1DefaultGm()
+                s.featureEnabled = av1Zeros(64)
+                s.featureData = av1Zeros(64)
+                slots.append(s)
+            }
+            featureEnabled = av1Zeros(64)
+            featureData = av1Zeros(64)
+        }
+    }
+
+    fn reset() {
+        setup()
+        for i in 0..8 {
+            slots[i].valid = false
+        }
+    }
+
+    fn su(_ n: Int) -> Int {
+        let v = r.bits(n)
+        let m = 1 << (n - 1)
+        if (v & m) != 0 {
+            return v - 2 * m
+        }
+        v
+    }
+
+    // ns(n) (4.10.7).
+    fn ns(_ n: Int) -> Int {
+        var w = 0
+        var x = n
+        while x != 0 {
+            x = x >> 1
+            w += 1
+        }
+        let m = (1 << w) - n
+        let v = r.bits(w - 1)
+        if v < m {
+            return v
+        }
+        let extra = r.bit()
+        (v << 1) - m + extra
+    }
+
+    fn relDist(_ a: Int, _ b: Int) -> Int {
+        av1RelDist(a, b, seq.enableOrderHint, seq.orderHintBits)
+    }
+
+    // uncompressed_header( ) (5.9.2). `r` must be set to the header's
+    // first bit. Returns false on an error (error set).
+    fn frameHeader(temporalId: Int, spatialId: Int) -> Bool {
+        setup()
+        let s = seq
+        var f = Av1Fh()
+        f.temporalId = temporalId
+        f.spatialId = spatialId
+        var h = Av1Hdr()
+        h.profile = s.profile
+        h.bitDepth = s.bitDepth
+        h.monochrome = s.monochrome
+        h.numPlanes = if s.monochrome { 1 } else { 3 }
+        h.subX = s.subX
+        h.subY = s.subY
+        h.colorPrimaries = s.colorPrimaries
+        h.transferCharacteristics = s.transferCharacteristics
+        h.matrixCoefficients = s.matrixCoefficients
+        h.fullRange = s.colorRange == 1
+        h.use128 = s.use128
+        h.enableFilterIntra = s.enableFilterIntra
+        h.enableIntraEdgeFilter = s.enableIntraEdgeFilter
+        h.enableOrderHint = s.enableOrderHint
+        h.orderHintBits = s.orderHintBits
+        h.enableSuperres = s.enableSuperres
+        h.enableCdef = s.enableCdef
+        h.enableRestoration = s.enableRestoration
+        h.filmGrainParamsPresent = s.filmGrainParamsPresent
+        h.gmParams = av1DefaultGm()
+        var idLen = 0
+        if s.frameIdNumbersPresent {
+            idLen = s.additionalFrameIdLength + s.deltaFrameIdLength
+        }
+        let allFrames = 255
+        if s.reducedStillPictureHeader {
+            h.showExistingFrame = false
+            h.frameType = av1KeyFrame
+            f.frameIsIntra = true
+            h.showFrame = true
+            h.showableFrame = false
+        } else {
+            h.showExistingFrame = r.flag()
+            if h.showExistingFrame {
+                h.frameToShowMapIdx = r.bits(3)
+                if s.decoderModelInfoPresent && !s.equalPictureInterval {
+                    r.bits(s.framePresentationTimeLength)
+                }
+                h.refreshFrameFlags = 0
+                if s.frameIdNumbersPresent {
+                    r.bits(idLen)
+                }
+                let sl = slots[h.frameToShowMapIdx]
+                h.frameType = sl.frameType
+                if h.frameType == av1KeyFrame {
+                    h.refreshFrameFlags = allFrames
+                }
+                if s.filmGrainParamsPresent {
+                    h.grain = sl.grain
+                }
+                // The shown frame's sizes (7.21) for the reconstructor.
+                h.upscaledWidth = sl.upscaledWidth
+                h.frameWidth = sl.frameWidth
+                h.frameHeight = sl.frameHeight
+                h.renderWidth = sl.renderWidth
+                h.renderHeight = sl.renderHeight
+                h.miCols = sl.miCols
+                h.miRows = sl.miRows
+                h.orderHint = sl.orderHint
+                f.h = h
+                fh = f
+                if !sl.valid {
+                    error = "show_existing_frame of an empty slot"
+                    return false
+                }
+                return true
+            }
+            h.frameType = r.bits(2)
+            f.frameIsIntra = h.frameType == av1IntraOnlyFrame || h.frameType == av1KeyFrame
+            h.showFrame = r.flag()
+            if h.showFrame && s.decoderModelInfoPresent && !s.equalPictureInterval {
+                r.bits(s.framePresentationTimeLength)
+            }
+            if h.showFrame {
+                h.showableFrame = h.frameType != av1KeyFrame
+            } else {
+                h.showableFrame = r.flag()
+            }
+            if h.frameType == av1SwitchFrame || (h.frameType == av1KeyFrame && h.showFrame) {
+                h.errorResilientMode = true
+            } else {
+                h.errorResilientMode = r.flag()
+            }
+        }
+        if h.frameType == av1KeyFrame && h.showFrame {
+            for i in 0..8 {
+                slots[i].valid = false
+                slots[i].orderHint = 0
+            }
+            for i in 0..7 {
+                h.orderHints[1 + i] = 0
+            }
+        }
+        f.disableCdfUpdate = r.flag()
+        if s.seqForceScreenContentTools == 2 {
+            f.allowScreenContentTools = r.flag()
+        } else {
+            f.allowScreenContentTools = s.seqForceScreenContentTools == 1
+        }
+        if f.allowScreenContentTools {
+            if s.seqForceIntegerMv == 2 {
+                h.forceIntegerMv = r.flag()
+            } else {
+                h.forceIntegerMv = s.seqForceIntegerMv == 1
+            }
+        } else {
+            h.forceIntegerMv = false
+        }
+        if f.frameIsIntra {
+            h.forceIntegerMv = true
+        }
+        if s.frameIdNumbersPresent {
+            f.currentFrameId = r.bits(idLen)
+            // mark_ref_frames( idLen )
+            let diffLen = s.deltaFrameIdLength
+            for i in 0..8 {
+                let rid = slots[i].frameId
+                let cur = f.currentFrameId
+                if cur > (1 << diffLen) {
+                    if rid > cur || rid < (cur - (1 << diffLen)) {
+                        slots[i].valid = false
+                    }
+                } else {
+                    if rid > cur && rid < ((1 << idLen) + cur - (1 << diffLen)) {
+                        slots[i].valid = false
+                    }
+                }
+            }
+        }
+        if h.frameType == av1SwitchFrame {
+            f.frameSizeOverride = true
+        } else if s.reducedStillPictureHeader {
+            f.frameSizeOverride = false
+        } else {
+            f.frameSizeOverride = r.flag()
+        }
+        h.orderHint = r.bits(s.orderHintBits)
+        if f.frameIsIntra || h.errorResilientMode {
+            f.primaryRefFrame = av1PrimaryRefNone
+        } else {
+            f.primaryRefFrame = r.bits(3)
+        }
+        if s.decoderModelInfoPresent {
+            if r.flag() {
+                for opNum in 0..s.operatingPointsCount {
+                    if s.decoderModelPresentForOp[opNum] == 1 {
+                        let opPtIdc = s.operatingPointIdc[opNum]
+                        let inT = (opPtIdc >> temporalId) & 1
+                        let inS = (opPtIdc >> (spatialId + 8)) & 1
+                        if opPtIdc == 0 || (inT == 1 && inS == 1) {
+                            r.bits(s.bufferRemovalTimeLength)
+                        }
+                    }
+                }
+            }
+        }
+        h.allowHighPrecisionMv = false
+        f.useRefFrameMvs = false
+        h.allowIntrabc = false
+        if h.frameType == av1SwitchFrame || (h.frameType == av1KeyFrame && h.showFrame) {
+            h.refreshFrameFlags = allFrames
+        } else {
+            h.refreshFrameFlags = r.bits(8)
+        }
+        if !f.frameIsIntra || h.refreshFrameFlags != allFrames {
+            if h.errorResilientMode && s.enableOrderHint {
+                for i in 0..8 {
+                    let roh = r.bits(s.orderHintBits)
+                    if roh != slots[i].orderHint {
+                        slots[i].valid = false
+                        // libaom/dav1d treat the slot as a (blank) frame
+                        // with this order hint from now on.
+                        slots[i].orderHint = roh
+                    }
+                }
+            }
+        }
+        f.h = h
+        fh = f
+        if f.frameIsIntra {
+            frameSize()
+            renderSize()
+            if fh.allowScreenContentTools && fh.h.upscaledWidth == fh.h.frameWidth {
+                fh.h.allowIntrabc = r.flag()
+            }
+        } else {
+            var shortSignaling = false
+            if s.enableOrderHint {
+                shortSignaling = r.flag()
+                if shortSignaling {
+                    let lastIdx = r.bits(3)
+                    let goldIdx = r.bits(3)
+                    setFrameRefs(lastIdx, goldIdx)
+                }
+            }
+            for i in 0..7 {
+                if !shortSignaling {
+                    fh.h.refFrameIdx[i] = r.bits(3)
+                }
+                if s.frameIdNumbersPresent {
+                    r.bits(s.deltaFrameIdLength)
+                }
+            }
+            if fh.frameSizeOverride && !fh.h.errorResilientMode {
+                frameSizeWithRefs()
+            } else {
+                frameSize()
+                renderSize()
+            }
+            if fh.h.forceIntegerMv {
+                fh.h.allowHighPrecisionMv = false
+            } else {
+                fh.h.allowHighPrecisionMv = r.flag()
+            }
+            // read_interpolation_filter( )
+            if r.flag() {
+                fh.interpolationFilter = 4
+            } else {
+                fh.interpolationFilter = r.bits(2)
+            }
+            fh.isMotionModeSwitchable = r.flag()
+            if fh.h.errorResilientMode || !s.enableRefFrameMvs {
+                fh.useRefFrameMvs = false
+            } else {
+                fh.useRefFrameMvs = r.flag()
+            }
+            for i in 0..7 {
+                let refFrame = 1 + i
+                let hint = slots[fh.h.refFrameIdx[i]].orderHint
+                fh.h.orderHints[refFrame] = hint
+                if !s.enableOrderHint {
+                    fh.refFrameSignBias[refFrame] = 0
+                } else {
+                    fh.refFrameSignBias[refFrame] = if relDist(hint, fh.h.orderHint) > 0 { 1 } else { 0 }
+                }
+            }
+        }
+        if s.reducedStillPictureHeader || fh.disableCdfUpdate {
+            fh.disableFrameEndUpdateCdf = true
+        } else {
+            fh.disableFrameEndUpdateCdf = r.flag()
+        }
+        if fh.primaryRefFrame == av1PrimaryRefNone {
+            // setup_past_independence( ) (header part)
+            featureEnabled = av1Zeros(64)
+            featureData = av1Zeros(64)
+            fh.prevGmParams = av1DefaultGm()
+            lfRefDeltas = [1, 0, 0, 0, -1, 0, -1, -1]
+            lfModeDeltas = [0, 0]
+            fh.h.loopFilterDeltaEnabled = true
+        } else {
+            // load_previous( )
+            let prev = slots[fh.h.refFrameIdx[fh.primaryRefFrame]]
+            fh.prevGmParams = prev.gmParams
+            lfRefDeltas = prev.lfRefDeltas
+            lfModeDeltas = prev.lfModeDeltas
+            featureEnabled = prev.featureEnabled
+            featureData = prev.featureData
+        }
+        tileInfo()
+        quantizationParams()
+        segmentationParams()
+        // delta_q_params( )
+        fh.deltaQRes = 0
+        fh.deltaQPresent = false
+        if fh.baseQIdx > 0 {
+            fh.deltaQPresent = r.flag()
+        }
+        if fh.deltaQPresent {
+            fh.deltaQRes = r.bits(2)
+        }
+        // delta_lf_params( )
+        fh.h.deltaLfPresent = false
+        fh.deltaLfRes = 0
+        fh.h.deltaLfMulti = false
+        if fh.deltaQPresent {
+            if !fh.h.allowIntrabc {
+                fh.h.deltaLfPresent = r.flag()
+            }
+            if fh.h.deltaLfPresent {
+                fh.deltaLfRes = r.bits(2)
+                fh.h.deltaLfMulti = r.flag()
+            }
+        }
+        var coded = true
+        fh.segQMLevel = av1Zeros(24)
+        for seg in 0..8 {
+            let q = qindex(true, seg, 0)
+            let lossless = q == 0 && fh.deltaQYDc == 0 && fh.deltaQUAc == 0 && fh.deltaQUDc == 0 && fh.deltaQVAc == 0 && fh.deltaQVDc == 0
+            fh.losslessArray[seg] = if lossless { 1 } else { 0 }
+            if !lossless {
+                coded = false
+            }
+            if fh.usingQmatrix {
+                if lossless {
+                    fh.segQMLevel[seg] = 15
+                    fh.segQMLevel[8 + seg] = 15
+                    fh.segQMLevel[16 + seg] = 15
+                } else {
+                    fh.segQMLevel[seg] = fh.qmY
+                    fh.segQMLevel[8 + seg] = fh.qmU
+                    fh.segQMLevel[16 + seg] = fh.qmV
+                }
+            }
+        }
+        fh.h.codedLossless = coded
+        fh.h.allLossless = coded && fh.h.frameWidth == fh.h.upscaledWidth
+        loopFilterParams()
+        cdefParams()
+        lrParams()
+        // read_tx_mode( )
+        if fh.h.codedLossless {
+            fh.txMode = 0
+        } else {
+            fh.txMode = if r.flag() { 2 } else { 1 }
+        }
+        // frame_reference_mode( )
+        if fh.frameIsIntra {
+            fh.referenceSelect = false
+        } else {
+            fh.referenceSelect = r.flag()
+        }
+        skipModeParams()
+        if fh.frameIsIntra || fh.h.errorResilientMode || !s.enableWarpedMotion {
+            fh.h.allowWarpedMotion = false
+        } else {
+            fh.h.allowWarpedMotion = r.flag()
+        }
+        fh.reducedTxSet = r.flag()
+        globalMotionParams()
+        filmGrainParams()
+        fh.h.loopFilterRefDeltas = lfRefDeltas
+        fh.h.loopFilterModeDeltas = lfModeDeltas
+        fh.h.featureEnabled = featureEnabled
+        fh.h.featureData = featureData
+        if r.overrun {
+            error = "frame header cut short"
+            return false
+        }
+        // Larger than any AV1 level allows (8192x4352): damaged.
+        if fh.h.upscaledWidth > 16384 || fh.h.frameHeight > 16384 || fh.h.upscaledWidth * fh.h.frameHeight > 8192 * 4352 {
+            error = "frame size {fh.h.upscaledWidth}x{fh.h.frameHeight} is too large"
+            return false
+        }
+        true
+    }
+
+    // get_qindex( ignoreDeltaQ, segmentId ) (7.12.2) with CurrentQIndex.
+    fn qindex(_ ignoreDeltaQ: Bool, _ seg: Int, _ currentQ: Int) -> Int {
+        if fh.h.segmentationEnabled && featureEnabled[seg * 8] == 1 {
+            let data = featureData[seg * 8]
+            var q = fh.baseQIdx + data
+            if !ignoreDeltaQ && fh.deltaQPresent {
+                q = currentQ + data
+            }
+            return min(max(q, 0), 255)
+        }
+        if !ignoreDeltaQ && fh.deltaQPresent {
+            return currentQ
+        }
+        fh.baseQIdx
+    }
+
+    // frame_size( ) with superres_params( ) and compute_image_size( ).
+    fn frameSize() {
+        if fh.frameSizeOverride {
+            fh.h.frameWidth = r.bits(seq.frameWidthBits) + 1
+            fh.h.frameHeight = r.bits(seq.frameHeightBits) + 1
+        } else {
+            fh.h.frameWidth = seq.maxFrameWidth
+            fh.h.frameHeight = seq.maxFrameHeight
+        }
+        superresParams()
+        computeImageSize()
+    }
+
+    fn superresParams() {
+        if seq.enableSuperres {
+            fh.h.useSuperres = r.flag()
+        } else {
+            fh.h.useSuperres = false
+        }
+        if fh.h.useSuperres {
+            fh.h.superresDenom = r.bits(3) + 9
+        } else {
+            fh.h.superresDenom = 8
+        }
+        fh.h.upscaledWidth = fh.h.frameWidth
+        fh.h.frameWidth = (fh.h.upscaledWidth * 8 + (fh.h.superresDenom / 2)) / fh.h.superresDenom
+    }
+
+    fn computeImageSize() {
+        fh.h.miCols = 2 * ((fh.h.frameWidth + 7) >> 3)
+        fh.h.miRows = 2 * ((fh.h.frameHeight + 7) >> 3)
+    }
+
+    fn renderSize() {
+        if r.flag() {
+            fh.h.renderWidth = r.bits(16) + 1
+            fh.h.renderHeight = r.bits(16) + 1
+        } else {
+            fh.h.renderWidth = fh.h.upscaledWidth
+            fh.h.renderHeight = fh.h.frameHeight
+        }
+    }
+
+    // frame_size_with_refs( ) (5.9.7).
+    fn frameSizeWithRefs() {
+        var found = false
+        for i in 0..7 {
+            if r.flag() {
+                let sl = slots[fh.h.refFrameIdx[i]]
+                fh.h.upscaledWidth = sl.upscaledWidth
+                fh.h.frameWidth = fh.h.upscaledWidth
+                fh.h.frameHeight = sl.frameHeight
+                fh.h.renderWidth = sl.renderWidth
+                fh.h.renderHeight = sl.renderHeight
+                found = true
+                break
+            }
+        }
+        if !found {
+            frameSize()
+            renderSize()
+        } else {
+            superresParams()
+            computeImageSize()
+        }
+    }
+
+    // Set frame refs process (7.8).
+    fn setFrameRefs(_ lastIdx: Int, _ goldIdx: Int) {
+        var idx: [Int] = [-1, -1, -1, -1, -1, -1, -1]
+        idx[0] = lastIdx
+        idx[3] = goldIdx
+        var used: [Int] = [0, 0, 0, 0, 0, 0, 0, 0]
+        used[lastIdx] = 1
+        used[goldIdx] = 1
+        let curFrameHint = 1 << (seq.orderHintBits - 1)
+        var shifted: [Int] = []
+        for i in 0..8 {
+            shifted.append(curFrameHint + relDist(slots[i].orderHint, fh.h.orderHint))
+        }
+        // ALTREF: latest backward.
+        var ref = -1
+        var best = 0
+        for i in 0..8 {
+            let hint = shifted[i]
+            if used[i] == 0 && hint >= curFrameHint && (ref < 0 || hint >= best) {
+                ref = i
+                best = hint
+            }
+        }
+        if ref >= 0 {
+            idx[6] = ref
+            used[ref] = 1
+        }
+        // BWDREF: earliest backward.
+        ref = -1
+        for i in 0..8 {
+            let hint = shifted[i]
+            if used[i] == 0 && hint >= curFrameHint && (ref < 0 || hint < best) {
+                ref = i
+                best = hint
+            }
+        }
+        if ref >= 0 {
+            idx[4] = ref
+            used[ref] = 1
+        }
+        // ALTREF2: next earliest backward.
+        ref = -1
+        for i in 0..8 {
+            let hint = shifted[i]
+            if used[i] == 0 && hint >= curFrameHint && (ref < 0 || hint < best) {
+                ref = i
+                best = hint
+            }
+        }
+        if ref >= 0 {
+            idx[5] = ref
+            used[ref] = 1
+        }
+        // The rest: forward references, latest first.
+        let refFrameList = [2, 3, 5, 6, 7]
+        for k in 0..5 {
+            let refFrame = refFrameList[k]
+            if idx[refFrame - 1] < 0 {
+                ref = -1
+                for i in 0..8 {
+                    let hint = shifted[i]
+                    if used[i] == 0 && hint < curFrameHint && (ref < 0 || hint >= best) {
+                        ref = i
+                        best = hint
+                    }
+                }
+                if ref >= 0 {
+                    idx[refFrame - 1] = ref
+                    used[ref] = 1
+                }
+            }
+        }
+        ref = -1
+        for i in 0..8 {
+            let hint = shifted[i]
+            if ref < 0 || hint < best {
+                ref = i
+                best = hint
+            }
+        }
+        for i in 0..7 {
+            if idx[i] < 0 {
+                idx[i] = ref
+            }
+        }
+        fh.h.refFrameIdx = idx
+    }
+
+    // tile_info( ) (5.9.15).
+    fn tileInfo() {
+        let miCols = fh.h.miCols
+        let miRows = fh.h.miRows
+        let use128 = seq.use128
+        let sbCols = if use128 { (miCols + 31) >> 5 } else { (miCols + 15) >> 4 }
+        let sbRows = if use128 { (miRows + 31) >> 5 } else { (miRows + 15) >> 4 }
+        let sbShift = if use128 { 5 } else { 4 }
+        let sbSize = sbShift + 2
+        let maxTileWidthSb = 4096 >> sbSize
+        var maxTileAreaSb = (4096 * 2304) >> (2 * sbSize)
+        let minLog2TileCols = av1TileLog2(maxTileWidthSb, sbCols)
+        let maxLog2TileCols = av1TileLog2(1, min(sbCols, 64))
+        let maxLog2TileRows = av1TileLog2(1, min(sbRows, 64))
+        let minLog2Tiles = max(minLog2TileCols, av1TileLog2(maxTileAreaSb, sbRows * sbCols))
+        var colStarts: [Int] = []
+        var rowStarts: [Int] = []
+        if r.flag() {
+            var tcl = minLog2TileCols
+            while tcl < maxLog2TileCols {
+                if r.flag() {
+                    tcl += 1
+                } else {
+                    break
+                }
+            }
+            let tileWidthSb = (sbCols + (1 << tcl) - 1) >> tcl
+            var startSb = 0
+            while startSb < sbCols {
+                colStarts.append(startSb << sbShift)
+                startSb += tileWidthSb
+            }
+            colStarts.append(miCols)
+            fh.tileColsLog2 = tcl
+            let minLog2TileRows = max(minLog2Tiles - tcl, 0)
+            var trl = minLog2TileRows
+            while trl < maxLog2TileRows {
+                if r.flag() {
+                    trl += 1
+                } else {
+                    break
+                }
+            }
+            let tileHeightSb = (sbRows + (1 << trl) - 1) >> trl
+            startSb = 0
+            while startSb < sbRows {
+                rowStarts.append(startSb << sbShift)
+                startSb += tileHeightSb
+            }
+            rowStarts.append(miRows)
+            fh.tileRowsLog2 = trl
+        } else {
+            var widestTileSb = 0
+            var startSb = 0
+            while startSb < sbCols {
+                colStarts.append(startSb << sbShift)
+                let maxWidth = min(sbCols - startSb, maxTileWidthSb)
+                let sizeSb = ns(maxWidth) + 1
+                widestTileSb = max(sizeSb, widestTileSb)
+                startSb += sizeSb
+                if r.overrun {
+                    break
+                }
+            }
+            colStarts.append(miCols)
+            fh.tileColsLog2 = av1TileLog2(1, colStarts.count - 1)
+            if minLog2Tiles > 0 {
+                maxTileAreaSb = (sbRows * sbCols) >> (minLog2Tiles + 1)
+            } else {
+                maxTileAreaSb = sbRows * sbCols
+            }
+            let maxTileHeightSb = max(maxTileAreaSb / max(widestTileSb, 1), 1)
+            startSb = 0
+            while startSb < sbRows {
+                rowStarts.append(startSb << sbShift)
+                let maxHeight = min(sbRows - startSb, maxTileHeightSb)
+                let sizeSb = ns(maxHeight) + 1
+                startSb += sizeSb
+                if r.overrun {
+                    break
+                }
+            }
+            rowStarts.append(miRows)
+            fh.tileRowsLog2 = av1TileLog2(1, rowStarts.count - 1)
+        }
+        fh.miColStarts = colStarts
+        fh.miRowStarts = rowStarts
+        fh.tileCols = colStarts.count - 1
+        fh.tileRows = rowStarts.count - 1
+        if fh.tileColsLog2 > 0 || fh.tileRowsLog2 > 0 {
+            fh.contextUpdateTileId = r.bits(fh.tileRowsLog2 + fh.tileColsLog2)
+            fh.tileSizeBytes = r.bits(2) + 1
+        } else {
+            fh.contextUpdateTileId = 0
+        }
+    }
+
+    fn readDeltaQ() -> Int {
+        if r.flag() {
+            return su(7)
+        }
+        0
+    }
+
+    // quantization_params( ) (5.9.12).
+    fn quantizationParams() {
+        fh.baseQIdx = r.bits(8)
+        fh.deltaQYDc = readDeltaQ()
+        if fh.h.numPlanes > 1 {
+            var diffUvDelta = false
+            if seq.separateUvDeltaQ {
+                diffUvDelta = r.flag()
+            }
+            fh.deltaQUDc = readDeltaQ()
+            fh.deltaQUAc = readDeltaQ()
+            if diffUvDelta {
+                fh.deltaQVDc = readDeltaQ()
+                fh.deltaQVAc = readDeltaQ()
+            } else {
+                fh.deltaQVDc = fh.deltaQUDc
+                fh.deltaQVAc = fh.deltaQUAc
+            }
+        } else {
+            fh.deltaQUDc = 0
+            fh.deltaQUAc = 0
+            fh.deltaQVDc = 0
+            fh.deltaQVAc = 0
+        }
+        fh.usingQmatrix = r.flag()
+        if fh.usingQmatrix {
+            fh.qmY = r.bits(4)
+            fh.qmU = r.bits(4)
+            if !seq.separateUvDeltaQ {
+                fh.qmV = fh.qmU
+            } else {
+                fh.qmV = r.bits(4)
+            }
+        }
+    }
+
+    // segmentation_params( ) (5.9.14).
+    fn segmentationParams() {
+        let bitsTab = [8, 6, 6, 6, 6, 3, 0, 0]
+        let signedTab = [1, 1, 1, 1, 1, 0, 0, 0]
+        let maxTab = [255, 63, 63, 63, 63, 7, 0, 0]
+        fh.h.segmentationEnabled = r.flag()
+        if fh.h.segmentationEnabled {
+            if fh.primaryRefFrame == av1PrimaryRefNone {
+                fh.segmentationUpdateMap = true
+                fh.segmentationTemporalUpdate = false
+                fh.segmentationUpdateData = true
+            } else {
+                fh.segmentationUpdateMap = r.flag()
+                if fh.segmentationUpdateMap {
+                    fh.segmentationTemporalUpdate = r.flag()
+                }
+                fh.segmentationUpdateData = r.flag()
+            }
+            if fh.segmentationUpdateData {
+                for i in 0..8 {
+                    for j in 0..8 {
+                        let en = r.bit()
+                        featureEnabled[i * 8 + j] = en
+                        var clipped = 0
+                        if en == 1 {
+                            let n = bitsTab[j]
+                            let limit = maxTab[j]
+                            if signedTab[j] == 1 {
+                                clipped = min(max(su(1 + n), -limit), limit)
+                            } else {
+                                clipped = min(max(r.bits(n), 0), limit)
+                            }
+                        }
+                        featureData[i * 8 + j] = clipped
+                    }
+                }
+            }
+        } else {
+            featureEnabled = av1Zeros(64)
+            featureData = av1Zeros(64)
+        }
+        fh.segIdPreSkip = false
+        fh.lastActiveSegId = 0
+        for i in 0..8 {
+            for j in 0..8 {
+                if featureEnabled[i * 8 + j] == 1 {
+                    fh.lastActiveSegId = i
+                    if j >= 5 {
+                        fh.segIdPreSkip = true
+                    }
+                }
+            }
+        }
+    }
+
+    // loop_filter_params( ) (5.9.11).
+    fn loopFilterParams() {
+        if fh.h.codedLossless || fh.h.allowIntrabc {
+            fh.h.loopFilterLevel = [0, 0, 0, 0]
+            lfRefDeltas = [1, 0, 0, 0, -1, 0, -1, -1]
+            lfModeDeltas = [0, 0]
+            return
+        }
+        fh.h.loopFilterLevel[0] = r.bits(6)
+        fh.h.loopFilterLevel[1] = r.bits(6)
+        if fh.h.numPlanes > 1 {
+            if fh.h.loopFilterLevel[0] != 0 || fh.h.loopFilterLevel[1] != 0 {
+                fh.h.loopFilterLevel[2] = r.bits(6)
+                fh.h.loopFilterLevel[3] = r.bits(6)
+            }
+        }
+        fh.h.loopFilterSharpness = r.bits(3)
+        fh.h.loopFilterDeltaEnabled = r.flag()
+        if fh.h.loopFilterDeltaEnabled {
+            if r.flag() {
+                for i in 0..8 {
+                    if r.flag() {
+                        lfRefDeltas[i] = su(7)
+                    }
+                }
+                for i in 0..2 {
+                    if r.flag() {
+                        lfModeDeltas[i] = su(7)
+                    }
+                }
+            }
+        }
+    }
+
+    // cdef_params( ) (5.9.19).
+    fn cdefParams() {
+        if fh.h.codedLossless || fh.h.allowIntrabc || !seq.enableCdef {
+            fh.h.cdefBits = 0
+            fh.h.cdefYPriStrength[0] = 0
+            fh.h.cdefYSecStrength[0] = 0
+            fh.h.cdefUVPriStrength[0] = 0
+            fh.h.cdefUVSecStrength[0] = 0
+            fh.h.cdefDamping = 3
+            return
+        }
+        fh.h.cdefDamping = r.bits(2) + 3
+        fh.h.cdefBits = r.bits(2)
+        for i in 0..(1 << fh.h.cdefBits) {
+            fh.h.cdefYPriStrength[i] = r.bits(4)
+            fh.h.cdefYSecStrength[i] = r.bits(2)
+            if fh.h.cdefYSecStrength[i] == 3 {
+                fh.h.cdefYSecStrength[i] += 1
+            }
+            if fh.h.numPlanes > 1 {
+                fh.h.cdefUVPriStrength[i] = r.bits(4)
+                fh.h.cdefUVSecStrength[i] = r.bits(2)
+                if fh.h.cdefUVSecStrength[i] == 3 {
+                    fh.h.cdefUVSecStrength[i] += 1
+                }
+            }
+        }
+    }
+
+    // lr_params( ) (5.9.20).
+    fn lrParams() {
+        if fh.h.allLossless || fh.h.allowIntrabc || !seq.enableRestoration {
+            fh.h.frameRestorationType = [0, 0, 0]
+            fh.h.usesLr = false
+            return
+        }
+        let remap = [0, 3, 1, 2]
+        var uses = false
+        var usesChroma = false
+        for i in 0..fh.h.numPlanes {
+            let t = remap[r.bits(2)]
+            fh.h.frameRestorationType[i] = t
+            if t != 0 {
+                uses = true
+                if i > 0 {
+                    usesChroma = true
+                }
+            }
+        }
+        fh.h.usesLr = uses
+        if uses {
+            var shift = 0
+            if seq.use128 {
+                shift = r.bit()
+                shift += 1
+            } else {
+                shift = r.bit()
+                if shift == 1 {
+                    shift += r.bit()
+                }
+            }
+            let size0 = 256 >> (2 - shift)
+            var uvShift = 0
+            if seq.subX == 1 && seq.subY == 1 && usesChroma {
+                uvShift = r.bit()
+            }
+            fh.h.loopRestorationSize = [size0, size0 >> uvShift, size0 >> uvShift]
+        }
+    }
+
+    // skip_mode_params( ) (5.9.22).
+    fn skipModeParams() {
+        var allowed = false
+        if fh.frameIsIntra || !fh.referenceSelect || !seq.enableOrderHint {
+            allowed = false
+        } else {
+            var forwardIdx = -1
+            var backwardIdx = -1
+            var forwardHint = 0
+            var backwardHint = 0
+            for i in 0..7 {
+                let refHint = slots[fh.h.refFrameIdx[i]].orderHint
+                if relDist(refHint, fh.h.orderHint) < 0 {
+                    if forwardIdx < 0 || relDist(refHint, forwardHint) > 0 {
+                        forwardIdx = i
+                        forwardHint = refHint
+                    }
+                } else if relDist(refHint, fh.h.orderHint) > 0 {
+                    if backwardIdx < 0 || relDist(refHint, backwardHint) < 0 {
+                        backwardIdx = i
+                        backwardHint = refHint
+                    }
+                }
+            }
+            if forwardIdx < 0 {
+                allowed = false
+            } else if backwardIdx >= 0 {
+                allowed = true
+                fh.skipModeFrame = [1 + min(forwardIdx, backwardIdx), 1 + max(forwardIdx, backwardIdx)]
+            } else {
+                var secondIdx = -1
+                var secondHint = 0
+                for i in 0..7 {
+                    let refHint = slots[fh.h.refFrameIdx[i]].orderHint
+                    if relDist(refHint, forwardHint) < 0 {
+                        if secondIdx < 0 || relDist(refHint, secondHint) > 0 {
+                            secondIdx = i
+                            secondHint = refHint
+                        }
+                    }
+                }
+                if secondIdx < 0 {
+                    allowed = false
+                } else {
+                    allowed = true
+                    fh.skipModeFrame = [1 + min(forwardIdx, secondIdx), 1 + max(forwardIdx, secondIdx)]
+                }
+            }
+        }
+        if allowed {
+            fh.skipModePresent = r.flag()
+        } else {
+            fh.skipModePresent = false
+        }
+    }
+
+    // global_motion_params( ) (5.9.24).
+    fn globalMotionParams() {
+        fh.h.gmType = [0, 0, 0, 0, 0, 0, 0, 0]
+        fh.h.gmParams = av1DefaultGm()
+        if fh.frameIsIntra {
+            return
+        }
+        for ref in 1..8 {
+            var type = 0
+            if r.flag() {
+                if r.flag() {
+                    type = 2
+                } else {
+                    type = if r.flag() { 1 } else { 3 }
+                }
+            }
+            fh.h.gmType[ref] = type
+            if type >= 2 {
+                readGlobalParam(type, ref, 2)
+                readGlobalParam(type, ref, 3)
+                if type == 3 {
+                    readGlobalParam(type, ref, 4)
+                    readGlobalParam(type, ref, 5)
+                } else {
+                    fh.h.gmParams[ref * 6 + 4] = -fh.h.gmParams[ref * 6 + 3]
+                    fh.h.gmParams[ref * 6 + 5] = fh.h.gmParams[ref * 6 + 2]
+                }
+            }
+            if type >= 1 {
+                readGlobalParam(type, ref, 0)
+                readGlobalParam(type, ref, 1)
+            }
+        }
+    }
+
+    // read_global_param( type, ref, idx ) (5.9.25).
+    fn readGlobalParam(_ type: Int, _ ref: Int, _ idx: Int) {
+        var absBits = 12
+        var precBits = 15
+        if idx < 2 {
+            if type == 1 {
+                let hp = if fh.h.allowHighPrecisionMv { 0 } else { 1 }
+                absBits = 9 - hp
+                precBits = 3 - hp
+            } else {
+                absBits = 12
+                precBits = 6
+            }
+        }
+        let precDiff = 16 - precBits
+        let round = if (idx % 3) == 2 { 1 << 16 } else { 0 }
+        let sub = if (idx % 3) == 2 { 1 << precBits } else { 0 }
+        let mx = 1 << absBits
+        let rr = (fh.prevGmParams[ref * 6 + idx] >> precDiff) - sub
+        fh.h.gmParams[ref * 6 + idx] = (decodeSignedSubexpWithRef(-mx, mx + 1, rr) << precDiff) + round
+    }
+
+    fn decodeSignedSubexpWithRef(_ low: Int, _ high: Int, _ rr: Int) -> Int {
+        let x = decodeUnsignedSubexpWithRef(high - low, rr - low)
+        x + low
+    }
+
+    fn decodeUnsignedSubexpWithRef(_ mx: Int, _ rr: Int) -> Int {
+        let v = decodeSubexp(mx)
+        if (rr << 1) <= mx {
+            return av1InverseRecenter(rr, v)
+        }
+        mx - 1 - av1InverseRecenter(mx - 1 - rr, v)
+    }
+
+    fn decodeSubexp(_ numSyms: Int) -> Int {
+        var i = 0
+        var mk = 0
+        let k = 3
+        while true {
+            let b2 = if i > 0 { k + i - 1 } else { k }
+            let a = 1 << b2
+            if numSyms <= mk + 3 * a {
+                return ns(numSyms - mk) + mk
+            } else {
+                if r.flag() {
+                    i += 1
+                    mk += a
+                } else {
+                    return r.bits(b2) + mk
+                }
+            }
+            if r.overrun {
+                return 0
+            }
+        }
+        0
+    }
+
+    // film_grain_params( ) (5.9.30).
+    fn filmGrainParams() {
+        if !seq.filmGrainParamsPresent || (!fh.h.showFrame && !fh.h.showableFrame) {
+            fh.h.grain = Av1Grain()
+            return
+        }
+        var g = Av1Grain()
+        g.applyGrain = r.flag()
+        if !g.applyGrain {
+            fh.h.grain = Av1Grain()
+            return
+        }
+        g.grainSeed = r.bits(16)
+        if fh.h.frameType == av1InterFrame {
+            g.updateGrain = r.flag()
+        } else {
+            g.updateGrain = true
+        }
+        if !g.updateGrain {
+            let refIdx = r.bits(3)
+            let seed = g.grainSeed
+            g = slots[refIdx].grain
+            g.grainSeed = seed
+            fh.h.grain = g
+            return
+        }
+        g.numYPoints = r.bits(4)
+        for _ in 0..g.numYPoints {
+            g.pointYValue.append(r.bits(8))
+            g.pointYScaling.append(r.bits(8))
+        }
+        if seq.monochrome {
+            g.chromaScalingFromLuma = false
+        } else {
+            g.chromaScalingFromLuma = r.flag()
+        }
+        if seq.monochrome || g.chromaScalingFromLuma || (seq.subX == 1 && seq.subY == 1 && g.numYPoints == 0) {
+            g.numCbPoints = 0
+            g.numCrPoints = 0
+        } else {
+            g.numCbPoints = r.bits(4)
+            for _ in 0..g.numCbPoints {
+                g.pointCbValue.append(r.bits(8))
+                g.pointCbScaling.append(r.bits(8))
+            }
+            g.numCrPoints = r.bits(4)
+            for _ in 0..g.numCrPoints {
+                g.pointCrValue.append(r.bits(8))
+                g.pointCrScaling.append(r.bits(8))
+            }
+        }
+        g.grainScalingMinus8 = r.bits(2)
+        g.arCoeffLag = r.bits(2)
+        let numPosLuma = 2 * g.arCoeffLag * (g.arCoeffLag + 1)
+        var numPosChroma = numPosLuma
+        if g.numYPoints > 0 {
+            numPosChroma = numPosLuma + 1
+            for _ in 0..numPosLuma {
+                g.arCoeffsYPlus128.append(r.bits(8))
+            }
+        }
+        if g.chromaScalingFromLuma || g.numCbPoints > 0 {
+            for _ in 0..numPosChroma {
+                g.arCoeffsCbPlus128.append(r.bits(8))
+            }
+        }
+        if g.chromaScalingFromLuma || g.numCrPoints > 0 {
+            for _ in 0..numPosChroma {
+                g.arCoeffsCrPlus128.append(r.bits(8))
+            }
+        }
+        g.arCoeffShiftMinus6 = r.bits(2)
+        g.grainScaleShift = r.bits(2)
+        if g.numCbPoints > 0 {
+            g.cbMult = r.bits(8)
+            g.cbLumaMult = r.bits(8)
+            g.cbOffset = r.bits(9)
+        }
+        if g.numCrPoints > 0 {
+            g.crMult = r.bits(8)
+            g.crLumaMult = r.bits(8)
+            g.crOffset = r.bits(9)
+        }
+        g.overlapFlag = r.flag()
+        g.clipToRestrictedRange = r.flag()
+        fh.h.grain = g
+    }
+
+    // The header part of the reference frame update process (7.20).
+    fn updateSlots() {
+        let h = fh.h
+        for i in 0..8 {
+            if (h.refreshFrameFlags >> i) & 1 == 1 {
+                var s = slots[i]
+                s.valid = true
+                s.frameId = fh.currentFrameId
+                s.upscaledWidth = h.upscaledWidth
+                s.frameWidth = h.frameWidth
+                s.frameHeight = h.frameHeight
+                s.renderWidth = h.renderWidth
+                s.renderHeight = h.renderHeight
+                s.miCols = h.miCols
+                s.miRows = h.miRows
+                s.frameType = h.frameType
+                s.subX = h.subX
+                s.subY = h.subY
+                s.bitDepth = h.bitDepth
+                s.orderHint = h.orderHint
+                s.savedOrderHints = h.orderHints
+                s.showableFrame = h.showableFrame
+                s.gmParams = h.gmParams
+                s.lfRefDeltas = lfRefDeltas
+                s.lfModeDeltas = lfModeDeltas
+                s.featureEnabled = featureEnabled
+                s.featureData = featureData
+                if seq.filmGrainParamsPresent {
+                    s.grain = h.grain
+                }
+                slots[i] = s
+            }
+        }
+    }
+
+    // show_existing_frame of a key frame: load the slot's state (7.21)
+    // and refresh every slot with it (7.20 with refresh_frame_flags 0xFF).
+    fn showExistingKey() {
+        let idx = fh.h.frameToShowMapIdx
+        let s = slots[idx]
+        lfRefDeltas = s.lfRefDeltas
+        lfModeDeltas = s.lfModeDeltas
+        featureEnabled = s.featureEnabled
+        featureData = s.featureData
+        for i in 0..8 {
+            if i != idx {
+                slots[i] = s
+            }
+        }
+    }
+}
+
+// tile_log2( blkSize, target ).
+fn av1TileLog2(_ blkSize: Int, _ target: Int) -> Int {
+    var k = 0
+    while (blkSize << k) < target {
+        k += 1
+    }
+    k
+}
+
+fn av1InverseRecenter(_ r: Int, _ v: Int) -> Int {
+    if v > 2 * r {
+        return v
+    } else if (v & 1) == 1 {
+        return r - ((v + 1) >> 1)
+    }
+    r + (v >> 1)
+}

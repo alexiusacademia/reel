@@ -1,0 +1,124 @@
+// net over real HTTP, against tests/net/server.py on 127.0.0.1 (run by
+// tests/net/http_check.sh, which starts and stops the server): probing,
+// ranged GETs, redirects, retries, Remote, an HLS and a DASH session over
+// http://, and internet radio read from a growing download.
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+import "../../../core"
+import "../../../net"
+
+struct Tally {
+    passed: Int = 0
+    total: Int = 0
+
+    fn check(_ ok: Bool, _ what: String) {
+        total += 1
+        if ok {
+            passed += 1
+        } else {
+            print("FAIL: {what}")
+        }
+    }
+}
+
+async fn runSession(_ start: net.Session) -> net.Session {
+    var s = start
+    s.bufferAhead = 1000.0
+    for _ in 0..100 {
+        let (next, worked) = await net.step(s)
+        s = next
+        if !worked {
+            break
+        }
+    }
+    s
+}
+
+async fn main() {
+    var t = Tally()
+    let base = "http://127.0.0.1:{arguments()[0]}"
+    let local = readData("tests/net/fixtures/hls_single/index.ts") ?? Data()
+
+    // Probe: HEAD gives size and Accept-Ranges.
+    match await net.probe("{base}/hls_single/index.ts") {
+        .ok(p) -> t.check(p.status == 200 && p.size == local.count && p.acceptsRanges && p.mime == "video/mp2t", "probe {p.status} {p.size} {p.mime}")
+        .failure(e) -> t.check(false, "probe: {e.message}")
+    }
+    // Redirects are followed by request itself.
+    match await net.probe("{base}/redirect/hls_single/index.ts") {
+        .ok(p) -> t.check(p.size == local.count && p.acceptsRanges, "probe through a 302")
+        .failure(e) -> t.check(false, "probe redirect: {e.message}")
+    }
+    t.check(!(await net.probe("{base}/missing.ts")).isOk(), "probe of a 404 fails")
+    // Ranged GET.
+    match await net.get("{base}/hls_single/index.ts", offset: 1000, length: 500) {
+        .ok(f) -> t.check(f.status == 206 && f.data == local.slice(from: 1000, to: 1500), "ranged GET is 206 with the bytes")
+        .failure(e) -> t.check(false, "ranged GET: {e.message}")
+    }
+    // Retries: the flaky path answers 503 twice.
+    let t0 = now()
+    match await net.get("{base}/flaky/hls_single/index.ts", offset: 0, length: 188, retries: 2) {
+        .ok(f) -> t.check(f.data == local.slice(from: 0, to: 188) && now() - t0 >= 1.4, "two 503s, then the bytes (after {now() - t0} s)")
+        .failure(e) -> t.check(false, "retries: {e.message}")
+    }
+    match await net.get("{base}/flaky/hls_single/index.m3u8", retries: 1) {
+        .ok(_) -> t.check(false, "one retry isn't enough")
+        .failure(e) -> t.check(e.message.contains("503"), "the error says what the server said: {e.message}")
+    }
+    match await net.get("http://127.0.0.1:1/nothing", retries: 0) {
+        .ok(_) -> t.check(false, "no server")
+        .failure(e) -> t.check(e.message.contains("can't reach"), "unreachable: {e.message}")
+    }
+    // Remote over HTTP.
+    match await net.openRemote("{base}/hls_single/index.ts", blockSize: 8192, maxBlocks: 3) {
+        .ok(r0) -> {
+            let (r1, a) = await net.readRemote(r0, from: 10000, to: 30000)
+            let (r2, b) = await net.readRemote(r1, from: 17000, to: 20000)
+            t.check((a.value() ?? Data()) == local.slice(from: 10000, to: 30000) && (b.value() ?? Data()) == local.slice(from: 17000, to: 20000) && r2.hits == 1 && r2.throughput > 0.0, "Remote over HTTP with the cache")
+        }
+        .failure(e) -> t.check(false, "openRemote: {e.message}")
+    }
+
+    // An HLS (AES-128) and a DASH session over http://.
+    match await net.openSession("{base}/hls_aes/index.m3u8") {
+        .ok(s0) -> {
+            let s = await runSession(s0)
+            t.check(s.buffer.segments.count == 3 && s.finished && s.keyUrls.count == 1 && core.packetsOf(s.buffer.media, 0).count == 150, "HLS AES-128 over HTTP: {s.buffer.segments.count} segments, {s.lastError}")
+            t.check(s.abr.samples == 3 && s.abr.estimate > 0.0, "throughput measured: {Int(s.abr.estimate / 1000.0)} kbit/s")
+        }
+        .failure(e) -> t.check(false, "HLS over HTTP: {e.message}")
+    }
+    match await net.openSession("{base}/dash_base/manifest.mpd") {
+        .ok(s0) -> {
+            let s = await runSession(s0)
+            t.check(s.buffer.segments.count == 3 && core.packetsOf(s.buffer.media, 0).count == 150, "DASH SegmentBase over HTTP (ranges for init, sidx, media)")
+        }
+        .failure(e) -> t.check(false, "DASH over HTTP: {e.message}")
+    }
+
+    // Radio: an endless response downloaded to a file, read as it grows.
+    let path = joinPath(currentFolder(), "build/scratch/net/radio_check.mp3")
+    var radio = net.Radio(url: "{base}/radio", path: path)
+    let id = download(url: "{base}/radio", to: path) { ok in
+        print("radio download ended: {ok}")
+    }
+    var grew = 0
+    for _ in 0..6 {
+        await after(seconds: 0.5)
+        if let d = readData(path + ".part") {
+            if radio.take(d) > 0.0 {
+                grew += 1
+            }
+        }
+    }
+    cancelRequest(id)
+    t.check(radio.format == "mp3" && radio.chunks >= 2 && grew >= 2 && radio.time > 0.5, "radio: {radio.chunks} chunks, {radio.time} s of audio from the growing .part")
+    t.check(radio.buffer.media.tracks.count == 1 && radio.buffer.media.tracks[0].codec == "mp3", "radio stream is MP3 frames")
+    // The headers (and so in-stream ICY metadata) aren't available to a
+    // download; a request asking for metadata never ends on an endless
+    // stream — see build/TESSEL_ISSUES.md.
+
+    print("net-http: {t.passed} of {t.total} passed")
+}

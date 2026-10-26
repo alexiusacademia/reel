@@ -1,0 +1,283 @@
+// The wma module: Windows Media Audio decoders with the common audio
+// decoder API (build/BRIEF.md): WMA 1 ("wmav1", tag 0x160), WMA 2
+// ("wmav2", 0x161), WMA 9 Professional ("wmapro", 0x162) and WMA 9
+// Lossless ("wmalossless", 0x163). `Track.extra` is the WAVEFORMATEX's
+// codec bytes (after cbSize), as every demuxer gives it.
+//
+// WMA packets are fixed-size blocks of nBlockAlign bytes (a container's
+// packet may hold several): `Track.blockAlign`, or `newDecoder(track,
+// blockAlign:)` to override it; when neither says, the first packet's size
+// is taken, which is right for files whose packets are single blocks.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../core"
+
+public struct Decoder {
+    codec: String = ""
+    rate: Int = 0
+    channels: Int = 0
+    layout: [String] = []
+    // Priming frames at the start to drop, as ffmpeg skips them.
+    delay: Int = 0
+    warnings: [String] = []
+    blockAlign: Int = 0
+    track: core.Track = core.Track(index: 0, kind: core.TrackKind.audio, codec: "")
+    ready: Bool = false
+    std: WmaStd = WmaStd()
+    pro: WmaPro = WmaPro()
+    lossless: WmaLossless = WmaLossless()
+    // Bytes of a block that a packet ended inside (not split normally).
+    damagedPackets: Int = 0
+
+    // Decodes one packet (one or more blocks of nBlockAlign bytes).
+    fn decode(_ packet: Data, pts: Int) -> core.Samples {
+        var out = core.Samples(rate: rate, channels: channels, layout: layout, pts: pts)
+        if !ready {
+            if blockAlign <= 0 {
+                blockAlign = packet.count
+            }
+            if !setUp() {
+                return out
+            }
+            out.rate = rate
+            out.channels = channels
+            out.layout = layout
+        }
+        if codec == "wmalossless" {
+            // ffmpeg's lossless decoder takes a short last block as it is
+            // (the end of a cut file).
+            var at = 0
+            while at < packet.count {
+                let to = min(at + blockAlign, packet.count)
+                let block = if at == 0 && to == packet.count { packet } else { packet.slice(from: at, to: to) }
+                decodeBlock(block, out)
+                at = to
+            }
+            return out
+        }
+        if packet.count < blockAlign {
+            damagedPackets += 1
+            note("WMA: a packet is shorter than a block ({packet.count} < {blockAlign} bytes)")
+            return out
+        }
+        var at = 0
+        while at + blockAlign <= packet.count {
+            let block = if at == 0 && packet.count == blockAlign { packet } else { packet.slice(from: at, to: at + blockAlign) }
+            decodeBlock(block, out)
+            at += blockAlign
+        }
+        out
+    }
+
+    fn decodeBlock(_ block: Data, _ out: bind core.Samples) {
+        let from = out.data.count
+        decodeOne(block, out)
+        // Damaged data can make huge values (or infinities): keep them out
+        // of the speakers. Real audio stays far inside ±8.
+        var bad = false
+        for i in from..out.data.count {
+            let v = out.data[i]
+            if !(abs(v) <= 8.0) {
+                out.data[i] = if v.isNaN { 0.0 } else if v > 0.0 { 8.0 } else { -8.0 }
+                bad = true
+            }
+        }
+        if bad {
+            note("WMA: out-of-range samples (damaged data) were clipped")
+        }
+    }
+
+    fn decodeOne(_ block: Data, _ out: bind core.Samples) {
+        if codec == "wmav1" || codec == "wmav2" {
+            std.out = []
+            if !std.decodeSuperframe(block) {
+                note("WMA: a damaged superframe was skipped")
+            }
+            out.data += std.out
+            for w in std.warnings {
+                note(w)
+            }
+            std.warnings = []
+        } else if codec == "wmapro" {
+            pro.samples = []
+            pro.decodePacket(block)
+            out.data += pro.samples
+            for w in pro.warnings {
+                note(w)
+            }
+            pro.warnings = []
+        } else if codec == "wmalossless" {
+            lossless.samples = []
+            lossless.decodePacket(block)
+            out.data += lossless.samples
+            for w in lossless.warnings {
+                note(w)
+            }
+            lossless.warnings = []
+        }
+    }
+
+    // The samples still held at the end of the stream.
+    fn flush() -> core.Samples {
+        var out = core.Samples(rate: rate, channels: channels, layout: layout)
+        if !ready {
+            return out
+        }
+        if codec == "wmav1" || codec == "wmav2" {
+            // The overlap of the last frame (ffmpeg's end-of-stream frame).
+            let n = std.frameLen
+            for i in 0..n {
+                for ch in 0..channels {
+                    out.data.append(std.frameOut[ch * 2 * wmaBlockMax + i])
+                }
+            }
+            std.resetState()
+        } else if codec == "wmapro" {
+            // (ffmpeg's WMA Pro decoder gives nothing at the end.)
+            pro.resetState()
+        } else if codec == "wmalossless" {
+            lossless.samples = []
+            lossless.flushFrames()
+            out.data = lossless.samples
+            lossless.resetState()
+        }
+        out
+    }
+
+    // After a seek: drop the bit reservoir and the overlap.
+    fn reset() {
+        if !ready {
+            return
+        }
+        if codec == "wmav1" || codec == "wmav2" {
+            std.resetState()
+        } else if codec == "wmapro" {
+            pro.resetState()
+        } else if codec == "wmalossless" {
+            lossless.resetState()
+        }
+    }
+
+    fn note(_ w: String) {
+        if warnings.count < 50 && !warnings.contains(w) {
+            warnings.append(w)
+        }
+    }
+
+    fn setUp() -> Bool {
+        let t = track
+        if codec == "wmav1" || codec == "wmav2" {
+            match wmaNewStd(version: if codec == "wmav1" { 1 } else { 2 }, channels: t.channels, rate: t.sampleRate, bitrate: t.bitrate, blockAlign: blockAlign, extra: t.extra) {
+                .ok(s) -> {
+                    std = s
+                }
+                .failure(e) -> {
+                    note(e.message)
+                    return false
+                }
+            }
+            rate = t.sampleRate
+            channels = t.channels
+            layout = core.defaultLayout(channels)
+            // ffmpeg drops the first two frames (the MDCT overlap's start).
+            delay = 2 * std.frameLen
+            ready = true
+            return true
+        }
+        if codec == "wmapro" {
+            match wmaNewPro(channels: t.channels, rate: t.sampleRate, blockAlign: blockAlign, extra: t.extra) {
+                .ok(s) -> {
+                    pro = s
+                }
+                .failure(e) -> {
+                    note(e.message)
+                    return false
+                }
+            }
+            rate = t.sampleRate
+            channels = pro.nbChannels
+            let named = wmaMaskLayout(pro.channelMask)
+            layout = if named.count == channels { named } else { core.defaultLayout(channels) }
+            // The first frame is dropped inside, as ffmpeg does.
+            delay = 0
+            ready = true
+            return true
+        }
+        if codec == "wmalossless" {
+            match wmaNewLossless(channels: t.channels, rate: t.sampleRate, blockAlign: blockAlign, extra: t.extra) {
+                .ok(s) -> {
+                    lossless = s
+                }
+                .failure(e) -> {
+                    note(e.message)
+                    return false
+                }
+            }
+            rate = t.sampleRate
+            channels = lossless.nbChannels
+            let named = wmaMaskLayout(lossless.channelMask)
+            layout = if named.count == channels { named } else { core.defaultLayout(channels) }
+            delay = 0
+            ready = true
+            return true
+        }
+        false
+    }
+}
+
+// A decoder for a "wmav1", "wmav2", "wmapro" or "wmalossless" track.
+// `blockAlign` overrides Track.blockAlign (WAVEFORMATEX nBlockAlign); with
+// neither, the first packet's size is taken.
+public fn newDecoder(_ track: core.Track, blockAlign: Int = 0) -> Result<Decoder> {
+    let c = track.codec
+    if c != "wmav1" && c != "wmav2" && c != "wmapro" && c != "wmalossless" {
+        return Result.failure(error: Error("wma: not a Windows Media Audio track ({c})"))
+    }
+    let align = if blockAlign > 0 { blockAlign } else { track.blockAlign }
+    var d = Decoder(codec: c, blockAlign: align, track: track)
+    d.rate = track.sampleRate
+    d.channels = track.channels
+    d.layout = core.defaultLayout(track.channels)
+    if align > 0 {
+        if !d.setUp() {
+            let why = if d.warnings.isEmpty { "wma: can't decode this track" } else { d.warnings[0] }
+            return Result.failure(error: Error(why))
+        }
+    }
+    Result.ok(value: d)
+}
+
+// What the media info window shows, e.g. "WMA 2, 44.1 kHz, stereo, 128 kb/s".
+public fn streamInfo(_ track: core.Track) -> String {
+    let name = match track.codec {
+        "wmav1" -> "WMA 1"
+        "wmav2" -> "WMA 2"
+        "wmapro" -> "WMA 9 Professional"
+        "wmalossless" -> "WMA 9 Lossless"
+        _ -> track.codec
+    }
+    var parts = [name]
+    if track.sampleRate > 0 {
+        let k = Float(track.sampleRate) / 1000.0
+        let s = if track.sampleRate % 1000 == 0 { "{track.sampleRate / 1000}" } else { k.formatted(decimals: 1) }
+        parts.append(s + " kHz")
+    }
+    if track.channels > 0 {
+        parts.append(match track.channels {
+            1 -> "mono"
+            2 -> "stereo"
+            6 -> "5.1"
+            8 -> "7.1"
+            _ -> "{track.channels} channels"
+        })
+    }
+    if track.bitsPerSample > 16 {
+        parts.append("{track.bitsPerSample}-bit")
+    }
+    if track.bitrate > 0 {
+        parts.append("{track.bitrate / 1000} kb/s")
+    }
+    parts.joined(separator: ", ")
+}

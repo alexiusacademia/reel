@@ -1,0 +1,185 @@
+// The inverse DCT of MPEG-1/2 (ISO/IEC 13818-2 Annex A) as an integer
+// row-column transform that meets IEEE 1180 accuracy. It is the "simple
+// IDCT" of ffmpeg (constants cos(k·π/16)·√2·2^14, rows rounded to 11
+// fractional bits, columns to 20), so decoded pictures can match ffmpeg's
+// bit for bit. Like ffmpeg's ARM NEON version (which made the reference
+// pictures on this Mac), rows holding only a DC value go through the
+// full row transform; ffmpeg's C version shortcuts them to DC · 8, which
+// differs by one for DC values over 1024.
+//
+// Blocks are 64 Ints in raster order (row = vertical frequency); the
+// transform works in place, then writes (put) or adds (add) the result to
+// a plane, clipped to 0…255.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+let m12W1 = 22725
+let m12W2 = 21407
+let m12W3 = 19266
+let m12W4 = 16383
+let m12W5 = 12873
+let m12W6 = 8867
+let m12W7 = 4520
+
+// The row pass: a 1-D IDCT of each row, keeping 3 more fractional bits.
+fn m12IdctRows(_ b: bind [Int]) {
+    var r = 0
+    while r < 64 {
+        let x0 = b[r]
+        let x1 = b[r + 1]
+        let x2 = b[r + 2]
+        let x3 = b[r + 3]
+        let x4 = b[r + 4]
+        let x5 = b[r + 5]
+        let x6 = b[r + 6]
+        let x7 = b[r + 7]
+        if (x0 | x1 | x2 | x3 | x4 | x5 | x6 | x7) == 0 {
+            // An empty row stays empty.
+        } else {
+            var a0 = m12W4 * x0 + 1024
+            var a1 = a0
+            var a2 = a0
+            var a3 = a0
+            a0 += m12W2 * x2
+            a1 += m12W6 * x2
+            a2 -= m12W6 * x2
+            a3 -= m12W2 * x2
+            var b0 = m12W1 * x1 + m12W3 * x3
+            var b1 = m12W3 * x1 - m12W7 * x3
+            var b2 = m12W5 * x1 - m12W1 * x3
+            var b3 = m12W7 * x1 - m12W5 * x3
+            if (x4 | x5 | x6 | x7) != 0 {
+                a0 += m12W4 * x4 + m12W6 * x6
+                a1 += -m12W4 * x4 - m12W2 * x6
+                a2 += -m12W4 * x4 + m12W2 * x6
+                a3 += m12W4 * x4 - m12W6 * x6
+                b0 += m12W5 * x5 + m12W7 * x7
+                b1 += -m12W1 * x5 - m12W5 * x7
+                b2 += m12W7 * x5 + m12W3 * x7
+                b3 += m12W3 * x5 - m12W1 * x7
+            }
+            b[r] = (a0 + b0) >> 11
+            b[r + 7] = (a0 - b0) >> 11
+            b[r + 1] = (a1 + b1) >> 11
+            b[r + 6] = (a1 - b1) >> 11
+            b[r + 2] = (a2 + b2) >> 11
+            b[r + 5] = (a2 - b2) >> 11
+            b[r + 3] = (a3 + b3) >> 11
+            b[r + 4] = (a3 - b3) >> 11
+        }
+        r += 8
+    }
+}
+
+fn m12Clip(_ v: Int) -> Int {
+    if v < 0 {
+        return 0
+    }
+    if v > 255 {
+        return 255
+    }
+    v
+}
+
+// The column pass over block b (after the row pass), writing (or, with
+// add, adding to) dst[off …] with rows `stride` apart, clipped to
+// 0…255. The block is left zeroed.
+fn m12IdctCols(_ b: bind [Int], _ dst: bind [Int], _ off: Int, _ stride: Int, _ add: Bool) {
+    let s = stride
+    for c in 0..8 {
+        let x0 = b[c]
+        let x1 = b[c + 8]
+        let x2 = b[c + 16]
+        let x3 = b[c + 24]
+        let x4 = b[c + 32]
+        let x5 = b[c + 40]
+        let x6 = b[c + 48]
+        let x7 = b[c + 56]
+        // (1 << 19) / W4 = 32: the rounding term folded into the DC input.
+        var a0 = m12W4 * (x0 + 32)
+        var a1 = a0
+        var a2 = a0
+        var a3 = a0
+        a0 += m12W2 * x2
+        a1 += m12W6 * x2
+        a2 -= m12W6 * x2
+        a3 -= m12W2 * x2
+        var b0 = m12W1 * x1 + m12W3 * x3
+        var b1 = m12W3 * x1 - m12W7 * x3
+        var b2 = m12W5 * x1 - m12W1 * x3
+        var b3 = m12W7 * x1 - m12W5 * x3
+        if (x4 | x5 | x6 | x7) != 0 {
+            a0 += m12W4 * x4 + m12W6 * x6
+            a1 += -m12W4 * x4 - m12W2 * x6
+            a2 += -m12W4 * x4 + m12W2 * x6
+            a3 += m12W4 * x4 - m12W6 * x6
+            b0 += m12W5 * x5 + m12W7 * x7
+            b1 += -m12W1 * x5 - m12W5 * x7
+            b2 += m12W7 * x5 + m12W3 * x7
+            b3 += m12W3 * x5 - m12W1 * x7
+        }
+        let at = off + c
+        if add {
+            dst[at] = m12Clip(dst[at] + ((a0 + b0) >> 20))
+            dst[at + s] = m12Clip(dst[at + s] + ((a1 + b1) >> 20))
+            dst[at + 2 * s] = m12Clip(dst[at + 2 * s] + ((a2 + b2) >> 20))
+            dst[at + 3 * s] = m12Clip(dst[at + 3 * s] + ((a3 + b3) >> 20))
+            dst[at + 4 * s] = m12Clip(dst[at + 4 * s] + ((a3 - b3) >> 20))
+            dst[at + 5 * s] = m12Clip(dst[at + 5 * s] + ((a2 - b2) >> 20))
+            dst[at + 6 * s] = m12Clip(dst[at + 6 * s] + ((a1 - b1) >> 20))
+            dst[at + 7 * s] = m12Clip(dst[at + 7 * s] + ((a0 - b0) >> 20))
+        } else {
+            dst[at] = m12Clip((a0 + b0) >> 20)
+            dst[at + s] = m12Clip((a1 + b1) >> 20)
+            dst[at + 2 * s] = m12Clip((a2 + b2) >> 20)
+            dst[at + 3 * s] = m12Clip((a3 + b3) >> 20)
+            dst[at + 4 * s] = m12Clip((a3 - b3) >> 20)
+            dst[at + 5 * s] = m12Clip((a2 - b2) >> 20)
+            dst[at + 6 * s] = m12Clip((a1 - b1) >> 20)
+            dst[at + 7 * s] = m12Clip((a0 - b0) >> 20)
+        }
+    }
+    for i in 0..64 {
+        b[i] = 0
+    }
+}
+
+// Transforms block `b` and writes it to dst[off …] with rows `stride`
+// apart. The block is left zeroed.
+fn m12IdctPut(_ b: bind [Int], _ dst: bind [Int], _ off: Int, _ stride: Int) {
+    m12IdctRows(b)
+    m12IdctCols(b, dst, off, stride, false)
+}
+
+// As m12IdctPut, adding to what dst holds (the prediction).
+fn m12IdctAdd(_ b: bind [Int], _ dst: bind [Int], _ off: Int, _ stride: Int) {
+    m12IdctRows(b)
+    m12IdctCols(b, dst, off, stride, true)
+}
+
+// The value every sample of a block with only a DC coefficient d becomes
+// (the row pass makes r = (W4 · d + 1024) >> 11, the column pass
+// (W4 · (r + 32)) >> 20).
+fn m12DcValue(_ d: Int) -> Int {
+    let r = (m12W4 * d + 1024) >> 11
+    (m12W4 * (r + 32)) >> 20
+}
+
+// Writes (or adds) a block of one value.
+fn m12FillBlock(_ dst: bind [Int], _ off: Int, _ stride: Int, _ v: Int, add: Bool) {
+    var at = off
+    for _ in 0..8 {
+        if add {
+            for x in 0..8 {
+                dst[at + x] = m12Clip(dst[at + x] + v)
+            }
+        } else {
+            let c = m12Clip(v)
+            for x in 0..8 {
+                dst[at + x] = c
+            }
+        }
+        at += stride
+    }
+}

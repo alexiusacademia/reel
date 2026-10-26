@@ -1,0 +1,209 @@
+// Byte reading helpers for the disc structures. Disc files come from
+// anywhere (damaged discs, half-copied folders), so every read checks its
+// bounds and gives 0 outside the data instead of stopping the program.
+// Also: BCD times (DVD), ISO 639-1 → 639-2 language codes, YCbCr → RGB,
+// and text from ASCII / UCS-2 / UTF-8 byte strings.
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+fn dU8(_ d: Data, _ at: Int) -> Int {
+    if at < 0 || at >= d.count {
+        return 0
+    }
+    d[at]
+}
+
+fn dU16(_ d: Data, _ at: Int) -> Int {
+    if at < 0 || at + 2 > d.count {
+        return 0
+    }
+    d.uint16(at: at, bigEndian: true)
+}
+
+fn dU32(_ d: Data, _ at: Int) -> Int {
+    if at < 0 || at + 4 > d.count {
+        return 0
+    }
+    d.uint32(at: at, bigEndian: true)
+}
+
+fn dL16(_ d: Data, _ at: Int) -> Int {
+    if at < 0 || at + 2 > d.count {
+        return 0
+    }
+    d.uint16(at: at, bigEndian: false)
+}
+
+fn dL32(_ d: Data, _ at: Int) -> Int {
+    if at < 0 || at + 4 > d.count {
+        return 0
+    }
+    d.uint32(at: at, bigEndian: false)
+}
+
+fn dL64(_ d: Data, _ at: Int) -> Int {
+    if at < 0 || at + 8 > d.count {
+        return 0
+    }
+    let lo = d.uint32(at: at, bigEndian: false)
+    let hi = d.uint32(at: at + 4, bigEndian: false)
+    // Sizes past 2^62 bytes aren't real; keep the math in range.
+    (hi & 0x3FFFFFFF) << 32 | lo
+}
+
+fn dSlice(_ d: Data, _ from: Int, _ to: Int) -> Data {
+    let a = max(0, min(from, d.count))
+    let b = max(a, min(to, d.count))
+    d.slice(from: a, to: b)
+}
+
+// Printable ASCII of a fixed-size field, trimmed (NULs and spaces).
+fn dAscii(_ d: Data, _ at: Int, _ n: Int) -> String {
+    var out = Data()
+    var i = 0
+    while i < n {
+        let c = dU8(d, at + i)
+        if c >= 0x20 && c < 0x7F {
+            out.append(byte: c)
+        } else if c == 0 {
+            out.append(byte: 0x20)
+        }
+        i += 1
+    }
+    (out.text ?? "").trim()
+}
+
+// One code point as UTF-8 bytes added to `out`.
+fn dPutUtf8(_ out: Data, _ cp: Int) -> Data {
+    var o = out
+    var c = cp
+    if c < 0 || c > 0x10FFFF || (c >= 0xD800 && c < 0xE000) {
+        c = 0xFFFD
+    }
+    if c < 0x80 {
+        o.append(byte: c)
+    } else if c < 0x800 {
+        o.append(byte: 0xC0 | c >> 6)
+        o.append(byte: 0x80 | c & 0x3F)
+    } else if c < 0x10000 {
+        o.append(byte: 0xE0 | c >> 12)
+        o.append(byte: 0x80 | (c >> 6) & 0x3F)
+        o.append(byte: 0x80 | c & 0x3F)
+    } else {
+        o.append(byte: 0xF0 | c >> 18)
+        o.append(byte: 0x80 | (c >> 12) & 0x3F)
+        o.append(byte: 0x80 | (c >> 6) & 0x3F)
+        o.append(byte: 0x80 | c & 0x3F)
+    }
+    o
+}
+
+// UCS-2 / UTF-16 big-endian text (Joliet names, UDF 16-bit CS0).
+fn dUtf16be(_ d: Data, _ at: Int, _ n: Int) -> String {
+    var out = Data()
+    var i = 0
+    while i + 1 < n {
+        var c = dU16(d, at + i)
+        i += 2
+        if c >= 0xD800 && c < 0xDC00 && i + 1 < n {
+            let lo = dU16(d, at + i)
+            if lo >= 0xDC00 && lo < 0xE000 {
+                c = 0x10000 + ((c - 0xD800) << 10) + (lo - 0xDC00)
+                i += 2
+            }
+        }
+        if c != 0 {
+            out = dPutUtf8(out, c)
+        }
+    }
+    out.text ?? ""
+}
+
+// Latin-1 bytes as text (UDF 8-bit CS0 names), without NULs.
+fn dLatin1(_ d: Data, _ at: Int, _ n: Int) -> String {
+    var out = Data()
+    var i = 0
+    while i < n {
+        let c = dU8(d, at + i)
+        if c != 0 {
+            out = dPutUtf8(out, c)
+        }
+        i += 1
+    }
+    out.text ?? ""
+}
+
+// A BCD byte (0x59 → 59); invalid digits count as 0.
+fn dBcd(_ b: Int) -> Int {
+    let hi = (b >> 4) & 15
+    let lo = b & 15
+    if hi > 9 || lo > 9 {
+        return 0
+    }
+    hi * 10 + lo
+}
+
+// DVD playback time (DVD-Video "dvd_time": hours, minutes, seconds BCD,
+// then frame rate in the top 2 bits — 01 = 25 fps, 11 = 30 (29.97) fps —
+// and frames BCD in the low 6) in seconds.
+fn dDvdTime(_ d: Data, _ at: Int) -> Float {
+    let h = dBcd(dU8(d, at))
+    let m = dBcd(dU8(d, at + 1))
+    let s = dBcd(dU8(d, at + 2))
+    let fb = dU8(d, at + 3)
+    let f = dBcd(fb & 0x3F)
+    let rate = fb >> 6
+    var fps = 30000.0 / 1001.0
+    if rate == 1 {
+        fps = 25.0
+    }
+    var t = Float(h * 3600 + m * 60 + s)
+    if rate != 0 {
+        t += Float(f) / fps
+    }
+    t
+}
+
+// BT.601 video-range YCbCr → rgba packed (opaque).
+fn dYcbcrToRgba(_ y: Int, _ cb: Int, _ cr: Int) -> Int {
+    let yy = 1.164383 * Float(y - 16)
+    let r = yy + 1.596027 * Float(cr - 128)
+    let g = yy - 0.391762 * Float(cb - 128) - 0.812968 * Float(cr - 128)
+    let b = yy + 2.017232 * Float(cb - 128)
+    let ri = max(0, min(255, Int(round(r))))
+    let gi = max(0, min(255, Int(round(g))))
+    let bi = max(0, min(255, Int(round(b))))
+    ri << 24 | gi << 16 | bi << 8 | 0xFF
+}
+
+// Two hex digits.
+fn dHex2(_ v: Int) -> String {
+    let digits = "0123456789abcdef"
+    let hi = (v >> 4) & 15
+    let lo = v & 15
+    digits.substring(from: hi, to: hi + 1) + digits.substring(from: lo, to: lo + 1)
+}
+
+// ISO 639-1 (two letters, as DVDs store them) → ISO 639-2/B (as Reel's
+// tracks carry them). The table is the standard's list for the languages
+// discs use; unknown codes give "".
+let discLang1 = "aa ab af ak am an ar as av ay az ba be bg bh bi bm bn bo br bs ca ce ch co cr cs cu cv cy da de dv dz ee el en eo es et eu fa ff fi fj fo fr fy ga gd gl gn gu gv ha he hi ho hr ht hu hy hz ia id ie ig ii ik io is it iu ja jv ka kg ki kj kk kl km kn ko kr ks ku kv kw ky la lb lg li ln lo lt lu lv mg mh mi mk ml mn mr ms mt my na nb nd ne ng nl nn no nr nv ny oc oj om or os pa pi pl ps pt qu rm rn ro ru rw sa sc sd se sg si sk sl sm sn so sq sr ss st su sv sw ta te tg th ti tk tl tn to tr ts tt tw ty ug uk ur uz ve vi vo wa wo xh yi yo za zh zu iw in ji"
+let discLang2 = "aar abk afr aka amh arg ara asm ava aym aze bak bel bul bih bis bam ben tib bre bos cat che cha cos cre cze chu chv wel dan ger div dzo ewe gre eng epo spa est baq per ful fin fij fao fre fry gle gla glg grn guj glv hau heb hin hmo hrv hat hun arm her ina ind ile ibo iii ipk ido ice ita iku jpn jav geo kon kik kua kaz kal khm kan kor kau kas kur kom cor kir lat ltz lug lim lin lao lit lub lav mlg mah mao mac mal mon mar may mlt bur nau nob nde nep ndo dut nno nor nbl nav nya oci oji orm ori oss pan pli pol pus por que roh run rum rus kin san srd snd sme sag sin slo slv smo sna som alb srp ssw sot sun swe swa tam tel tgk tha tir tuk tgl tsn ton tur tso tat twi tah uig ukr urd uzb ven vie vol wln wol xho yid yor zha chi zul heb ind yid"
+
+fn discLanguage3(_ two: String) -> String {
+    let code = two.lowercase()
+    if code.count != 2 {
+        return ""
+    }
+    let a = discLang1.split(" ")
+    let b = discLang2.split(" ")
+    var i = 0
+    while i < a.count && i < b.count {
+        if a[i] == code {
+            return b[i]
+        }
+        i += 1
+    }
+    ""
+}

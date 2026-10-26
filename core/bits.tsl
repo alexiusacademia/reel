@@ -1,0 +1,446 @@
+// Readers for bytes and bits, shared by every container and decoder.
+//
+// BitReader reads most significant bit first (MPEG, H.264, AAC, FLAC,
+// MP3, JPEG); LsbReader least significant first (Vorbis, DEFLATE).
+// Both read past the end as zero bits and set `overrun`, so a damaged
+// packet never stops the program; decoders check `overrun` and give up
+// on that packet.
+//
+// Bits are held in a cache of up to 56 bits (Ints are 64-bit and signed,
+// and overflow stops the program, so the cache stays below 2^56).
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+public struct BitReader {
+    data: Data
+    // Next byte to load into the cache.
+    next: Int = 0
+    // One past the last byte to read.
+    end: Int = 0
+    cache: Int = 0
+    // Bits held in the cache (the low `held` bits of cache).
+    held: Int = 0
+    overrun: Bool = false
+
+    // Loads bytes until at least 49 bits are held (or the data ends).
+    fn refill() {
+        while held <= 48 {
+            if next < end {
+                cache = (cache << 8) | data[next]
+                next += 1
+            } else {
+                // Zero bytes past the end; `overrun` is set when they're used.
+                cache = cache << 8
+                next += 1
+            }
+            held += 8
+        }
+    }
+
+    // The next n bits (0 to 32) as a number, without moving on.
+    fn peek(_ n: Int) -> Int {
+        if held < n {
+            refill()
+        }
+        (cache >> (held - n)) & ((1 << n) - 1)
+    }
+
+    // Reads n bits (0 to 32).
+    fn bits(_ n: Int) -> Int {
+        if n == 0 {
+            return 0
+        }
+        if held < n {
+            refill()
+        }
+        held -= n
+        let v = (cache >> held) & ((1 << n) - 1)
+        cache = cache & ((1 << held) - 1)
+        if next > end && position > end * 8 {
+            overrun = true
+        }
+        v
+    }
+
+    fn bit() -> Int {
+        bits(1)
+    }
+
+    fn flag() -> Bool {
+        bits(1) == 1
+    }
+
+    // Reads n bits (0 to 32) as a two's complement signed number.
+    fn signed(_ n: Int) -> Int {
+        let v = bits(n)
+        if n > 0 && v >= (1 << (n - 1)) {
+            return v - (1 << n)
+        }
+        v
+    }
+
+    // Reads up to 56 bits.
+    fn long(_ n: Int) -> Int {
+        if n <= 32 {
+            return bits(n)
+        }
+        let hi = bits(n - 32)
+        (hi << 32) | bits(32)
+    }
+
+    fn skip(_ n: Int) {
+        var left = n
+        while left > 32 {
+            bits(32)
+            left -= 32
+        }
+        bits(left)
+    }
+
+    // Unsigned Exp-Golomb (H.264 ue(v)).
+    fn ue() -> Int {
+        var zeros = 0
+        while bits(1) == 0 {
+            zeros += 1
+            if zeros > 31 {
+                overrun = true
+                return 0
+            }
+        }
+        if zeros == 0 {
+            return 0
+        }
+        (1 << zeros) - 1 + bits(zeros)
+    }
+
+    // Signed Exp-Golomb (H.264 se(v)).
+    fn se() -> Int {
+        let k = ue()
+        if k & 1 == 1 {
+            return (k + 1) / 2
+        }
+        -(k / 2)
+    }
+
+    // Unary: counts 0 bits before a 1 (and reads the 1).
+    fn zerosBeforeOne(limit: Int = 64) -> Int {
+        var n = 0
+        while bits(1) == 0 {
+            n += 1
+            if n >= limit {
+                return n
+            }
+        }
+        n
+    }
+
+    // Bit position from the start of `data`.
+    position: Int {
+        next * 8 - held
+    }
+
+    // Bits left before `end` (negative after an overrun).
+    left: Int {
+        end * 8 - position
+    }
+
+    isByteAligned: Bool {
+        held % 8 == 0
+    }
+
+    fn alignToByte() {
+        let r = held % 8
+        if r > 0 {
+            bits(r)
+        }
+    }
+
+    // Moves to a bit position (from the start of `data`).
+    fn seek(toBit: Int) {
+        next = toBit / 8
+        cache = 0
+        held = 0
+        overrun = false
+        let r = toBit % 8
+        if r > 0 {
+            bits(r)
+        }
+    }
+
+    // The byte position, when byte aligned.
+    bytePosition: Int {
+        position / 8
+    }
+
+    // Whether there is more data before the RBSP trailing bits (H.264
+    // more_rbsp_data): anything but a final 1 followed by zeros.
+    fn moreRbspData() -> Bool {
+        let pos = position
+        let total = end * 8
+        if pos >= total {
+            return false
+        }
+        // Find the last 1 bit in the data.
+        var last = end - 1
+        while last >= 0 && data[last] == 0 {
+            last -= 1
+        }
+        if last < 0 {
+            return false
+        }
+        let b = data[last]
+        var lowest = 0
+        while (b >> lowest) & 1 == 0 {
+            lowest += 1
+        }
+        let stopBit = last * 8 + (7 - lowest)
+        pos < stopBit
+    }
+}
+
+// A reader over all of `data`.
+public fn bitReader(_ data: Data) -> BitReader {
+    BitReader(data: data, next: 0, end: data.count)
+}
+
+// A reader over data[from..<to].
+public fn bitReaderRange(_ data: Data, from: Int, to: Int) -> BitReader {
+    BitReader(data: data, next: from, end: to)
+}
+
+public struct LsbReader {
+    data: Data
+    next: Int = 0
+    end: Int = 0
+    cache: Int = 0
+    held: Int = 0
+    overrun: Bool = false
+
+    fn refill() {
+        while held <= 48 {
+            if next < end {
+                cache = cache | (data[next] << held)
+            }
+            next += 1
+            held += 8
+        }
+    }
+
+    fn peek(_ n: Int) -> Int {
+        if held < n {
+            refill()
+        }
+        cache & ((1 << n) - 1)
+    }
+
+    // Reads n bits (0 to 32), first bit lowest.
+    fn bits(_ n: Int) -> Int {
+        if n == 0 {
+            return 0
+        }
+        if held < n {
+            refill()
+        }
+        let v = cache & ((1 << n) - 1)
+        cache = cache >> n
+        held -= n
+        if next * 8 - held > end * 8 {
+            overrun = true
+        }
+        v
+    }
+
+    fn flag() -> Bool {
+        bits(1) == 1
+    }
+
+    position: Int {
+        next * 8 - held
+    }
+
+    left: Int {
+        end * 8 - position
+    }
+
+    fn alignToByte() {
+        let r = held % 8
+        if r > 0 {
+            bits(r)
+        }
+    }
+}
+
+public fn lsbReader(_ data: Data) -> LsbReader {
+    LsbReader(data: data, next: 0, end: data.count)
+}
+
+public fn lsbReaderRange(_ data: Data, from: Int, to: Int) -> LsbReader {
+    LsbReader(data: data, next: from, end: to)
+}
+
+// A cursor over bytes for container headers. Reads past the end give 0
+// and set `overrun`.
+public struct ByteReader {
+    data: Data
+    pos: Int = 0
+    end: Int = 0
+    overrun: Bool = false
+
+    fn has(_ n: Int) -> Bool {
+        pos + n <= end
+    }
+
+    fn u8() -> Int {
+        if pos >= end {
+            overrun = true
+            pos += 1
+            return 0
+        }
+        let v = data[pos]
+        pos += 1
+        v
+    }
+
+    fn u16(bigEndian: Bool = true) -> Int {
+        if pos + 2 > end {
+            overrun = true
+            pos += 2
+            return 0
+        }
+        let v = data.uint16(at: pos, bigEndian: bigEndian)
+        pos += 2
+        v
+    }
+
+    fn u24(bigEndian: Bool = true) -> Int {
+        let a = u8()
+        let b = u8()
+        let c = u8()
+        if bigEndian {
+            return (a << 16) | (b << 8) | c
+        }
+        (c << 16) | (b << 8) | a
+    }
+
+    fn u32(bigEndian: Bool = true) -> Int {
+        if pos + 4 > end {
+            overrun = true
+            pos += 4
+            return 0
+        }
+        let v = data.uint32(at: pos, bigEndian: bigEndian)
+        pos += 4
+        v
+    }
+
+    // A 64-bit number; values of 2^63 and over stop at 2^63 - 1.
+    fn u64(bigEndian: Bool = true) -> Int {
+        let a = u32(bigEndian: bigEndian)
+        let b = u32(bigEndian: bigEndian)
+        let hi = if bigEndian { a } else { b }
+        let lo = if bigEndian { b } else { a }
+        if hi >= 0x80000000 {
+            return 9223372036854775807
+        }
+        (hi << 32) | lo
+    }
+
+    fn i16(bigEndian: Bool = true) -> Int {
+        let v = u16(bigEndian: bigEndian)
+        if v >= 32768 { v - 65536 } else { v }
+    }
+
+    fn i32(bigEndian: Bool = true) -> Int {
+        let v = u32(bigEndian: bigEndian)
+        if v >= 2147483648 { v - 4294967296 } else { v }
+    }
+
+    fn f32(bigEndian: Bool = true) -> Float {
+        if pos + 4 > end {
+            overrun = true
+            pos += 4
+            return 0.0
+        }
+        let v = data.float32(at: pos, bigEndian: bigEndian)
+        pos += 4
+        v
+    }
+
+    fn f64(bigEndian: Bool = true) -> Float {
+        if pos + 8 > end {
+            overrun = true
+            pos += 8
+            return 0.0
+        }
+        let v = data.float64(at: pos, bigEndian: bigEndian)
+        pos += 8
+        v
+    }
+
+    // Four bytes as text ("moov", "RIFF").
+    fn fourcc() -> String {
+        if pos + 4 > end {
+            overrun = true
+            pos += 4
+            return ""
+        }
+        let s = data.slice(from: pos, to: pos + 4).latin1
+        pos += 4
+        s
+    }
+
+    fn bytes(_ n: Int) -> Data {
+        let from = pos
+        pos += n
+        if pos > end {
+            overrun = true
+            return data.slice(from: from, to: end)
+        }
+        data.slice(from: from, to: pos)
+    }
+
+    fn skip(_ n: Int) {
+        pos += n
+        if pos > end {
+            overrun = true
+        }
+    }
+
+    left: Int {
+        end - pos
+    }
+}
+
+public fn byteReader(_ data: Data) -> ByteReader {
+    ByteReader(data: data, pos: 0, end: data.count)
+}
+
+public fn byteReaderRange(_ data: Data, from: Int, to: Int) -> ByteReader {
+    ByteReader(data: data, pos: from, end: to)
+}
+
+// Removes H.264/HEVC emulation prevention bytes (00 00 03 → 00 00) from
+// data[from..<to].
+public fn unescapeRbsp(_ data: Data, from: Int, to: Int) -> Data {
+    var out = Data()
+    var zeros = 0
+    var i = from
+    // Copy runs without a 00 00 03 in one slice each.
+    var runStart = from
+    while i < to {
+        let b = data[i]
+        if zeros >= 2 && b == 3 {
+            out += data.slice(from: runStart, to: i)
+            runStart = i + 1
+            zeros = 0
+        } else if b == 0 {
+            zeros += 1
+        } else {
+            zeros = 0
+        }
+        i += 1
+    }
+    out += data.slice(from: runStart, to: to)
+    out
+}

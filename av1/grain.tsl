@@ -1,0 +1,681 @@
+// AV1 film grain synthesis (spec 7.18.3), applied to a picture as it is
+// output: a pseudo-random Gaussian grain template is made per plane
+// (7.18.3.3, white noise shaped by an auto-regressive filter, chroma
+// correlated with luma), cut into 32x32 blocks at random offsets laid in
+// stripes of 32 luma rows with optional overlap blending, and added to
+// the samples scaled by a piecewise linear function of the intensity
+// (7.18.3.4 scaling lookup, 7.18.3.5 add noise).
+//
+// No noise stripes or noise image are stored: only each stripe's random
+// block offsets (and the previous stripe's, for the vertical overlap),
+// and the noise is read straight from the grain templates while it is
+// added; the few blended rows and columns are worked out on the side. The
+// 256-entry scaling tables are expanded once per picture into tables over
+// every sample value (scale_lut of 7.18.3.5 for 10/12-bit included).
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+public struct Av1FilmGrain {
+    // The picture: grain is added in place (callers pass copies of the
+    // reference frame's planes).
+    y: [Int] = []
+    u: [Int] = []
+    v: [Int] = []
+
+    ready: Bool = false
+    gauss: [Int] = []
+    // Grain templates: luma 82x73, chroma up to 82x73 (44x38 for 4:2:0).
+    lumaG: [Int] = []
+    cbG: [Int] = []
+    crG: [Int] = []
+    // Scaling functions over every sample value, per plane.
+    lutY: [Int] = []
+    lutU: [Int] = []
+    lutV: [Int] = []
+    scal: [Int] = []
+    // The random block offsets of the current and previous noise stripe,
+    // and noise row buffers.
+    offs: [Int] = []
+    prevOffs: [Int] = []
+    nBlocks: Int = 0
+    rb: [Int] = []
+    rb2: [Int] = []
+    rbU: [Int] = []
+    // Width of the chroma grain templates (44 or 82).
+    cgw: Int = 82
+    // RandomRegister.
+    rr: Int = 0
+    // Auto-regressive coefficients (minus 128), padded to 25.
+    arY: [Int] = []
+    arCb: [Int] = []
+    arCr: [Int] = []
+
+    fn setup() {
+        if ready {
+            return
+        }
+        ready = true
+        gauss = av1GaussianSequence
+        lumaG = fgZeros(82 * 73)
+        cbG = fgZeros(82 * 73)
+        crG = fgZeros(82 * 73)
+        scal = fgZeros(256 * 3)
+        arY = fgZeros(25)
+        arCb = fgZeros(25)
+        arCr = fgZeros(25)
+    }
+
+    // get_random_number (7.18.3.2).
+    fn rand(_ bits: Int) -> Int {
+        let r = rr
+        let bit = (r ^ (r >> 1) ^ (r >> 3) ^ (r >> 12)) & 1
+        let r2 = (r >> 1) | (bit << 15)
+        rr = r2
+        (r2 >> (16 - bits)) & ((1 << bits) - 1)
+    }
+
+    // Adds film grain to the w x h picture in y/u/v.
+    fn apply(_ g: Av1Grain, _ w: Int, _ h: Int, _ yStride: Int, _ cStride: Int,
+             _ subX: Int, _ subY: Int, _ bitDepth: Int, _ mono: Bool,
+             _ matrixCoefficients: Int) {
+        setup()
+        if !g.applyGrain || w <= 0 || h <= 0 {
+            return
+        }
+        let numPlanes = if mono { 1 } else { 3 }
+        let grainCenter = 128 << (bitDepth - 8)
+        let grainMin = -grainCenter
+        let grainMax = (256 << (bitDepth - 8)) - 1 - grainCenter
+        fgCoefs(g.arCoeffsYPlus128)
+        generate(g, subX, subY, bitDepth, mono, grainMin, grainMax)
+        scaling(g, numPlanes, bitDepth)
+        addNoise(g, w, h, yStride, cStride, subX, subY, bitDepth, numPlanes, grainMin, grainMax,
+                 matrixCoefficients)
+    }
+
+    // Copies a +128 biased coefficient list into a padded list of the
+    // coefficients themselves (missing ones are 0).
+    fn fgCoefs(_ a: [Int]) {
+        for i in 0..25 {
+            arY[i] = if i < a.count { a[i] - 128 } else { 0 }
+        }
+    }
+
+    // Generate grain process (7.18.3.3).
+    fn generate(_ g: Av1Grain, _ subX: Int, _ subY: Int, _ bitDepth: Int, _ mono: Bool,
+                _ grainMin: Int, _ grainMax: Int) {
+        let gs = gauss
+        let shift = 12 - bitDepth + g.grainScaleShift
+        let half = if shift > 0 { 1 << (shift - 1) } else { 0 }
+        rr = g.grainSeed
+        for i in 0..(82 * 73) {
+            var v = 0
+            if g.numYPoints > 0 {
+                v = gs[rand(11)]
+            }
+            lumaG[i] = (v + half) >> shift
+        }
+        let lag = g.arCoeffLag
+        let arShift = g.arCoeffShiftMinus6 + 6
+        let arHalf = 1 << (arShift - 1)
+        for y in 3..73 {
+            for x in 3..(82 - 3) {
+                var s = 0
+                var pos = 0
+                var dr = -lag
+                while dr <= 0 {
+                    var dc = -lag
+                    while dc <= lag {
+                        if dr == 0 && dc == 0 {
+                            break
+                        }
+                        s += lumaG[(y + dr) * 82 + x + dc] * arY[pos]
+                        pos += 1
+                        dc += 1
+                    }
+                    dr += 1
+                }
+                let at = y * 82 + x
+                lumaG[at] = fgClip(lumaG[at] + ((s + arHalf) >> arShift), grainMin, grainMax)
+            }
+        }
+        if mono {
+            return
+        }
+        let cw = if subX == 1 { 44 } else { 82 }
+        let ch = if subY == 1 { 38 } else { 73 }
+        let useCb = g.numCbPoints > 0 || g.chromaScalingFromLuma
+        let useCr = g.numCrPoints > 0 || g.chromaScalingFromLuma
+        rr = g.grainSeed ^ 0xb524
+        for i in 0..(cw * ch) {
+            var v = 0
+            if useCb {
+                v = gs[rand(11)]
+            }
+            cbG[i] = (v + half) >> shift
+        }
+        rr = g.grainSeed ^ 0x49d8
+        for i in 0..(cw * ch) {
+            var v = 0
+            if useCr {
+                v = gs[rand(11)]
+            }
+            crG[i] = (v + half) >> shift
+        }
+        let a = g.arCoeffsCbPlus128
+        let b = g.arCoeffsCrPlus128
+        for i in 0..25 {
+            arCb[i] = if i < a.count { a[i] - 128 } else { 0 }
+            arCr[i] = if i < b.count { b[i] - 128 } else { 0 }
+        }
+        let lumaShift = subX + subY
+        let lumaHalf = if lumaShift > 0 { 1 << (lumaShift - 1) } else { 0 }
+        for y in 3..ch {
+            for x in 3..(cw - 3) {
+                var s0 = 0
+                var s1 = 0
+                var pos = 0
+                var dr = -lag
+                while dr <= 0 {
+                    var dc = -lag
+                    while dc <= lag {
+                        let c0 = arCb[pos]
+                        let c1 = arCr[pos]
+                        if dr == 0 && dc == 0 {
+                            if g.numYPoints > 0 {
+                                var luma = 0
+                                let lumaX = ((x - 3) << subX) + 3
+                                let lumaY = ((y - 3) << subY) + 3
+                                for i in 0..(subY + 1) {
+                                    for j in 0..(subX + 1) {
+                                        luma += lumaG[(lumaY + i) * 82 + lumaX + j]
+                                    }
+                                }
+                                luma = (luma + lumaHalf) >> lumaShift
+                                s0 += luma * c0
+                                s1 += luma * c1
+                            }
+                            break
+                        }
+                        let k = (y + dr) * cw + x + dc
+                        s0 += cbG[k] * c0
+                        s1 += crG[k] * c1
+                        pos += 1
+                        dc += 1
+                    }
+                    dr += 1
+                }
+                let at = y * cw + x
+                cbG[at] = fgClip(cbG[at] + ((s0 + arHalf) >> arShift), grainMin, grainMax)
+                crG[at] = fgClip(crG[at] + ((s1 + arHalf) >> arShift), grainMin, grainMax)
+            }
+        }
+    }
+
+    // Scaling lookup initialization (7.18.3.4), then scale_lut (7.18.3.5)
+    // for every sample value.
+    fn scaling(_ g: Av1Grain, _ numPlanes: Int, _ bitDepth: Int) {
+        for plane in 0..numPlanes {
+            var xs = g.pointYValue
+            var ys = g.pointYScaling
+            var n = g.numYPoints
+            if plane == 1 && !g.chromaScalingFromLuma {
+                xs = g.pointCbValue
+                ys = g.pointCbScaling
+                n = g.numCbPoints
+            } else if plane == 2 && !g.chromaScalingFromLuma {
+                xs = g.pointCrValue
+                ys = g.pointCrScaling
+                n = g.numCrPoints
+            }
+            n = min(n, min(xs.count, ys.count))
+            let base = plane * 256
+            if n == 0 {
+                for x in 0..256 {
+                    scal[base + x] = 0
+                }
+            } else {
+                for x in 0..min(xs[0], 256) {
+                    scal[base + x] = ys[0]
+                }
+                for i in 0..(n - 1) {
+                    let deltaY = ys[i + 1] - ys[i]
+                    let deltaX = xs[i + 1] - xs[i]
+                    if deltaX <= 0 {
+                        continue
+                    }
+                    let delta = deltaY * ((65536 + (deltaX >> 1)) / deltaX)
+                    for x in 0..deltaX {
+                        let at = xs[i] + x
+                        if at < 256 {
+                            scal[base + at] = ys[i] + ((x * delta + 32768) >> 16)
+                        }
+                    }
+                }
+                for x in xs[n - 1]..256 {
+                    scal[base + x] = ys[n - 1]
+                }
+            }
+        }
+        let count = 1 << bitDepth
+        let shift = bitDepth - 8
+        for plane in 0..numPlanes {
+            var lut: [Int] = []
+            if plane == 0 {
+                lut = lutY
+            } else if plane == 1 {
+                lut = lutU
+            } else {
+                lut = lutV
+            }
+            if lut.count != count {
+                lut = fgZeros(count)
+            }
+            let base = plane * 256
+            for idx in 0..count {
+                let x = idx >> shift
+                if bitDepth == 8 || x == 255 {
+                    lut[idx] = scal[base + x]
+                } else {
+                    let rem = idx - (x << shift)
+                    let start = scal[base + x]
+                    let end = scal[base + x + 1]
+                    lut[idx] = start + (((end - start) * rem + (1 << (shift - 1))) >> shift)
+                }
+            }
+            if plane == 0 {
+                lutY = lut
+            } else if plane == 1 {
+                lutU = lut
+            } else {
+                lutV = lut
+            }
+        }
+    }
+
+    // The random block offsets of noise stripe lumaNum (7.18.3.5): one
+    // get_random_number(8) per 32x32 luma block, into `offs`.
+    fn stripeOffsets(_ g: Av1Grain, _ lumaNum: Int, _ w: Int) {
+        rr = g.grainSeed
+        rr = rr ^ (((lumaNum * 37 + 178) & 255) << 8)
+        rr = rr ^ ((lumaNum * 173 + 105) & 255)
+        var k = 0
+        var x = 0
+        let halfW = (w + 1) / 2
+        while x < halfW {
+            offs[k] = rand(8)
+            k += 1
+            x += 16
+        }
+        nBlocks = k
+    }
+
+    // Row i of noise stripe `which` (0: offs, 1: prevOffs) of a plane,
+    // with the horizontal overlap blending, into rb[0 ..< n].
+    fn fillRow(_ plane: Int, _ which: Int, _ i: Int, _ n: Int, _ psx: Int, _ psy: Int,
+               _ overlap: Bool, _ grainMin: Int, _ grainMax: Int) {
+        let tpl = if plane == 0 { lumaG } else if plane == 1 { cbG } else { crG }
+        let gw = if plane == 0 { 82 } else { cgw }
+        let o = if which == 0 { offs } else { prevOffs }
+        let bw = 32 >> psx
+        let ovl = 2 >> psx
+        var k = 0
+        var c0 = 0
+        while c0 < n {
+            let r = o[k]
+            let pox = if psx == 1 { 6 + (r >> 4) } else { 9 + (r >> 4) * 2 }
+            let poy = if psy == 1 { 6 + (r & 15) } else { 9 + (r & 15) * 2 }
+            let base = (poy + i) * gw + pox
+            let c1 = min(c0 + bw, n)
+            for c in c0..c1 {
+                rb[c] = tpl[base + c - c0]
+            }
+            if k > 0 && overlap {
+                let q = o[k - 1]
+                let qx = if psx == 1 { 6 + (q >> 4) } else { 9 + (q >> 4) * 2 }
+                let qy = if psy == 1 { 6 + (q & 15) } else { 9 + (q & 15) * 2 }
+                let qb = (qy + i) * gw + qx + bw
+                for j in 0..ovl {
+                    if c0 + j < n {
+                        let old = tpl[qb + j]
+                        let gv = tpl[base + j]
+                        var s0 = 0
+                        if psx == 1 {
+                            s0 = old * 23 + gv * 22
+                        } else if j == 0 {
+                            s0 = old * 27 + gv * 17
+                        } else {
+                            s0 = old * 17 + gv * 27
+                        }
+                        rb[c0 + j] = fgClip((s0 + 16) >> 5, grainMin, grainMax)
+                    }
+                }
+            }
+            k += 1
+            c0 += bw
+        }
+    }
+
+    // The horizontally blended noise of column j (< 2 >> psx) of block k
+    // (> 0) in row i of the current stripe.
+    fn blendAt(_ plane: Int, _ k: Int, _ i: Int, _ j: Int, _ psx: Int, _ psy: Int,
+               _ grainMin: Int, _ grainMax: Int) -> Int {
+        let tpl = if plane == 0 { lumaG } else if plane == 1 { cbG } else { crG }
+        let gw = if plane == 0 { 82 } else { cgw }
+        let r = offs[k]
+        let q = offs[k - 1]
+        let pox = if psx == 1 { 6 + (r >> 4) } else { 9 + (r >> 4) * 2 }
+        let poy = if psy == 1 { 6 + (r & 15) } else { 9 + (r & 15) * 2 }
+        let qx = if psx == 1 { 6 + (q >> 4) } else { 9 + (q >> 4) * 2 }
+        let qy = if psy == 1 { 6 + (q & 15) } else { 9 + (q & 15) * 2 }
+        let gv = tpl[(poy + i) * gw + pox + j]
+        let old = tpl[(qy + i) * gw + qx + (32 >> psx) + j]
+        var s0 = 0
+        if psx == 1 {
+            s0 = old * 23 + gv * 22
+        } else if j == 0 {
+            s0 = old * 27 + gv * 17
+        } else {
+            s0 = old * 17 + gv * 27
+        }
+        fgClip((s0 + 16) >> 5, grainMin, grainMax)
+    }
+
+    // Like fillRow, with the vertical overlap with the previous stripe
+    // when the row needs it (7.18.3.5 noise image).
+    fn noiseRow(_ plane: Int, _ i: Int, _ n: Int, _ psx: Int, _ psy: Int, _ lumaNum: Int,
+                _ overlap: Bool, _ grainMin: Int, _ grainMax: Int) {
+        fillRow(plane, 0, i, n, psx, psy, overlap, grainMin, grainMax)
+        if lumaNum > 0 && overlap && i < (2 >> psy) {
+            for c in 0..n {
+                rb2[c] = rb[c]
+            }
+            fillRow(plane, 1, i + (32 >> psy), n, psx, psy, overlap, grainMin, grainMax)
+            let kind = if psy == 1 { 3 } else { i + 1 }
+            for c in 0..n {
+                rb[c] = fgBlend(rb[c], rb2[c], kind, grainMin, grainMax)
+            }
+        }
+    }
+
+    // Add noise synthesis process (7.18.3.5). Rows that need no vertical
+    // blending read the grain templates directly (block by block); the
+    // others, and the horizontally blended columns, go through noiseRow.
+    fn addNoise(_ g: Av1Grain, _ w: Int, _ h: Int, _ yStride: Int, _ cStride: Int,
+                _ subX: Int, _ subY: Int, _ bitDepth: Int, _ numPlanes: Int,
+                _ grainMin: Int, _ grainMax: Int, _ matrixCoefficients: Int) {
+        let need = (w + 1) / 32 + 4
+        if offs.count < need {
+            offs = fgZeros(need)
+            prevOffs = fgZeros(need)
+        }
+        if rb.count < w + 64 {
+            rb = fgZeros(w + 64)
+            rb2 = fgZeros(w + 64)
+            rbU = fgZeros(w + 64)
+        }
+        cgw = if subX == 1 { 44 } else { 82 }
+        var minValue = 0
+        var maxLuma = (256 << (bitDepth - 8)) - 1
+        var maxChroma = maxLuma
+        if g.clipToRestrictedRange {
+            minValue = 16 << (bitDepth - 8)
+            maxLuma = 235 << (bitDepth - 8)
+            // MC_IDENTITY is matrix_coefficients 0.
+            maxChroma = if matrixCoefficients == 0 { maxLuma } else { 240 << (bitDepth - 8) }
+        }
+        let scalingShift = g.grainScalingMinus8 + 8
+        let sHalf = 1 << (scalingShift - 1)
+        let pixMax = (1 << bitDepth) - 1
+        let overlap = g.overlapFlag
+        let cw = (w + subX) >> subX
+        let ch = (h + subY) >> subY
+        let useCb = numPlanes > 1 && (g.numCbPoints > 0 || g.chromaScalingFromLuma)
+        let useCr = numPlanes > 1 && (g.numCrPoints > 0 || g.chromaScalingFromLuma)
+        let csfl = g.chromaScalingFromLuma
+        let cbMul = g.cbMult - 128
+        let cbLumaMul = g.cbLumaMult - 128
+        let cbOff = (g.cbOffset - 256) << (bitDepth - 8)
+        let crMul = g.crMult - 128
+        let crLumaMul = g.crLumaMult - 128
+        let crOff = (g.crOffset - 256) << (bitDepth - 8)
+        let lY = lutY
+        let lU = if numPlanes > 1 { lutU } else { lutY }
+        let lV = if numPlanes > 1 { lutV } else { lutY }
+        let tY = lumaG
+        let tU = cbG
+        let tV = crG
+        let ctw = cgw
+        let cbw = 32 >> subX
+        let ovlC = 2 >> subX
+        let cRows = 32 >> subY
+        let cVov = 2 >> subY
+        var lumaNum = 0
+        var ys = 0
+        let halfH = (h + 1) / 2
+        while ys < halfH {
+            let t = prevOffs
+            prevOffs = offs
+            offs = t
+            stripeOffsets(g, lumaNum, w)
+            let o = offs
+            let nb = nBlocks
+            // Chroma first: it reads the luma samples before their noise.
+            if useCb || useCr {
+                let y0 = lumaNum * cRows
+                let y1 = min(ch, y0 + cRows)
+                var pu = u
+                u = []
+                var pv = v
+                v = []
+                var cy = y0
+                while cy < y1 {
+                    let i = cy - y0
+                    let lumaRow = (cy << subY) * yStride
+                    let crow = cy * cStride
+                    let slow = lumaNum > 0 && overlap && i < cVov
+                    if slow {
+                        if useCb {
+                            noiseRow(1, i, cw, subX, subY, lumaNum, overlap, grainMin, grainMax)
+                            for c in 0..cw {
+                                rbU[c] = rb[c]
+                            }
+                        }
+                        if useCr {
+                            noiseRow(2, i, cw, subX, subY, lumaNum, overlap, grainMin, grainMax)
+                        }
+                    }
+                    var k = 0
+                    var c0 = 0
+                    while c0 < cw {
+                        let r = o[k]
+                        let pox = if subX == 1 { 6 + (r >> 4) } else { 9 + (r >> 4) * 2 }
+                        let poy = if subY == 1 { 6 + (r & 15) } else { 9 + (r & 15) * 2 }
+                        let base = (poy + i) * ctw + pox - c0
+                        let c1 = min(c0 + cbw, cw)
+                        if !slow && k > 0 && overlap {
+                            // The blended columns.
+                            for j in 0..ovlC {
+                                if c0 + j < cw {
+                                    if useCb {
+                                        rbU[c0 + j] = blendAt(1, k, i, j, subX, subY, grainMin, grainMax)
+                                    }
+                                    if useCr {
+                                        rb[c0 + j] = blendAt(2, k, i, j, subX, subY, grainMin, grainMax)
+                                    }
+                                }
+                            }
+                        }
+                        var cx = c0
+                        while cx < c1 {
+                            let fromRow = slow || (k > 0 && overlap && cx < c0 + ovlC)
+                            let lumaX = cx << subX
+                            var avg = 0
+                            if subX == 1 {
+                                var nx = lumaX + 1
+                                if nx > w - 1 {
+                                    nx = w - 1
+                                }
+                                avg = (y[lumaRow + lumaX] + y[lumaRow + nx] + 1) >> 1
+                            } else {
+                                avg = y[lumaRow + lumaX]
+                            }
+                            if useCb {
+                                let n = if fromRow { rbU[cx] } else { tU[base + cx] }
+                                let orig = pu[crow + cx]
+                                var merged = avg
+                                if !csfl {
+                                    merged = ((avg * cbLumaMul + orig * cbMul) >> 6) + cbOff
+                                    if merged < 0 {
+                                        merged = 0
+                                    } else if merged > pixMax {
+                                        merged = pixMax
+                                    }
+                                }
+                                var ov = orig + ((lU[merged] * n + sHalf) >> scalingShift)
+                                if ov < minValue {
+                                    ov = minValue
+                                } else if ov > maxChroma {
+                                    ov = maxChroma
+                                }
+                                pu[crow + cx] = ov
+                            }
+                            if useCr {
+                                let n = if fromRow { rb[cx] } else { tV[base + cx] }
+                                let orig = pv[crow + cx]
+                                var merged = avg
+                                if !csfl {
+                                    merged = ((avg * crLumaMul + orig * crMul) >> 6) + crOff
+                                    if merged < 0 {
+                                        merged = 0
+                                    } else if merged > pixMax {
+                                        merged = pixMax
+                                    }
+                                }
+                                var ov = orig + ((lV[merged] * n + sHalf) >> scalingShift)
+                                if ov < minValue {
+                                    ov = minValue
+                                } else if ov > maxChroma {
+                                    ov = maxChroma
+                                }
+                                pv[crow + cx] = ov
+                            }
+                            cx += 1
+                        }
+                        k += 1
+                        c0 += cbw
+                    }
+                    cy += 1
+                }
+                u = pu
+                v = pv
+            }
+            if g.numYPoints > 0 {
+                var py = y
+                y = []
+                let y0 = lumaNum * 32
+                let y1 = min(h, y0 + 32)
+                var ly = y0
+                while ly < y1 {
+                    let i = ly - y0
+                    let row = ly * yStride
+                    if lumaNum > 0 && overlap && i < 2 {
+                        noiseRow(0, i, w, 0, 0, lumaNum, overlap, grainMin, grainMax)
+                        for lx in 0..w {
+                            let orig = py[row + lx]
+                            var ov = orig + ((lY[orig] * rb[lx] + sHalf) >> scalingShift)
+                            if ov < minValue {
+                                ov = minValue
+                            } else if ov > maxLuma {
+                                ov = maxLuma
+                            }
+                            py[row + lx] = ov
+                        }
+                    } else {
+                        var k = 0
+                        var c0 = 0
+                        while c0 < w {
+                            let r = o[k]
+                            let pox = 9 + (r >> 4) * 2
+                            let poy = 9 + (r & 15) * 2
+                            let base = (poy + i) * 82 + pox - c0
+                            let c1 = min(c0 + 32, w)
+                            var lx = c0
+                            if k > 0 && overlap {
+                                let q = o[k - 1]
+                                let qb = (9 + (q & 15) * 2 + i) * 82 + 9 + (q >> 4) * 2 + 32
+                                for j in 0..2 {
+                                    if lx < c1 {
+                                        let gv = tY[base + lx]
+                                        let old = tY[qb + j]
+                                        let s0 = if j == 0 { old * 27 + gv * 17 } else { old * 17 + gv * 27 }
+                                        let n = fgClip((s0 + 16) >> 5, grainMin, grainMax)
+                                        let orig = py[row + lx]
+                                        var ov = orig + ((lY[orig] * n + sHalf) >> scalingShift)
+                                        if ov < minValue {
+                                            ov = minValue
+                                        } else if ov > maxLuma {
+                                            ov = maxLuma
+                                        }
+                                        py[row + lx] = ov
+                                        lx += 1
+                                    }
+                                }
+                            }
+                            while lx < c1 {
+                                let orig = py[row + lx]
+                                var ov = orig + ((lY[orig] * tY[base + lx] + sHalf) >> scalingShift)
+                                if ov < minValue {
+                                    ov = minValue
+                                } else if ov > maxLuma {
+                                    ov = maxLuma
+                                }
+                                py[row + lx] = ov
+                                lx += 1
+                            }
+                            k += 1
+                            c0 += 32
+                        }
+                    }
+                    ly += 1
+                }
+                y = py
+            }
+            lumaNum += 1
+            ys += 16
+        }
+    }
+}
+
+fn fgClip(_ v: Int, _ lo: Int, _ hi: Int) -> Int {
+    if v < lo {
+        return lo
+    }
+    if v > hi {
+        return hi
+    }
+    v
+}
+
+// The vertical overlap of two noise stripes: kind 1 the first row (27/17),
+// 2 the second (17/27), 3 subsampled chroma (23/22).
+fn fgBlend(_ old: Int, _ g: Int, _ kind: Int, _ lo: Int, _ hi: Int) -> Int {
+    var s = 0
+    if kind == 1 {
+        s = old * 27 + g * 17
+    } else if kind == 2 {
+        s = old * 17 + g * 27
+    } else {
+        s = old * 23 + g * 22
+    }
+    fgClip((s + 16) >> 5, lo, hi)
+}
+
+fn fgZeros(_ n: Int) -> [Int] {
+    var out: [Int] = []
+    for _ in 0..n {
+        out.append(0)
+    }
+    out
+}

@@ -1,0 +1,841 @@
+// The MP4 writer (ISO/IEC 14496-12 ISO base media file format, 14496-14
+// MP4, 14496-15 for AVC/HEVC): writes a ClipPlan as a "faststart" .mp4 —
+// the movie header first, so playback can start before the file is all
+// there:
+//   ftyp  isom, iso2, avc1, mp41
+//   moov  mvhd, trak* (tkhd, edts/elst, mdia: mdhd, hdlr, minf: vmhd/
+//         smhd/nmhd, dinf, stbl: stsd stts ctts stss stsc stsz stco|co64),
+//         udta (Nero chpl chapters, iTunes ilst tags + cover)
+//   mdat  the samples, interleaved in decode-time order (one chunk per run
+//         of a track's samples)
+// The sample tables are worked out from the plan before anything is
+// written (a first pass sizes the packets that need rewriting), so the
+// moov's size — and with it every chunk offset — is known up front and
+// the samples are then copied straight from the source in pieces.
+//
+// Times: each track keeps its source clock (audio uses its sample rate);
+// decode times start at 0 (stts) and composition offsets (ctts) give the
+// pts. An edit list (§8.6.6) maps the movie's 0 to the plan's 0: audio
+// priming and pictures before an exact clip start are decoded but not
+// shown; a track starting later gets an empty edit first.
+//
+// Sample entries (stsd) for: h264 (avc1/avcC), hevc (hvc1/hvcC), av1
+// (av01/av1C), vp9 (vp09/vpcC), mpeg4/mpeg2/mpeg1 (mp4v/esds), mjpeg
+// (jpeg), aac and MPEG audio (mp4a/esds), ac3 (ac-3/dac3), eac3
+// (ec-3/dec3), opus (Opus/dOps), flac (fLaC/dfLa), alac (alac), and text
+// subtitles as 3GPP timed text (tx3g).
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+import "../core"
+
+struct ExMp4Track {
+    keep: Bool = false
+    mode: Int = 0
+    hevc: Bool = false
+    id: Int = 0
+    timescale: Int = 1000
+    handler: String = ""
+    entry: Data = Data()
+    // Tables.
+    sizes: [Int] = []
+    dts: [Int] = []
+    pts: [Int] = []
+    durs: [Int] = []
+    keys: [Bool] = []
+    chunkOffsets: [Int] = []
+    chunkCounts: [Int] = []
+    // Edit list, movie timescale for durations.
+    emptyEdit: Int = 0
+    editDuration: Int = 0
+    mediaTime: Int = 0
+    mediaDuration: Int = 0
+}
+
+let exMovieScale = 1000
+
+// Writes `plan` (packets read from `file`) as a faststart MP4 to `path`,
+// or to memory when path is "".
+public fn writeMp4(_ file: Data, _ plan: ClipPlan, path: String = "", title: String = "") -> Result<WriteResult> {
+    var res = WriteResult()
+    res.warnings = plan.warnings
+    var outs: [ExMp4Track] = []
+    var firstPacket: [Int] = []
+    for _ in plan.tracks {
+        firstPacket.append(-1)
+    }
+    for (j, p) in plan.packets.enumerated() {
+        if firstPacket[p.track] < 0 {
+            firstPacket[p.track] = j
+        }
+    }
+    var nextId = 1
+    for (k, t) in plan.tracks.enumerated() {
+        var o = ExMp4Track()
+        if firstPacket[k] < 0 {
+            res.warnings.append("track {plan.sources[k]} ({t.codec}) has no packets and was left out")
+            outs.append(o)
+            continue
+        }
+        let first = exSourceBytes(file, plan.prefixes[k], plan.packets[firstPacket[k]])
+        o.hevc = t.codec == "hevc"
+        o.mode = payloadMode(t, mp4: true)
+        var keyFrame = first
+        if t.codec == "vp9" {
+            for p in plan.packets {
+                if p.track == k && p.key {
+                    keyFrame = exSourceBytes(file, plan.prefixes[k], p)
+                    break
+                }
+            }
+        }
+        var config = Data()
+        if o.mode == exAnnexB {
+            var ps = ExParamSets()
+            var seen = 0
+            for p in plan.packets {
+                if p.track == k && seen < 300 && !ps.complete(o.hevc) {
+                    ps.collect(exSourceBytes(file, plan.prefixes[k], p), o.hevc)
+                    seen += 1
+                }
+            }
+            config = if o.hevc { exBuildHvcC(ps) } else { exBuildAvcC(ps) }
+        } else if o.mode == exAdts {
+            config = exAscFromAdts(first)
+        }
+        let (entry, handler, why) = exSampleEntry(t, config, keyFrame, nextId)
+        if entry.isEmpty {
+            res.warnings.append("track {plan.sources[k]} ({t.codec}) can't be stored in MP4 ({why}) and was left out")
+            outs.append(o)
+            continue
+        }
+        o.keep = true
+        o.entry = entry
+        o.handler = handler
+        o.id = nextId
+        nextId += 1
+        o.timescale = if t.kind == .audio && t.sampleRate > 0 { t.sampleRate } else { max(1, t.timescale) }
+        if t.codec == "opus" {
+            o.timescale = 48000
+        }
+        outs.append(o)
+    }
+    if nextId == 1 {
+        return Result.failure(error: Error("none of the tracks can be stored in MP4"))
+    }
+    // Sample tables and chunks (offsets from the start of mdat's payload).
+    var payload = 0
+    var lastTrack = -1
+    var chunkBytes = 0
+    for p in plan.packets {
+        let k = p.track
+        if !outs[k].keep {
+            continue
+        }
+        let t = plan.tracks[k]
+        let ts = outs[k].timescale
+        let size = if outs[k].mode == exCopy { plan.prefixes[k].count + p.size } else { exTransform(exSourceBytes(file, plan.prefixes[k], p), outs[k].mode, outs[k].hevc).count }
+        outs[k].sizes.append(size)
+        outs[k].dts.append(exRescale(p.dts, t.timescale, ts))
+        outs[k].pts.append(exRescale(p.pts, t.timescale, ts))
+        outs[k].durs.append(exRescale(max(0, p.duration), t.timescale, ts))
+        outs[k].keys.append(p.key)
+        let n = outs[k].chunkCounts.count
+        if k != lastTrack || n == 0 || chunkBytes > 1048576 || outs[k].chunkCounts[n - 1] >= 1024 {
+            outs[k].chunkOffsets.append(payload)
+            outs[k].chunkCounts.append(1)
+            chunkBytes = 0
+        } else {
+            outs[k].chunkCounts[n - 1] += 1
+        }
+        chunkBytes += size
+        payload += size
+        lastTrack = k
+    }
+    // Decode times rising, durations, edit lists.
+    // The edit list doesn't cut the end: a clip's last B-pictures need the
+    // reference picture after them, which may show just past the end, and
+    // readers (Reel's demuxer, like ffmpeg) leave out samples past an edit.
+    let endLimit = -1.0
+    var movieDuration = 0
+    for k in 0..outs.count {
+        if outs[k].keep {
+            exMp4Timing(outs[k], endLimit)
+            movieDuration = max(movieDuration, outs[k].emptyEdit + outs[k].editDuration)
+        }
+    }
+    // The moov twice: once to learn its size, then with real offsets.
+    let ftyp = exFtyp(plan)
+    let large = payload + 8 > 0xFFFFFFFF - 16777216
+    let mdatHead = if large { 16 } else { 8 }
+    let draft = exMoov(plan, outs, movieDuration, 0, large, title)
+    let base = ftyp.count + draft.count + mdatHead
+    let moov = exMoov(plan, outs, movieDuration, base, large, title)
+    var sink = newSink(path)
+    sink.put(ftyp)
+    sink.put(moov)
+    var mh = ExBuf()
+    if large {
+        mh.u32(1)
+        mh.fourcc("mdat")
+        mh.u64(payload + 16)
+    } else {
+        mh.u32(payload + 8)
+        mh.fourcc("mdat")
+    }
+    sink.put(mh.data)
+    for p in plan.packets {
+        let o = outs[p.track]
+        if !o.keep {
+            continue
+        }
+        var d = exSourceBytes(file, plan.prefixes[p.track], p)
+        if o.mode != exCopy {
+            d = exTransform(d, o.mode, o.hevc)
+        }
+        sink.put(d)
+    }
+    sink.flush()
+    if sink.failed {
+        return Result.failure(error: Error("couldn't write {path}"))
+    }
+    res.bytes = sink.written
+    if path.isEmpty {
+        res.data = sink.data
+    }
+    Result.ok(value: res)
+}
+
+// Makes decode times rise (stts can't go back), works out each sample's
+// duration and the edit list.
+fn exMp4Timing(_ o: bind ExMp4Track, _ endLimit: Float) {
+    let n = o.dts.count
+    if n == 0 {
+        return
+    }
+    for j in 1..max(1, n) {
+        if o.dts[j] <= o.dts[j - 1] {
+            o.dts[j] = o.dts[j - 1] + 1
+        }
+    }
+    // pts must not come before dts by more than ctts can say; keep pts.
+    var durs: [Int] = []
+    for j in 0..n {
+        if j + 1 < n {
+            durs.append(o.dts[j + 1] - o.dts[j])
+        } else {
+            let last = if o.durs[j] > 0 { o.durs[j] } else if n > 1 { durs[n - 2] } else { 1 }
+            durs.append(last)
+        }
+    }
+    o.durs = durs
+    let origin = o.dts[0]
+    var minPts = o.pts[0]
+    var maxEnd = o.pts[0] + durs[0]
+    for j in 0..n {
+        minPts = min(minPts, o.pts[j])
+        maxEnd = max(maxEnd, o.pts[j] + durs[j])
+    }
+    let start = max(0, minPts)
+    if endLimit >= 0.0 {
+        let lim = Int(floor(endLimit * Float(o.timescale) + 0.5))
+        if lim > start && lim < maxEnd {
+            maxEnd = lim
+        }
+    }
+    o.mediaTime = start - origin
+    o.emptyEdit = exRescale(start, o.timescale, exMovieScale)
+    // Round the shown length up, so the last sample isn't cut by rounding.
+    let shown = maxEnd - start
+    o.editDuration = (shown * exMovieScale + o.timescale - 1) / o.timescale
+    o.mediaDuration = o.dts[n - 1] + durs[n - 1] - origin
+}
+
+fn exFtyp(_ plan: ClipPlan) -> Data {
+    var b = ExBuf()
+    b.fourcc("isom")
+    b.u32(0x200)
+    b.fourcc("isom")
+    b.fourcc("iso2")
+    var avc = false
+    for t in plan.tracks {
+        if t.codec == "h264" {
+            avc = true
+        }
+    }
+    if avc {
+        b.fourcc("avc1")
+    }
+    b.fourcc("mp41")
+    exBox("ftyp", b.data)
+}
+
+fn exMatrix(_ b: bind ExBuf, _ rotation: Int, _ w: Int, _ h: Int) {
+    // { a b u, c d v, x y w }: a, b, c, d, x, y in 16.16, u, v, w in 2.30.
+    let one = 0x10000
+    var m = [one, 0, 0, 0, one, 0, 0, 0, 0x40000000]
+    if rotation == 90 {
+        m = [0, one, 0, -one, 0, 0, h * one, 0, 0x40000000]
+    } else if rotation == 180 {
+        m = [-one, 0, 0, 0, -one, 0, w * one, h * one, 0x40000000]
+    } else if rotation == 270 {
+        m = [0, -one, 0, one, 0, 0, 0, w * one, 0x40000000]
+    }
+    for v in m {
+        b.u32(v & 0xFFFFFFFF)
+    }
+}
+
+fn exMoov(_ plan: ClipPlan, _ outs: [ExMp4Track], _ movieDuration: Int, _ base: Int, _ large: Bool, _ title: String) -> Data {
+    var body = Data()
+    let v1 = movieDuration > 0xFFFFFFFF
+    var mv = ExBuf()
+    if v1 {
+        mv.u64(0)
+        mv.u64(0)
+        mv.u32(exMovieScale)
+        mv.u64(movieDuration)
+    } else {
+        mv.u32(0)
+        mv.u32(0)
+        mv.u32(exMovieScale)
+        mv.u32(movieDuration)
+    }
+    mv.u32(0x00010000)
+    mv.u16(0x0100)
+    mv.zeros(10)
+    exMatrix(mv, 0, 0, 0)
+    mv.zeros(24)
+    var nextId = 1
+    for o in outs {
+        if o.keep {
+            nextId = max(nextId, o.id + 1)
+        }
+    }
+    mv.u32(nextId)
+    body += exFullBox("mvhd", if v1 { 1 } else { 0 }, 0, mv.data)
+    // A default track of each kind.
+    var defaultSeen: [core.TrackKind] = []
+    for (k, t) in plan.tracks.enumerated() {
+        if outs[k].keep && t.isDefault && !defaultSeen.contains(t.kind) {
+            defaultSeen.append(t.kind)
+        }
+    }
+    for (k, t) in plan.tracks.enumerated() {
+        let o = outs[k]
+        if !o.keep {
+            continue
+        }
+        var isDefault = t.isDefault
+        if !defaultSeen.contains(t.kind) {
+            isDefault = true
+            defaultSeen.append(t.kind)
+        }
+        body += exTrak(t, o, isDefault, base, large)
+    }
+    let udta = exUdta(plan, title)
+    if !udta.isEmpty {
+        body += exBox("udta", udta)
+    }
+    exBox("moov", body)
+}
+
+fn exTrak(_ t: core.Track, _ o: ExMp4Track, _ isDefault: Bool, _ base: Int, _ large: Bool) -> Data {
+    var trak = Data()
+    // tkhd (§8.3.2).
+    let total = o.emptyEdit + o.editDuration
+    let v1 = total > 0xFFFFFFFF
+    var th = ExBuf()
+    if v1 {
+        th.u64(0)
+        th.u64(0)
+        th.u32(o.id)
+        th.u32(0)
+        th.u64(total)
+    } else {
+        th.u32(0)
+        th.u32(0)
+        th.u32(o.id)
+        th.u32(0)
+        th.u32(total)
+    }
+    th.zeros(8)
+    th.u16(0)
+    th.u16(if t.kind == .audio { 1 } else if t.kind == .subtitle { 2 } else { 0 })
+    th.u16(if t.kind == .audio { 0x0100 } else { 0 })
+    th.u16(0)
+    var w = 0
+    var h = 0
+    if t.kind == .video {
+        w = t.width
+        h = t.height
+        if t.sarNum > 0 && t.sarDen > 0 && t.sarNum != t.sarDen {
+            w = (t.width * t.sarNum + t.sarDen / 2) / t.sarDen
+        }
+    }
+    exMatrix(th, t.rotation, w, h)
+    th.u32(w << 16)
+    th.u32(h << 16)
+    trak += exFullBox("tkhd", if v1 { 1 } else { 0 }, if isDefault { 3 } else { 2 }, th.data)
+    // edts/elst (§8.6.5–6).
+    var el = ExBuf()
+    let ev1 = total > 0xFFFFFFFF || o.mediaTime > 0x7FFFFFFF
+    el.u32(if o.emptyEdit > 0 { 2 } else { 1 })
+    if o.emptyEdit > 0 {
+        if ev1 {
+            el.u64(o.emptyEdit)
+            el.u64(-1)
+        } else {
+            el.u32(o.emptyEdit)
+            el.u32(0xFFFFFFFF)
+        }
+        el.u32(0x00010000)
+    }
+    if ev1 {
+        el.u64(o.editDuration)
+        el.u64(o.mediaTime)
+    } else {
+        el.u32(o.editDuration)
+        el.u32(o.mediaTime & 0xFFFFFFFF)
+    }
+    el.u32(0x00010000)
+    trak += exBox("edts", exFullBox("elst", if ev1 { 1 } else { 0 }, 0, el.data))
+    // mdia.
+    var mdia = Data()
+    let mv1 = o.mediaDuration > 0xFFFFFFFF
+    var md = ExBuf()
+    if mv1 {
+        md.u64(0)
+        md.u64(0)
+        md.u32(o.timescale)
+        md.u64(o.mediaDuration)
+    } else {
+        md.u32(0)
+        md.u32(0)
+        md.u32(o.timescale)
+        md.u32(o.mediaDuration)
+    }
+    md.u16(exPackLanguage(t.language))
+    md.u16(0)
+    mdia += exFullBox("mdhd", if mv1 { 1 } else { 0 }, 0, md.data)
+    var hd = ExBuf()
+    hd.u32(0)
+    hd.fourcc(o.handler)
+    hd.zeros(12)
+    let hname = match o.handler {
+        "vide" -> "VideoHandler"
+        "soun" -> "SoundHandler"
+        _ -> "SubtitleHandler"
+    }
+    hd.bytes(Data(text: hname))
+    hd.u8(0)
+    mdia += exFullBox("hdlr", 0, 0, hd.data)
+    var minf = Data()
+    if o.handler == "vide" {
+        minf += exFullBox("vmhd", 0, 1, Data(bytes: [0, 0, 0, 0, 0, 0, 0, 0]))
+    } else if o.handler == "soun" {
+        minf += exFullBox("smhd", 0, 0, Data(bytes: [0, 0, 0, 0]))
+    } else {
+        minf += exFullBox("nmhd", 0, 0, Data())
+    }
+    var dref = ExBuf()
+    dref.u32(1)
+    dref.bytes(exFullBox("url ", 0, 1, Data()))
+    minf += exBox("dinf", exFullBox("dref", 0, 0, dref.data))
+    minf += exBox("stbl", exStbl(o, base, large))
+    mdia += exBox("minf", minf)
+    trak += exBox("mdia", mdia)
+    exBox("trak", trak)
+}
+
+// ISO 639-2 code packed as three 5-bit letters (§8.4.2.3).
+fn exPackLanguage(_ lang: String) -> Int {
+    let code = if lang.count == 3 { lang.lowercase() } else { "und" }
+    let b = Data(text: code)
+    if b.count != 3 {
+        return 0x55C4
+    }
+    var v = 0
+    for i in 0..3 {
+        let c = b[i]
+        if c < 0x61 || c > 0x7A {
+            return 0x55C4
+        }
+        v = (v << 5) | (c - 0x60)
+    }
+    v
+}
+
+fn exStbl(_ o: ExMp4Track, _ base: Int, _ large: Bool) -> Data {
+    var stbl = Data()
+    var sd = ExBuf()
+    sd.u32(1)
+    sd.bytes(o.entry)
+    stbl += exFullBox("stsd", 0, 0, sd.data)
+    let n = o.sizes.count
+    // stts: runs of equal durations.
+    var st = ExBuf()
+    var runs = 0
+    var j = 0
+    var body = ExBuf()
+    while j < n {
+        var k = j + 1
+        while k < n && o.durs[k] == o.durs[j] {
+            k += 1
+        }
+        body.u32(k - j)
+        body.u32(o.durs[j])
+        runs += 1
+        j = k
+    }
+    st.u32(runs)
+    st.bytes(body.data)
+    stbl += exFullBox("stts", 0, 0, st.data)
+    // ctts: composition offsets, when any isn't 0.
+    var anyOffset = false
+    var negative = false
+    for i in 0..n {
+        let off = o.pts[i] - o.dts[i]
+        if off != 0 {
+            anyOffset = true
+        }
+        if off < 0 {
+            negative = true
+        }
+    }
+    if anyOffset {
+        var ct = ExBuf()
+        var cruns = 0
+        var cb = ExBuf()
+        j = 0
+        while j < n {
+            let off = o.pts[j] - o.dts[j]
+            var k = j + 1
+            while k < n && o.pts[k] - o.dts[k] == off {
+                k += 1
+            }
+            cb.u32(k - j)
+            cb.u32(off & 0xFFFFFFFF)
+            cruns += 1
+            j = k
+        }
+        ct.u32(cruns)
+        ct.bytes(cb.data)
+        stbl += exFullBox("ctts", if negative { 1 } else { 0 }, 0, ct.data)
+    }
+    // stss: sync samples, when not all are.
+    var allKey = true
+    for k in o.keys {
+        if !k {
+            allKey = false
+        }
+    }
+    if !allKey {
+        var ss = ExBuf()
+        var count = 0
+        var sb = ExBuf()
+        for i in 0..n {
+            if o.keys[i] {
+                sb.u32(i + 1)
+                count += 1
+            }
+        }
+        ss.u32(count)
+        ss.bytes(sb.data)
+        stbl += exFullBox("stss", 0, 0, ss.data)
+    }
+    // stsc: runs of chunks with the same sample count.
+    var sc = ExBuf()
+    var scRuns = 0
+    var scb = ExBuf()
+    for c in 0..o.chunkCounts.count {
+        if c == 0 || o.chunkCounts[c] != o.chunkCounts[c - 1] {
+            scb.u32(c + 1)
+            scb.u32(o.chunkCounts[c])
+            scb.u32(1)
+            scRuns += 1
+        }
+    }
+    sc.u32(scRuns)
+    sc.bytes(scb.data)
+    stbl += exFullBox("stsc", 0, 0, sc.data)
+    // stsz.
+    var sz = ExBuf()
+    var same = n > 0
+    for i in 0..n {
+        if o.sizes[i] != o.sizes[0] {
+            same = false
+        }
+    }
+    if same {
+        sz.u32(o.sizes[0])
+        sz.u32(n)
+    } else {
+        sz.u32(0)
+        sz.u32(n)
+        for s in o.sizes {
+            sz.u32(s)
+        }
+    }
+    stbl += exFullBox("stsz", 0, 0, sz.data)
+    // stco / co64.
+    var co = ExBuf()
+    co.u32(o.chunkOffsets.count)
+    for off in o.chunkOffsets {
+        if large {
+            co.u64(base + off)
+        } else {
+            co.u32(base + off)
+        }
+    }
+    stbl += exFullBox(if large { "co64" } else { "stco" }, 0, 0, co.data)
+    stbl
+}
+
+// An MPEG-4 descriptor (ISO/IEC 14496-1 §8.3.3) with a 4-byte size.
+fn exDescriptor(_ tag: Int, _ body: Data) -> Data {
+    let n = body.count
+    var out = Data(bytes: [tag, 0x80 | ((n >> 21) & 127), 0x80 | ((n >> 14) & 127), 0x80 | ((n >> 7) & 127), n & 127])
+    out += body
+    out
+}
+
+// esds (ISO/IEC 14496-14 §3.1.2): ES_Descriptor { DecoderConfigDescriptor
+// { DecoderSpecificInfo }, SLConfigDescriptor }.
+fn exEsds(_ esId: Int, _ oti: Int, _ audio: Bool, _ dsi: Data, _ bitrate: Int) -> Data {
+    var dc = ExBuf()
+    dc.u8(oti)
+    dc.u8(((if audio { 5 } else { 4 }) << 2) | 1)
+    dc.u24(0)
+    dc.u32(bitrate)
+    dc.u32(bitrate)
+    if !dsi.isEmpty {
+        dc.bytes(exDescriptor(5, dsi))
+    }
+    var es = ExBuf()
+    es.u16(esId & 0xFFFF)
+    es.u8(0)
+    es.bytes(exDescriptor(4, dc.data))
+    es.bytes(exDescriptor(6, Data(bytes: [2])))
+    exFullBox("esds", 0, 0, exDescriptor(3, es.data))
+}
+
+fn exVisualEntry(_ type: String, _ t: core.Track, _ boxes: Data) -> Data {
+    var b = ExBuf()
+    b.zeros(6)
+    b.u16(1)
+    b.u16(0)
+    b.u16(0)
+    b.zeros(12)
+    b.u16(t.width)
+    b.u16(t.height)
+    b.u32(0x00480000)
+    b.u32(0x00480000)
+    b.u32(0)
+    b.u16(1)
+    b.zeros(32)
+    b.u16(0x0018)
+    b.u16(0xFFFF)
+    b.bytes(boxes)
+    if t.sarNum > 0 && t.sarDen > 0 && t.sarNum != t.sarDen {
+        var pa = ExBuf()
+        pa.u32(t.sarNum)
+        pa.u32(t.sarDen)
+        b.bytes(exBox("pasp", pa.data))
+    }
+    exBox(type, b.data)
+}
+
+fn exAudioEntry(_ type: String, _ channels: Int, _ rate: Int, _ bits: Int, _ boxes: Data) -> Data {
+    var b = ExBuf()
+    b.zeros(6)
+    b.u16(1)
+    b.zeros(8)
+    b.u16(max(1, channels))
+    b.u16(if bits > 0 { bits } else { 16 })
+    b.u16(0)
+    b.u16(0)
+    b.u32(if rate < 65536 { rate << 16 } else { 0 })
+    b.bytes(boxes)
+    exBox(type, b.data)
+}
+
+// The sample entry, handler type, and (when the entry is empty) why not.
+fn exSampleEntry(_ t: core.Track, _ built: Data, _ first: Data, _ id: Int) -> (Data, String, String) {
+    let c = t.codec
+    if t.kind == .video {
+        let cfg = if built.isEmpty { t.extra } else { built }
+        if c == "h264" {
+            if cfg.isEmpty { return (Data(), "", "no avcC") }
+            return (exVisualEntry("avc1", t, exBox("avcC", cfg)), "vide", "")
+        }
+        if c == "hevc" {
+            if cfg.isEmpty { return (Data(), "", "no hvcC") }
+            return (exVisualEntry("hvc1", t, exBox("hvcC", cfg)), "vide", "")
+        }
+        if c == "av1" {
+            if t.extra.count < 4 { return (Data(), "", "no av1C") }
+            return (exVisualEntry("av01", t, exBox("av1C", t.extra)), "vide", "")
+        }
+        if c == "vp9" {
+            let vpc = if t.extra.count >= 12 && t.extra[0] == 1 { t.extra } else { exVpcC(first, t) }
+            return (exVisualEntry("vp09", t, exBox("vpcC", vpc)), "vide", "")
+        }
+        if c == "mpeg4" || c == "mpeg2" || c == "mpeg1" {
+            let oti = if c == "mpeg4" { 0x20 } else if c == "mpeg2" { 0x61 } else { 0x6A }
+            return (exVisualEntry("mp4v", t, exEsds(id, oti, false, t.extra, t.bitrate)), "vide", "")
+        }
+        if c == "mjpeg" {
+            return (exVisualEntry("jpeg", t, Data()), "vide", "")
+        }
+        return (Data(), "", "no MP4 mapping for {c}")
+    }
+    if t.kind == .audio {
+        let ch = t.channels
+        let rate = t.sampleRate
+        if c == "aac" {
+            var asc = if built.isEmpty { t.extra } else { built }
+            if asc.isEmpty {
+                asc = exAscFor(rate, ch)
+            }
+            return (exAudioEntry("mp4a", ch, rate, 16, exEsds(id, 0x40, true, asc, t.bitrate)), "soun", "")
+        }
+        if c == "mp3" || c == "mp2" || c == "mp1" {
+            let oti = if rate >= 32000 { 0x6B } else { 0x69 }
+            return (exAudioEntry("mp4a", ch, rate, 16, exEsds(id, oti, true, Data(), t.bitrate)), "soun", "")
+        }
+        if c == "ac3" {
+            return (exAudioEntry("ac-3", ch, rate, 16, exBox("dac3", exDac3(first))), "soun", "")
+        }
+        if c == "eac3" {
+            let d = exDec3(first)
+            if d.isEmpty { return (Data(), "", "no E-AC-3 header") }
+            return (exAudioEntry("ec-3", ch, rate, 16, exBox("dec3", d)), "soun", "")
+        }
+        if c == "opus" {
+            let head = if t.extra.count >= 19 { t.extra } else { exOpusHeadFor(ch) }
+            return (exAudioEntry("Opus", ch, 48000, 16, exBox("dOps", exDopsFromOpusHead(head))), "soun", "")
+        }
+        if c == "flac" {
+            // dfLa: FullBox + metadata blocks; STREAMINFO only, marked last.
+            let x = t.extra
+            if x.count < 42 || x.slice(from: 0, to: 4).latin1 != "fLaC" {
+                return (Data(), "", "no STREAMINFO")
+            }
+            var blocks = Data(bytes: [0x80, 0, 0, 34])
+            blocks += x.slice(from: 8, to: 42)
+            return (exAudioEntry("fLaC", ch, rate, t.bitsPerSample, exFullBox("dfLa", 0, 0, blocks)), "soun", "")
+        }
+        if c == "alac" {
+            if t.extra.count < 24 { return (Data(), "", "no ALAC cookie") }
+            return (exAudioEntry("alac", ch, rate, t.bitsPerSample, exFullBox("alac", 0, 0, t.extra)), "soun", "")
+        }
+        return (Data(), "", "no MP4 mapping for {c}")
+    }
+    if t.kind == .subtitle {
+        if c == "tx3g" && !t.extra.isEmpty {
+            // core keeps the entry's fields after its 8-byte header.
+            var b = ExBuf()
+            b.zeros(6)
+            b.u16(1)
+            b.bytes(t.extra)
+            return (exBox("tx3g", b.data), "sbtl", "")
+        }
+        if c == "tx3g" || c == "srt" || c == "text" || c == "webvtt" {
+            return (exTx3gEntry(), "sbtl", "")
+        }
+        return (Data(), "", "only text subtitles go into MP4")
+    }
+    (Data(), "", "not audio, video or subtitles")
+}
+
+// A plain TextSampleEntry (3GPP TS 26.245 §5.16): bottom-centred white
+// text, one font.
+fn exTx3gEntry() -> Data {
+    var b = ExBuf()
+    b.zeros(6)
+    b.u16(1)
+    b.u32(0)              // displayFlags
+    b.u8(1)               // horizontal justification: centre
+    b.u8(0xFF)            // vertical: bottom (−1)
+    b.u32(0)              // background rgba
+    b.zeros(8)            // BoxRecord
+    // StyleRecord: startChar, endChar, font ID 1, face 0, size 18, white.
+    b.u16(0)
+    b.u16(0)
+    b.u16(1)
+    b.u8(0)
+    b.u8(18)
+    b.u32(0xFFFFFFFF)
+    var ft = ExBuf()
+    ft.u16(1)
+    ft.u16(1)
+    let font = Data(text: "Serif")
+    ft.u8(font.count)
+    ft.bytes(font)
+    b.bytes(exBox("ftab", ft.data))
+    exBox("tx3g", b.data)
+}
+
+// udta: Nero chapters (chpl) and iTunes tags (meta/ilst).
+fn exUdta(_ plan: ClipPlan, _ title: String) -> Data {
+    var u = Data()
+    if !plan.chapters.isEmpty {
+        var c = ExBuf()
+        c.u32(0)
+        let count = min(255, plan.chapters.count)
+        c.u8(count)
+        for i in 0..count {
+            let ch = plan.chapters[i]
+            c.u64(Int(ch.start * 10000000.0 + 0.5))
+            var t = Data(text: ch.title)
+            if t.count > 255 {
+                t = t.slice(from: 0, to: 255)
+            }
+            c.u8(t.count)
+            c.bytes(t)
+        }
+        u += exFullBox("chpl", 1, 0, c.data)
+    }
+    var tags = plan.tags
+    if !title.isEmpty {
+        tags["title"] = title
+    }
+    var ilst = Data()
+    let keys = [("title", "©nam"), ("artist", "©ART"), ("albumartist", "aART"), ("album", "©alb"), ("date", "©day"), ("genre", "©gen"), ("comment", "©cmt"), ("composer", "©wrt"), ("copyright", "cprt"), ("description", "desc")]
+    for (key, box) in keys {
+        if let v = tags[key] {
+            if !v.isEmpty {
+                var d = ExBuf()
+                d.u32(1)
+                d.u32(0)
+                d.bytes(Data(text: v))
+                ilst += exBox(box, exBox("data", d.data))
+            }
+        }
+    }
+    var too = ExBuf()
+    too.u32(1)
+    too.u32(0)
+    too.bytes(Data(text: "Reel"))
+    ilst += exBox("©too", exBox("data", too.data))
+    if !plan.cover.isEmpty {
+        let png = plan.cover.count > 4 && plan.cover[0] == 0x89 && plan.cover[1] == 0x50
+        var d = ExBuf()
+        d.u32(if png { 14 } else { 13 })
+        d.u32(0)
+        d.bytes(plan.cover)
+        ilst += exBox("covr", exBox("data", d.data))
+    }
+    var hd = ExBuf()
+    hd.u32(0)
+    hd.fourcc("mdir")
+    hd.fourcc("appl")
+    hd.zeros(8)
+    hd.u8(0)
+    var meta = exFullBox("hdlr", 0, 0, hd.data)
+    meta += exBox("ilst", ilst)
+    u += exFullBox("meta", 0, 0, meta)
+    u
+}

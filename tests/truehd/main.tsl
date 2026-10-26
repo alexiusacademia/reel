@@ -1,0 +1,338 @@
+// Tests for the truehd module (TrueHD and MLP decoding) and demux/thd.tsl
+// (raw .thd/.mlp streams): every fixture in tests/truehd/fixtures (made by
+// build/scratch/dolby/make_fixtures.sh: FFmpeg's truehd and mlp encoders,
+// mono to 5.1, 16/24-bit, 44.1/48/96 kHz, in raw form and in MKV, MP4 and
+// M2TS; plus small FATE samples: Atmos TrueHD, a 5.1 Blu-ray cut, an MLP
+// cut, a mono cut, a tiny padded stream) is opened with demux.open and
+// decoded; the md5 of the output as 32-bit samples must equal FFmpeg's
+// (bit-exact). Also the full FATE samples when
+// build/scratch/dolby/get_conformance.sh has fetched them, a .thd+ac3
+// stream (AC-3 frames interleaved), damaged input, and speed.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../../truehd"
+import "../../demux"
+import "../../core"
+
+let fixtureDir = "tests/truehd/fixtures"
+let confDir = "build/conformance/dolby"
+
+struct Decoded {
+    ok: Bool = false
+    problem: String = ""
+    samples: [Float] = []
+    rate: Int = 0
+    channels: Int = 0
+    layout: [String] = []
+    bits: Int = 0
+    atmos: Bool = false
+    units: Int = 0
+    damaged: Int = 0
+    checkErrors: Int = 0
+    warnings: [String] = []
+    ms: Float = 0.0
+    trackRate: Int = 0
+    trackChannels: Int = 0
+    trackCodec: String = ""
+    info: String = ""
+    keys: Int = 0
+}
+
+fn decodeData(_ data: Data, name: String) -> Decoded {
+    var out = Decoded()
+    // demux.sniff knows raw streams that start with a major sync; FATE's
+    // truehd_5.1.raw starts mid-unit, so it's opened as TrueHD directly.
+    // A .thd+ac3 stream starts with an AC-3 frame, which demux.sniff takes
+    // for a raw AC-3 file (see build/NEEDED.md).
+    let r = if name.hasSuffix(".raw") || name.hasSuffix(".thd+ac3") { demux.thdOpen(data) } else { demux.open(data, name: name) }
+    if let e = r.error() {
+        out.problem = "open: {e.message}"
+        return out
+    }
+    let m = r.value() ?? core.Media()
+    var ti = -1
+    for t in m.tracks {
+        if (t.codec == "truehd" || t.codec == "mlp") && ti < 0 {
+            ti = t.index
+        }
+    }
+    if ti < 0 {
+        out.problem = "no TrueHD track"
+        return out
+    }
+    let track = m.tracks[ti]
+    out.trackRate = track.sampleRate
+    out.trackChannels = track.channels
+    out.trackCodec = track.codec
+    var d = truehd.newDecoder(track).value() ?? truehd.Decoder()
+    var firstUnit = Data()
+    let t0 = now()
+    for p in m.packets {
+        if p.track != ti {
+            continue
+        }
+        let bytes = core.packetBytes(data, m, p)
+        if firstUnit.isEmpty {
+            firstUnit = bytes
+        }
+        if p.key {
+            out.keys += 1
+        }
+        out.samples += d.decode(bytes, pts: p.pts).data
+    }
+    out.samples += d.flush().data
+    out.ms = (now() - t0) * 1000.0
+    out.info = truehd.streamInfo(track, firstUnit: firstUnit)
+    out.ok = true
+    out.rate = d.rate
+    out.channels = d.channels
+    out.layout = d.layout
+    out.bits = d.bits
+    out.atmos = d.atmos
+    out.units = d.units
+    out.damaged = d.damaged
+    out.checkErrors = d.checkErrors
+    out.warnings = d.warnings
+    out
+}
+
+fn decodeFile(_ path: String) -> Decoded {
+    let data = readData(path) ?? Data()
+    if data.isEmpty {
+        var out = Decoded()
+        out.problem = "missing"
+        return out
+    }
+    decodeData(data, name: path)
+}
+
+// The md5 of the samples as FFmpeg's s32le output.
+fn s32Md5(_ samples: [Float]) -> String {
+    var bytes: [Int] = []
+    for f in samples {
+        let v = Int(f * 2147483648.0)
+        bytes.append(v & 0xff)
+        bytes.append((v >> 8) & 0xff)
+        bytes.append((v >> 16) & 0xff)
+        bytes.append((v >> 24) & 0xff)
+    }
+    Data(bytes: bytes).hash("md5").hex
+}
+
+struct Want {
+    md5: String = ""
+    frames: Int = 0
+    channels: Int = 0
+}
+
+fn loadWant(_ path: String) -> Want {
+    let text = readFile(path + ".s32md5") ?? ""
+    let parts = text.trim().split(" ")
+    if parts.count < 3 {
+        return Want()
+    }
+    Want(md5: parts[0], frames: Int(parts[1]) ?? 0, channels: Int(parts[2]) ?? 0)
+}
+
+struct Tally {
+    passed: Int = 0
+    total: Int = 0
+
+    fn check(_ ok: Bool, _ what: String) {
+        total += 1
+        if ok {
+            passed += 1
+        } else {
+            print("FAIL: {what}")
+        }
+    }
+}
+
+// Decodes a file and compares it bit for bit with FFmpeg; returns the
+// decoded result for further checks.
+fn checkBitExact(_ t: bind Tally, _ path: String, layout: [String] = []) -> Decoded {
+    let want = loadWant(path)
+    let d = decodeFile(path)
+    let name = path.split("/").last ?? path
+    if !d.ok {
+        t.check(false, "{name}: {d.problem}")
+        return d
+    }
+    let frames = if d.channels > 0 { d.samples.count / d.channels } else { 0 }
+    let md5 = s32Md5(d.samples)
+    let same = md5 == want.md5 && d.channels == want.channels && frames == want.frames
+    t.check(same, "{name}: md5 {md5} frames {frames} ch {d.channels}, FFmpeg {want.md5} frames {want.frames} ch {want.channels} (warnings: {d.warnings.prefix(4)})")
+    if !layout.isEmpty {
+        t.check(d.layout == layout, "{name}: layout {d.layout}, want {layout}")
+    }
+    t.check(d.checkErrors == 0, "{name}: {d.checkErrors} check byte mismatches")
+    let secs = if d.rate > 0 { Float(frames) / Float(d.rate) } else { 0.0 }
+    let speed = if d.ms > 0.0 { secs * 1000.0 / d.ms } else { 0.0 }
+    print("  {name}: {d.info}, {frames} frames, {d.ms} ms ({Int(speed)}× real time){if same { "" } else { " MISMATCH" }}")
+    d
+}
+
+fn main() {
+    var t = Tally()
+
+    // --- Headers. ---
+    let unit = readData(joinPath(fixtureDir, "thd_51.thd")) ?? Data()
+    let mh = truehd.thdReadMajorSync(unit, 4)
+    t.check(mh.ok && mh.streamType == truehd.thdSyncTrueHD, "thd_51 major sync: {mh.problem}")
+    t.check(mh.group1Rate == 48000 && mh.auSize == 40, "thd_51 rate {mh.group1Rate} au {mh.auSize}")
+    t.check(truehd.thdPopCount(mh.mask) == 6, "thd_51 channels {truehd.thdPopCount(mh.mask)}")
+    let mlpUnit = readData(joinPath(fixtureDir, "mlp_44k24.mlp")) ?? Data()
+    let mh2 = truehd.thdReadMajorSync(mlpUnit, 4)
+    t.check(mh2.ok && mh2.streamType == truehd.thdSyncMlp && mh2.group1Rate == 44100 && mh2.group1Bits == 24, "mlp_44k24 major sync: {mh2.problem} rate {mh2.group1Rate} bits {mh2.group1Bits}")
+
+    // --- Demuxing raw streams. ---
+    let r = demux.open(unit, name: "x.thd")
+    let m = r.value() ?? core.Media()
+    t.check(m.tracks.count == 1 && m.tracks[0].codec == "truehd", "thd_51.thd tracks {m.tracks.count}")
+    if m.tracks.count == 1 {
+        let tr = m.tracks[0]
+        t.check(tr.sampleRate == 48000 && tr.channels == 6 && tr.timescale == 48000, "thd_51 track {tr.sampleRate} {tr.channels} {tr.timescale}")
+        t.check(tr.layout == ["FL", "FR", "FC", "LFE", "SL", "SR"], "thd_51 layout {tr.layout}")
+        t.check(tr.duration == 2400, "thd_51 duration {tr.duration}")
+        var keys = 0
+        var size = 0
+        var lastPts = -1
+        var ordered = true
+        for p in m.packets {
+            if p.key {
+                keys += 1
+            }
+            size += p.size
+            if p.pts <= lastPts {
+                ordered = false
+            }
+            lastPts = p.pts
+        }
+        t.check(m.packets.count > 0 && m.packets[0].key && keys >= 2, "thd_51 packets {m.packets.count} keys {keys}")
+        t.check(size == unit.count && ordered, "thd_51 packets cover {size} of {unit.count} bytes, ordered {ordered}")
+        t.check(m.duration > 0.049 && m.duration < 0.051, "thd_51 duration {m.duration} s")
+    }
+
+    // --- Bit-exact decoding of every fixture. ---
+    print("fixtures:")
+    let names = ["thd_stereo16.thd", "thd_stereo24.thd", "thd_mono.thd", "thd_40.thd", "thd_96k.thd", "thd_192k.thd", "mlp_176k.mlp", "thd_51.thd", "thd_51.mkv", "thd_51.mp4", "thd_51.m2ts", "mlp_stereo16.mlp", "mlp_stereo16.mkv", "mlp_44k24.mlp", "mlp_21.mlp", "mlp_51.mlp", "atmos.thd", "fate_51_cut.thd", "fate_mlp_cut.mlp", "ticket-1726-monocut.thd", "spdifenc-branch-padding.thd"]
+    for name in names {
+        let path = joinPath(fixtureDir, name)
+        var layout: [String] = []
+        if name.hasPrefix("thd_51") {
+            layout = ["FL", "FR", "FC", "LFE", "SL", "SR"]
+        } else if name == "atmos.thd" {
+            layout = ["FL", "FR", "FC", "LFE", "BL", "BR", "SL", "SR"]
+        } else if name == "thd_mono.thd" {
+            layout = ["FC"]
+        }
+        let d = checkBitExact(t, path, layout: layout)
+        if name == "atmos.thd" {
+            t.check(d.atmos && d.info == "TrueHD 7.1 (Atmos), 48 kHz, 24-bit", "atmos info \"{d.info}\" atmos {d.atmos}")
+        }
+        if name == "mlp_stereo16.mlp" {
+            t.check(d.bits == 16 && d.info == "MLP stereo, 48 kHz, 16-bit", "mlp info \"{d.info}\" bits {d.bits}")
+        }
+        if name == "thd_51.mkv" || name == "thd_51.mp4" || name == "thd_51.m2ts" {
+            // MP4 and M2TS tracks don't say; the decoder knows after the
+            // first access unit.
+            t.check(d.rate == 48000 && d.channels == 6 && d.trackCodec == "truehd", "{name}: decoded {d.rate} Hz {d.channels} ch, track {d.trackCodec}")
+        }
+    }
+
+    // --- .thd+ac3: AC-3 frames interleaved (Blu-ray). ---
+    let ac3Data = readData("tests/fixtures/ac3.ac3") ?? Data()
+    if !ac3Data.isEmpty {
+        var mixed = Data()
+        var a = 0
+        var u = 0
+        var frames = 0
+        while u < unit.count {
+            let al = truehd.thdAc3FrameSize(ac3Data, a)
+            if al > 0 && a + al <= ac3Data.count && frames < 20 {
+                mixed += ac3Data.slice(from: a, to: a + al)
+                a += al
+                frames += 1
+            }
+            var k = 0
+            while k < 16 && u < unit.count {
+                let len = truehd.thdAccessUnitLength(unit, u)
+                mixed += unit.slice(from: u, to: u + len)
+                u += len
+                k += 1
+            }
+        }
+        let mm = demux.thdOpen(mixed).value() ?? core.Media()
+        t.check(mm.tracks.count == 2 && mm.tracks[1].codec == "ac3" && mm.tracks[0].codec == "truehd", "thd+ac3 tracks {mm.tracks.count}")
+        var ac3Packets = 0
+        for p in mm.packets {
+            if p.track == 1 {
+                ac3Packets += 1
+            }
+        }
+        t.check(ac3Packets == frames, "thd+ac3: {ac3Packets} AC-3 packets of {frames}")
+        let want = loadWant(joinPath(fixtureDir, "thd_51.thd"))
+        let d = decodeData(mixed, name: "mixed.thd+ac3")
+        t.check(s32Md5(d.samples) == want.md5, "thd+ac3: TrueHD output differs: {d.samples.count / max(d.channels, 1)} frames, {d.warnings.prefix(4)}")
+        // The decoder alone skips AC-3 frames handed to it (one TS track).
+        var dec = truehd.newDecoder(core.Track(index: 0, kind: .audio, codec: "truehd")).value() ?? truehd.Decoder()
+        var all: [Float] = []
+        var at = 0
+        while at < mixed.count {
+            let to = min(mixed.count, at + 1000)
+            all += dec.decode(mixed.slice(from: at, to: to), pts: 0).data
+            at = to
+        }
+        t.check(s32Md5(all) == want.md5, "thd+ac3 in 1000-byte pieces: output differs ({dec.warnings.prefix(3)})")
+    }
+
+    // --- Damaged input never stops the decoder. ---
+    var bytes = unit.bytes
+    var i = 100
+    while i < bytes.count {
+        bytes[i] = bytes[i] ^ 0x5a
+        i += 997
+    }
+    let damaged = decodeData(Data(bytes: bytes), name: "bad.thd")
+    t.check(damaged.ok && damaged.damaged > 0 && !damaged.warnings.isEmpty, "damaged stream: {damaged.damaged} damaged units, {damaged.warnings.count} warnings")
+    var cut = truehd.newDecoder(core.Track(index: 0, kind: .audio, codec: "truehd")).value() ?? truehd.Decoder()
+    let s1 = cut.decode(unit.slice(from: 0, to: 3000), pts: 0)
+    cut.reset()
+    let s2 = cut.decode(unit.slice(from: 7000, to: 20000), pts: 0)
+    t.check(s1.frames > 0 && s2.frames > 0, "reset then a cut stream: {s1.frames}, {s2.frames} frames")
+    t.check(truehd.newDecoder(core.Track(index: 0, kind: .audio, codec: "aac")).error() != nil, "refuses other codecs")
+    t.check(demux.thdOpen(Data(bytes: [1, 2, 3, 4, 5, 6, 7, 8])).error() != nil, "thdOpen refuses junk")
+
+    // --- The full FATE samples, when downloaded. ---
+    print("conformance:")
+    let conf = ["truehd_5.1.raw", "luckynight-partial.mlp", "atmos.thd", "ticket-1726-monocut.thd", "spdifenc-branch-padding.thd"]
+    for name in conf {
+        let path = joinPath(confDir, name)
+        if fileExists(path) && fileExists(path + ".s32md5") {
+            let d = checkBitExact(t, path)
+            if name == "truehd_5.1.raw" {
+                let frames = if d.channels > 0 { d.samples.count / d.channels } else { 0 }
+                let secs = Float(frames) / 48000.0
+                print("time truehd 5.1 decode: {Int(d.ms / max(secs, 0.001))} ms per second of audio ({Int(secs * 1000.0 / max(d.ms, 0.001))}× real time)")
+            }
+        }
+    }
+    // Speed: TrueHD 7.1 (the Atmos bed), repeated to a few seconds.
+    let atmos = readData(joinPath(fixtureDir, "atmos.thd")) ?? Data()
+    if !atmos.isEmpty {
+        var dec = truehd.newDecoder(core.Track(index: 0, kind: .audio, codec: "truehd")).value() ?? truehd.Decoder()
+        var frames = 0
+        let t0 = now()
+        for _ in 0..20 {
+            dec.reset()
+            frames += dec.decode(atmos, pts: 0).frames
+        }
+        let ms = (now() - t0) * 1000.0
+        let secs = Float(frames) / 48000.0
+        print("time truehd 7.1 decode: {Int(ms / secs)} ms per second of audio ({Int(secs * 1000.0 / ms)}× real time)")
+    }
+
+    print("truehd: {t.passed} of {t.total} passed")
+}

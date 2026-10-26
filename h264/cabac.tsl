@@ -1,0 +1,335 @@
+// The CABAC arithmetic decoding engine (ITU-T H.264 9.3.1.2 and 9.3.3.2):
+// context variable initialisation, DecodeDecision, DecodeBypass and
+// DecodeTerminate.
+//
+// The spec's 9-bit codIOffset is kept in `value` together with `held`
+// bits read ahead: value = codIOffset * 2^held + the next `held` bits.
+// Renormalising by n bits then only lowers `held` by n (the offset takes
+// those bits from the read-ahead), and a comparison with codIRange
+// becomes value < codIRange << held. Bytes are loaded two at a time.
+//
+// Context states are stored as pStateIdx * 2 + valMPS.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+struct Cabac {
+    data: Data = Data()
+    pos: Int = 0
+    end: Int = 0
+    range: Int = 510
+    value: Int = 0
+    held: Int = 0
+    overrun: Bool = false
+    states: [Int] = []
+    // Copies of the state tables (module constants cost more to read).
+    lpsTab: [Int] = []
+    mpsNext: [Int] = []
+    lpsNext: [Int] = []
+    normShift: [Int] = []
+    // Residual block results: scan indices and signed levels, in the order
+    // decoded (highest frequency first).
+    resPos: [Int] = []
+    resLev: [Int] = []
+    sig8: [Int] = []
+    last8: [Int] = []
+
+    // Starts decoding at byte `at` (9.3.1.2).
+    fn start(_ d: Data, at: Int, end: Int) {
+        data = d
+        pos = at
+        self.end = end
+        overrun = false
+        range = 510
+        value = 0
+        held = -9
+        refill()
+        // `held` counts read-ahead bits beyond the 9 of codIOffset.
+    }
+
+    fn refill() {
+        var b0 = 0
+        var b1 = 0
+        if pos < end {
+            b0 = data[pos]
+        } else {
+            overrun = pos > end + 2
+        }
+        if pos + 1 < end {
+            b1 = data[pos + 1]
+        }
+        pos += 2
+        value = (value << 16) | (b0 << 8) | b1
+        held += 16
+    }
+
+    // Initialises the 1024 context variables (9.3.1.1) for a slice.
+    fn initContexts(sliceQp: Int, isIntra: Bool, initIdc: Int) {
+        if states.count < 1024 {
+            states = []
+            for _ in 0..1024 {
+                states.append(0)
+            }
+            // Tables indexed by the state pStateIdx * 2 + valMPS: rangeTabLPS
+            // by state and qCodIRangeIdx, the states after an MPS and an
+            // LPS (Table 9-45), and the renormalisation shift of a range.
+            lpsTab = []
+            mpsNext = []
+            lpsNext = []
+            for st in 0..128 {
+                let p = st >> 1
+                let m = st & 1
+                for q in 0..4 {
+                    lpsTab.append(cabacRangeLps[p * 4 + q])
+                }
+                mpsNext.append(cabacTransMps[p] * 2 + m)
+                let nm = if p == 0 { 1 - m } else { m }
+                lpsNext.append(cabacTransLps[p] * 2 + nm)
+            }
+            resPos = []
+            resLev = []
+            for _ in 0..64 {
+                resPos.append(0)
+                resLev.append(0)
+            }
+            sig8 = cabacSig8x8
+            last8 = cabacLast8x8
+            normShift = []
+            for r in 0..512 {
+                var v = max(r, 1)
+                var n = 0
+                while v < 256 {
+                    v = v << 1
+                    n += 1
+                }
+                normShift.append(n)
+            }
+        }
+        let qp = max(0, min(51, sliceQp))
+        let ti = cabacInitI
+        let tp = cabacInitPB
+        var i = 0
+        while i < 1024 {
+            var m = 0
+            var n = 0
+            if isIntra {
+                m = ti[i * 2]
+                n = ti[i * 2 + 1]
+            } else {
+                m = tp[initIdc * 2048 + i * 2]
+                n = tp[initIdc * 2048 + i * 2 + 1]
+            }
+            let pre = max(1, min(126, ((m * qp) >> 4) + n))
+            if pre <= 63 {
+                states[i] = (63 - pre) * 2
+            } else {
+                states[i] = (pre - 64) * 2 + 1
+            }
+            i += 1
+        }
+    }
+
+    // DecodeDecision (9.3.3.2.1) with context ctx.
+    fn decision(_ ctx: Int) -> Int {
+        let s = states[ctx]
+        let lps = lpsTab[s * 4 + ((range >> 6) & 3)]
+        range -= lps
+        let scaled = range << held
+        if value < scaled {
+            // Most probable symbol.
+            states[ctx] = mpsNext[s]
+            if range < 256 {
+                range = range << 1
+                held -= 1
+                if held < 0 {
+                    refill()
+                }
+            }
+            return s & 1
+        }
+        // Least probable symbol; renormalise (lps < 256 always).
+        value -= scaled
+        states[ctx] = lpsNext[s]
+        let shift = normShift[lps]
+        range = lps << shift
+        held -= shift
+        if held < 0 {
+            refill()
+        }
+        1 - (s & 1)
+    }
+
+    // The significance map and levels of one residual block
+    // (residual_block_cabac after coded_block_flag, 7.3.5.3.3, with the
+    // contexts of 9.3.3.1.3): sigBase / lastBase / absBase are the ctxIdx
+    // offsets of the block category, maxCoeff 4, 15, 16 or 64, chromaDc
+    // for 4:2:0 chroma DC, f8 0 (frame) or 64 (field) for 8x8 blocks.
+    // Results go to resPos / resLev; returns how many.
+    fn residual(sigBase: Int, lastBase: Int, absBase: Int, maxCoeff: Int, chromaDc: Bool, f8: Int) -> Int {
+        var count = 0
+        var last = 0
+        if maxCoeff == 64 {
+            while last < 63 {
+                if decision(sigBase + sig8[f8 + last]) == 1 {
+                    resPos[count] = last
+                    count += 1
+                    if decision(lastBase + last8[last]) == 1 {
+                        last = 64
+                        break
+                    }
+                }
+                last += 1
+            }
+            if last == 63 {
+                resPos[count] = 63
+                count += 1
+            }
+        } else {
+            let m1 = maxCoeff - 1
+            while last < m1 {
+                let inc = if chromaDc { min(last, 2) } else { last }
+                if decision(sigBase + inc) == 1 {
+                    resPos[count] = last
+                    count += 1
+                    if decision(lastBase + inc) == 1 {
+                        last = maxCoeff
+                        break
+                    }
+                }
+                last += 1
+            }
+            if last == m1 {
+                resPos[count] = last
+                count += 1
+            }
+        }
+        // Levels in reverse scan order; node counts the levels decoded so
+        // far that were 1 (0..3) or greater than 1 (4..7).
+        var node = 0
+        var i = count
+        while i > 0 {
+            i -= 1
+            var level = 1
+            let c1 = if node < 4 { node + 1 } else { 0 }
+            if decision(absBase + c1) == 0 {
+                node = if node < 3 { node + 1 } else { node }
+            } else {
+                let c2 = 5 + max(node - 3, 0)
+                node = if node < 4 { 4 } else { min(node + 1, 7) }
+                var a = 2
+                let ctx = absBase + c2
+                while a < 15 && decision(ctx) == 1 {
+                    a += 1
+                }
+                if a >= 15 {
+                    // Exp-Golomb (k = 0) suffix in bypass bins.
+                    var j = 0
+                    while bypass() == 1 && j < 23 {
+                        j += 1
+                    }
+                    var v = 1
+                    while j > 0 {
+                        j -= 1
+                        v = v * 2 + bypass()
+                    }
+                    a = v + 14
+                }
+                level = a
+            }
+            if bypass() == 1 {
+                level = -level
+            }
+            resLev[i] = level
+        }
+        count
+    }
+
+    // DecodeBypass (9.3.3.2.3).
+    fn bypass() -> Int {
+        held -= 1
+        if held < 0 {
+            refill()
+        }
+        let scaled = range << held
+        if value >= scaled {
+            value -= scaled
+            return 1
+        }
+        0
+    }
+
+    // DecodeTerminate (9.3.3.2.2.3): 1 at the end of a slice (and for
+    // I_PCM), without renormalisation then.
+    fn terminate() -> Int {
+        range -= 2
+        let scaled = range << held
+        if value >= scaled {
+            return 1
+        }
+        if range < 256 {
+            range = range << 1
+            held -= 1
+            if held < 0 {
+                refill()
+            }
+        }
+        0
+    }
+
+    // The bit position of the spec's decoder after a terminate that gave
+    // 1: where pcm samples (or the slice's trailing bits) begin.
+    bitPosition: Int {
+        pos * 8 - held
+    }
+}
+
+// ----------------------------------------------------------------------
+// Context index offsets and increments of the residual syntax elements.
+
+// ctxIdxOffsets of the residual syntax elements by ctxBlockCat (Table
+// 9-34) for frame coded blocks (field coded ones in the second half).
+let cabacSigOffset: [Int] = [105, 120, 134, 149, 152, 402, 277, 292, 306, 321, 324, 436]
+let cabacLastOffset: [Int] = [166, 181, 195, 210, 213, 417, 338, 353, 367, 382, 385, 451]
+let cabacAbsOffset: [Int] = [227, 237, 247, 257, 266, 426]
+let cabacCbfOffset: [Int] = [85, 89, 93, 97, 101, 1012]
+// ctxIdxInc of significant_coeff_flag in 8x8 blocks (Table 9-43), frame
+// then field coded.
+let cabacSig8x8: [Int] = [
+    0, 1, 2, 3, 4, 5, 5, 4, 4, 3, 3, 4, 4, 4, 5, 5,
+    4, 4, 4, 4, 3, 3, 6, 7, 7, 7, 8, 9, 10, 9, 8, 7,
+    7, 6, 11, 12, 13, 11, 6, 7, 8, 9, 14, 10, 9, 8, 6, 11,
+    12, 13, 11, 6, 9, 14, 10, 9, 11, 12, 13, 11, 14, 10, 12, 0,
+    0, 1, 1, 2, 2, 3, 3, 4, 5, 6, 7, 7, 7, 8, 4, 5,
+    6, 9, 10, 10, 8, 11, 12, 11, 9, 9, 10, 10, 8, 11, 12, 11,
+    9, 9, 10, 10, 8, 11, 12, 11, 9, 9, 10, 10, 8, 13, 13, 9,
+    9, 10, 10, 8, 13, 13, 9, 9, 10, 10, 14, 14, 14, 14, 14, 0,
+]
+let cabacLast8x8: [Int] = [
+    0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+    2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
+    3, 3, 3, 3, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4, 4,
+    5, 5, 5, 5, 6, 6, 6, 6, 7, 7, 7, 7, 8, 8, 8, 8,
+]
+// coeff_abs_level_minus1 contexts (9.3.3.1.3): for the first bin by node
+// state, for later bins by node state, and the state transitions.
+let cabacAbsLevel1Ctx: [Int] = [1, 2, 3, 4, 0, 0, 0, 0]
+let cabacAbsLevelGt1Ctx: [Int] = [5, 5, 5, 5, 6, 7, 8, 9]
+let cabacAbsTrans1: [Int] = [1, 2, 3, 3, 4, 5, 6, 7]
+let cabacAbsTransGt1: [Int] = [4, 4, 4, 4, 5, 6, 7, 7]
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+let h264Identity: [Int] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]

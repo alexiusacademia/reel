@@ -1,0 +1,430 @@
+// Tests for the ac3 module (AC-3 and E-AC-3 decoding, E-AC-3 7.1 with a
+// dependent substream, several programs): syncframe headers,
+// decoding against FFmpeg's output for the shared fixtures and for this
+// test's own (tests/ac3/fixtures, made by build/scratch/ac3/make_fixtures.sh:
+// every channel mode, coupling on and off, low bitrates, 32/44.1/48 kHz),
+// real-world streams when they have been downloaded into
+// build/conformance/ac3, damaged input, and decoding speed.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../../ac3"
+import "../../demux"
+import "../../core"
+import "../../testkit"
+
+// Decodes a raw .ac3/.eac3 stream frame by frame.
+struct RawResult {
+    samples: [Float] = []
+    rate: Int = 0
+    channels: Int = 0
+    layout: [String] = []
+    frames: Int = 0
+    warnings: [String] = []
+}
+
+fn decodeRaw(_ data: Data, codec: String, drc: Float = 0.0) -> RawResult {
+    var out = RawResult()
+    let track = core.Track(index: 0, kind: .audio, codec: codec)
+    var d = ac3.newDecoder(track).value() ?? ac3.Decoder()
+    d.drcScale = drc
+    let starts = ac3.syncFrames(data)
+    var pts = 0
+    // E-AC-3 dependent substreams go in one packet with the independent
+    // frame before them, as demuxers deliver them.
+    var k = 0
+    while k < starts.count {
+        let at = starts[k]
+        var end = at + ac3.frameInfo(data, at: at).size
+        k += 1
+        while k < starts.count {
+            let next = ac3.frameInfo(data, at: starts[k])
+            if !(next.eac3 && next.frameType == 1) {
+                break
+            }
+            end = starts[k] + next.size
+            k += 1
+        }
+        let s = d.decode(data.slice(from: at, to: end), pts: pts)
+        out.samples += s.data
+        pts += s.frames
+        out.frames += 1
+    }
+    out.rate = d.rate
+    out.channels = d.channels
+    out.layout = d.layout
+    out.warnings = d.warnings
+    out
+}
+
+// The lag (in frames, −range…range) at which `got` best matches `want`:
+// got[i] ≈ want[i + lag]. Compares the first channel over a window.
+fn bestLag(_ got: [Float], _ want: [Float], channels: Int, range: Int) -> Int {
+    let n = min(4096, got.count / channels)
+    var best = 0
+    var bestErr = -1.0
+    var lag = -range
+    while lag <= range {
+        var err = 0.0
+        var i = 0
+        var used = 0
+        while i < n {
+            let j = i + lag
+            if j >= 0 && j * channels < want.count {
+                let d = got[i * channels] - want[j * channels]
+                err += d * d
+                used += 1
+                if bestErr >= 0.0 && err > bestErr {
+                    break
+                }
+            }
+            i += 1
+        }
+        if used > n / 2 && (bestErr < 0.0 || err < bestErr) {
+            bestErr = err
+            best = lag
+        }
+        lag += 1
+    }
+    best
+}
+
+// SNR of got against want at a lag (frames), over the samples both have.
+fn snrAt(_ got: [Float], _ want: [Float], channels: Int, lag: Int) -> Float {
+    if lag >= 0 {
+        return testkit.snr(got, want, offset: lag * channels)
+    }
+    testkit.snr(got.dropFirst(-lag * channels), want)
+}
+
+// A fixture's reference made by make_fixtures.sh: zlib-compressed 24-bit
+// little-endian samples (the first frames of FFmpeg's output).
+fn ref24(_ path: String) -> [Float] {
+    let packed = readData(path) ?? Data()
+    let raw = packed.decompressed("zlib") ?? Data()
+    var out: [Float] = []
+    var i = 0
+    while i + 3 <= raw.count {
+        var v = raw[i] | (raw[i + 1] << 8) | (raw[i + 2] << 16)
+        if v >= 8388608 {
+            v -= 16777216
+        }
+        out.append(Float(v) / 8388608.0)
+        i += 3
+    }
+    out
+}
+
+// 32-bit float little-endian samples.
+fn readF32(_ path: String) -> [Float] {
+    let data = readData(path) ?? Data()
+    var out: [Float] = []
+    var i = 0
+    while i + 4 <= data.count {
+        out.append(data.float32(at: i))
+        i += 4
+    }
+    out
+}
+
+// The AC-3 elementary stream inside an MPEG-TS file: the payload of the
+// PES packets of private stream 1 (0xBD), joined.
+fn tsAc3Stream(_ file: Data) -> Data {
+    var out = Data()
+    var pid = -1
+    var at = 0
+    while at + 188 <= file.count {
+        if file[at] != 0x47 {
+            at += 1
+            continue
+        }
+        let p = ((file[at + 1] & 0x1f) << 8) | file[at + 2]
+        let start = (file[at + 1] & 0x40) != 0
+        let afc = (file[at + 3] >> 4) & 3
+        var pay = at + 4
+        if afc == 2 || afc == 3 {
+            pay += 1 + file[at + 4]
+        }
+        if afc != 2 && pay < at + 188 {
+            if start && pid < 0 && file[pay] == 0 && file[pay + 1] == 0 && file[pay + 2] == 1 && file[pay + 3] == 0xbd {
+                pid = p
+            }
+            if p == pid {
+                if start {
+                    pay += 9 + file[pay + 8]
+                }
+                if pay < at + 188 {
+                    out += file.slice(from: pay, to: at + 188)
+                }
+            }
+        }
+        at += 188
+    }
+    out
+}
+
+fn main() {
+    var passed = 0
+    var total = 0
+    fn check(_ ok: Bool, _ what: String) {
+        total += 1
+        if ok { passed += 1 } else { print("FAIL: {what}") }
+    }
+    fn f1(_ x: Float) -> String {
+        "{Int(x * 10.0 + 0.5) / 10}.{Int(x * 10.0 + 0.5) % 10}"
+    }
+
+    // --- Headers ---
+    let ac3File = testkit.fixture("ac3.ac3")
+    let info = ac3.frameInfo(ac3File, at: 0)
+    check(info.ok && info.size == 1792 && info.rate == 48000 && info.channels == 6, "ac3.ac3 first frame header: {info.size} bytes {info.rate} Hz {info.channels} ch")
+    check(info.acmod == 7 && info.lfe && info.blocks == 6 && !info.eac3 && info.bsid == 8, "ac3.ac3 mode 3/2+LFE, bsid 8")
+    check(info.bitrate == 448000, "ac3.ac3 bitrate {info.bitrate}")
+    check(ac3.crc16(ac3File, from: 2, to: 1792) == 0, "ac3.ac3 first frame CRC")
+    let ac3Ref = testkit.loadRef("ac3.ac3")
+    let starts = ac3.syncFrames(ac3File)
+    var same = starts.count == ac3Ref.packets.count
+    if same {
+        for i in 0..starts.count {
+            if starts[i] != ac3Ref.packets[i].pos {
+                same = false
+            }
+        }
+    }
+    check(same, "ac3.ac3 syncframes at FFmpeg's packet positions ({starts.count} vs {ac3Ref.packets.count})")
+    check(ac3.layoutFor(acmod: 7, lfe: true) == ["FL", "FR", "FC", "LFE", "SL", "SR"], "5.1 layout in WAV order")
+    check(ac3.layoutFor(acmod: 4, lfe: false) == ["FL", "FR", "BC"], "2/1 layout")
+    check(ac3.layoutFor(acmod: 1, lfe: false) == ["FC"], "mono layout")
+
+    let eac3File = testkit.fixture("eac3.eac3")
+    let einfo = ac3.frameInfo(eac3File, at: 0)
+    check(einfo.ok && einfo.eac3 && einfo.bsid == 16 && einfo.size == 768 && einfo.channels == 2 && einfo.frameType == 0, "eac3.eac3 header: bsid {einfo.bsid} {einfo.size} bytes")
+    check(ac3.syncFrames(eac3File).count == testkit.loadRef("eac3.eac3").packets.count, "eac3.eac3 syncframe count")
+
+    // --- The shared fixtures against FFmpeg ---
+    let t0 = now()
+    let a = decodeRaw(ac3File, codec: "ac3")
+    let ms = (now() - t0) * 1000.0
+    let want = testkit.referenceSamples("ac3.ac3")
+    check(a.channels == 6 && a.rate == 48000 && a.layout == ["FL", "FR", "FC", "LFE", "SL", "SR"], "ac3.ac3 decodes as 48 kHz 5.1")
+    check(a.samples.count == 32 * 1536 * 6, "ac3.ac3 frame count: {a.samples.count / 6}")
+    let s1 = testkit.snr(a.samples, want)
+    print("ac3.ac3: SNR {f1(s1)} dB vs FFmpeg (offset 0)")
+    check(s1 >= 90.0, "ac3.ac3 SNR {f1(s1)} dB")
+    let secs = Float(a.samples.count / 6) / 48000.0
+    print("time ac3 5.1 448k decode: {Int(ms)} ms")
+    print("ac3 5.1 speed: {Int(secs * 1000.0 / max(ms, 0.001))}x real time")
+
+    let t1 = now()
+    let e = decodeRaw(eac3File, codec: "eac3")
+    let ems = (now() - t1) * 1000.0
+    let ewant = testkit.referenceSamples("eac3.eac3")
+    check(e.channels == 2 && e.layout == ["FL", "FR"] && e.samples.count == ewant.count, "eac3.eac3 stereo, {e.samples.count} of {ewant.count} samples")
+    let s2 = testkit.snr(e.samples, ewant)
+    print("eac3.eac3: SNR {f1(s2)} dB vs FFmpeg")
+    check(s2 >= 90.0, "eac3.eac3 SNR {f1(s2)} dB")
+    print("time eac3 stereo decode: {Int(ems)} ms")
+
+    // mpeg2.ts: AC-3 in MPEG-TS PES packets.
+    let ts = testkit.fixture("mpeg2.ts")
+    let es = tsAc3Stream(ts)
+    let t = decodeRaw(es, codec: "ac3")
+    let twant = testkit.referenceSamples("mpeg2.ts")
+    check(t.frames == 63 && t.channels == 2, "mpeg2.ts: {t.frames} AC-3 frames, {t.channels} channels")
+    let lag = bestLag(t.samples, twant, channels: 2, range: 4096)
+    let s3 = snrAt(t.samples, twant, channels: 2, lag: lag)
+    print("mpeg2.ts ac3: SNR {f1(s3)} dB vs FFmpeg at lag {lag}")
+    check(s3 >= 90.0, "mpeg2.ts ac3 SNR {f1(s3)} dB")
+
+    // --- This test's own fixtures ---
+    let own = ["mono.ac3", "stereo_nocpl.ac3", "stereo_cpl.ac3", "stereo_32k_low.ac3", "s21.ac3", "s30.ac3", "s30back.ac3", "quad.ac3", "s40.ac3", "s50_low.ac3", "s51.ac3", "e_mono.eac3", "e_stereo_low.eac3", "e_51.eac3"]
+    for name in own {
+        let data = readData(joinPath("tests/ac3/fixtures", name)) ?? Data()
+        let r = decodeRaw(data, codec: if name.hasSuffix(".eac3") { "eac3" } else { "ac3" })
+        let ref = ref24(joinPath("tests/ac3/fixtures", name + ".ref24z"))
+        let s = testkit.snr(r.samples, ref)
+        print("{name}: {r.rate} Hz {r.layout.joined(separator: " ")}, SNR {f1(s)} dB")
+        check(!ref.isEmpty && s >= 90.0 && r.warnings.isEmpty, "{name} SNR {f1(s)} dB, warnings {r.warnings.count}")
+    }
+
+    // --- Real-world streams (build/scratch/ac3/get_conformance.sh) ---
+    // FFmpeg applies the streams' dynamic range words by default, so these
+    // are decoded with drcScale 1 to compare.
+    let conf = ["millers_crossing_4.0.ac3", "monsters_inc_2.0_192_small.ac3", "monsters_inc_5.1_448_small.ac3", "csi_miami_5.1_256_spx_small.eac3", "csi_miami_stereo_128_spx_small.eac3", "matrix2_commentary1_stereo_192_small.eac3", "serenity_english_5.1_1536_small.eac3", "the_great_wall_7.1.eac3"]
+    var confFound = 0
+    var confMs = 0.0
+    var confSecs = 0.0
+    for name in conf {
+        let path = joinPath("build/conformance/ac3", name)
+        if !fileExists(path) || !fileExists(path + ".f32") {
+            continue
+        }
+        confFound += 1
+        let data = readData(path) ?? Data()
+        let tc = now()
+        let r = decodeRaw(data, codec: if name.hasSuffix(".eac3") { "eac3" } else { "ac3" }, drc: 1.0)
+        confMs += (now() - tc) * 1000.0
+        confSecs += Float(r.samples.count / max(r.channels, 1)) / Float(max(r.rate, 1))
+        let ref = readF32(path + ".f32")
+        // FFmpeg's decoder, the first time the channels of a block use
+        // different transform lengths, "upmixes" its delay lines as if it
+        // had been downmixing (ac3_upmix_delay: in stereo the right
+        // channel's overlap is replaced by the left's, in 3/1 the centre's
+        // moves to the right). That spoils one 256-sample block of its
+        // output; we decode that block as A/52 says, so it is left out of
+        // the comparison here (and the whole-file figure printed too).
+        var quirkBlock = -1
+        if name == "millers_crossing_4.0.ac3" {
+            quirkBlock = 38 * 6 + 5
+        } else if name == "monsters_inc_2.0_192_small.ac3" {
+            quirkBlock = 122 * 6 + 4
+        }
+        let whole = testkit.snr(r.samples, ref)
+        var s = whole
+        if quirkBlock >= 0 {
+            let cut = quirkBlock * 256 * r.channels
+            let next = cut + 256 * r.channels
+            s = testkit.snr(r.samples.prefix(cut) + r.samples.slice(from: next, to: r.samples.count), ref.prefix(cut) + ref.slice(from: next, to: ref.count))
+            print("{name}: whole file {f1(whole)} dB; block {quirkBlock} differs because of FFmpeg's delay upmix")
+        }
+        print("{name}: {r.rate} Hz {r.layout.joined(separator: " ")}, {r.frames} frames, SNR {f1(s)} dB, {r.warnings.count} warnings")
+        for w in r.warnings.prefix(3) {
+            print("    warning: {w}")
+        }
+        if name == "the_great_wall_7.1.eac3" {
+            // AC-3 5.1 + an E-AC-3 dependent substream with Ls Rs Lrs Rrs:
+            // FFmpeg's 7.1.
+            check(r.layout == ["FL", "FR", "FC", "LFE", "BL", "BR", "SL", "SR"] && r.warnings.isEmpty, "7.1 stream layout {r.layout}, {r.warnings.count} warnings")
+            let secs = Float(r.samples.count / max(r.channels, 1)) / Float(max(r.rate, 1))
+            let t71 = now()
+            let again = decodeRaw(data, codec: "eac3", drc: 1.0)
+            let ms71 = (now() - t71) * 1000.0
+            print("time eac3 7.1 decode: {Int(ms71)} ms for {f1(secs)} s ({Int(secs * 1000.0 / max(ms71, 0.001))}x real time, {again.frames} frames)")
+        }
+        check(!ref.isEmpty && s >= 90.0 && r.samples.count >= ref.count - 1536 * r.channels, "{name} SNR {f1(s)} dB, {r.samples.count} of {ref.count} samples")
+    }
+    if confFound == 0 {
+        print("(no real-world streams in build/conformance/ac3: run build/scratch/ac3/get_conformance.sh)")
+    } else {
+        print("time ac3 real-world streams: {Int(confMs)} ms for {Int(confSecs)} s of audio ({Int(confSecs * 1000.0 / max(confMs, 0.001))}x real time)")
+    }
+
+    // --- E-AC-3 7.1: a dependent substream (build/scratch/dolby/make_eac3_fixtures.sh) ---
+    // A cut of FATE's the_great_wall_7.1.eac3: AC-3 5.1 frames each
+    // followed by an E-AC-3 dependent frame (3/1, chanmap Ls Rs Lrs Rrs).
+    let wallRef = ref24("tests/ac3/fixtures/wall71_cut.eac3.ref24z")
+    let wallData = readData("tests/ac3/fixtures/wall71_cut.eac3") ?? Data()
+    let wall = decodeRaw(wallData, codec: "eac3", drc: 1.0)
+    let wallSnr = testkit.snr(wall.samples, wallRef)
+    print("wall71_cut.eac3: {wall.rate} Hz {wall.layout.joined(separator: " ")}, SNR {f1(wallSnr)} dB")
+    check(wall.layout == ["FL", "FR", "FC", "LFE", "BL", "BR", "SL", "SR"] && wall.samples.count == wallRef.count && wallSnr >= 90.0 && wall.warnings.isEmpty, "E-AC-3 7.1 cut: SNR {f1(wallSnr)} dB, {wall.samples.count} of {wallRef.count} samples, {wall.warnings}")
+    let wallInfo = ac3.streamInfo(core.Track(index: 0, kind: .audio, codec: "eac3"), firstPacket: wallData.slice(from: 0, to: 4608))
+    check(wallInfo == "E-AC-3 7.1, 48 kHz, 1152 kb/s", "7.1 stream info \"{wallInfo}\"")
+    let plainInfo = ac3.streamInfo(core.Track(index: 0, kind: .audio, codec: "ac3"), firstPacket: ac3File.slice(from: 0, to: 4000))
+    check(plainInfo.hasPrefix("AC-3 5.1, 48 kHz"), "AC-3 stream info \"{plainInfo}\"")
+    // The same in MKV, through demux.open.
+    let wallMkv = readData("tests/ac3/fixtures/wall71_cut.mkv") ?? Data()
+    let wm = demux.open(wallMkv, name: "wall71_cut.mkv").value() ?? core.Media()
+    var mkvSamples: [Float] = []
+    var mkvLayout: [String] = []
+    if wm.tracks.count == 1 {
+        var d = ac3.newDecoder(wm.tracks[0]).value() ?? ac3.Decoder()
+        d.drcScale = 1.0
+        for p in wm.packets {
+            mkvSamples += d.decode(core.packetBytes(wallMkv, wm, p), pts: p.pts).data
+        }
+        mkvLayout = d.layout
+    }
+    let mkvSnr = testkit.snr(mkvSamples, wallRef)
+    check(mkvLayout.count == 8 && mkvSamples.count == wallRef.count && mkvSnr >= 90.0, "E-AC-3 7.1 in MKV: SNR {f1(mkvSnr)} dB, layout {mkvLayout}")
+    // A dependent frame in a packet of its own can't be joined to its
+    // independent frame: the 5.1 comes out, with a warning.
+    let wallStarts = ac3.syncFrames(wallData)
+    var lone = ac3.newDecoder(core.Track(index: 0, kind: .audio, codec: "eac3")).value() ?? ac3.Decoder()
+    var loneCount = 0
+    for at in wallStarts {
+        let info = ac3.frameInfo(wallData, at: at)
+        loneCount += lone.decode(wallData.slice(from: at, to: at + info.size), pts: 0).data.count
+    }
+    check(lone.channels == 6 && loneCount == wallStarts.count / 2 * 1536 * 6 && lone.warnings.count == 1, "lone dependent frames: {lone.channels} channels, {lone.warnings}")
+
+    // --- E-AC-3 with two programs: independent substream 1 (and its
+    // dependent) after program 0's frame in each packet; program 0 comes
+    // out unchanged. Program 1 is e_mono.eac3 with its substream id set to
+    // 1 (and its CRC redone).
+    let p0 = readData("tests/ac3/fixtures/e_51.eac3") ?? Data()
+    let p1 = readData("tests/ac3/fixtures/e_mono.eac3") ?? Data()
+    let ps0 = ac3.syncFrames(p0)
+    let ps1 = ac3.syncFrames(p1)
+    var single = ac3.newDecoder(core.Track(index: 0, kind: .audio, codec: "eac3")).value() ?? ac3.Decoder()
+    var multi = ac3.newDecoder(core.Track(index: 0, kind: .audio, codec: "eac3")).value() ?? ac3.Decoder()
+    var pa: [Float] = []
+    var b2: [Float] = []
+    for (i, at) in ps0.enumerated() {
+        let f0 = p0.slice(from: at, to: at + ac3.frameInfo(p0, at: at).size)
+        pa += single.decode(f0, pts: 0).data
+        var packet = f0
+        if i < ps1.count {
+            let size = ac3.frameInfo(p1, at: ps1[i]).size
+            var bytes = p1.slice(from: ps1[i], to: ps1[i] + size).bytes
+            bytes[2] = (bytes[2] & 0xc7) | (1 << 3)
+            let crc = ac3.crc16(Data(bytes: bytes), from: 2, to: size - 2)
+            bytes[size - 2] = crc >> 8
+            bytes[size - 1] = crc & 0xff
+            packet += Data(bytes: bytes)
+        }
+        b2 += multi.decode(packet, pts: 0).data
+    }
+    let progInfo = ac3.frameInfo(p0, at: 0)
+    check(progInfo.ok && pa.count > 0 && pa == b2 && multi.channels == 6 && multi.warnings.count == 1 && multi.warnings[0].contains("substream 1"), "two programs: program 0 decoded alone ({pa.count} vs {b2.count} samples, {multi.warnings})")
+
+    // --- Damaged and odd input ---
+    // A frame with flipped bytes: CRC mismatch, that frame muted, a warning,
+    // the next frame decodes.
+    var bytes = ac3File.slice(from: 0, to: 1792 * 4).bytes
+    for i in 600..640 {
+        bytes[1792 + i] = bytes[1792 + i] ^ 0x5a
+    }
+    let broken = Data(bytes: bytes)
+    let b = decodeRaw(broken, codec: "ac3")
+    check(b.frames == 4 && b.samples.count == 4 * 1536 * 6, "damaged stream still gives 4 frames")
+    check(b.warnings.count >= 1 && b.warnings[0].contains("CRC"), "damaged frame warned: {b.warnings.first ?? "none"}")
+    let wantFrame3 = want.slice(from: 3 * 1536 * 6 + 256 * 6, to: 4 * 1536 * 6)
+    check(testkit.snr(b.samples.slice(from: 3 * 1536 * 6 + 256 * 6, to: 4 * 1536 * 6), wantFrame3) > 60.0, "the frame after the damage decodes")
+
+    // Garbage, a cut-off frame, an empty packet, two frames in one packet.
+    var dec = ac3.newDecoder(core.Track(index: 0, kind: .audio, codec: "ac3")).value() ?? ac3.Decoder()
+    let junk = dec.decode(Data(bytes: [1, 2, 3, 0x0b, 0x77, 9, 9, 9, 9, 9, 9, 9]), pts: 0)
+    check(junk.data.isEmpty, "garbage gives no samples")
+    let cut = dec.decode(ac3File.slice(from: 0, to: 1000), pts: 0)
+    check(cut.data.isEmpty && dec.warnings.count >= 1, "cut-off frame gives a warning, no samples")
+    check(dec.decode(Data(), pts: 0).data.isEmpty, "empty packet")
+    var dec2 = ac3.newDecoder(core.Track(index: 0, kind: .audio, codec: "ac3")).value() ?? ac3.Decoder()
+    let two = dec2.decode(ac3File.slice(from: 0, to: 3584), pts: 1234)
+    check(two.frames == 3072 && two.pts == 1234 && two.channels == 6 && two.rate == 48000, "two frames in one packet: {two.frames} frames")
+    check(testkit.snr(two.data, want) > 130.0, "two frames in one packet decode right")
+    dec2.reset()
+    let afterReset = dec2.decode(ac3File.slice(from: 1792 * 10, to: 1792 * 11), pts: 0)
+    check(afterReset.frames == 1536 && dec2.flush().data.isEmpty, "decodes after reset; flush gives nothing")
+    check(!ac3.newDecoder(core.Track(index: 0, kind: .audio, codec: "aac")).isOk(), "newDecoder refuses other codecs")
+    let fromTrack = ac3.newDecoder(core.Track(index: 0, kind: .audio, codec: "eac3", sampleRate: 48000, channels: 6)).value() ?? ac3.Decoder()
+    check(fromTrack.rate == 48000 && fromTrack.channels == 6 && fromTrack.delay == 0, "format from the track before the first frame")
+
+    // A track that already states the format (stereo): samples still come out.
+    var stereoDec = ac3.newDecoder(core.Track(index: 0, kind: .audio, codec: "eac3", sampleRate: 48000, channels: 2)).value() ?? ac3.Decoder()
+    var stereoOut: [Float] = []
+    for at in ac3.syncFrames(eac3File) {
+        let fi = ac3.frameInfo(eac3File, at: at)
+        stereoOut += stereoDec.decode(eac3File.slice(from: at, to: at + fi.size), pts: 0).data
+    }
+    check(stereoOut.count == ewant.count && testkit.snr(stereoOut, ewant) > 130.0 && stereoDec.warnings.isEmpty, "track stating 2 channels: {stereoOut.count} of {ewant.count} samples")
+
+    // Dynamic range compression on (drcScale 1) changes nothing in a
+    // stream without dynrng words (FFmpeg's encoder writes none).
+    let drc = decodeRaw(eac3File, codec: "eac3", drc: 1.0)
+    check(testkit.snr(drc.samples, ewant) > 130.0, "drcScale 1 on a stream without dynrng")
+
+    print("ac3 tests done")
+    print("ac3: {passed} of {total} passed")
+}

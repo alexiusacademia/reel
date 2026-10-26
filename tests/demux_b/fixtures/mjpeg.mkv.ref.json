@@ -1,0 +1,90 @@
+{
+ "format": "matroska,webm",
+ "duration": 0.2,
+ "tags": {
+  "encoder": "Lavf62.12.102"
+ },
+ "tracks": [
+  {
+   "index": 0,
+   "kind": "video",
+   "codec": "mjpeg",
+   "ffCodec": "mjpeg",
+   "profile": "Baseline",
+   "timescale": 1000,
+   "duration": -9223372036854775807,
+   "extraHex": "",
+   "width": 64,
+   "height": 48,
+   "sarNum": 1,
+   "sarDen": 1,
+   "fpsNum": 25,
+   "fpsDen": 1,
+   "rotation": 0,
+   "pixFmt": "yuvj420p",
+   "sampleRate": 0,
+   "channels": 0,
+   "channelLayout": "",
+   "bitsPerSample": 8,
+   "pcm": {
+    "bits": 16,
+    "float": false,
+    "bigEndian": false,
+    "signed": true
+   },
+   "language": "",
+   "title": "",
+   "isDefault": false,
+   "isCover": false,
+   "frames": -1
+  }
+ ],
+ "packets": [
+  {
+   "track": 0,
+   "pts": 0,
+   "dts": 0,
+   "duration": 40,
+   "key": true,
+   "pos": 546,
+   "size": 1821
+  },
+  {
+   "track": 0,
+   "pts": 40,
+   "dts": 40,
+   "duration": 40,
+   "key": true,
+   "pos": 2374,
+   "size": 1821
+  },
+  {
+   "track": 0,
+   "pts": 80,
+   "dts": 80,
+   "duration": 40,
+   "key": true,
+   "pos": 4202,
+   "size": 1821
+  },
+  {
+   "track": 0,
+   "pts": 120,
+   "dts": 120,
+   "duration": 40,
+   "key": true,
+   "pos": 6045,
+   "size": 1825
+  },
+  {
+   "track": 0,
+   "pts": 160,
+   "dts": 160,
+   "duration": 40,
+   "key": true,
+   "pos": 7877,
+   "size": 1825
+  }
+ ],
+ "chapters": []
+}

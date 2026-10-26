@@ -1,0 +1,317 @@
+// Layers I and II (ISO/IEC 11172-3 sections 2.4.1.5–2.4.1.6 and
+// 2.4.3.2–2.4.3.3; 13818-3 for the low sampling frequencies): bit
+// allocation, scale factors and uniformly quantized subband samples,
+// requantized in fixed point exactly as ffmpeg's default mp1/mp2 decoders
+// do (23 fractional bits), so the output can match it bit for bit.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../core"
+
+// Layer I/II scale factor multipliers: for n + 1 bits (n = 1…15) and the
+// three fractional steps 2^(-k/3): 2^n / (2^n - 1) * 2^(-k/3) * 2, in
+// 23-bit fixed point.
+fn mpaMakeScaleMult() -> [Int] {
+    var out: [Int] = []
+    let fracs = [Int(1.0 * 2.0 * 8388608.0 + 0.5), Int(0.7937005259 * 2.0 * 8388608.0 + 0.5), Int(0.6299605249 * 2.0 * 8388608.0 + 0.5)]
+    for i in 0..15 {
+        let n = i + 2
+        let norm = ((1 << n) * 8388608) / ((1 << n) - 1)
+        for k in 0..3 {
+            out.append((norm * fracs[k]) >> 23)
+        }
+    }
+    out
+}
+
+// Layer II grouped quantizers (3, 5 and 9 steps): (4/steps) * 2^(-k/3).
+fn mpaMakeScaleMult2() -> [Int] {
+    var out: [Int] = []
+    for v in [4.0 / 3.0, 4.0 / 5.0, 4.0 / 9.0] {
+        out.append(Int(1.0 * v * 8388608.0 + 0.5))
+        out.append(Int(0.7937005259 * v * 8388608.0 + 0.5))
+        out.append(Int(0.6299605249 * v * 8388608.0 + 0.5))
+    }
+    out
+}
+
+let mpaScaleMult = mpaMakeScaleMult()
+let mpaScaleMult2 = mpaMakeScaleMult2()
+
+// A sample of n + 1 bits with scale factor index sf, requantized.
+fn mpaL1Unscale(_ n: Int, _ mant: Int, _ sf: Int) -> Int {
+    let mod = sf % 3
+    let shift = sf / 3 + n
+    let v = (mant - (1 << n) + 1) * mpaScaleMult[(n - 1) * 3 + mod]
+    (v + (1 << (shift - 1))) >> shift
+}
+
+// One value of a grouped (3, 5 or 9 step) quantizer.
+fn mpaL2UnscaleGroup(_ steps: Int, _ mant: Int, _ sf: Int) -> Int {
+    let mod = sf % 3
+    let shift = sf / 3
+    var v = (mant - (steps >> 1)) * mpaScaleMult2[(steps >> 2) * 3 + mod]
+    v = mpaI32(v)
+    if shift > 0 {
+        v = (v + (1 << (shift - 1))) >> shift
+    }
+    v
+}
+
+// Layer II: which allocation table a stream uses (from its bitrate per
+// channel and rate; 11172-3 Annex B.2, 13818-3 B.1 for LSF).
+fn mpaL2Table(_ kbps: Int, _ channels: Int, _ rate: Int, _ lsf: Bool) -> Int {
+    if lsf {
+        return 4
+    }
+    let per = kbps / channels
+    if (rate == 48000 && per >= 56) || (per >= 56 && per <= 80) {
+        return 0
+    }
+    if rate != 48000 && per >= 96 {
+        return 1
+    }
+    if rate != 32000 && per <= 48 {
+        return 2
+    }
+    3
+}
+
+public struct MpaLayer12 {
+    // Requantized subband samples: channel c, slot t, subband i at
+    // c * 1152 + t * 32 + i (12 slots for layer I, 36 for layer II).
+    sb: [Int] = []
+    alloc: [Int] = []
+    scfsiCode: [Int] = []
+    scale: [Int] = []
+    br: core.BitReader = core.bitReader(Data())
+
+    fn setup() {
+        sb = []
+        for _ in 0..2304 {
+            sb.append(0)
+        }
+        alloc = []
+        scfsiCode = []
+        for _ in 0..64 {
+            alloc.append(0)
+            scfsiCode.append(0)
+        }
+        scale = []
+        for _ in 0..192 {
+            scale.append(0)
+        }
+    }
+
+    // Decodes the frame at d[at…]; returns the slots made (12 or 36), or
+    // 0 when the frame is damaged.
+    fn decode(_ h: MpaHeader, _ d: Data, _ at: Int) -> Int {
+        br = core.bitReaderRange(d, from: at + 4, to: min(at + h.frameSize, d.count))
+        if h.crc {
+            br.skip(16)
+        }
+        if h.layer == 1 {
+            return layer1(h)
+        }
+        layer2(h)
+    }
+
+    // Layer I (2.4.1.5): 4-bit allocations, 6-bit scale factors, 12
+    // samples per subband. Joint stereo shares the samples above `bound`.
+    fn layer1(_ h: MpaHeader) -> Int {
+        let nch = h.channels
+        let bound = if h.mode == 1 { (h.modeExt + 1) * 4 } else { 32 }
+        for i in 0..bound {
+            for ch in 0..nch {
+                alloc[ch * 32 + i] = br.bits(4)
+            }
+        }
+        for i in bound..32 {
+            let a = br.bits(4)
+            alloc[i] = a
+            alloc[32 + i] = a
+        }
+        for i in 0..32 {
+            for ch in 0..nch {
+                if alloc[ch * 32 + i] != 0 {
+                    scale[ch * 32 + i] = br.bits(6)
+                }
+            }
+        }
+        for j in 0..12 {
+            for i in 0..bound {
+                for ch in 0..nch {
+                    let n = alloc[ch * 32 + i]
+                    var v = 0
+                    if n != 0 {
+                        v = mpaL1Unscale(n, br.bits(n + 1), scale[ch * 32 + i])
+                    }
+                    sb[ch * 1152 + j * 32 + i] = v
+                }
+            }
+            for i in bound..32 {
+                let n = alloc[i]
+                if n != 0 {
+                    let mant = br.bits(n + 1)
+                    sb[j * 32 + i] = mpaL1Unscale(n, mant, scale[i])
+                    sb[1152 + j * 32 + i] = mpaL1Unscale(n, mant, scale[32 + i])
+                } else {
+                    sb[j * 32 + i] = 0
+                    sb[1152 + j * 32 + i] = 0
+                }
+            }
+        }
+        if br.overrun {
+            return 0
+        }
+        12
+    }
+
+    // Layer II (2.4.1.6): table-driven allocations, scale factor selection
+    // information (scfsi: 1, 2 or 3 scale factors per subband for the three
+    // parts of the frame), grouped or plain samples in granules of 3.
+    fn layer2(_ h: MpaHeader) -> Int {
+        let nch = h.channels
+        let table = mpaL2Table(h.bitrate / 1000, nch, h.rate, h.lsf)
+        let sblimit = mpaSblimit[table]
+        let at = if table < 2 { mpaAlloc1 } else if table < 4 { mpaAlloc3 } else { mpaAlloc4 }
+        var bound = if h.mode == 1 { (h.modeExt + 1) * 4 } else { sblimit }
+        if bound > sblimit {
+            bound = sblimit
+        }
+        // Allocations; `alloc` holds them, `at` positions per subband.
+        var j = 0
+        var starts: [Int] = []
+        for i in 0..sblimit {
+            starts.append(j)
+            let bits = at[j]
+            if i < bound {
+                for ch in 0..nch {
+                    alloc[ch * 32 + i] = br.bits(bits)
+                }
+            } else {
+                let v = br.bits(bits)
+                alloc[i] = v
+                alloc[32 + i] = v
+            }
+            j += 1 << bits
+        }
+        for i in 0..sblimit {
+            for ch in 0..nch {
+                if alloc[ch * 32 + i] != 0 {
+                    scfsiCode[ch * 32 + i] = br.bits(2)
+                }
+            }
+        }
+        for i in 0..sblimit {
+            for ch in 0..nch {
+                if alloc[ch * 32 + i] != 0 {
+                    let s = (ch * 32 + i) * 3
+                    let code = scfsiCode[ch * 32 + i]
+                    if code == 0 {
+                        scale[s] = br.bits(6)
+                        scale[s + 1] = br.bits(6)
+                        scale[s + 2] = br.bits(6)
+                    } else if code == 2 {
+                        let v = br.bits(6)
+                        scale[s] = v
+                        scale[s + 1] = v
+                        scale[s + 2] = v
+                    } else if code == 1 {
+                        scale[s] = br.bits(6)
+                        scale[s + 2] = br.bits(6)
+                        scale[s + 1] = scale[s]
+                    } else {
+                        scale[s] = br.bits(6)
+                        scale[s + 2] = br.bits(6)
+                        scale[s + 1] = scale[s + 2]
+                    }
+                }
+            }
+        }
+        for k in 0..3 {
+            var l = 0
+            while l < 12 {
+                let t = k * 12 + l
+                for i in 0..bound {
+                    let aj = starts[i]
+                    for ch in 0..nch {
+                        let b = alloc[ch * 32 + i]
+                        let base = ch * 1152 + t * 32 + i
+                        if b != 0 {
+                            let sf = scale[(ch * 32 + i) * 3 + k]
+                            let q = at[aj + b]
+                            let bits = mpaQuantBits[q]
+                            if bits < 0 {
+                                // Three samples in one code (base `steps`).
+                                var v = br.bits(-bits)
+                                let steps = mpaQuantSteps[q]
+                                let m0 = v % steps
+                                v = v / steps
+                                let m1 = v % steps
+                                let m2 = v / steps
+                                sb[base] = mpaL2UnscaleGroup(steps, m0, sf)
+                                sb[base + 32] = mpaL2UnscaleGroup(steps, m1, sf)
+                                sb[base + 64] = mpaL2UnscaleGroup(steps, m2, sf)
+                            } else {
+                                for m in 0..3 {
+                                    sb[base + m * 32] = mpaL1Unscale(bits - 1, br.bits(bits), sf)
+                                }
+                            }
+                        } else {
+                            sb[base] = 0
+                            sb[base + 32] = 0
+                            sb[base + 64] = 0
+                        }
+                    }
+                }
+                for i in bound..sblimit {
+                    let aj = starts[i]
+                    let b = alloc[i]
+                    let base = t * 32 + i
+                    if b != 0 {
+                        let sf0 = scale[i * 3 + k]
+                        let sf1 = scale[(32 + i) * 3 + k]
+                        let q = at[aj + b]
+                        let bits = mpaQuantBits[q]
+                        if bits < 0 {
+                            var v = br.bits(-bits)
+                            let steps = mpaQuantSteps[q]
+                            for m in 0..3 {
+                                let mant = if m < 2 { v % steps } else { v }
+                                v = v / steps
+                                sb[base + m * 32] = mpaL2UnscaleGroup(steps, mant, sf0)
+                                sb[1152 + base + m * 32] = mpaL2UnscaleGroup(steps, mant, sf1)
+                            }
+                        } else {
+                            for m in 0..3 {
+                                let mant = br.bits(bits)
+                                sb[base + m * 32] = mpaL1Unscale(bits - 1, mant, sf0)
+                                sb[1152 + base + m * 32] = mpaL1Unscale(bits - 1, mant, sf1)
+                            }
+                        }
+                    } else {
+                        for m in 0..3 {
+                            sb[base + m * 32] = 0
+                            sb[1152 + base + m * 32] = 0
+                        }
+                    }
+                }
+                for i in sblimit..32 {
+                    for ch in 0..nch {
+                        let base = ch * 1152 + t * 32 + i
+                        sb[base] = 0
+                        sb[base + 32] = 0
+                        sb[base + 64] = 0
+                    }
+                }
+                l += 3
+            }
+        }
+        if br.overrun {
+            return 0
+        }
+        36
+    }
+}

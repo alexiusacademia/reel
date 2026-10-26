@@ -1,0 +1,135 @@
+{
+ "format": "matroska,webm",
+ "duration": 0.4,
+ "tags": {
+  "encoder": "Lavf62.12.102"
+ },
+ "tracks": [
+  {
+   "index": 0,
+   "kind": "video",
+   "codec": "mpeg2",
+   "ffCodec": "mpeg2video",
+   "profile": "Main",
+   "timescale": 1000,
+   "duration": -9223372036854775807,
+   "extraHex": "000001b304003023ffffe018000001b5148a00010000",
+   "width": 64,
+   "height": 48,
+   "sarNum": 1,
+   "sarDen": 1,
+   "fpsNum": 25,
+   "fpsDen": 1,
+   "rotation": 0,
+   "pixFmt": "yuv420p",
+   "sampleRate": 0,
+   "channels": 0,
+   "channelLayout": "",
+   "bitsPerSample": 0,
+   "pcm": {
+    "bits": 16,
+    "float": false,
+    "bigEndian": false,
+    "signed": true
+   },
+   "language": "",
+   "title": "",
+   "isDefault": false,
+   "isCover": false,
+   "frames": -1
+  }
+ ],
+ "packets": [
+  {
+   "track": 0,
+   "pts": 0,
+   "dts": -40,
+   "duration": 40,
+   "key": true,
+   "pos": 551,
+   "size": 2035
+  },
+  {
+   "track": 0,
+   "pts": 40,
+   "dts": 0,
+   "duration": 40,
+   "key": false,
+   "pos": 2593,
+   "size": 345
+  },
+  {
+   "track": 0,
+   "pts": 80,
+   "dts": 40,
+   "duration": 40,
+   "key": false,
+   "pos": 2944,
+   "size": 100
+  },
+  {
+   "track": 0,
+   "pts": 120,
+   "dts": 80,
+   "duration": 40,
+   "key": false,
+   "pos": 3051,
+   "size": 217
+  },
+  {
+   "track": 0,
+   "pts": 160,
+   "dts": 120,
+   "duration": 40,
+   "key": false,
+   "pos": 3274,
+   "size": 59
+  },
+  {
+   "track": 0,
+   "pts": 200,
+   "dts": 160,
+   "duration": 40,
+   "key": false,
+   "pos": 3339,
+   "size": 46
+  },
+  {
+   "track": 0,
+   "pts": 240,
+   "dts": 200,
+   "duration": 40,
+   "key": false,
+   "pos": 3391,
+   "size": 92
+  },
+  {
+   "track": 0,
+   "pts": 280,
+   "dts": 240,
+   "duration": 40,
+   "key": false,
+   "pos": 3489,
+   "size": 92
+  },
+  {
+   "track": 0,
+   "pts": 320,
+   "dts": 280,
+   "duration": 40,
+   "key": false,
+   "pos": 3587,
+   "size": 47
+  },
+  {
+   "track": 0,
+   "pts": 360,
+   "dts": 320,
+   "duration": 40,
+   "key": false,
+   "pos": 3640,
+   "size": 94
+  }
+ ],
+ "chapters": []
+}

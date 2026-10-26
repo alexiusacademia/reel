@@ -1,0 +1,172 @@
+// The Video tab of the "Effects and Filters" window, for a render.View
+// (picture adjustments and geometry) and a vfx.Settings (filters):
+// brightness, contrast, saturation, hue and gamma with Reset; crop (four
+// edges, or "detect black bars"); the aspect ratio (render.aspectPresets
+// or a custom ratio typed as "1.66" or "12:5"); zoom and pan; flips and
+// rotation; deinterlacing (mode, double rate, only pictures marked
+// interlaced); sharpen and denoise.
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+import "../render"
+import "../vfx"
+
+public view VideoEffectsView(look: bind render.View, filters: bind vfx.Settings, onChange: fn()) {
+    state aspectDraft = ""
+    state aspectError = ""
+
+    fn pickAspect(_ name: String) {
+        for (n, v) in render.aspectPresets {
+            if n == name {
+                look.aspect = v
+            }
+        }
+        aspectError = ""
+        onChange()
+    }
+
+    fn submitAspect() {
+        let v = render.parseAspect(aspectDraft)
+        let t = aspectDraft.trim().lowercase()
+        if v > 0.0 || t == "default" || t == "" {
+            look.aspect = v
+            aspectDraft = ""
+            aspectError = ""
+            onChange()
+        } else {
+            aspectError = "Type a ratio such as 1.66 or 12:5."
+        }
+    }
+
+    fn resetAdjustments() {
+        look.resetAdjustments()
+        onChange()
+    }
+
+    fn resetCrop() {
+        look.cropLeft = 0
+        look.cropTop = 0
+        look.cropRight = 0
+        look.cropBottom = 0
+        filters.autoCrop = false
+        onChange()
+    }
+
+    fn resetZoom() {
+        look.zoom = 1.0
+        look.panX = 0.0
+        look.panY = 0.0
+        onChange()
+    }
+
+    fn pickRotation(_ name: String) {
+        look.rotation = fxRotation(named: name)
+        onChange()
+    }
+
+    fn pickDeinterlace(_ name: String) {
+        filters.deinterlace = fxDeinterlaceValue(name)
+        onChange()
+    }
+
+    VStack(spacing: 12, alignment: .leading) {
+        FxuSection(title: "Picture") {
+            FxuSliderRow(label: "Brightness", value: look.brightness, from: -1, to: 1, step: 0.01, text: fxSigned(look.brightness, decimals: 2), onChange: onChange)
+            FxuSliderRow(label: "Contrast", value: look.contrast, from: 0, to: 2, step: 0.01, text: look.contrast.formatted(decimals: 2), onChange: onChange)
+            FxuSliderRow(label: "Saturation", value: look.saturation, from: 0, to: 3, step: 0.01, text: look.saturation.formatted(decimals: 2), onChange: onChange)
+            FxuSliderRow(label: "Hue", value: look.hue, from: -180, to: 180, step: 1, text: "{fxSigned(look.hue, decimals: 0)}°", onChange: onChange)
+            FxuSliderRow(label: "Gamma", value: look.gamma, from: 0.1, to: 4, step: 0.01, text: look.gamma.formatted(decimals: 2), onChange: onChange)
+            HStack {
+                Spacer()
+                Button("Reset picture") { resetAdjustments() }
+                    .disabled(!look.lumaAdjusted && !look.chromaAdjusted)
+            }
+        }
+
+        FxuSection(title: "Crop") {
+            FxuSwitch(label: "Detect black bars", isOn: filters.autoCrop, onChange: onChange)
+            Grid(spacing: 10) {
+                GridRow {
+                    Text("Left").gridColumnAlignment(.trailing)
+                    Stepper(value: look.cropLeft, step: 2, from: 0, to: 8192) { onChange() }
+                        .accessibilityLabel("Crop left")
+                    Text("Right").gridColumnAlignment(.trailing)
+                    Stepper(value: look.cropRight, step: 2, from: 0, to: 8192) { onChange() }
+                        .accessibilityLabel("Crop right")
+                }
+                GridRow {
+                    Text("Top")
+                    Stepper(value: look.cropTop, step: 2, from: 0, to: 8192) { onChange() }
+                        .accessibilityLabel("Crop top")
+                    Text("Bottom")
+                    Stepper(value: look.cropBottom, step: 2, from: 0, to: 8192) { onChange() }
+                        .accessibilityLabel("Crop bottom")
+                }
+            }
+            .disabled(filters.autoCrop)
+            HStack {
+                Text(if filters.autoCrop { "Found by detection: {fxCropText(look)}" } else { "Samples off each edge of the decoded picture." })
+                    .font(size: 12)
+                    .color(.secondary)
+                Spacer()
+                Button("Reset crop") { resetCrop() }
+            }
+        }
+
+        FxuSection(title: "Aspect ratio") {
+            FxuChoiceMenu(label: "Aspect", options: fxuAspectNames(), selected: fxAspectName(look.aspect), width: 100, onPick: pickAspect)
+            HStack(spacing: 8) {
+                Text("Custom").frame(width: fxuLabelWidth, alignment: .leading)
+                TextField(if look.aspect > 0.0 { "Now {fxAspectText(look.aspect)}: type a ratio" } else { "A ratio, like 1.66 or 12:5" }, text: aspectDraft)
+                    .onSubmit { submitAspect() }
+                    .accessibilityLabel("Custom aspect ratio")
+                Button("Set") { submitAspect() }
+            }
+            if aspectError != "" {
+                Text(aspectError).font(size: 12).color(.red)
+            }
+        }
+
+        FxuSection(title: "Zoom and pan") {
+            FxuSliderRow(label: "Zoom", value: look.zoom, from: 0.25, to: 4, step: 0.05, text: fxSpeed(look.zoom), onChange: onChange)
+            VStack(spacing: 8, alignment: .leading) {
+                FxuSliderRow(label: "Pan across", value: look.panX, from: -1, to: 1, step: 0.05, text: fxSigned(look.panX, decimals: 2), onChange: onChange)
+                FxuSliderRow(label: "Pan up/down", value: look.panY, from: -1, to: 1, step: 0.05, text: fxSigned(look.panY, decimals: 2), onChange: onChange)
+            }
+            .disabled(look.zoom <= 1.0)
+            HStack {
+                Spacer()
+                Button("Reset zoom") { resetZoom() }
+            }
+        }
+
+        FxuSection(title: "Orientation") {
+            FxuSwitch(label: "Flip across", isOn: look.flipH, onChange: onChange)
+            FxuSwitch(label: "Flip upside down", isOn: look.flipV, onChange: onChange)
+            FxuSegments(label: "Rotate", options: fxRotationNames, selected: fxRotationName(look.rotation), onPick: pickRotation)
+        }
+
+        FxuSection(title: "Deinterlacing") {
+            FxuSegments(label: "Mode", options: fxDeinterlaceNames, selected: fxDeinterlaceName(filters.deinterlace), onPick: pickDeinterlace)
+            VStack(spacing: 8, alignment: .leading) {
+                FxuSwitch(label: "Double rate", isOn: filters.doubleRate, onChange: onChange)
+                FxuSwitch(label: "Only when marked", isOn: filters.autoDeinterlace, onChange: onChange)
+            }
+            .disabled(fxDeinterlaceName(filters.deinterlace) == "Off")
+            Text("Double rate shows each field as a picture (50 or 60 a second). \"Only when marked\" leaves pictures the stream calls progressive alone.")
+                .font(size: 12)
+                .color(.secondary)
+        }
+
+        FxuSection(title: "Filters") {
+            FxuSliderRow(label: "Sharpen", value: filters.sharpen, from: 0, to: 4, step: 0.1, text: if filters.sharpen <= 0.0 { "Off" } else { fxPlain(filters.sharpen, decimals: 1) }, onChange: onChange)
+            FxuSliderRow(label: "Denoise", value: filters.denoise, from: 0, to: 1, step: 0.05, text: if filters.denoise <= 0.0 { "Off" } else { "{Int(floor(filters.denoise * 100.0 + 0.5))} %" }, onChange: onChange)
+        }
+    }
+}
+
+// The aspect presets' names, in menu order.
+fn fxuAspectNames() -> [String] {
+    render.aspectPresets.map { p in p.0 }
+}

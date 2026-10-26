@@ -1,0 +1,405 @@
+// Media information, second version: tabs General, Codec, Metadata,
+// Statistics and Chapters for a core.Media, with each decoder's own
+// description of its stream (the `streamInfo(track)` strings, passed in by
+// the app), live statistics passed in as label/value rows, and a button
+// that copies everything as text.
+//
+// Also the names the tools views show for codecs, channel counts,
+// containers and languages.
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+import "../core"
+import "../subs"
+
+// ---- names ----
+
+// A codec's everyday name: "H.264", "E-AC-3", "SubRip".
+public fn codecTitle(_ codec: String) -> String {
+    match codec {
+        "h264" -> "H.264"
+        "hevc" -> "HEVC (H.265)"
+        "av1" -> "AV1"
+        "vp9" -> "VP9"
+        "vp8" -> "VP8"
+        "prores" -> "ProRes"
+        "theora" -> "Theora"
+        "mpeg4" -> "MPEG-4 Part 2"
+        "mpeg2" -> "MPEG-2"
+        "mpeg1" -> "MPEG-1"
+        "mjpeg" -> "Motion JPEG"
+        "dnxhd" -> "DNxHD"
+        "rawvideo" -> "Raw video"
+        "vc1" -> "VC-1"
+        "wmv3" -> "WMV9"
+        "wmv2" -> "WMV8"
+        "wmv1" -> "WMV7"
+        "msmpeg4v3" -> "DivX 3 (MS-MPEG4 v3)"
+        "msmpeg4v2" -> "MS-MPEG4 v2"
+        "msmpeg4v1" -> "MS-MPEG4 v1"
+        "aac" -> "AAC"
+        "mp3" -> "MP3"
+        "mp2" -> "MPEG Layer II"
+        "mp1" -> "MPEG Layer I"
+        "flac" -> "FLAC"
+        "alac" -> "ALAC"
+        "vorbis" -> "Vorbis"
+        "opus" -> "Opus"
+        "ac3" -> "AC-3"
+        "eac3" -> "E-AC-3"
+        "dts" -> "DTS"
+        "truehd" -> "TrueHD"
+        "mlp" -> "MLP"
+        "pcm" -> "PCM"
+        "alaw" -> "A-law"
+        "ulaw" -> "µ-law"
+        "wmav1" -> "WMA 1"
+        "wmav2" -> "WMA 2"
+        "wmapro" -> "WMA Pro"
+        "wmalossless" -> "WMA Lossless"
+        "srt" -> "SubRip"
+        "ass" -> "ASS/SSA"
+        "webvtt" -> "WebVTT"
+        "tx3g" -> "MP4 timed text"
+        "text" -> "Plain text"
+        "pgs" -> "PGS (Blu-ray)"
+        "dvdsub" -> "VobSub (DVD)"
+        "dvbsub" -> "DVB subtitles"
+        _ -> {
+            if codec.hasPrefix("unknown:") { "Unknown ({codec.substring(from: 8, to: codec.count)})" } else { codec.uppercase() }
+        }
+    }
+}
+
+// "mono", "stereo", "5.1", "7.1", "3 channels".
+public fn channelsText(_ n: Int) -> String {
+    match n {
+        1 -> "mono"
+        2 -> "stereo"
+        6 -> "5.1"
+        8 -> "7.1"
+        _ -> "{n} channels"
+    }
+}
+
+// The container's name: "MPEG-4", "Matroska", "MPEG transport stream".
+public fn containerTitle(_ format: String) -> String {
+    match format {
+        "mp4" -> "MPEG-4 (MP4)"
+        "mov" -> "QuickTime (MOV)"
+        "mkv" -> "Matroska"
+        "webm" -> "WebM"
+        "avi" -> "AVI"
+        "ogg" -> "Ogg"
+        "ts" -> "MPEG transport stream"
+        "ps" -> "MPEG program stream"
+        "wav" -> "WAV"
+        "aiff" -> "AIFF"
+        "asf" -> "ASF (Windows Media)"
+        _ -> format.uppercase()
+    }
+}
+
+// "English (eng)", or the code itself when it isn't known, or "".
+public fn languageText(_ code: String) -> String {
+    if code.isEmpty {
+        return ""
+    }
+    let name = subs.languageName(code)
+    if name.isEmpty || name == code { code } else { "{name} ({code})" }
+}
+
+// ---- rows ----
+
+// One line of a table: a label and its value.
+public struct MediaInfoRow {
+    label: String
+    value: String
+}
+
+fn toolsKindName(_ k: core.TrackKind) -> String {
+    match k {
+        .video -> "Video"
+        .audio -> "Audio"
+        .subtitle -> "Subtitles"
+        .other -> "Other"
+    }
+}
+
+// The General tab.
+public fn mediaGeneralRows(_ media: core.Media, path: String, fileSize: Int) -> [MediaInfoRow] {
+    var rows: [MediaInfoRow] = []
+    rows.append(MediaInfoRow(label: "File", value: path.fileName))
+    rows.append(MediaInfoRow(label: "Folder", value: path.folder))
+    if fileSize > 0 {
+        rows.append(MediaInfoRow(label: "Size", value: "{formatBytes(fileSize)} ({formatCount(fileSize)} bytes)"))
+    }
+    rows.append(MediaInfoRow(label: "Container", value: containerTitle(media.format)))
+    rows.append(MediaInfoRow(label: "Duration", value: if media.duration < 0.0 { "live / unknown" } else { formatClock(media.duration, tenths: true) }))
+    if fileSize > 0 && media.duration > 0.0 {
+        rows.append(MediaInfoRow(label: "Overall bit rate", value: "{Int(Float(fileSize) * 8.0 / media.duration / 1000.0 + 0.5)} kb/s"))
+    }
+    var counts: [String] = []
+    for k in [core.TrackKind.video, core.TrackKind.audio, core.TrackKind.subtitle, core.TrackKind.other] {
+        let n = media.tracks.count(where: { t in t.kind == k })
+        if n > 0 {
+            counts.append("{n} {toolsKindName(k).lowercase()}")
+        }
+    }
+    rows.append(MediaInfoRow(label: "Tracks", value: if counts.isEmpty { "none" } else { counts.joined(separator: ", ") }))
+    if let title = media.tags["title"] {
+        rows.append(MediaInfoRow(label: "Title", value: title))
+    }
+    if !media.chapters.isEmpty {
+        rows.append(MediaInfoRow(label: "Chapters", value: "{media.chapters.count}"))
+    }
+    if !media.attachments.isEmpty {
+        rows.append(MediaInfoRow(label: "Attachments", value: "{media.attachments.count}"))
+    }
+    if !media.cover.isEmpty {
+        rows.append(MediaInfoRow(label: "Cover art", value: formatBytes(media.cover.count)))
+    }
+    rows
+}
+
+// The Codec tab's rows for one track (`info`: the decoder's streamInfo,
+// `note`: e.g. "Reel can't decode this yet").
+public fn mediaTrackRows(_ t: core.Track, info: String = "", note: String = "") -> [MediaInfoRow] {
+    var rows: [MediaInfoRow] = []
+    rows.append(MediaInfoRow(label: "Codec", value: codecTitle(t.codec) + (if t.tag.isEmpty { "" } else { " ({t.tag})" })))
+    if !t.language.isEmpty {
+        rows.append(MediaInfoRow(label: "Language", value: languageText(t.language)))
+    }
+    if !t.title.isEmpty {
+        rows.append(MediaInfoRow(label: "Title", value: t.title))
+    }
+    if t.kind == .video {
+        rows.append(MediaInfoRow(label: "Size", value: "{t.width} × {t.height}"))
+        if t.sarNum != t.sarDen && t.sarNum > 0 && t.sarDen > 0 {
+            rows.append(MediaInfoRow(label: "Pixel shape", value: "{t.sarNum}:{t.sarDen}"))
+        }
+        if t.fpsNum > 0 && t.fpsDen > 0 {
+            rows.append(MediaInfoRow(label: "Frame rate", value: "{(Float(t.fpsNum) / Float(t.fpsDen)).formatted(decimals: 3)} fps"))
+        }
+        if t.rotation != 0 {
+            rows.append(MediaInfoRow(label: "Rotation", value: "{t.rotation}°"))
+        }
+    }
+    if t.kind == .audio {
+        if t.sampleRate > 0 {
+            rows.append(MediaInfoRow(label: "Sample rate", value: "{t.sampleRate} Hz"))
+        }
+        if t.channels > 0 {
+            rows.append(MediaInfoRow(label: "Channels", value: channelsText(t.channels) + (if t.layout.isEmpty { "" } else { " ({t.layout.joined(separator: " ")})" })))
+        }
+        if t.bitsPerSample > 0 {
+            rows.append(MediaInfoRow(label: "Bits", value: "{t.bitsPerSample}"))
+        }
+    }
+    if t.bitrate > 0 {
+        rows.append(MediaInfoRow(label: "Bit rate", value: "{t.bitrate / 1000} kb/s"))
+    }
+    if t.duration != core.noTime && t.timescale > 0 {
+        rows.append(MediaInfoRow(label: "Duration", value: formatClock(core.seconds(t.duration, t.timescale), tenths: true)))
+    }
+    var flags: [String] = []
+    if t.isDefault {
+        flags.append("default")
+    }
+    if t.isForced {
+        flags.append("forced")
+    }
+    if !flags.isEmpty {
+        rows.append(MediaInfoRow(label: "Flags", value: flags.joined(separator: ", ")))
+    }
+    if !info.isEmpty {
+        rows.append(MediaInfoRow(label: "Decoder", value: info))
+    }
+    if !note.isEmpty {
+        rows.append(MediaInfoRow(label: "Note", value: note))
+    }
+    rows
+}
+
+// The Metadata tab: every tag (sorted), then the attachments.
+public fn mediaMetadataRows(_ media: core.Media) -> [MediaInfoRow] {
+    var rows: [MediaInfoRow] = []
+    for k in media.tags.keys.sorted() {
+        if k == "delay" || k == "padding" {
+            continue
+        }
+        rows.append(MediaInfoRow(label: k.capitalized(), value: media.tags[k] ?? ""))
+    }
+    for a in media.attachments {
+        rows.append(MediaInfoRow(label: "Attachment", value: "{a.name}" + (if a.mime.isEmpty { "" } else { " ({a.mime})" }) + ", {formatBytes(a.data.count)}"))
+    }
+    rows
+}
+
+// The Chapters tab: start time and title.
+public fn mediaChapterRows(_ media: core.Media) -> [MediaInfoRow] {
+    var rows: [MediaInfoRow] = []
+    for (i, c) in media.chapters.enumerated() {
+        rows.append(MediaInfoRow(label: formatClock(c.start), value: if c.title.isEmpty { "Chapter {i + 1}" } else { c.title }))
+    }
+    rows
+}
+
+fn toolsRowsText(_ title: String, _ rows: [MediaInfoRow]) -> String {
+    var out = title + "\n"
+    for r in rows {
+        out += "    {r.label}: {r.value.replace("\n", with: "\n        ")}\n"
+    }
+    out
+}
+
+// Everything as text, for the clipboard.
+public fn mediaInfoText(_ media: core.Media, path: String, fileSize: Int, streamInfo: [String] = [], trackNotes: [String] = [], stats: [MediaInfoRow] = [], warnings: [String] = []) -> String {
+    var out = toolsRowsText("General", mediaGeneralRows(media, path: path, fileSize: fileSize))
+    for t in media.tracks {
+        out += "\n" + toolsRowsText("Track {t.index + 1}: {toolsKindName(t.kind)}", mediaTrackRows(t, info: if t.index < streamInfo.count { streamInfo[t.index] } else { "" }, note: if t.index < trackNotes.count { trackNotes[t.index] } else { "" }))
+    }
+    let meta = mediaMetadataRows(media)
+    if !meta.isEmpty {
+        out += "\n" + toolsRowsText("Metadata", meta)
+    }
+    if !media.chapters.isEmpty {
+        out += "\n" + toolsRowsText("Chapters", mediaChapterRows(media))
+    }
+    if !stats.isEmpty {
+        out += "\n" + toolsRowsText("Statistics", stats)
+    }
+    let all = media.warnings + warnings
+    if !all.isEmpty {
+        out += "\nWarnings\n"
+        for w in all.prefix(40) {
+            out += "    {w}\n"
+        }
+    }
+    out
+}
+
+// ---- the view ----
+
+// `media`, `path`, `fileSize`: the open file; `streamInfo`: each track's
+// decoder description (index = track index, "" when none); `trackNotes`:
+// a note per track (e.g. "Reel can't decode this yet"); `stats`: live
+// statistics rows (the app refreshes them); `warnings`: the player's own
+// warnings (the media's are added); `tab`: "general", "codec",
+// "metadata", "statistics" or "chapters". Callback: `onSeek(t)` when a
+// chapter is clicked.
+public view MediaInfoView(media: core.Media, path: String, fileSize: Int = 0, streamInfo: [String] = [], trackNotes: [String] = [], stats: [MediaInfoRow] = [], warnings: [String] = [], tab: bind String, onSeek: fn(Float)) {
+    VStack(spacing: 8, alignment: .leading) {
+        TabView(selection: tab) {
+            Scroll {
+                VStack(spacing: 10, alignment: .leading) {
+                    ToolsInfoRows(rows: mediaGeneralRows(media, path: path, fileSize: fileSize))
+                    let all = media.warnings + warnings
+                    if !all.isEmpty {
+                        Text("Warnings").font(size: 12, weight: .semibold).color(.orange)
+                        for w in all.prefix(40) {
+                            Text(w).font(size: 12).color(.secondary).selectable()
+                        }
+                    }
+                }
+                .padding(12)
+            }
+            .tabItem("General")
+            .tag("general")
+
+            Scroll {
+                VStack(spacing: 12, alignment: .leading) {
+                    if media.tracks.isEmpty {
+                        Text("No tracks.").color(.secondary)
+                    }
+                    // One grid for every track, so the columns line up.
+                    Grid(spacing: 10, rowSpacing: 4) {
+                        for t in media.tracks {
+                            Text("Track {t.index + 1}: {toolsKindName(t.kind)}").font(size: 13, weight: .semibold).padding(top: if t.index == 0 { 0 } else { 8 }).frame(maxWidth: .infinity, alignment: .leading)
+                            for r in mediaTrackRows(t, info: if t.index < streamInfo.count { streamInfo[t.index] } else { "" }, note: if t.index < trackNotes.count { trackNotes[t.index] } else { "" }) {
+                                GridRow {
+                                    Text(r.label).font(size: 12).color(.secondary).gridColumnAlignment(.trailing)
+                                    Text(r.value).font(size: 12).selectable()
+                                }
+                            }
+                        }
+                    }
+                }
+                .padding(12)
+            }
+            .tabItem("Codec")
+            .tag("codec")
+
+            Scroll {
+                VStack(spacing: 10, alignment: .leading) {
+                    let meta = mediaMetadataRows(media)
+                    if meta.isEmpty {
+                        Text("No tags.").color(.secondary)
+                    } else {
+                        ToolsInfoRows(rows: meta)
+                    }
+                }
+                .padding(12)
+            }
+            .tabItem("Metadata")
+            .tag("metadata")
+
+            Scroll {
+                VStack(spacing: 10, alignment: .leading) {
+                    if stats.isEmpty {
+                        Text("Statistics show while the file plays.").color(.secondary)
+                    } else {
+                        ToolsInfoRows(rows: stats)
+                    }
+                }
+                .padding(12)
+            }
+            .tabItem("Statistics")
+            .tag("statistics")
+
+            Scroll {
+                VStack(spacing: 2, alignment: .leading) {
+                    if media.chapters.isEmpty {
+                        Text("No chapters.").color(.secondary)
+                    }
+                    for (i, c) in media.chapters.enumerated() {
+                        HStack(spacing: 10) {
+                            Text(formatClock(c.start)).font(size: 12).color(.secondary).frame(width: 64, alignment: .leading)
+                            Text(if c.title.isEmpty { "Chapter {i + 1}" } else { c.title })
+                            Spacer()
+                        }
+                        .padding(horizontal: 6, vertical: 4)
+                        .hoverBackground(.lightGray, radius: 4)
+                        .onTap { onSeek(c.start) }
+                        .accessibilityLabel("Go to chapter {i + 1}")
+                    }
+                }
+                .padding(12)
+            }
+            .tabItem("Chapters")
+            .tag("chapters")
+        }
+        HStack {
+            Spacer()
+            Button("Copy All") {
+                let ok = copyToClipboard(mediaInfoText(media, path: path, fileSize: fileSize, streamInfo: streamInfo, trackNotes: trackNotes, stats: stats, warnings: warnings))
+                showNotice(if ok { "Media information copied" } else { "Couldn't copy" })
+            }
+            .tooltip("Copy every tab as text")
+        }
+        .padding(horizontal: 12, bottom: 10)
+    }
+}
+
+// Label / value rows lined up in a grid; values can be selected.
+view ToolsInfoRows(rows: [MediaInfoRow]) {
+    Grid(spacing: 10, rowSpacing: 4) {
+        for r in rows {
+            GridRow {
+                Text(r.label).font(size: 12).color(.secondary).gridColumnAlignment(.trailing)
+                Text(r.value).font(size: 12).selectable()
+            }
+        }
+    }
+}

@@ -1,0 +1,133 @@
+// The Equalizer tab of the "Effects and Filters" window: on/off, the
+// preset list (fx.presets()), the preamp and ten vertical band sliders
+// (31 Hz … 16 kHz, ±12 dB, with their dB values above and frequencies
+// below), the response curve of the current settings drawn on a Canvas,
+// and Reset (back to Flat). Moving a slider turns the equalizer on and
+// names the settings after the preset they match ("Custom" otherwise).
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+import "../fx"
+
+// Length of a band slider, in points.
+let fxuBandLength = 150.0
+// Range of the response plot, ± dB.
+let fxuPlotDb = 15.0
+
+public view EqualizerView(audio: bind fx.Settings, onChange: fn()) {
+    fn pickPreset(_ name: String) {
+        audio = fx.withPreset(audio, name)
+        onChange()
+    }
+
+    fn edited() {
+        audio.eqOn = true
+        audio.eqPreset = fxPresetName(audio)
+        onChange()
+    }
+
+    fn reset() {
+        audio = fx.withPreset(audio, "Flat")
+        onChange()
+    }
+
+    VStack(spacing: 12, alignment: .leading) {
+        HStack(spacing: 8) {
+            Text("Equalizer").font(size: 13, weight: .semibold)
+            FxuSwitchButton(label: "Equalizer", isOn: audio.eqOn, onChange: onChange)
+            Spacer().frame(width: 12)
+            FxuChoiceMenu(label: "", options: fxuPresetNames(), selected: fxPresetName(audio), speak: "Equalizer preset", onPick: pickPreset)
+            Spacer()
+            Button("Reset") { reset() }
+        }
+
+        Canvas { g in fxuDrawResponse(g, audio) }
+            .frame(height: 130)
+            .accessibilityLabel("Equalizer response curve")
+
+        HStack(spacing: 0, alignment: .top) {
+            FxuBand(label: "Preamp", value: audio.eqPreamp, onChange: edited)
+            Divider().frame(height: fxuBandLength + 40.0)
+            for i in 0..audio.eqGains.count {
+                FxuBand(label: fxFreqLabel(fx.eqFrequencies[i]), value: audio.eqGains[i], onChange: edited)
+            }
+        }
+        .opacity(if audio.eqOn { 1.0 } else { 0.6 })
+    }
+}
+
+// The preset names, in menu order, and "Custom" (which picks nothing).
+fn fxuPresetNames() -> [String] {
+    fx.presets().map { p in p.name }
+}
+
+// One vertical slider with its value above and its name below.
+view FxuBand(label: String, value: bind Float, onChange: fn()) {
+    VStack(spacing: 4) {
+        Text(fxSigned(value, decimals: 1)).font(size: 11).color(.secondary)
+        Slider(value: value, from: -fx.eqMaxDb, to: fx.eqMaxDb, step: 0.5) { onChange() }
+            .frame(width: fxuBandLength)
+            .rotation(-90)
+            .accessibilityLabel(if label == "Preamp" { "Preamp" } else { "{label} Hz band" })
+        Text(label).font(size: 11)
+    }
+    .frame(minWidth: if label == "Preamp" { 54.0 } else { 40.0 }, maxWidth: .infinity)
+}
+
+// The response plot: dB grid, frequency grid on a log axis, the curve.
+fn fxuDrawResponse(_ g: Graphics, _ s: fx.Settings) {
+    let left = 34.0
+    let right = g.width - 8.0
+    let top = 6.0
+    let bottom = g.height - 18.0
+    let w = right - left
+    let h = bottom - top
+    g.fillRect(x: left, y: top, width: w, height: h, color: .sidebar, radius: 4)
+    // dB lines.
+    for db in [-12.0, -6.0, 0.0, 6.0, 12.0] {
+        let y = top + h * (fxuPlotDb - db) / (2.0 * fxuPlotDb)
+        g.line(left, y, right, y, color: .separator, width: if db == 0.0 { 1.5 } else { 1.0 })
+        g.text(fxSigned(db, decimals: 0), x: left - 4.0, y: y, size: 10, color: .secondary, align: .trailing)
+    }
+    // Frequency lines.
+    for f in [100.0, 1000.0, 10000.0] {
+        let x = left + w * fxLogPosition(f)
+        g.line(x, top, x, bottom, color: .separator)
+    }
+    for (i, f) in fx.eqFrequencies.enumerated() {
+        if i % 2 == 0 || i == fx.eqFrequencies.count - 1 {
+            g.text(fxFreqLabel(f), x: left + w * fxLogPosition(f), y: bottom + 3.0, size: 10, color: .secondary, align: .top)
+        }
+    }
+    // The curve (flat when the equalizer is off).
+    let n = 160
+    let freqs = fxLogFrequencies(n)
+    let gains = if s.eqOn { s.eqGains } else { [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0] }
+    let pre = if s.eqOn { s.eqPreamp } else { 0.0 }
+    let dbs = fxEqResponse(gains: gains, preamp: pre, freqs: freqs)
+    let zero = top + h / 2.0
+    var pts: [Float] = []
+    for i in 0..n {
+        let d = max(-fxuPlotDb, min(dbs[i], fxuPlotDb))
+        pts.append(left + w * Float(i) / Float(n - 1))
+        pts.append(top + h * (fxuPlotDb - d) / (2.0 * fxuPlotDb))
+    }
+    g.save()
+    g.clip(x: left, y: top, width: w, height: h)
+    g.beginPath()
+    g.lines([left, zero] + pts + [right, zero], closed: true)
+    g.fill(if s.eqOn { .rgba(242, 140, 26, 0.18) } else { .rgba(142, 142, 147, 0.15) })
+    g.beginPath()
+    g.lines(pts)
+    g.stroke(if s.eqOn { fxuAccent } else { .gray }, width: 2)
+    // The band centres as dots on the curve.
+    if s.eqOn {
+        let centres = fxEqResponse(gains: gains, preamp: pre, freqs: fx.eqFrequencies)
+        for (i, f) in fx.eqFrequencies.enumerated() {
+            let d = max(-fxuPlotDb, min(centres[i], fxuPlotDb))
+            g.fillCircle(x: left + w * fxLogPosition(f), y: top + h * (fxuPlotDb - d) / (2.0 * fxuPlotDb), radius: 3, color: fxuAccent)
+        }
+    }
+    g.restore()
+}

@@ -1,0 +1,53 @@
+// The "Effects and Filters" window's content: tabs for the Equalizer,
+// Loudness & dynamics, Stereo, Video and Synchronisation views (each also
+// usable on its own). Every change the user makes calls onChange() once
+// (the app debounces, then applies the settings: fx.Chain.settings,
+// the Converter's render.View and vfx.Chain.configure, the player's
+// delays and speed).
+//
+// `tab` is one of fxTabs' tags ("equalizer", "loudness", "stereo",
+// "video", "sync"); anything else shows the Equalizer.
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+import "../fx"
+import "../render"
+import "../vfx"
+
+// The tabs: tag and title, in order.
+public let fxTabs: [(String, String)] = [("equalizer", "Equalizer"), ("loudness", "Loudness & dynamics"), ("stereo", "Stereo"), ("video", "Video"), ("sync", "Synchronisation")]
+
+public view EffectsView(audio: bind fx.Settings, look: bind render.View, filters: bind vfx.Settings, sync: bind SyncSettings, meter: MeterReadout, tab: bind String, onChange: fn()) {
+    TabView(selection: tab) {
+        Scroll {
+            EqualizerView(audio: audio, onChange: onChange).padding(16)
+        }
+        .tabItem("Equalizer")
+        .tag("equalizer")
+
+        Scroll {
+            LoudnessView(audio: audio, meter: meter, onChange: onChange).padding(16)
+        }
+        .tabItem("Loudness & dynamics")
+        .tag("loudness")
+
+        Scroll {
+            StereoView(audio: audio, onChange: onChange).padding(16)
+        }
+        .tabItem("Stereo")
+        .tag("stereo")
+
+        Scroll {
+            VideoEffectsView(look: look, filters: filters, onChange: onChange).padding(16)
+        }
+        .tabItem("Video")
+        .tag("video")
+
+        Scroll {
+            SyncView(sync: sync, onChange: onChange).padding(16)
+        }
+        .tabItem("Synchronisation")
+        .tag("sync")
+    }
+}

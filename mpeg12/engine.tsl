@@ -1,0 +1,1108 @@
+// The picture decoding engine of MPEG-1 and MPEG-2 video: slices,
+// macroblocks, motion vectors, coefficient blocks and motion-compensated
+// prediction (ISO/IEC 13818-2 clauses 6.2.4 to 6.2.6 for the syntax and
+// clause 7 for the decoding process; ISO/IEC 11172-2 2.4.2.7 on for
+// MPEG-1, which the same code handles with MPEG-2's defaults).
+//
+// Planes have the coded size (whole macroblocks). The engine writes the
+// current frame's planes and reads its references' planes, which the
+// Decoder hands it (lists are shared, not copied, until written). The
+// second field of a frame that predicts from the first field reads a
+// snapshot of the frame taken before the second field began.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../core"
+
+// Indexes of M12Engine.usage, whose names m12Tools gives: 0 to 2 are the
+// frame pictures' motion types 1 to 3, 3 to 5 the field pictures'.
+let m12UseFieldDct = 6
+let m12UseConceal = 7
+let m12UseSkip = 8
+let m12UseEdge = 9
+let m12UseFieldPicture = 10
+public let m12Tools = ["field MC in frame pictures", "frame MC", "dual prime in frame pictures", "field MC in field pictures", "16x8 MC", "dual prime in field pictures", "field DCT", "concealment vectors", "skipped macroblocks", "vectors past the edge", "field pictures", "alternate scan", "intra VLC table one", "non-linear quantiser"]
+
+struct M12Engine {
+    // Planes of the frame being decoded, of the forward and backward
+    // references, and the first-field snapshot (sources 0, 1 and 2 of mc).
+    curY: [Int] = []
+    curU: [Int] = []
+    curV: [Int] = []
+    fwdY: [Int] = []
+    fwdU: [Int] = []
+    fwdV: [Int] = []
+    bwdY: [Int] = []
+    bwdU: [Int] = []
+    bwdV: [Int] = []
+    ffY: [Int] = []
+    ffU: [Int] = []
+    ffV: [Int] = []
+    blk: [Int] = []
+    col: [Int] = []
+    br: core.BitReader = core.bitReader(Data())
+
+    // Geometry: macroblocks across and down (frame rows), plane strides
+    // and heights, chroma_format (1 = 4:2:0, 2 = 4:2:2, 3 = 4:4:4) and the
+    // chroma macroblock's width and height.
+    mbw: Int = 0
+    mbh: Int = 0
+    yStride: Int = 0
+    yH: Int = 0
+    cStride: Int = 0
+    cH: Int = 0
+    chromaFmt: Int = 1
+    cmbW: Int = 8
+    cmbH: Int = 8
+    ySize: Int = 0
+    cSize: Int = 0
+    blockCount: Int = 6
+
+    // The picture being decoded (picture header and coding extension).
+    mpeg2: Bool = false
+    picType: Int = 1
+    structure: Int = 3
+    // f_code[s][t] at s * 2 + t (s: 0 forward, 1 backward; t: 0
+    // horizontal, 1 vertical).
+    fcode: [Int] = [1, 1, 1, 1]
+    fullPelF: Bool = false
+    fullPelB: Bool = false
+    dcPrec: Int = 0
+    framePredFrameDct: Bool = true
+    concealMv: Bool = false
+    qScaleType: Int = 0
+    intraVlc: Int = 0
+    altScan: Bool = false
+    topFieldFirst: Bool = true
+    secondField: Bool = false
+
+    // Quantiser matrices in raster order.
+    qIntra: [Int] = []
+    qInter: [Int] = []
+    qIntraC: [Int] = []
+    qInterC: [Int] = []
+
+
+    // Decoding state.
+    qscale: Int = 2
+    dcPred: [Int] = [128, 128, 128]
+    // PMV[r][s][t] at r * 4 + s * 2 + t.
+    pmv: [Int] = [0, 0, 0, 0, 0, 0, 0, 0]
+    // Vectors in use: mv[s][k][t] at s * 8 + k * 2 + t (k: first and
+    // second vector, then for dual prime the two opposite-parity ones).
+    mv: [Int] = []
+    // motion_vertical_field_select[r][s] at r * 2 + s.
+    fsel: [Int] = [0, 0, 0, 0]
+    motionType: Int = 2
+    dctField: Bool = false
+    mbType: Int = 0
+    lastMbType: Int = 0
+    mbx: Int = 0
+    mby: Int = 0
+    // Per macroblock: the serial of the picture that decoded it.
+    mbDone: [Int] = []
+    serial: Int = 1
+    doneCount: Int = 0
+    errors: Int = 0
+    // How often each coding tool was met (for tests and the media info):
+    // see m12Tools for the names.
+    usage: [Int] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+
+    // Sets the size (in macroblocks) and chroma format.
+    fn setup(mbWidth: Int, mbHeight: Int, chroma: Int) {
+        mbw = mbWidth
+        mbh = mbHeight
+        chromaFmt = chroma
+        yStride = mbw * 16
+        yH = mbh * 16
+        cmbW = if chroma == 3 { 16 } else { 8 }
+        cmbH = if chroma == 1 { 8 } else { 16 }
+        cStride = mbw * cmbW
+        cH = mbh * cmbH
+        ySize = yStride * yH
+        cSize = cStride * cH
+        blockCount = if chroma == 1 { 6 } else if chroma == 2 { 8 } else { 12 }
+        blk = core.zeros(64)
+        col = core.zeros(8)
+        mv = core.zeros(16)
+        mbDone = core.zeros(mbw * mbh)
+        serial = 1
+    }
+
+    // Macroblock rows of the picture being decoded (field rows for a
+    // field picture).
+    picMbRows: Int {
+        if structure == 3 { mbh } else { mbh / 2 }
+    }
+
+    fn setFwd(_ f: M12Frame) {
+        fwdY = f.y
+        fwdU = f.u
+        fwdV = f.v
+    }
+
+    fn setBwd(_ f: M12Frame) {
+        bwdY = f.y
+        bwdU = f.u
+        bwdV = f.v
+    }
+
+    // Lets go of the references and the snapshot (so their planes aren't
+    // shared needlessly).
+    fn release() {
+        fwdY = []
+        fwdU = []
+        fwdV = []
+        bwdY = []
+        bwdU = []
+        bwdV = []
+        ffY = []
+        ffU = []
+        ffV = []
+    }
+
+    fn setQ(_ code: Int) {
+        if mpeg2 && qScaleType == 1 {
+            qscale = m12NonLinearQ[code]
+        } else {
+            qscale = code * 2
+        }
+    }
+
+    fn resetDc() {
+        let v = 1 << (7 + dcPrec)
+        dcPred[0] = v
+        dcPred[1] = v
+        dcPred[2] = v
+    }
+
+    fn resetPmv() {
+        for i in 0..8 {
+            pmv[i] = 0
+        }
+    }
+
+    // Reads one code of a table made by m12Build: its value, or -1.
+    fn vlc(_ t: [Int]) -> Int {
+        let r = t[0]
+        let l = t[1]
+        let p = br.peek(l)
+        var e = t[2 + (p >> (l - r))]
+        if e < 0 {
+            let s = -e
+            let k = s & 31
+            e = t[(s >> 5) + ((p >> (l - r - k)) & ((1 << k) - 1))]
+        }
+        let len = e & 31
+        if len == 0 {
+            return -1
+        }
+        br.skip(len)
+        e >> 5
+    }
+
+    // ---- Slices (6.2.4, 7.1 to 7.2) ----
+
+    // Decodes the slice whose header starts at data[from] (just after its
+    // start code, whose last byte was `code`) up to data[to]. Returns
+    // false when it was damaged.
+    fn decodeSlice(_ data: Data, from: Int, to: Int, code: Int, verticalSize: Int) -> Bool {
+        br = core.bitReaderRange(data, from: from, to: to)
+        var row = code - 1
+        if mpeg2 && verticalSize > 2800 {
+            row += br.bits(3) << 7
+        }
+        if row >= picMbRows {
+            return false
+        }
+        setQ(br.bits(5))
+        if mpeg2 && br.peek(1) == 1 {
+            // intra_slice_flag, intra_slice, reserved_bits
+            br.skip(9)
+        }
+        while br.bits(1) == 1 {
+            br.skip(8)
+            if br.overrun {
+                return false
+            }
+        }
+        resetDc()
+        resetPmv()
+        let total = mbw * picMbRows
+        var addr = row * mbw - 1
+        var first = true
+        while true {
+            // macroblock_address_increment, with escapes and (MPEG-1)
+            // stuffing.
+            var inc = 0
+            while true {
+                let v = vlc(m12Mba)
+                if v < 0 {
+                    return false
+                }
+                if v == 35 {
+                    continue
+                }
+                if v == 34 {
+                    inc += 33
+                    continue
+                }
+                inc += v
+                break
+            }
+            if first {
+                addr += inc
+                first = false
+                lastMbType = 0
+            } else {
+                // Skipped macroblocks (7.6.6).
+                var k = 1
+                while k < inc {
+                    if addr + k >= total {
+                        return false
+                    }
+                    skipMb(addr + k)
+                    k += 1
+                }
+                addr += inc
+            }
+            if addr >= total {
+                return false
+            }
+            if !decodeMb(addr) {
+                return false
+            }
+            if br.overrun {
+                return false
+            }
+            // The slice ends where only zero bits are left before the next
+            // start code.
+            if br.left <= 0 || br.peek(23) == 0 {
+                return true
+            }
+        }
+        true
+    }
+
+    fn markDone(_ addr: Int) {
+        let i = picMbIndex(addr)
+        if mbDone[i] != serial {
+            mbDone[i] = serial
+            doneCount += 1
+        }
+    }
+
+    // The macroblock's index in the frame's mbDone list (field pictures
+    // count their own macroblocks, kept apart by row parity).
+    fn picMbIndex(_ addr: Int) -> Int {
+        if structure == 3 {
+            return addr
+        }
+        (structure - 1) * mbw * (mbh / 2) + addr
+    }
+
+    fn skipMb(_ addr: Int) {
+        usage[m12UseSkip] += 1
+        mbx = addr % mbw
+        mby = addr / mbw
+        resetDc()
+        let parity = structure - 1
+        if picType == 2 {
+            // P: forward prediction with a zero vector (from the field of
+            // the same parity in a field picture); PMVs reset.
+            resetPmv()
+            if structure == 3 {
+                mc(0, -1, -1, mby * 16, 16, 0, 0, false)
+            } else {
+                mc(0, parity, parity, mby * 16, 16, 0, 0, false)
+            }
+        } else {
+            // B: the previous macroblock's directions with the PMVs as
+            // vectors, frame (or same-parity field) prediction.
+            var dirs = lastMbType & (m12Fwd | m12Bwd)
+            if dirs == 0 {
+                dirs = m12Fwd
+            }
+            var avg = false
+            for s in 0..2 {
+                let flag = if s == 0 { m12Fwd } else { m12Bwd }
+                if dirs & flag != 0 {
+                    if structure == 3 {
+                        mc(s, -1, -1, mby * 16, 16, pmv[s * 2], pmv[s * 2 + 1], avg)
+                    } else {
+                        mc(s, parity, parity, mby * 16, 16, pmv[s * 2], pmv[s * 2 + 1], avg)
+                    }
+                    avg = true
+                }
+            }
+        }
+        markDone(addr)
+    }
+
+    // ---- Macroblocks (6.2.5) ----
+
+    fn decodeMb(_ addr: Int) -> Bool {
+        mbx = addr % mbw
+        mby = addr / mbw
+        let t = if picType == 1 { m12MbTypeI } else if picType == 2 { m12MbTypeP } else { m12MbTypeB }
+        let type = vlc(t)
+        if type < 0 {
+            return false
+        }
+        mbType = type
+        let intra = type & m12Intra != 0
+        motionType = if structure == 3 { 2 } else { 1 }
+        dctField = false
+        if mpeg2 {
+            if type & (m12Fwd | m12Bwd) != 0 {
+                if structure != 3 || !framePredFrameDct {
+                    motionType = br.bits(2)
+                }
+            }
+            if structure == 3 && !framePredFrameDct && type & (m12Intra | m12Pattern) != 0 {
+                dctField = br.bits(1) == 1
+            }
+        }
+        if type & m12Quant != 0 {
+            setQ(br.bits(5))
+        }
+        if dctField {
+            usage[m12UseFieldDct] += 1
+        }
+        if intra {
+            if mpeg2 && concealMv {
+                usage[m12UseConceal] += 1
+                // Concealment vectors are parsed and kept as predictors
+                // (7.6.3.1); the macroblock itself is intra coded.
+                if structure != 3 {
+                    br.skip(1)
+                }
+                readVector(0, 0, false)
+                pmv[4] = pmv[0]
+                pmv[5] = pmv[1]
+                br.skip(1)
+            } else {
+                resetPmv()
+            }
+            for b in 0..blockCount {
+                if !intraBlock(b) {
+                    return false
+                }
+            }
+        } else {
+            resetDc()
+            if type & m12Fwd != 0 {
+                if !readMotion(0) {
+                    return false
+                }
+            }
+            if type & m12Bwd != 0 {
+                if !readMotion(1) {
+                    return false
+                }
+            }
+            var cbp = 0
+            if type & m12Pattern != 0 {
+                cbp = vlc(m12Cbp)
+                if cbp < 0 {
+                    return false
+                }
+                if chromaFmt == 2 {
+                    cbp = (cbp << 2) | br.bits(2)
+                } else if chromaFmt == 3 {
+                    cbp = (cbp << 6) | br.bits(6)
+                }
+            }
+            predict(type)
+            for b in 0..blockCount {
+                if (cbp >> (blockCount - 1 - b)) & 1 == 1 {
+                    if !interBlock(b) {
+                        return false
+                    }
+                }
+            }
+        }
+        lastMbType = type
+        markDone(addr)
+        true
+    }
+
+    // ---- Motion vectors (6.2.5.2, 7.6.3) ----
+
+    // One motion vector component: motion_code, motion_residual and the
+    // wrap into the f_code range.
+    fn mvComponent(_ f: Int, _ pred: Int) -> Int {
+        let code = vlc(m12Motion)
+        if code <= 0 {
+            if code < 0 {
+                errors += 1
+            }
+            return pred
+        }
+        let negative = br.bits(1) == 1
+        // f_code is 1 to 9; anything else (15 = unused) is damage.
+        let rsize = if f >= 1 && f <= 9 { f - 1 } else { 0 }
+        var delta = code
+        if rsize > 0 {
+            delta = ((code - 1) << rsize) + br.bits(rsize) + 1
+        }
+        if negative {
+            delta = -delta
+        }
+        var v = pred + delta
+        let high = (16 << rsize) - 1
+        let low = -(16 << rsize)
+        if v < low {
+            v += 32 << rsize
+        } else if v > high {
+            v -= 32 << rsize
+        }
+        v
+    }
+
+    // motion_vector(r, s): sets mv[s][r] and PMV[r][s]. `fieldInFrame` is
+    // a field vector in a frame picture, whose vertical predictor is kept
+    // in frame units (7.6.3.1).
+    fn readVector(_ r: Int, _ s: Int, _ fieldInFrame: Bool) {
+        let p = r * 4 + s * 2
+        let x = mvComponent(fcode[s * 2], pmv[p])
+        pmv[p] = x
+        if fieldInFrame {
+            let y = mvComponent(fcode[s * 2 + 1], pmv[p + 1] >> 1)
+            pmv[p + 1] = y * 2
+            mv[s * 8 + r * 2] = x
+            mv[s * 8 + r * 2 + 1] = y
+        } else {
+            let y = mvComponent(fcode[s * 2 + 1], pmv[p + 1])
+            pmv[p + 1] = y
+            mv[s * 8 + r * 2] = x
+            mv[s * 8 + r * 2 + 1] = y
+        }
+    }
+
+    // dmvector (Table B.11).
+    fn dmv() -> Int {
+        if br.bits(1) == 0 {
+            return 0
+        }
+        if br.bits(1) == 0 { 1 } else { -1 }
+    }
+
+    // motion_vectors(s) for the macroblock's motion type.
+    fn readMotion(_ s: Int) -> Bool {
+        if !mpeg2 {
+            // MPEG-1: one frame vector; full-pel vectors count whole
+            // samples (11172-2 2.4.4.2).
+            readVector(0, s, false)
+            pmv[4 + s * 2] = pmv[s * 2]
+            pmv[5 + s * 2] = pmv[s * 2 + 1]
+            let full = if s == 0 { fullPelF } else { fullPelB }
+            if full {
+                mv[s * 8] = mv[s * 8] * 2
+                mv[s * 8 + 1] = mv[s * 8 + 1] * 2
+            }
+            return true
+        }
+        if motionType < 1 || motionType > 3 {
+            // motion_type 0 is reserved.
+            return false
+        }
+        if structure == 3 {
+            usage[motionType - 1] += 1
+            if motionType == 1 {
+                // Field prediction in a frame picture: two vectors.
+                fsel[s] = br.bits(1)
+                readVector(0, s, true)
+                fsel[2 + s] = br.bits(1)
+                readVector(1, s, true)
+            } else if motionType == 2 {
+                readVector(0, s, false)
+                pmv[4 + s * 2] = pmv[s * 2]
+                pmv[5 + s * 2] = pmv[s * 2 + 1]
+            } else if motionType == 3 {
+                dualPrime(s)
+            } else {
+                return false
+            }
+        } else {
+            usage[2 + motionType] += 1
+            if motionType == 1 {
+                fsel[s] = br.bits(1)
+                readVector(0, s, false)
+                pmv[4 + s * 2] = pmv[s * 2]
+                pmv[5 + s * 2] = pmv[s * 2 + 1]
+            } else if motionType == 2 {
+                // 16x8 prediction: a vector for each half.
+                fsel[s] = br.bits(1)
+                readVector(0, s, false)
+                fsel[2 + s] = br.bits(1)
+                readVector(1, s, false)
+            } else if motionType == 3 {
+                dualPrime(s)
+            } else {
+                return false
+            }
+        }
+        true
+    }
+
+    // Dual prime (7.6.3.6): one field vector and a small differential
+    // give the opposite-parity vectors, scaled by the fields' distance.
+    fn dualPrime(_ s: Int) {
+        let frame = structure == 3
+        let x = mvComponent(fcode[s * 2], pmv[s * 2])
+        let dmx = dmv()
+        let pred = if frame { pmv[s * 2 + 1] >> 1 } else { pmv[s * 2 + 1] }
+        let y = mvComponent(fcode[s * 2 + 1], pred)
+        let dmy = dmv()
+        let py = if frame { y * 2 } else { y }
+        pmv[s * 2] = x
+        pmv[s * 2 + 1] = py
+        pmv[4 + s * 2] = x
+        pmv[5 + s * 2] = py
+        let o = s * 8
+        mv[o] = x
+        mv[o + 1] = y
+        mv[o + 2] = x
+        mv[o + 3] = y
+        let px = if x > 0 { 1 } else { 0 }
+        let pyr = if y > 0 { 1 } else { 0 }
+        if frame {
+            // Top field from the bottom reference field, then bottom from
+            // top (Table 7-11).
+            var m = if topFieldFirst { 1 } else { 3 }
+            mv[o + 4] = ((x * m + px) >> 1) + dmx
+            mv[o + 5] = ((y * m + pyr) >> 1) + dmy - 1
+            m = 4 - m
+            mv[o + 6] = ((x * m + px) >> 1) + dmx
+            mv[o + 7] = ((y * m + pyr) >> 1) + dmy + 1
+        } else {
+            mv[o + 4] = ((x + px) >> 1) + dmx
+            mv[o + 5] = ((y + pyr) >> 1) + dmy + (if structure == 1 { -1 } else { 1 })
+        }
+    }
+
+    // ---- Prediction (7.6) ----
+
+    // Forms the macroblock's prediction in the current frame.
+    fn predict(_ type: Int) {
+        let parity = structure - 1
+        var avg = false
+        var dirs = type & (m12Fwd | m12Bwd)
+        if dirs == 0 {
+            // P macroblock without motion_forward: zero vector, PMVs
+            // reset (7.6.3.4), same-parity field in field pictures.
+            resetPmv()
+            if structure == 3 {
+                mc(0, -1, -1, mby * 16, 16, 0, 0, false)
+            } else {
+                mc(0, parity, parity, mby * 16, 16, 0, 0, false)
+            }
+            return
+        }
+        for s in 0..2 {
+            let flag = if s == 0 { m12Fwd } else { m12Bwd }
+            if dirs & flag == 0 {
+                continue
+            }
+            let o = s * 8
+            if structure == 3 {
+                if !mpeg2 || motionType == 2 {
+                    mc(s, -1, -1, mby * 16, 16, mv[o], mv[o + 1], avg)
+                } else if motionType == 1 {
+                    mc(s, fsel[s], 0, mby * 8, 8, mv[o], mv[o + 1], avg)
+                    mc(s, fsel[2 + s], 1, mby * 8, 8, mv[o + 2], mv[o + 3], avg)
+                } else {
+                    // Dual prime: same parity, then the average with the
+                    // opposite parity.
+                    mc(s, 0, 0, mby * 8, 8, mv[o], mv[o + 1], false)
+                    mc(s, 1, 1, mby * 8, 8, mv[o + 2], mv[o + 3], false)
+                    mc(s, 1, 0, mby * 8, 8, mv[o + 4], mv[o + 5], true)
+                    mc(s, 0, 1, mby * 8, 8, mv[o + 6], mv[o + 7], true)
+                }
+            } else {
+                if motionType == 1 {
+                    mc(fieldRef(s, fsel[s]), fsel[s], parity, mby * 16, 16, mv[o], mv[o + 1], avg)
+                } else if motionType == 2 {
+                    mc(fieldRef(s, fsel[s]), fsel[s], parity, mby * 16, 8, mv[o], mv[o + 1], avg)
+                    mc(fieldRef(s, fsel[2 + s]), fsel[2 + s], parity, mby * 16 + 8, 8, mv[o + 2], mv[o + 3], avg)
+                } else {
+                    mc(s, parity, parity, mby * 16, 16, mv[o], mv[o + 1], false)
+                    let opposite = 1 - parity
+                    let oslot = if secondField { 2 } else { s }
+                    mc(oslot, opposite, parity, mby * 16, 16, mv[o + 4], mv[o + 5], true)
+                }
+            }
+            avg = true
+        }
+    }
+
+    // The source holding reference field `sel` for a field picture: the
+    // second field of a P frame predicts from the first field of its own
+    // frame when it selects the other parity (7.6.2.1).
+    fn fieldRef(_ s: Int, _ sel: Int) -> Int {
+        if s == 0 && picType == 2 && secondField && sel != structure - 1 {
+            return 2
+        }
+        s
+    }
+
+    // Motion compensation of the current macroblock's part: from source
+    // `src` (0 forward reference, 1 backward, 2 the first-field snapshot),
+    // its field `sf` (or the whole frame when -1), into the current frame
+    // (field `df`, or the frame when -1), rows yTop to yTop + h of the
+    // destination's (field or frame) plane, with vector (mvx, mvy) in half
+    // samples. Luma and both chroma planes.
+    fn mc(_ src: Int, _ sf: Int, _ df: Int, _ yTop: Int, _ h: Int, _ mvx: Int, _ mvy: Int, _ avg: Bool) {
+        let sMul = if sf < 0 { 1 } else { 2 }
+        let dMul = if df < 0 { 1 } else { 2 }
+        let sOff = if sf > 0 { yStride } else { 0 }
+        let dOff = if df > 0 { yStride } else { 0 }
+        let lx = mbx * 16 + (mvx >> 1)
+        let ly = yTop + (mvy >> 1)
+        let ld = dOff + yTop * yStride * dMul + mbx * 16
+        // Chroma vectors (7.6.3.7): halved (toward zero) where the plane
+        // is subsampled.
+        var cx = mvx
+        var cy = mvy
+        var cTop = yTop
+        var ch = h
+        if chromaFmt != 3 {
+            cx = mvx / 2
+        }
+        if chromaFmt == 1 {
+            cy = mvy / 2
+            cTop = yTop / 2
+            ch = h / 2
+        }
+        let csOff = if sf > 0 { cStride } else { 0 }
+        let cdOff = if df > 0 { cStride } else { 0 }
+        let x = mbx * cmbW + (cx >> 1)
+        let y = cTop + (cy >> 1)
+        let d = cdOff + cTop * cStride * dMul + mbx * cmbW
+        let ys = yStride * sMul
+        let yd = yStride * dMul
+        let yh = yH / sMul
+        let cs = cStride * sMul
+        let cd = cStride * dMul
+        let chh = cH / sMul
+        if src == 0 {
+            m12Mc(fwdY, curY, sOff, ys, yStride, yh, lx, ly, mvx & 1, mvy & 1, ld, yd, 16, h, avg)
+            m12Mc(fwdU, curU, csOff, cs, cStride, chh, x, y, cx & 1, cy & 1, d, cd, cmbW, ch, avg)
+            m12Mc(fwdV, curV, csOff, cs, cStride, chh, x, y, cx & 1, cy & 1, d, cd, cmbW, ch, avg)
+        } else if src == 1 {
+            m12Mc(bwdY, curY, sOff, ys, yStride, yh, lx, ly, mvx & 1, mvy & 1, ld, yd, 16, h, avg)
+            m12Mc(bwdU, curU, csOff, cs, cStride, chh, x, y, cx & 1, cy & 1, d, cd, cmbW, ch, avg)
+            m12Mc(bwdV, curV, csOff, cs, cStride, chh, x, y, cx & 1, cy & 1, d, cd, cmbW, ch, avg)
+        } else {
+            m12Mc(ffY, curY, sOff, ys, yStride, yh, lx, ly, mvx & 1, mvy & 1, ld, yd, 16, h, avg)
+            m12Mc(ffU, curU, csOff, cs, cStride, chh, x, y, cx & 1, cy & 1, d, cd, cmbW, ch, avg)
+            m12Mc(ffV, curV, csOff, cs, cStride, chh, x, y, cx & 1, cy & 1, d, cd, cmbW, ch, avg)
+        }
+    }
+
+    // ---- Blocks (6.2.6, 7.2 to 7.5) ----
+
+    // Where block b of the current macroblock goes: its plane (0 Y, 1
+    // Cb, 2 Cr), its first sample's index and the step between its rows.
+    fn blockDest(_ b: Int) -> (Int, Int, Int) {
+        let field = structure != 3
+        let lineMul = if field { 2 } else { 1 }
+        if b < 4 {
+            var off = mbx * 16 + (b & 1) * 8
+            var stride = yStride * lineMul
+            if field {
+                off += (structure - 1) * yStride + mby * 16 * stride + (b >> 1) * 8 * stride
+            } else if dctField {
+                off += (mby * 16 + (b >> 1)) * yStride
+                stride = yStride * 2
+            } else {
+                off += (mby * 16 + (b >> 1) * 8) * yStride
+            }
+            return (0, off, stride)
+        }
+        let plane = if b & 1 == 0 { 1 } else { 2 }
+        // Chroma blocks: Cb 4, 6, 8, 10 and Cr 5, 7, 9, 11 (Figures 6-10
+        // and 6-11): k counts down then across.
+        let k = (b - 4) >> 1
+        let rowBlock = k & 1
+        let colBlock = k >> 1
+        var off = mbx * cmbW + colBlock * 8
+        var stride = cStride * lineMul
+        if field {
+            off += (structure - 1) * cStride + mby * cmbH * stride + rowBlock * 8 * stride
+        } else if dctField && chromaFmt != 1 {
+            off += (mby * cmbH + rowBlock) * cStride
+            stride = cStride * 2
+        } else {
+            off += (mby * cmbH + rowBlock * 8) * cStride
+        }
+        (plane, off, stride)
+    }
+
+    // Writes (or adds) the block in blk to its place and clears blk.
+    fn putBlock(_ b: Int, _ ac: Bool, _ add: Bool) {
+        let (plane, off, stride) = blockDest(b)
+        if ac {
+            if plane == 0 {
+                if add { m12IdctAdd(blk, curY, off, stride) } else { m12IdctPut(blk, curY, off, stride) }
+            } else if plane == 1 {
+                if add { m12IdctAdd(blk, curU, off, stride) } else { m12IdctPut(blk, curU, off, stride) }
+            } else {
+                if add { m12IdctAdd(blk, curV, off, stride) } else { m12IdctPut(blk, curV, off, stride) }
+            }
+        } else {
+            let v = m12DcValue(blk[0])
+            blk[0] = 0
+            if plane == 0 {
+                m12FillBlock(curY, off, stride, v, add: add)
+            } else if plane == 1 {
+                m12FillBlock(curU, off, stride, v, add: add)
+            } else {
+                m12FillBlock(curV, off, stride, v, add: add)
+            }
+        }
+    }
+
+    // An intra block: DC differential, then AC coefficients, inverse
+    // quantisation (7.4.2.1 and 7.4.2.2 for MPEG-2; 11172-2 2.4.4.1 for
+    // MPEG-1), mismatch control or oddification, the IDCT and put.
+    fn intraBlock(_ b: Int) -> Bool {
+        let cc = if b < 4 { 0 } else { 1 + ((b - 4) & 1) }
+        let size = if cc == 0 { vlc(m12DcLuma) } else { vlc(m12DcChroma) }
+        if size < 0 {
+            return false
+        }
+        var diff = 0
+        if size > 0 {
+            let v = br.bits(size)
+            diff = if v < (1 << (size - 1)) { v - (1 << size) + 1 } else { v }
+        }
+        dcPred[cc] += diff
+        let dc = if mpeg2 { dcPred[cc] << (3 - dcPrec) } else { dcPred[cc] * 8 }
+        blk[0] = dc
+        var parity = dc & 1
+        var ac = false
+        let table = if intraVlc == 1 { m12DctOne } else { m12DctZero }
+        let q = if cc == 0 { qIntra } else { qIntraC }
+        let scan = if altScan { m12AltScan } else { m12ZigZag }
+        let qs = qscale
+        var i = 1
+        while true {
+            let p = br.peek(16)
+            var e = table[2 + (p >> 8)]
+            if e < 0 {
+                let s = -e
+                let k = s & 31
+                e = table[(s >> 5) + ((p >> (8 - k)) & ((1 << k) - 1))]
+            }
+            let len = e & 31
+            if len == 0 {
+                return false
+            }
+            let v = e >> 5
+            var run = 0
+            var level = 0
+            if v == m12Eob {
+                br.skip(len)
+                break
+            } else if v == m12Escape {
+                br.skip(len)
+                run = br.bits(6)
+                if mpeg2 {
+                    level = br.signed(12)
+                } else {
+                    level = mpeg1EscapeLevel()
+                }
+                if level == 0 {
+                    return false
+                }
+            } else {
+                run = v >> 6
+                level = v & 63
+                if br.bits(len + 1) & 1 == 1 {
+                    level = -level
+                }
+            }
+            i += run
+            if i > 63 {
+                return false
+            }
+            let j = scan[i]
+            var val = 0
+            if level > 0 {
+                val = (level * q[j] * qs) >> 4
+                if !mpeg2 && val & 1 == 0 && val != 0 {
+                    val -= 1
+                }
+            } else {
+                val = -((-level * q[j] * qs) >> 4)
+                if !mpeg2 && val & 1 == 0 && val != 0 {
+                    val += 1
+                }
+            }
+            if val > 2047 {
+                val = 2047
+            } else if val < -2048 {
+                val = -2048
+            }
+            blk[j] = val
+            parity = parity ^ (val & 1)
+            ac = true
+            i += 1
+        }
+        if mpeg2 && parity == 0 {
+            blk[63] = blk[63] ^ 1
+            ac = true
+        }
+        putBlock(b, ac, false)
+        true
+    }
+
+    // MPEG-1's escape level: 8 bits, or 16 when the first 8 are 0 or 128
+    // (11172-2 Table 2-B.5g).
+    fn mpeg1EscapeLevel() -> Int {
+        let a = br.bits(8)
+        if a == 0 {
+            return br.bits(8)
+        }
+        if a == 128 {
+            return br.bits(8) - 256
+        }
+        if a > 128 { a - 256 } else { a }
+    }
+
+    // A non-intra block: coefficients with table zero (the first may use
+    // the short "1s" code), inverse quantisation, IDCT, added to the
+    // prediction.
+    fn interBlock(_ b: Int) -> Bool {
+        let cc = if b < 4 { 0 } else { 1 }
+        let q = if cc == 0 { qInter } else { qInterC }
+        let scan = if altScan { m12AltScan } else { m12ZigZag }
+        let qs = qscale
+        var parity = 0
+        var ac = false
+        var i = 0
+        var firstCoef = true
+        while true {
+            var run = 0
+            var level = 0
+            if firstCoef && br.peek(1) == 1 {
+                // "1s": run 0, level ±1 (Table B.14 note 2).
+                level = if br.bits(2) & 1 == 1 { -1 } else { 1 }
+            } else {
+                let p = br.peek(16)
+                var e = m12DctZero[2 + (p >> 8)]
+                if e < 0 {
+                    let s = -e
+                    let k = s & 31
+                    e = m12DctZero[(s >> 5) + ((p >> (8 - k)) & ((1 << k) - 1))]
+                }
+                let len = e & 31
+                if len == 0 {
+                    return false
+                }
+                let v = e >> 5
+                if v == m12Eob {
+                    br.skip(len)
+                    break
+                } else if v == m12Escape {
+                    br.skip(len)
+                    run = br.bits(6)
+                    if mpeg2 {
+                        level = br.signed(12)
+                    } else {
+                        level = mpeg1EscapeLevel()
+                    }
+                    if level == 0 {
+                        return false
+                    }
+                } else {
+                    run = v >> 6
+                    level = v & 63
+                    if br.bits(len + 1) & 1 == 1 {
+                        level = -level
+                    }
+                }
+            }
+            firstCoef = false
+            i += run
+            if i > 63 {
+                return false
+            }
+            let j = scan[i]
+            var val = 0
+            if level > 0 {
+                val = ((2 * level + 1) * q[j] * qs) >> 5
+                if !mpeg2 && val & 1 == 0 && val != 0 {
+                    val -= 1
+                }
+            } else {
+                val = -(((-2 * level + 1) * q[j] * qs) >> 5)
+                if !mpeg2 && val & 1 == 0 && val != 0 {
+                    val += 1
+                }
+            }
+            if val > 2047 {
+                val = 2047
+            } else if val < -2048 {
+                val = -2048
+            }
+            blk[j] = val
+            parity = parity ^ (val & 1)
+            if j != 0 {
+                ac = true
+            }
+            i += 1
+        }
+        if mpeg2 && parity == 0 {
+            blk[63] = blk[63] ^ 1
+            ac = true
+        }
+        putBlock(b, ac, true)
+        true
+    }
+
+    // ---- Concealment ----
+
+    // Copies every macroblock this picture didn't decode from the
+    // forward reference (from = 0), or leaves it as it was (from < 0).
+    fn conceal(_ from: Int) -> Int {
+        var missing = 0
+        let rows = picMbRows
+        for y in 0..rows {
+            for x in 0..mbw {
+                let addr = y * mbw + x
+                if mbDone[picMbIndex(addr)] == serial {
+                    continue
+                }
+                missing += 1
+                if from < 0 {
+                    continue
+                }
+                mbx = x
+                mby = y
+                let parity = structure - 1
+                if structure == 3 {
+                    mc(from, -1, -1, y * 16, 16, 0, 0, false)
+                } else {
+                    mc(from, parity, parity, y * 16, 16, 0, 0, false)
+                }
+            }
+        }
+        missing
+    }
+}
+
+// Half-sample prediction of a w×h block (7.6.4) from plane `src` (rows
+// sStride apart from src[base], planeW × planeH samples) at integer
+// position (x, y) with half-sample flags hx, hy, written or (avg)
+// averaged into dst[d …], rows dStride apart. Positions outside the plane
+// take the nearest edge sample.
+fn m12Mc(_ src: [Int], _ dst: bind [Int], _ base: Int, _ sStride: Int, _ planeW: Int, _ planeH: Int, _ x: Int, _ y: Int,
+    _ hx: Int, _ hy: Int, _ d0: Int, _ dStride: Int, _ w: Int, _ h: Int, _ avg: Bool) {
+    if src.isEmpty {
+        // No reference (damage before the first I picture): leave it.
+        return
+    }
+    if x < 0 || y < 0 || x + w + hx > planeW || y + h + hy > planeH {
+        m12McEdge(src, dst, base, sStride, planeW, planeH, x, y, hx, hy, d0, dStride, w, h, avg)
+        return
+    }
+    var r = 0
+    while r < h {
+        var s = base + (y + r) * sStride + x
+        var d = d0 + r * dStride
+        let e = d + w
+        if hx == 0 && hy == 0 {
+            if avg {
+                while d < e {
+                    dst[d] = (dst[d] + src[s] + 1) >> 1
+                    d += 1
+                    s += 1
+                }
+            } else {
+                while d < e {
+                    dst[d] = src[s]
+                    d += 1
+                    s += 1
+                }
+            }
+        } else if hy == 0 {
+            if avg {
+                while d < e {
+                    dst[d] = (dst[d] + ((src[s] + src[s + 1] + 1) >> 1) + 1) >> 1
+                    d += 1
+                    s += 1
+                }
+            } else {
+                while d < e {
+                    dst[d] = (src[s] + src[s + 1] + 1) >> 1
+                    d += 1
+                    s += 1
+                }
+            }
+        } else if hx == 0 {
+            if avg {
+                while d < e {
+                    dst[d] = (dst[d] + ((src[s] + src[s + sStride] + 1) >> 1) + 1) >> 1
+                    d += 1
+                    s += 1
+                }
+            } else {
+                while d < e {
+                    dst[d] = (src[s] + src[s + sStride] + 1) >> 1
+                    d += 1
+                    s += 1
+                }
+            }
+        } else {
+            if avg {
+                while d < e {
+                    let v = (src[s] + src[s + 1] + src[s + sStride] + src[s + sStride + 1] + 2) >> 2
+                    dst[d] = (dst[d] + v + 1) >> 1
+                    d += 1
+                    s += 1
+                }
+            } else {
+                while d < e {
+                    dst[d] = (src[s] + src[s + 1] + src[s + sStride] + src[s + sStride + 1] + 2) >> 2
+                    d += 1
+                    s += 1
+                }
+            }
+        }
+        r += 1
+    }
+}
+
+fn m12McEdge(_ src: [Int], _ dst: bind [Int], _ base: Int, _ sStride: Int, _ planeW: Int, _ planeH: Int, _ x: Int, _ y: Int,
+    _ hx: Int, _ hy: Int, _ d0: Int, _ dStride: Int, _ w: Int, _ h: Int, _ avg: Bool) {
+    for r in 0..h {
+        let y0 = min(max(y + r, 0), planeH - 1)
+        let y1 = min(max(y + r + hy, 0), planeH - 1)
+        for c in 0..w {
+            let x0 = min(max(x + c, 0), planeW - 1)
+            let x1 = min(max(x + c + hx, 0), planeW - 1)
+            let a = src[base + y0 * sStride + x0]
+            let b = src[base + y0 * sStride + x1]
+            let cc = src[base + y1 * sStride + x0]
+            let dd = src[base + y1 * sStride + x1]
+            var v = a
+            if hx == 1 && hy == 1 {
+                v = (a + b + cc + dd + 2) >> 2
+            } else if hx == 1 {
+                v = (a + b + 1) >> 1
+            } else if hy == 1 {
+                v = (a + cc + 1) >> 1
+            }
+            let at = d0 + r * dStride + c
+            if avg {
+                dst[at] = (dst[at] + v + 1) >> 1
+            } else {
+                dst[at] = v
+            }
+        }
+    }
+}

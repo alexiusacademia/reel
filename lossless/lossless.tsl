@@ -1,0 +1,298 @@
+// The lossless audio decoder: one Decoder for every codec Reel plays
+// bit for bit — FLAC (flac.tsl), ALAC (alac.tsl), PCM in all the forms
+// containers store it (Track.pcm: 8-bit unsigned or signed, 16/24/32-bit
+// signed little or big endian, 32/64-bit float), and G.711 A-law and µ-law
+// (ITU-T G.711, expanded to 16 bits).
+//
+//   var d = try lossless.newDecoder(track)
+//   let s = d.decode(packetBytes, pts: p.pts)   // core.Samples
+//
+// Samples come out as Floats: an integer sample v of b bits is
+// v / 2^(b-1), exactly what ffmpeg's float conversion gives, so the
+// output can be compared with ffmpeg's bit for bit.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../core"
+
+public struct Decoder {
+    codec: String = ""
+    rate: Int = 0
+    channels: Int = 0
+    layout: [String] = []
+    // Lossless codecs have no priming.
+    delay: Int = 0
+    warnings: [String] = []
+    // Bits per sample of the stream (what the source had).
+    bitsPerSample: Int = 0
+
+    pcm: core.PcmFormat = core.PcmFormat()
+    // Bytes of a PCM frame that didn't fit in the last packet.
+    carry: Data = Data()
+    // A-law / µ-law expansion table (256 entries, 16-bit values).
+    g711: [Int] = []
+    flac: FlacDecoder = FlacDecoder()
+    alac: AlacDecoder = AlacDecoder()
+    // Packets decoded since the start or the last reset.
+    packets: Int = 0
+
+    // Decodes one packet; returns its samples (empty for a damaged
+    // packet, with a warning).
+    fn decode(_ packet: Data, pts: Int) -> core.Samples {
+        packets += 1
+        match codec {
+            "flac" -> decodeFlac(packet, pts)
+            "alac" -> decodeAlac(packet, pts)
+            "alaw", "ulaw" -> decodeG711(packet, pts)
+            _ -> decodePcm(packet, pts)
+        }
+    }
+
+    // Nothing is held back at the end of a stream.
+    fn flush() -> core.Samples {
+        carry = Data()
+        core.Samples(rate: rate, channels: channels, layout: layout)
+    }
+
+    // After a seek: drop partial PCM frames.
+    fn reset() {
+        carry = Data()
+    }
+
+    fn warn(_ s: String) {
+        if warnings.count < 100 {
+            warnings.append(s)
+        }
+    }
+
+    fn empty(_ pts: Int) -> core.Samples {
+        core.Samples(rate: rate, channels: channels, layout: layout, pts: pts)
+    }
+
+    fn decodeFlac(_ packet: Data, _ pts: Int) -> core.Samples {
+        if !flac.decodeFrame(packet) {
+            warn("packet {packets}: {flac.problem}")
+            return empty(pts)
+        }
+        if flac.crcMismatch {
+            warn("packet {packets}: FLAC frame CRC-16 mismatch")
+        }
+        let ch = flac.channels
+        if ch != channels {
+            // A stream may change its channel count between frames
+            // (rare); follow it.
+            channels = ch
+            layout = core.defaultLayout(ch)
+        }
+        if flac.rate > 0 {
+            rate = flac.rate
+        }
+        bitsPerSample = flac.bits
+        let n = flac.blockSize
+        let scale = 1.0 / Float(1 << (flac.bits - 1))
+        var data: [Float] = []
+        for i in 0..n {
+            for c in 0..ch {
+                data.append(Float(flac.work[c * n + i]) * scale)
+            }
+        }
+        core.Samples(rate: rate, channels: ch, data: data, layout: layout, pts: pts)
+    }
+
+    fn decodeAlac(_ packet: Data, _ pts: Int) -> core.Samples {
+        if !alac.decodePacket(packet) {
+            warn("packet {packets}: {alac.problem}")
+            return empty(pts)
+        }
+        let n = alac.frames
+        let fl = alac.config.frameLength
+        let ch = channels
+        // 20- and 24-bit samples keep their own scale (ffmpeg shifts them
+        // up to 32 bits and divides by 2^31: the same numbers).
+        let scale = 1.0 / Float(1 << (alac.config.bitDepth - 1))
+        var data: [Float] = []
+        for i in 0..n {
+            for c in 0..ch {
+                data.append(Float(alac.out[c * fl + i]) * scale)
+            }
+        }
+        core.Samples(rate: rate, channels: ch, data: data, layout: layout, pts: pts)
+    }
+
+    fn decodeG711(_ packet: Data, _ pts: Int) -> core.Samples {
+        let ch = max(channels, 1)
+        var bytes = packet
+        if !carry.isEmpty {
+            bytes = carry + packet
+            carry = Data()
+        }
+        let whole = bytes.count / ch * ch
+        if whole < bytes.count {
+            carry = bytes.slice(from: whole, to: bytes.count)
+        }
+        var data: [Float] = []
+        let scale = 1.0 / 32768.0
+        for i in 0..whole {
+            data.append(Float(g711[bytes[i]]) * scale)
+        }
+        core.Samples(rate: rate, channels: ch, data: data, layout: layout, pts: pts)
+    }
+
+    fn decodePcm(_ packet: Data, _ pts: Int) -> core.Samples {
+        let ch = max(channels, 1)
+        let size = max(pcm.bits / 8, 1)
+        var bytes = packet
+        if !carry.isEmpty {
+            bytes = carry + packet
+            carry = Data()
+        }
+        let frameBytes = size * ch
+        let whole = bytes.count / frameBytes * frameBytes
+        if whole < bytes.count {
+            carry = bytes.slice(from: whole, to: bytes.count)
+        }
+        let count = whole / size
+        var data: [Float] = []
+        let be = pcm.bigEndian
+        if pcm.float {
+            if size == 4 {
+                for i in 0..count {
+                    data.append(bytes.float32(at: i * 4, bigEndian: be))
+                }
+            } else {
+                for i in 0..count {
+                    data.append(bytes.float64(at: i * 8, bigEndian: be))
+                }
+            }
+        } else if size == 1 {
+            if pcm.signed {
+                for i in 0..count {
+                    data.append(Float(bytes.int8(at: i)) / 128.0)
+                }
+            } else {
+                for i in 0..count {
+                    data.append(Float(bytes[i] - 128) / 128.0)
+                }
+            }
+        } else if size == 2 {
+            for i in 0..count {
+                data.append(Float(bytes.int16(at: i * 2, bigEndian: be)) / 32768.0)
+            }
+        } else if size == 3 {
+            for i in 0..count {
+                let p = i * 3
+                var v = if be {
+                    (bytes[p] << 16) | (bytes[p + 1] << 8) | bytes[p + 2]
+                } else {
+                    (bytes[p + 2] << 16) | (bytes[p + 1] << 8) | bytes[p]
+                }
+                if v >= 0x800000 {
+                    v -= 0x1000000
+                }
+                data.append(Float(v) / 8388608.0)
+            }
+        } else if size == 4 {
+            for i in 0..count {
+                data.append(Float(bytes.int32(at: i * 4, bigEndian: be)) / 2147483648.0)
+            }
+        } else {
+            // 64-bit integers: rare; keep the top 53 bits' worth.
+            for i in 0..count {
+                let lo = bytes.uint32(at: i * 8 + (if be { 4 } else { 0 }), bigEndian: be)
+                let hi = bytes.int32(at: i * 8 + (if be { 0 } else { 4 }), bigEndian: be)
+                data.append((Float(hi) * 4294967296.0 + Float(lo)) / 9223372036854775808.0)
+            }
+        }
+        core.Samples(rate: rate, channels: ch, data: data, layout: layout, pts: pts)
+    }
+}
+
+// G.711 A-law expansion (ITU-T G.711, the classic Sun g711.c form).
+fn alawToLinear(_ code: Int) -> Int {
+    let a = code ^ 0x55
+    var t = a & 0x0f
+    let seg = (a & 0x70) >> 4
+    if seg > 0 {
+        t = (t + t + 1 + 32) << (seg + 2)
+    } else {
+        t = (t + t + 1) << 3
+    }
+    if a & 0x80 != 0 { t } else { -t }
+}
+
+// G.711 µ-law expansion.
+fn ulawToLinear(_ code: Int) -> Int {
+    let u = (~code) & 0xff
+    var t = ((u & 0x0f) << 3) + 0x84
+    t = t << ((u & 0x70) >> 4)
+    if u & 0x80 != 0 { 0x84 - t } else { t - 0x84 }
+}
+
+fn g711Table(_ alaw: Bool) -> [Int] {
+    var t: [Int] = []
+    for i in 0..256 {
+        t.append(if alaw { alawToLinear(i) } else { ulawToLinear(i) })
+    }
+    t
+}
+
+// A decoder for a "flac", "alac", "pcm", "alaw" or "ulaw" track.
+public fn newDecoder(_ track: core.Track) -> Result<Decoder> {
+    var d = Decoder(codec: track.codec)
+    d.rate = track.sampleRate
+    d.channels = track.channels
+    d.bitsPerSample = track.bitsPerSample
+    match track.codec {
+        "flac" -> {
+            if let info = parseFlacInfo(track.extra) {
+                d.flac.info = info
+                d.rate = info.rate
+                d.channels = info.channels
+                d.bitsPerSample = info.bits
+            } else if track.channels > 0 {
+                // No STREAMINFO: frames carry what we need, mostly.
+                d.flac.info = FlacInfo(rate: track.sampleRate, channels: track.channels, bits: track.bitsPerSample)
+            }
+        }
+        "alac" -> {
+            if let c = parseAlacConfig(track.extra) {
+                d.alac.setup(c)
+                d.channels = c.channels
+                d.bitsPerSample = c.bitDepth
+                if c.rate > 0 {
+                    d.rate = c.rate
+                }
+                d.layout = alacLayout(c.channels)
+                return .ok(value: d)
+            }
+            return .failure(error: Error("the ALAC track has no magic cookie"))
+        }
+        "pcm" -> {
+            d.pcm = track.pcm
+            d.bitsPerSample = track.pcm.bits
+            let b = track.pcm.bits
+            let okInt = b == 8 || b == 16 || b == 24 || b == 32 || b == 64
+            let okFloat = b == 32 || b == 64
+            if (track.pcm.float && !okFloat) || (!track.pcm.float && !okInt) {
+                return .failure(error: Error("{b}-bit PCM isn't supported"))
+            }
+        }
+        "alaw" -> {
+            d.g711 = g711Table(true)
+            d.bitsPerSample = 8
+        }
+        "ulaw" -> {
+            d.g711 = g711Table(false)
+            d.bitsPerSample = 8
+        }
+        _ -> {
+            return .failure(error: Error("lossless can't decode \"{track.codec}\""))
+        }
+    }
+    if d.channels <= 0 {
+        return .failure(error: Error("the {track.codec} track doesn't say how many channels it has"))
+    }
+    d.layout = core.defaultLayout(d.channels)
+    Result.ok(value: d)
+}

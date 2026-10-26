@@ -1,0 +1,265 @@
+// The render test's audio checks: mixer coefficients, resampler quality,
+// the tempo stretcher, WAV writing, gain/peak and the spectrum.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../../render"
+import "../../core"
+
+fn mixerTests(_ t: bind Tally) {
+    var five = core.Samples(rate: 48000, channels: 6)
+    five.layout = ["FL", "FR", "FC", "LFE", "BL", "BR"]
+    for _ in 0..100 {
+        five.data.appendAll([0.1, 0.2, 0.3, 0.4, 0.05, 0.06])
+    }
+    var mx = render.newMixer(channels: 2, rate: 48000)
+    let st = mx.process(five)
+    let h = 0.7071067811865476
+    t.check(st.channels == 2 && st.frames == 100 && st.layout == ["FL", "FR"], "5.1 → stereo frames")
+    t.check(abs(st.data[0] - (0.1 + h * 0.3 + h * 0.05)) < 1e-12, "left = FL + −3 dB FC + −3 dB BL (LFE dropped)")
+    t.check(abs(st.data[1] - (0.2 + h * 0.3 + h * 0.06)) < 1e-12, "right = FR + −3 dB FC + −3 dB BR")
+    var side = five
+    side.layout = ["FL", "FR", "FC", "LFE", "SL", "SR"]
+    var mxs = render.newMixer(channels: 2, rate: 48000)
+    t.check(abs(mxs.process(side).data[0] - (0.1 + h * 0.3 + h * 0.05)) < 1e-12, "side surrounds −3 dB")
+    let mono = core.Samples(rate: 48000, channels: 1, data: [0.5, -0.25])
+    var mxm = render.newMixer(channels: 2, rate: 48000)
+    t.check(mxm.process(mono).data == [0.5, 0.5, -0.25, -0.25], "mono → both sides at full level")
+    let stereo = core.Samples(rate: 48000, channels: 2, data: [0.5, -0.25, 0.1, 0.2])
+    var mxp = render.newMixer(channels: 2, rate: 48000)
+    t.check(mxp.process(stereo).data == stereo.data, "stereo passes through")
+    var mx1 = render.newMixer(channels: 1, rate: 48000)
+    let monoOut = mx1.process(stereo).data
+    t.check(monoOut.count == 2 && abs(monoOut[0] - 0.125) < 1e-12 && abs(monoOut[1] - 0.15) < 1e-12, "stereo → mono is the mean")
+    var mx6 = render.newMixer(channels: 6, rate: 48000)
+    t.check(mx6.process(five).data == five.data, "5.1 → 5.1 passes through")
+    var loud = core.Samples(rate: 48000, channels: 6, layout: ["FL", "FR", "FC", "LFE", "BL", "BR"])
+    for _ in 0..10 {
+        loud.data.appendAll([0.9, 0.9, 0.9, 0.9, 0.9, 0.9])
+    }
+    var mxl = render.newMixer(channels: 2, rate: 48000)
+    let ld = mxl.process(loud).data
+    t.check(ld.all(where: { v in v < 1.0 && v > 0.95 }), "a downmix past full scale is soft-clipped below 1")
+    t.check(render.softClip(0.5) == 0.5 && render.softClip(-3.0) > -1.0 && render.softClip(0.95) < 0.95, "softClip")
+}
+
+fn resamplerTests(_ t: bind Tally) {
+    // A 20 Hz – 18 kHz sweep at 44.1 kHz → 48 kHz, against the same sweep
+    // made at 48 kHz (skipping the first and last 10 ms).
+    let secs = 2.0
+    let sweep = tone(rate: 44100, channels: 2, seconds: secs, f0: 20.0, f1: 18000.0, amp: 0.5)
+    var rs1 = render.newMixer(channels: 2, rate: 48000)
+    let t0 = now()
+    var res = rs1.process(sweep)
+    let resampleMs = ms(t0)
+    res = joinSamples(res, rs1.flush())
+    t.check(res.frames == (sweep.frames * 48000 + 44099) / 44100, "44.1 → 48 kHz length {res.frames}")
+    var sig = 0.0
+    var noise = 0.0
+    for i in 480..(res.frames - 480) {
+        let want = sweepAt(Float(i) / 48000.0, f0: 20.0, f1: 18000.0, seconds: secs, amp: 0.5)
+        let d = res.data[2 * i] - want
+        sig += want * want
+        noise += d * d
+    }
+    let sweepSnr = 10.0 * log10(sig / noise)
+    print("resample 44.1→48 kHz sweep 20 Hz–18 kHz: SNR {f2(sweepSnr)} dB")
+    print("time resample 2 s stereo 44.1→48 kHz: {Int(resampleMs)} ms")
+    t.check(sweepSnr >= 90.0, "44.1 → 48 kHz sweep SNR {f2(sweepSnr)} dB (≥ 90)")
+    // 48 → 44.1 kHz.
+    let sweep48 = tone(rate: 48000, channels: 1, seconds: secs, f0: 20.0, f1: 18000.0, amp: 0.5)
+    var rs2 = render.newMixer(channels: 1, rate: 44100)
+    let downS = joinSamples(rs2.process(sweep48), rs2.flush())
+    sig = 0.0
+    noise = 0.0
+    for i in 441..(downS.frames - 441) {
+        let want = sweepAt(Float(i) / 44100.0, f0: 20.0, f1: 18000.0, seconds: secs, amp: 0.5)
+        let d = downS.data[i] - want
+        sig += want * want
+        noise += d * d
+    }
+    let downSnr = 10.0 * log10(sig / noise)
+    print("resample 48→44.1 kHz sweep 20 Hz–18 kHz: SNR {f2(downSnr)} dB")
+    t.check(downSnr >= 90.0, "48 → 44.1 kHz sweep SNR {f2(downSnr)} dB (≥ 90)")
+    // Alias rejection: a 23 kHz tone at 48 kHz is above 44.1 kHz's
+    // Nyquist frequency and must vanish, not fold down to 21.1 kHz.
+    let high = tone(rate: 48000, channels: 1, seconds: 0.5, f0: 23000.0, f1: 23000.0, amp: 0.5)
+    var rs3 = render.newMixer(channels: 1, rate: 44100)
+    let folded = joinSamples(rs3.process(high), rs3.flush())
+    var en = 0.0
+    for i in 441..(folded.frames - 441) {
+        en += folded.data[i] * folded.data[i]
+    }
+    let aliasDb = 10.0 * log10(en / Float(folded.frames - 882) / 0.125)
+    print("resample 48→44.1 kHz alias rejection at 23 kHz: {f2(-aliasDb)} dB")
+    t.check(aliasDb < -90.0, "alias rejection {f2(-aliasDb)} dB (≥ 90)")
+    // Streaming: odd block sizes give exactly the same output.
+    var rs4 = render.newMixer(channels: 2, rate: 48000)
+    var pieces = core.Samples(rate: 48000, channels: 2)
+    var at = 0
+    var blockSize = 1
+    while at < sweep.frames {
+        let n = min(blockSize, sweep.frames - at)
+        pieces = joinSamples(pieces, rs4.process(part(sweep, at, at + n)))
+        at += n
+        blockSize = (blockSize * 7 + 13) % 5000 + 1
+    }
+    pieces = joinSamples(pieces, rs4.flush())
+    t.check(maxDiff(pieces.data, res.data) < 1e-12, "resampling in blocks equals one block")
+    // 22.05 kHz mono → 48 kHz stereo, and an odd rate.
+    let low = tone(rate: 22050, channels: 1, seconds: 0.5, f0: 1000.0, f1: 1000.0, amp: 0.5)
+    var rs5 = render.newMixer(channels: 2, rate: 48000)
+    let lowUp = joinSamples(rs5.process(low), rs5.flush())
+    let lowHz = zeroCrossingHz(lowUp, channel: 1, from: 1000, to: 23000)
+    t.check(lowUp.frames == 24000 && abs(lowHz - 1000.0) < 0.5, "22.05 kHz mono → 48 kHz stereo ({lowUp.frames}, {f2(lowHz)} Hz)")
+    let oddRate = tone(rate: 44101, channels: 1, seconds: 0.5, f0: 1000.0, f1: 1000.0, amp: 0.5)
+    var rs6 = render.newMixer(channels: 1, rate: 48000)
+    let oddUp = joinSamples(rs6.process(oddRate), rs6.flush())
+    let oddHz = zeroCrossingHz(oddUp, channel: 0, from: 1000, to: 23000)
+    t.check(abs(Float(oddUp.frames) - 24000.0) < 10.0 && abs(oddHz - 1000.0) < 1.0, "odd rate 44101 → 48000 ({oddUp.frames}, {f2(oddHz)} Hz)")
+}
+
+fn stretcherTests(_ t: bind Tally) {
+    let a440 = tone(rate: 44100, channels: 2, seconds: 3.0, f0: 440.0, f1: 440.0, amp: 0.5)
+    for sp in [2.0, 0.5, 1.5, 4.0, 0.25] {
+        var stz = render.newStretcher(channels: 2, rate: 44100)
+        stz.setSpeed(sp)
+        let t0 = now()
+        var outS = core.Samples(rate: 44100, channels: 2)
+        var at = 0
+        while at < a440.frames {
+            let n = min(4096, a440.frames - at)
+            outS = joinSamples(outS, stz.process(part(a440, at, at + n)))
+            at += n
+        }
+        outS = joinSamples(outS, stz.flush())
+        let took = ms(t0)
+        let want = Float(a440.frames) / sp
+        let hz = zeroCrossingHz(outS, channel: 0, from: 2000, to: outS.frames - 2000)
+        let hz1 = zeroCrossingHz(outS, channel: 1, from: 2000, to: outS.frames - 2000)
+        print("stretch speed {sp}: {outS.frames} frames (want {Int(want)}), {f2(hz)} Hz")
+        print("time stretch 3 s stereo at {sp}×: {Int(took)} ms")
+        t.check(abs(Float(outS.frames) - want) <= want * 0.01, "speed {sp}: length {outS.frames} within 1 % of {Int(want)}")
+        t.check(abs(hz - 440.0) <= 2.0 && abs(hz1 - 440.0) <= 2.0, "speed {sp}: pitch {f2(hz)} Hz stays 440 ± 2")
+        var peakOut = 0.0
+        for i in 2000..(outS.frames - 2000) {
+            peakOut = max(peakOut, abs(outS.data[2 * i]))
+        }
+        t.check(peakOut > 0.45 && peakOut < 0.55, "speed {sp}: level kept (peak {f2(peakOut)})")
+    }
+    var st1 = render.newStretcher(channels: 2, rate: 44100)
+    let one = joinSamples(st1.process(a440), st1.flush())
+    t.check(maxDiff(one.data, a440.data) < 1e-9, "speed 1 gives the input back")
+    // Changing speed while playing (1 s at 1×, 1 s at 2×, 1 s at 0.5×):
+    // a change applies to what comes out after it, so the length matches
+    // the blocks' speeds within the stretcher's latency, and the sound
+    // keeps its pitch with no gaps.
+    var stc = render.newStretcher(channels: 2, rate: 44100)
+    var changing = core.Samples(rate: 44100, channels: 2)
+    var expected = 0.0
+    var at = 0
+    var worstLatency = 0
+    while at < a440.frames {
+        let n = min(4410, a440.frames - at)
+        let sp = if at < 44100 { 1.0 } else if at < 88200 { 2.0 } else { 0.5 }
+        stc.setSpeed(sp)
+        expected += Float(n) / sp
+        changing = joinSamples(changing, stc.process(part(a440, at, at + n)))
+        worstLatency = max(worstLatency, stc.latency)
+        at += n
+    }
+    changing = joinSamples(changing, stc.flush())
+    print("stretch with speed changes: {changing.frames} frames (blocks' speeds say {Int(expected)}), latency up to {worstLatency} frames")
+    t.check(abs(Float(changing.frames) - expected) <= 4410.0, "speed changes: length {changing.frames} within 0.1 s of {Int(expected)}")
+    t.check(worstLatency > 0 && worstLatency < 4410, "latency {worstLatency} frames (under 0.1 s)")
+    let changingHz = zeroCrossingHz(changing, channel: 0, from: 2000, to: changing.frames - 2000)
+    t.check(abs(changingHz - 440.0) <= 2.0, "speed changes: pitch kept ({f2(changingHz)} Hz)")
+    var gaps = 0
+    var w = 0
+    while w + 2205 <= changing.frames - 2205 {
+        var crossings = 0
+        for i in (w + 1)..(w + 2205) {
+            if changing.data[2 * (i - 1)] < 0.0 && changing.data[2 * i] >= 0.0 {
+                crossings += 1
+            }
+        }
+        if crossings < 21 || crossings > 23 {
+            gaps += 1
+        }
+        w += 2205
+    }
+    t.check(gaps == 0, "speed changes: every 50 ms has 22 ± 1 periods ({gaps} windows off)")
+    var cs = render.newStretcher(channels: 1, rate: 8000)
+    cs.setSpeed(10.0)
+    t.check(cs.speed == 4.0, "speed is limited to 4")
+}
+
+fn wavTests(_ t: bind Tally) {
+    let wavIn = tone(rate: 44100, channels: 2, seconds: 0.2, f0: 1000.0, f1: 1000.0, amp: 0.8)
+    let file = render.wavFile(wavIn)
+    let path = "build/scratch/render/roundtrip.wav"
+    t.check(writeData(path: path, data: file), "write the WAV file")
+    let back = readData(path) ?? Data()
+    t.check(back.count == 44 + wavIn.data.count * 2, "WAV size")
+    t.check(back.slice(from: 0, to: 4).latin1 == "RIFF" && back.slice(from: 8, to: 16).latin1 == "WAVEfmt " && back.uint32(at: 4) == back.count - 8, "RIFF header")
+    t.check(back.uint16(at: 20) == 1 && back.uint16(at: 22) == 2 && back.uint32(at: 24) == 44100 && back.uint32(at: 28) == 176400 && back.uint16(at: 32) == 4 && back.uint16(at: 34) == 16, "fmt chunk")
+    t.check(back.slice(from: 36, to: 40).latin1 == "data" && back.uint32(at: 40) == wavIn.data.count * 2, "data chunk")
+    var worstLsb = 0.0
+    var ditherSum = 0.0
+    for i in 0..wavIn.data.count {
+        let v = Float(back.int16(at: 44 + 2 * i))
+        let d = v - wavIn.data[i] * 32767.0
+        worstLsb = max(worstLsb, abs(d))
+        ditherSum += d
+    }
+    t.check(worstLsb <= 1.5 && abs(ditherSum / Float(wavIn.data.count)) < 0.05, "16-bit samples within the dither (±1 LSB)")
+    let h24 = render.wavHeader(rate: 48000, channels: 6, frames: 10, bits: 24)
+    t.check(h24.count == 68 && h24.uint16(at: 20) == 0xfffe && h24.uint32(at: 40) == 0x3f && h24.uint16(at: 34) == 24, "extensible header for 5.1 24-bit")
+    let d24 = render.wavData(core.Samples(rate: 48000, channels: 1, data: [0.5, -1.0]), bits: 24)
+    t.check(d24.count == 6 && d24[0] == 0 && d24[1] == 0 && d24[2] == 0x40 && d24[5] == 0x80, "24-bit samples")
+    let d32 = render.wavData(core.Samples(rate: 48000, channels: 1, data: [0.25, -0.5]), bits: 32)
+    t.check(d32.float32(at: 0) == 0.25 && d32.float32(at: 4) == -0.5, "32-bit float samples")
+    let d8 = render.wavData(core.Samples(rate: 8000, channels: 1, data: [0.0, 1.0, -1.0]), bits: 8)
+    t.check(abs(d8[0] - 128) <= 1 && d8[1] >= 254 && d8[2] <= 2, "8-bit unsigned samples")
+    let tooLoud = render.wavData(core.Samples(rate: 8000, channels: 1, data: [2.0, -2.0]))
+    t.check(tooLoud.int16(at: 0) == 32767 && tooLoud.int16(at: 2) == -32768, "16-bit clamps")
+    let wavBig = tone(rate: 48000, channels: 2, seconds: 1.0, f0: 440.0, f1: 440.0, amp: 0.5)
+    let t0 = now()
+    let wb = render.wavFile(wavBig)
+    print("time wavFile 1 s stereo 48 kHz: {Int(ms(t0))} ms")
+    t.check(wb.count == 44 + 192000, "1 s stereo WAV")
+
+    // Gain and peak.
+    let pk = core.Samples(rate: 8000, channels: 2, data: [0.1, -0.7, 0.3, 0.2])
+    t.check(render.peak(pk) == 0.7, "peak")
+    t.check(render.gain(pk, 0.5).data == [0.05, -0.35, 0.15, 0.1], "gain")
+    t.check(render.peak(core.Samples(rate: 8000, channels: 2)) == 0.0, "peak of nothing")
+    t.check(abs(render.dbToGain(-6.0206) - 0.5) < 1e-4, "dbToGain")
+}
+
+fn spectrumTests(_ t: bind Tally) {
+    let sine1k = tone(rate: 48000, channels: 2, seconds: 0.1, f0: 1000.0, f1: 1000.0, amp: 1.0)
+    let lv = render.levels(sine1k, bands: 32)
+    t.check(lv.count == 32, "32 bands")
+    var topBand = 0
+    for i in 0..lv.count {
+        if lv[i] > lv[topBand] {
+            topBand = i
+        }
+    }
+    // Band edges: 23.4 Hz · 1024^(i/32) (from the first bin to 24 kHz);
+    // 1 kHz is in band 17.
+    t.check(topBand == 17 && lv[topBand] > 0.95, "a full-scale 1 kHz sine fills its band (band {topBand}, {f2(lv[topBand])})")
+    t.check(lv[3] < 0.3 && lv[30] < 0.3, "far bands stay low")
+    let quiet = render.levels(tone(rate: 48000, channels: 1, seconds: 0.1, f0: 1000.0, f1: 1000.0, amp: 0.01), bands: 32)
+    t.check(abs(quiet[17] - (1.0 - 40.0 / 70.0)) < 0.05, "a −40 dB sine shows 40 dB down ({f2(quiet[17])})")
+    t.check(render.levels(core.Samples(rate: 48000, channels: 2), bands: 8) == [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], "silence")
+    let t0 = now()
+    var bandsSeen = 0
+    for _ in 0..30 {
+        bandsSeen += render.levels(sine1k, bands: 32).count
+    }
+    print("time levels (2048-point FFT, 32 bands) ×30: {Int(ms(t0))} ms")
+    t.check(bandsSeen == 30 * 32, "levels again and again")
+}

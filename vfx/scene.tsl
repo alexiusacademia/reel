@@ -1,0 +1,178 @@
+// Scene change detection: a cheap score per picture saying how different
+// it is from the one before, and the cuts (times) found in a run of
+// scores, for automatic chapters and the scene strip.
+//
+// Each picture is reduced to a small luma thumbnail (lumaThumb: at most
+// 64 columns, area-averaged over a sparse grid of samples, ~0.1 ms for
+// 1080p). Two measures between consecutive thumbnails:
+//   * d, the mean absolute difference of the thumbnails, in 8-bit steps;
+//   * hist, half the L1 distance of their 16-bin luma histograms (0…1).
+// A pan or a fast move has a large d but a small hist; a cut has both.
+// The score is sqrt(min(1, d/32) · hist), 0…1. sceneCuts then calls a
+// picture a cut when its score is at least `threshold` and at least
+// `ratio` times the mean score of the pictures around it (so busy footage
+// with high scores everywhere doesn't cut at every picture), at least
+// `minGap` seconds after the last cut. A design of Reel's own from these
+// common ingredients.
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+import "../core"
+
+// The visible luma averaged down to tw×th (tw ≤ 64, th by the shape),
+// as 8-bit values; reads at most about 8×8 samples per output.
+public fn lumaThumb(_ p: core.Picture, columns: Int = 64) -> (Int, Int, [Int]) {
+    let tw = max(1, min(columns, p.width))
+    let th = max(1, min(p.height, (p.height * tw + p.width / 2) / max(p.width, 1)))
+    var out = core.zeros(tw * th)
+    if p.width <= 0 || p.height <= 0 || p.y.count < p.yOffset + (p.height - 1) * p.yStride + p.width {
+        return (tw, th, out)
+    }
+    let shift = max(0, min(p.depth, 16) - 8)
+    let ys = p.y
+    for oy in 0..th {
+        let y0 = oy * p.height / th
+        let y1 = max(y0 + 1, (oy + 1) * p.height / th)
+        let sy = max(1, (y1 - y0) / 8)
+        for ox in 0..tw {
+            let x0 = ox * p.width / tw
+            let x1 = max(x0 + 1, (ox + 1) * p.width / tw)
+            let sx = max(1, (x1 - x0) / 8)
+            var sum = 0
+            var n = 0
+            var y = y0 + sy / 2
+            while y < y1 {
+                let b = p.yOffset + y * p.yStride
+                var x = x0 + sx / 2
+                while x < x1 {
+                    sum += ys[b + x]
+                    n += 1
+                    x += sx
+                }
+                y += sy
+            }
+            out[oy * tw + ox] = (sum / max(n, 1)) >> shift
+        }
+    }
+    (tw, th, out)
+}
+
+// The score between two luma thumbnails of the same size (0…1).
+public fn sceneScore(_ a: [Int], _ b: [Int]) -> Float {
+    if a.count != b.count || a.isEmpty {
+        return 1.0
+    }
+    var sad = 0
+    var ha = core.zeros(16)
+    var hb = core.zeros(16)
+    for i in 0..a.count {
+        let va = max(0, min(a[i], 255))
+        let vb = max(0, min(b[i], 255))
+        sad += abs(va - vb)
+        ha[va >> 4] += 1
+        hb[vb >> 4] += 1
+    }
+    var hd = 0
+    for k in 0..16 {
+        hd += abs(ha[k] - hb[k])
+    }
+    let d = Float(sad) / Float(a.count)
+    let hist = Float(hd) / Float(2 * a.count)
+    sqrt(min(1.0, d / 32.0) * hist)
+}
+
+// One picture's place in a run: its time and score.
+public struct SceneScore {
+    time: Float
+    score: Float
+}
+
+// Streaming scores: push each decoded picture (display order); after a
+// seek, reset (the next picture then scores 0).
+public struct SceneDetector {
+    last: [Int] = []
+    lastW: Int = 0
+    lastH: Int = 0
+    scores: [SceneScore] = []
+
+    fn reset() {
+        last = []
+    }
+
+    // The picture's score against the previous one (0 for the first),
+    // also kept in `scores`.
+    fn push(_ p: core.Picture, time: Float) -> Float {
+        let (tw, th, t) = lumaThumb(p)
+        var s = 0.0
+        if !last.isEmpty && tw == lastW && th == lastH {
+            s = sceneScore(last, t)
+        }
+        last = t
+        lastW = tw
+        lastH = th
+        scores.append(SceneScore(time: time, score: s))
+        s
+    }
+
+    // The cuts among the scores so far.
+    fn cuts(threshold: Float = 0.35, ratio: Float = 3.0, minGap: Float = 1.0) -> [Float] {
+        sceneCuts(scores, threshold: threshold, ratio: ratio, minGap: minGap)
+    }
+}
+
+public fn newSceneDetector() -> SceneDetector {
+    SceneDetector()
+}
+
+// The times of the cuts in a run of scores (see the top of the file). The
+// local mean is over the 8 pictures before and after, the picture itself
+// left out.
+public fn sceneCuts(_ scores: [SceneScore], threshold: Float = 0.35, ratio: Float = 3.0, minGap: Float = 1.0) -> [Float] {
+    var cuts: [Float] = []
+    var lastCut = -1e18
+    let n = scores.count
+    for i in 0..n {
+        let s = scores[i].score
+        if s < threshold {
+            continue
+        }
+        var sum = 0.0
+        var count = 0
+        for j in max(0, i - 8)..min(n, i + 9) {
+            if j != i {
+                sum += scores[j].score
+                count += 1
+            }
+        }
+        let mean = if count > 0 { sum / Float(count) } else { 0.0 }
+        if s < ratio * mean {
+            continue
+        }
+        let t = scores[i].time
+        if t - lastCut < minGap {
+            continue
+        }
+        cuts.append(t)
+        lastCut = t
+    }
+    cuts
+}
+
+// Chapters from cut times: one starting at 0 and one at each cut, each
+// ending where the next starts (the last at `duration`), titled
+// "Scene 1", "Scene 2"…
+public fn sceneChapters(_ cuts: [Float], duration: Float) -> [core.Chapter] {
+    var starts: [Float] = [0.0]
+    for c in cuts {
+        if c > starts[starts.count - 1] + 0.001 && (duration <= 0.0 || c < duration) {
+            starts.append(c)
+        }
+    }
+    var out: [core.Chapter] = []
+    for i in 0..starts.count {
+        let end = if i + 1 < starts.count { starts[i + 1] } else { duration }
+        out.append(core.Chapter(start: starts[i], end: end, title: "Scene {i + 1}"))
+    }
+    out
+}

@@ -1,0 +1,416 @@
+// The Preferences window's data and pure helpers: the settings it shows
+// that library.Preferences doesn't have yet (PrefsExtra, asked for in
+// build/NEEDED.md), the values the app passes in for it to show
+// (PrefsStatus), and the small functions behind its controls: the
+// subtitle style as subs.TextStyle, colours as hex text, the language list
+// editor, shortcut recording and conflicts, and number formatting. All of
+// them are plain functions, tested in tests/ui_prefs.
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+import "../library"
+import "../subs"
+
+// Settings the Preferences window offers that library.Preferences has no
+// field for yet. The app keeps one of these in its state (and may save it
+// beside the preferences) until the fields move into library.Preferences.
+public struct PrefsExtra {
+    // How much Faster/Slower change the speed.
+    speedStep: Float = 0.1
+    // The sleep timer's default: minutes, 0 off, −1 "at the end of the
+    // current item".
+    sleepTimerMinutes: Int = 0
+    // "off" (never), "menu" (only from the View menu), "small" (also when
+    // the window is made narrow).
+    miniPlayer: String = "off"
+    // Never hide the controls over the video.
+    alwaysShowControls: Bool = false
+    // The highest volume the volume control goes to (1 = 100 %; above 1
+    // boosts quiet files).
+    volumeLimit: Float = 1.0
+    // The aspect ratio new videos start with: a name of render.aspectPresets.
+    defaultAspect: String = "Default"
+    // The style of the second subtitle track (shown at the top).
+    secondaryStyle: library.SubtitleStyle = library.SubtitleStyle(fontScale: 0.85, position: "top")
+}
+
+// What the app tells the Preferences window, to show (all optional).
+public struct PrefsStatus {
+    // Entries in the watch history; −1 when not known.
+    historyCount: Int = -1
+    // Bytes the thumbnail cache uses now; −1 when not known.
+    thumbnailCacheBytes: Int = -1
+    // A library scan is running (the rescan button waits).
+    scanning: Bool = false
+    // A line about the library: "1,204 items · last scan 10:42" or the
+    // scan's progress.
+    libraryStatus: String = ""
+    // OpenSubtitles: the result of checking the key or logging in, the
+    // quota left, or an error.
+    openSubtitlesStatus: String = ""
+    // "macos" or "windows" for how key combinations are written; "" =
+    // this system.
+    os: String = ""
+    // A picture to preview subtitles over (rgba pixels as g.image takes
+    // them, e.g. the paused video's frame); empty = a drawn sample scene.
+    previewPixels: [Int] = []
+    previewWidth: Int = 0
+    previewHeight: Int = 0
+}
+
+// The pages, in sidebar order: (tag, title).
+public let prefsTabs: [(String, String)] = [
+    ("general", "General"),
+    ("playback", "Playback"),
+    ("audio", "Audio"),
+    ("video", "Video"),
+    ("subtitles", "Subtitles"),
+    ("library", "Library"),
+    ("network", "Network"),
+    ("opensubtitles", "OpenSubtitles"),
+    ("shortcuts", "Shortcuts"),
+]
+
+// A tab name as the app may write it ("Subtitles", "keys") as a tag of
+// prefsTabs; "general" for anything else.
+public fn prefsTabTag(_ name: String) -> String {
+    let t = name.trim().lowercase()
+    for (tag, title) in prefsTabs {
+        if t == tag || t == title.lowercase() {
+            return tag
+        }
+    }
+    if t == "keys" || t == "keyboard" {
+        return "shortcuts"
+    }
+    if t == "subs" {
+        return "subtitles"
+    }
+    "general"
+}
+
+// --- Subtitle style ---
+
+// A preferences style as subs.TextStyle (what subs.styleCues puts on).
+// `outlineWidth` is in pixels of a 576-line picture (2 = subs' default
+// outline, 1/288 of the height); the shadow, when on, is offset by one
+// default outline width; the box shows only when `background` is on.
+public fn prefsTextStyle(_ s: library.SubtitleStyle) -> subs.TextStyle {
+    subs.TextStyle(
+        scale: s.fontScale,
+        color: s.color,
+        outline: s.outlineWidth / 2.0,
+        outlineColor: s.outlineColor,
+        shadow: if s.shadow { 1.0 } else { 0.0 },
+        shadowColor: s.shadowColor,
+        background: s.backgroundColor,
+        backgroundOpacity: if s.background { s.backgroundOpacity } else { 0.0 },
+        bold: s.bold,
+        font: s.font,
+        marginV: s.marginV,
+        position: if s.position == "top" { "top" } else { "bottom" },
+        overrideAss: s.overrideAss
+    )
+}
+
+// The cues the style preview shows: two lines at the bottom, and a line
+// at the top for the second track when `secondary` is on; styled.
+public fn prefsPreviewCues(_ primary: library.SubtitleStyle, _ second: library.SubtitleStyle, secondary: Bool) -> ([subs.Cue], [subs.Cue]) {
+    let a = subs.Cue(start: 0.0, end: 100.0, spans: [subs.Span(text: "This is how subtitles will look."), subs.Span(text: "\n"), subs.Span(text: "A second line, as dialogue has.")])
+    let first = subs.styleCues([a], prefsTextStyle(primary), format: "srt")
+    if !secondary {
+        return (first, [])
+    }
+    var st = prefsTextStyle(second)
+    st.position = "top"
+    let b = subs.Cue(start: 0.0, end: 100.0, spans: [subs.Span(text: "The second track sits at the top.")])
+    (first, subs.styleCues([b], st, format: "srt"))
+}
+
+// --- Colours (rgba packed r<<24 | g<<16 | b<<8 | a) ---
+
+// Colours offered in the colour menus, as rgb (alpha 0).
+public let prefsPalette: [(String, Int)] = [
+    ("White", 0xFFFFFF00),
+    ("Light grey", 0xC8C8C800),
+    ("Yellow", 0xFFE14000),
+    ("Amber", 0xF28C1A00),
+    ("Cyan", 0x40E0F000),
+    ("Green", 0x60E06000),
+    ("Pink", 0xFF80C000),
+    ("Red", 0xF0404000),
+    ("Blue", 0x4080FF00),
+    ("Dark grey", 0x40404000),
+    ("Black", 0x00000000),
+]
+
+// The colour with another colour's alpha.
+public fn prefsWithAlpha(_ rgb: Int, alphaOf: Int) -> Int {
+    (rgb & 0xFFFFFF00) | (alphaOf & 0xFF)
+}
+
+// "#RRGGBB" (the alpha is kept apart).
+public fn prefsHex(_ rgba: Int) -> String {
+    let digits = "0123456789ABCDEF"
+    var s = "#"
+    for shift in [28, 24, 20, 16, 12, 8] {
+        let d = (rgba >> shift) & 15
+        s += digits.substring(from: d, to: d + 1)
+    }
+    s
+}
+
+// A colour typed as "#rgb", "#rrggbb" or "#rrggbbaa" (the # may be left
+// out); without an alpha of its own it takes `alpha`. nil when it isn't one.
+public fn prefsParseHex(_ text: String, alpha: Int = 255) -> Int? {
+    var t = text.trim().lowercase()
+    if t.hasPrefix("#") {
+        t = t.substring(from: 1, to: t.count)
+    }
+    let digits = "0123456789abcdef"
+    var vals: [Int] = []
+    for ch in t.characters {
+        if let i = digits.find(ch) {
+            vals.append(i)
+        } else {
+            return nil
+        }
+    }
+    if vals.count == 3 {
+        let r = vals[0] * 17
+        let g = vals[1] * 17
+        let b = vals[2] * 17
+        return r << 24 | g << 16 | b << 8 | (alpha & 255)
+    }
+    if vals.count == 6 || vals.count == 8 {
+        var v = 0
+        for x in vals {
+            v = v * 16 + x
+        }
+        if vals.count == 6 {
+            v = v << 8 | (alpha & 255)
+        }
+        return v
+    }
+    nil
+}
+
+// The palette name of a colour (alpha ignored), or "Custom".
+public fn prefsColorName(_ rgba: Int) -> String {
+    for (name, rgb) in prefsPalette {
+        if rgb == (rgba & 0xFFFFFF00) {
+            return name
+        }
+    }
+    "Custom"
+}
+
+// A packed colour as a Color to draw (its alpha as opacity).
+public fn prefsColor(_ rgba: Int) -> Color {
+    Color.rgba(rgba >> 24 & 255, rgba >> 16 & 255, rgba >> 8 & 255, Float(rgba & 255) / 255.0)
+}
+
+// --- Language lists ---
+
+// Whether a typed language is one Reel knows by name.
+public fn prefsKnownLanguage(_ text: String) -> Bool {
+    let c = library.languageCode(text)
+    !c.isEmpty && library.languageName(c) != c
+}
+
+// "English (eng)", or the code itself when it has no name.
+public fn prefsLanguageLabel(_ code: String) -> String {
+    let name = library.languageName(code)
+    if name == code { code } else { "{name} ({code})" }
+}
+
+// Adds a typed language ("English", "en", "pt-BR", "fre") to a list as its
+// ISO 639-2/B code. Gives the new list and a message: "" when added, or
+// why not (unknown, already there).
+public fn prefsAddLanguage(_ list: [String], _ text: String) -> ([String], String) {
+    let t = text.trim()
+    if t.isEmpty {
+        return (list, "")
+    }
+    if !prefsKnownLanguage(t) {
+        return (list, "“{t}” isn't a language Reel knows. Type a name (Japanese) or a code (ja, jpn).")
+    }
+    let code = library.languageCode(t)
+    for l in list {
+        if library.languageCode(l) == code {
+            return (list, "{library.languageName(code)} is already in the list.")
+        }
+    }
+    (list + [code], "")
+}
+
+// The list with item `index` moved by `by` places (−1 up, +1 down);
+// unchanged when that goes past either end.
+public fn prefsMoved(_ list: [String], _ index: Int, by: Int) -> [String] {
+    let to = index + by
+    if index < 0 || index >= list.count || to < 0 || to >= list.count {
+        return list
+    }
+    var out = list
+    let item = out[index]
+    out.remove(at: index)
+    out.insert(item, at: to)
+    out
+}
+
+// --- Shortcuts ---
+
+// The groups of library.keyActions, in order.
+public fn prefsKeyGroups() -> [String] {
+    var out: [String] = []
+    for a in library.keyActions {
+        if !out.contains(a.group) {
+            out.append(a.group)
+        }
+    }
+    out
+}
+
+// The combination a key press records (canonical text, "cmd+shift+s"),
+// or "" for a press that can't be one: a modifier key on its own, or a key
+// with no name.
+public fn prefsComboFromKey(key: String, command: Bool = false, control: Bool = false, alt: Bool = false, shift: Bool = false) -> String {
+    if key == "shift" || key == "alt" || key == "control" || key == "command" {
+        return ""
+    }
+    let k = library.canonicalKey(key)
+    if k.isEmpty {
+        return ""
+    }
+    library.KeyCombo(key: k, command: command, control: control, alt: alt, shift: shift).text
+}
+
+// The conflicts an action is part of.
+public fn prefsConflictsOf(_ conflicts: [library.KeyConflict], action: String) -> [library.KeyConflict] {
+    conflicts.filter { c in c.actions.contains(action) }
+}
+
+// A conflict as the row of `action` says it: "⌘Q is used by the system"
+// or "⇧N also runs Next Episode".
+public fn prefsConflictText(_ c: library.KeyConflict, action: String, os: String = "") -> String {
+    let shown = library.displayCombo(c.combo, os: os)
+    let others = c.actions.filter { a in a != action }.map { a in library.actionTitle(a) }
+    var parts: [String] = []
+    if !others.isEmpty {
+        parts.append("{shown} also runs {others.joined(separator: ", ")}")
+    }
+    if c.reserved {
+        parts.append("{shown} is used by the system, so it may never reach Reel")
+    }
+    parts.joined(separator: "; ")
+}
+
+// Whether an action's combinations differ from its defaults.
+public fn prefsKeyChanged(_ m: library.Keymap, action: String) -> Bool {
+    m.combos(action) != library.defaultKeymap().combos(action)
+}
+
+// Whether an action matches a search: its title, group or one of its
+// combinations as shown ("⌘O", "Ctrl+O") or written ("cmd+o").
+public fn prefsKeyMatches(_ a: library.KeyAction, _ m: library.Keymap, query: String, os: String = "") -> Bool {
+    let q = query.trim().lowercase()
+    if q.isEmpty {
+        return true
+    }
+    if a.title.lowercase().contains(q) || a.group.lowercase().contains(q) {
+        return true
+    }
+    for c in m.combos(a.id) {
+        if c.contains(q) || library.displayCombo(c, os: os).lowercase().contains(q) {
+            return true
+        }
+    }
+    false
+}
+
+// --- Numbers ---
+
+// "12 s", "1.5 s", "1 min", "2 min 30 s".
+public fn prefsSeconds(_ s: Float) -> String {
+    if s >= 60.0 && abs(s - round(s)) < 0.001 {
+        let total = Int(round(s))
+        let m = total / 60
+        let r = total % 60
+        return if r == 0 { "{m} min" } else { "{m} min {r} s" }
+    }
+    if abs(s - round(s)) < 0.001 {
+        return "{Int(round(s))} s"
+    }
+    "{s.formatted(decimals: 1)} s"
+}
+
+// A size in bytes: "0 bytes", "820 KB", "12.4 MB", "1.2 GB".
+public fn prefsBytes(_ n: Int) -> String {
+    if n < 1024 {
+        return "{n} bytes"
+    }
+    let kb = Float(n) / 1024.0
+    if kb < 1000.0 {
+        return "{Int(round(kb))} KB"
+    }
+    let mb = kb / 1024.0
+    if mb < 1000.0 {
+        return "{mb.formatted(decimals: 1)} MB"
+    }
+    "{(mb / 1024.0).formatted(decimals: 1)} GB"
+}
+
+// A percentage of a 0…1 (or more) factor: "85 %".
+public fn prefsPercent(_ f: Float) -> String {
+    "{Int(round(f * 100.0))} %"
+}
+
+// Picture heights offered as the network's highest quality (0 = no limit).
+public let prefsStreamHeights: [Int] = [0, 2160, 1440, 1080, 720, 480, 360]
+
+// "No limit", "4K (2160p)", "1080p".
+public fn prefsHeightTitle(_ h: Int) -> String {
+    if h <= 0 {
+        return "No limit"
+    }
+    if h == 2160 {
+        return "4K (2160p)"
+    }
+    "{h}p"
+}
+
+// Sleep timer defaults offered: minutes, 0 off, −1 end of the item.
+public let prefsSleepChoices: [Int] = [0, 15, 30, 45, 60, 90, -1]
+
+public fn prefsSleepTitle(_ m: Int) -> String {
+    if m == 0 {
+        return "Off"
+    }
+    if m < 0 {
+        return "At the end of the current item"
+    }
+    "{m} minutes"
+}
+
+// An API key shown without giving it away: "••••••••3f9a".
+public fn prefsMaskedKey(_ key: String) -> String {
+    if key.isEmpty {
+        return ""
+    }
+    if key.count <= 4 {
+        return "•".repeated(key.count)
+    }
+    "•".repeated(8) + key.substring(from: key.count - 4, to: key.count)
+}
+
+// A history count as a sentence for the confirm step.
+public fn prefsClearHistoryQuestion(_ count: Int) -> String {
+    if count < 0 {
+        return "Clear the whole watch history? Positions to continue from are forgotten too."
+    }
+    if count == 1 {
+        return "Clear the 1 item in the watch history? Its position to continue from is forgotten too."
+    }
+    "Clear the {count} items in the watch history? Positions to continue from are forgotten too."
+}

@@ -1,0 +1,225 @@
+// What a demuxer finds in a media file: its tracks, its packets and its
+// tags. Every container module (mp4, mkv, avi, ogg, ts, wav, raw streams)
+// produces a `Media`; every decoder reads `Track`s and packet bytes.
+//
+// The whole file is one `Data` (Tessel reads files whole). Packets don't
+// copy their bytes: a `PacketRef` says where they are in the file, and
+// `packetBytes` gathers them when a decoder needs them.
+//
+// Times: each track counts in its own `timescale` (ticks per second).
+// `pts` is when a packet's content is shown or heard, `dts` the order it's
+// decoded in (they differ for video with B-frames). `noTime` marks a time
+// the container doesn't give.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+public let noTime = -9223372036854775807
+
+public enum TrackKind {
+    video, audio, subtitle, other
+}
+
+// Codec names used everywhere (Track.codec):
+//   video     "h264" "hevc" "mpeg1" "mpeg2" "mpeg4" "mjpeg" "vp8" "vp9" "av1"
+//             "theora" "prores" "dnxhd" "rawvideo"
+//             Windows Media: "vc1" (WVC1/WMVA, VC-1 Advanced), "wmv3" (WMV9,
+//             VC-1 Simple/Main), "wmv2", "wmv1", "msmpeg4v3" (MP43, DIV3),
+//             "msmpeg4v2" (MP42), "msmpeg4v1" (MPG4)
+//   audio     "aac" "mp3" "mp2" "mp1" "flac" "vorbis" "opus" "alac" "ac3"
+//             "eac3" "dts" "truehd" "mlp" "pcm" (see Track.pcm) "alaw" "ulaw"
+//             Windows Media: "wmav1" "wmav2" "wmapro" "wmalossless"
+//   subtitle  "srt" (SubRip text) "ass" (SSA/ASS events) "webvtt" "tx3g"
+//             (MP4 timed text) "text" (plain UTF-8) "pgs" "dvdsub" "dvbsub"
+// A codec the demuxer can't name is "unknown:<container's id>".
+//
+// `extra` is the codec's setup bytes, in these forms:
+//   h264   the avcC box body (AVCDecoderConfigurationRecord), or empty when
+//          parameter sets are in the stream (Annex B, as in MPEG-TS).
+//   hevc   the hvcC box body, or empty (Annex B).
+//   aac    the AudioSpecificConfig (from esds / CodecPrivate), or empty when
+//          packets carry ADTS headers (then `adts` is true).
+//   vorbis the three header packets, each as a 4-byte big-endian length
+//          followed by its bytes (identification, comment, setup).
+//   opus   the OpusHead packet.
+//   flac   the "fLaC" marker followed by the metadata blocks (STREAMINFO
+//          first), as at the start of a .flac file.
+//   alac   the ALAC magic cookie (ALACSpecificConfig, 24 bytes or more).
+//   theora the three header packets as for vorbis.
+//   ass    the script header ([Script Info], [V4+ Styles] … up to [Events]
+//          and its Format line), as text.
+//   others empty, or the container's private bytes unchanged.
+public struct Track {
+    // Position in Media.tracks; packets name their track by it.
+    index: Int
+    // The container's own number for the track (MP4 track_ID, MKV
+    // TrackNumber, TS PID, Ogg serial, AVI stream number).
+    id: Int = 0
+    kind: TrackKind
+    codec: String
+    // The container's own codec tag (AVI/MP4 fourcc like "XVID", "avc1",
+    // MKV CodecID), when it has one; decoders may use it for workarounds.
+    tag: String = ""
+    timescale: Int = 1000
+    // Length in ticks, or noTime.
+    duration: Int = noTime
+    // ISO 639-2 code ("eng", "jpn") or "" when unknown ("und" is "").
+    language: String = ""
+    title: String = ""
+    isDefault: Bool = false
+    isForced: Bool = false
+    extra: Data = Data()
+    // Bytes the container stripped from the start of every packet (MKV
+    // header stripping); packetBytes puts them back.
+    prefix: Data = Data()
+    // Average bits per second, 0 when unknown.
+    bitrate: Int = 0
+
+    // Video.
+    width: Int = 0
+    height: Int = 0
+    // Pixel shape (sample aspect ratio); 1:1 when unknown.
+    sarNum: Int = 1
+    sarDen: Int = 1
+    // Frames per second as a fraction; 0/1 when unknown.
+    fpsNum: Int = 0
+    fpsDen: Int = 1
+    // Clockwise rotation to show it at: 0, 90, 180 or 270.
+    rotation: Int = 0
+    // Colour as the container says (MP4 `colr`, Matroska Colour); the
+    // stream's own (e.g. H.264 VUI) wins when it has one.
+    matrix: ColorMatrix = .unknown
+    fullRange: Bool = false
+
+    // Audio.
+    sampleRate: Int = 0
+    channels: Int = 0
+    // Channel names in WAV order (core/samples.tsl), when the container
+    // says (WAV channel mask, MP4 chan); empty when it doesn't.
+    layout: [String] = []
+    bitsPerSample: Int = 0
+    // WAVEFORMATEX nBlockAlign (WAV, AVI, MKV A_MS/ACM, ASF): WMA packets
+    // are blocks of this size. 0 when the container doesn't say.
+    blockAlign: Int = 0
+    // For "pcm": how samples are stored.
+    pcm: PcmFormat = PcmFormat()
+    // For "aac": packets start with ADTS headers.
+    adts: Bool = false
+}
+
+public struct PcmFormat {
+    // 8, 16, 24, 32 or 64.
+    bits: Int = 16
+    float: Bool = false
+    bigEndian: Bool = false
+    // 8-bit WAV is unsigned; everything else is signed.
+    signed: Bool = true
+}
+
+// One packet: a frame of video, a block of audio, one subtitle event.
+public struct PacketRef {
+    track: Int
+    pts: Int = noTime
+    dts: Int = noTime
+    duration: Int = 0
+    // A keyframe: decoding can start here.
+    key: Bool = false
+    // Where the bytes are in the file.
+    offset: Int = 0
+    size: Int = 0
+    // When the bytes are split (Ogg packets across pages, MPEG-TS PES
+    // payloads), the pieces as offset, size pairs; offset/size are then
+    // the first piece's and `size` the total.
+    parts: [Int] = []
+}
+
+public struct Chapter {
+    // Seconds.
+    start: Float
+    end: Float = -1.0
+    title: String = ""
+}
+
+// A file attached to the container (fonts for ASS subtitles, cover art).
+public struct Attachment {
+    name: String
+    mime: String = ""
+    data: Data = Data()
+}
+
+public struct Media {
+    // "mp4" "mov" "mkv" "webm" "avi" "ogg" "ts" "ps" "wav" "aiff" "mp3"
+    // "aac" "flac" "srt" "vtt" "ass".
+    format: String = ""
+    // Seconds, or -1 when unknown (a live stream).
+    duration: Float = -1.0
+    tracks: [Track] = []
+    // Every packet of every track, in the order they are stored.
+    packets: [PacketRef] = []
+    // Lower-case keys: "title" "artist" "album" "albumartist" "date"
+    // "genre" "track" "disc" "comment" "composer" "encoder" "copyright".
+    tags: [String: String] = [:]
+    // Cover art: the picture file's bytes (JPEG or PNG), or empty.
+    cover: Data = Data()
+    chapters: [Chapter] = []
+    attachments: [Attachment] = []
+    // Problems found while reading that didn't stop it (damaged packets
+    // skipped, an index rebuilt), for the media info window.
+    warnings: [String] = []
+}
+
+// The bytes of a packet, ready for its decoder.
+public fn packetBytes(_ file: Data, _ media: Media, _ p: PacketRef) -> Data {
+    let prefix = media.tracks[p.track].prefix
+    if p.parts.isEmpty {
+        let body = file.slice(from: p.offset, to: p.offset + p.size)
+        if prefix.isEmpty {
+            return body
+        }
+        return prefix + body
+    }
+    var out = prefix
+    var i = 0
+    while i + 1 < p.parts.count {
+        out += file.slice(from: p.parts[i], to: p.parts[i] + p.parts[i + 1])
+        i += 2
+    }
+    out
+}
+
+// Ticks of a track's clock in seconds.
+public fn seconds(_ ticks: Int, _ timescale: Int) -> Float {
+    if ticks == noTime || timescale <= 0 {
+        return 0.0
+    }
+    Float(ticks) / Float(timescale)
+}
+
+// Seconds in ticks of a track's clock.
+public fn ticks(_ seconds: Float, _ timescale: Int) -> Int {
+    Int(seconds * Float(timescale))
+}
+
+// Rescales a time from one clock to another without overflow for times up
+// to days at clocks up to 90 kHz (and much more).
+public fn rescale(_ t: Int, from: Int, to: Int) -> Int {
+    if t == noTime || from == to {
+        return t
+    }
+    if from <= 0 {
+        return 0
+    }
+    let whole = t / from
+    let rest = t % from
+    whole * to + rest * to / from
+}
+
+// The tracks of one kind.
+public fn tracksOf(_ media: Media, _ kind: TrackKind) -> [Track] {
+    media.tracks.filter { t in t.kind == kind }
+}
+
+// The packets of one track, in stored order.
+public fn packetsOf(_ media: Media, _ track: Int) -> [PacketRef] {
+    media.packets.filter { p in p.track == track }
+}

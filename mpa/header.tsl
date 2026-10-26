@@ -1,0 +1,248 @@
+// MPEG audio frame headers (ISO/IEC 11172-3 section 2.4.1.3, with the
+// MPEG-2 LSF rates of 13818-3 and the unofficial MPEG-2.5 extension),
+// finding frames in a raw stream, and the Xing/Info, LAME and VBRI tags
+// encoders put in the first frame.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../core"
+
+let mpaBitrates = [
+    // MPEG-1 layers I, II, III
+    0, 32, 64, 96, 128, 160, 192, 224, 256, 288, 320, 352, 384, 416, 448,
+    0, 32, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384,
+    0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320,
+    // MPEG-2 / 2.5 layers I, II, III
+    0, 32, 48, 56, 64, 80, 96, 112, 128, 144, 160, 176, 192, 224, 256,
+    0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160,
+    0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160,
+]
+
+// A frame header.
+public struct MpaHeader {
+    // 1, 2 or 3.
+    layer: Int = 0
+    // MPEG-2 / 2.5 low sampling frequencies (one granule per layer III
+    // frame, other scale factor coding).
+    lsf: Bool = false
+    mpeg25: Bool = false
+    rate: Int = 0
+    // 0–8: 44.1, 48, 32, 22.05, 24, 16, 11.025, 12, 8 kHz.
+    rateIndex: Int = 0
+    // Bits per second.
+    bitrate: Int = 0
+    bitrateIndex: Int = 0
+    padding: Int = 0
+    crc: Bool = false
+    // 0 stereo, 1 joint stereo, 2 dual channel, 3 mono.
+    mode: Int = 0
+    modeExt: Int = 0
+    channels: Int = 0
+    // Bytes in the whole frame, header included.
+    frameSize: Int = 0
+    // Output frames (instants) per frame: 384, 1152 or 576.
+    samples: Int = 0
+}
+
+// Reads a 4-byte header. Free format (bitrate index 0) and reserved
+// values give nil.
+public fn parseHeader(_ h: Int) -> MpaHeader? {
+    if (h >> 21) & 0x7ff != 0x7ff {
+        return nil
+    }
+    let version = (h >> 19) & 3
+    let layerBits = (h >> 17) & 3
+    let bitrateIndex = (h >> 12) & 15
+    let rateBits = (h >> 10) & 3
+    if version == 1 || layerBits == 0 || bitrateIndex == 15 || bitrateIndex == 0 || rateBits == 3 {
+        return nil
+    }
+    var hd = MpaHeader()
+    hd.layer = 4 - layerBits
+    hd.lsf = version != 3
+    hd.mpeg25 = version == 0
+    let shift = if hd.mpeg25 { 2 } else if hd.lsf { 1 } else { 0 }
+    let base = [44100, 48000, 32000]
+    hd.rate = base[rateBits] >> shift
+    hd.rateIndex = rateBits + 3 * shift
+    hd.crc = (h >> 16) & 1 == 0
+    hd.bitrateIndex = bitrateIndex
+    hd.padding = (h >> 9) & 1
+    hd.mode = (h >> 6) & 3
+    hd.modeExt = (h >> 4) & 3
+    hd.channels = if hd.mode == 3 { 1 } else { 2 }
+    let kbps = mpaBitrates[(if hd.lsf { 3 } else { 0 } + hd.layer - 1) * 15 + bitrateIndex]
+    hd.bitrate = kbps * 1000
+    if hd.layer == 1 {
+        hd.frameSize = (kbps * 12000 / hd.rate + hd.padding) * 4
+        hd.samples = 384
+    } else if hd.layer == 2 {
+        hd.frameSize = kbps * 144000 / hd.rate + hd.padding
+        hd.samples = 1152
+    } else {
+        let div = if hd.lsf { hd.rate * 2 } else { hd.rate }
+        hd.frameSize = kbps * 144000 / div + hd.padding
+        hd.samples = if hd.lsf { 576 } else { 1152 }
+    }
+    hd
+}
+
+// The header at d[at…], or nil.
+public fn headerAt(_ d: Data, _ at: Int) -> MpaHeader? {
+    if at < 0 || at + 4 > d.count || d[at] != 0xff || d[at + 1] & 0xe0 != 0xe0 {
+        return nil
+    }
+    parseHeader((d[at] << 24) | (d[at + 1] << 16) | (d[at + 2] << 8) | d[at + 3])
+}
+
+// Whether two headers belong to the same stream: same version, layer and
+// rate (the channel mode may change from frame to frame, as in the ISO
+// test stream he_mode).
+fn mpaSameStream(_ a: MpaHeader, _ b: MpaHeader) -> Bool {
+    a.layer == b.layer && a.lsf == b.lsf && a.mpeg25 == b.mpeg25 && a.rate == b.rate
+}
+
+// The size of an ID3v2 tag at the start of a file (0 when there is none).
+public fn id3v2Size(_ d: Data) -> Int {
+    if d.count < 10 || d.slice(from: 0, to: 3).latin1 != "ID3" {
+        return 0
+    }
+    let size = (d[6] << 21) | (d[7] << 14) | (d[8] << 7) | d[9]
+    let footer = if d[5] & 0x10 != 0 { 10 } else { 0 }
+    10 + size + footer
+}
+
+// The frames of a raw MPEG audio stream (.mp3, .mp2, .mp1), as offset,
+// size pairs: after any ID3v2 tag, each frame must be followed by another
+// frame of the same stream (or by the end of the file, or a trailing tag)
+// to count, so stray sync patterns in tags or junk are skipped. The Xing/
+// Info frame, if any, is the first one listed (see `isTagFrame`).
+public fn findFrames(_ d: Data) -> [Int] {
+    var out: [Int] = []
+    var at = id3v2Size(d)
+    var first = MpaHeader()
+    var haveFirst = false
+    while at + 4 <= d.count {
+        if d[at] == 0xff && d[at + 1] & 0xe0 == 0xe0 {
+            if let h = headerAt(d, at) {
+                let next = at + h.frameSize
+                var ok = false
+                if haveFirst && mpaSameStream(first, h) && next <= d.count {
+                    ok = true
+                } else if next == d.count {
+                    ok = true
+                } else if let h2 = headerAt(d, next) {
+                    ok = mpaSameStream(h, h2)
+                } else if next + 3 <= d.count && d.slice(from: next, to: next + 3).latin1 == "TAG" {
+                    ok = true
+                } else if next + 8 <= d.count && d.slice(from: next, to: next + 8).latin1 == "APETAGEX" {
+                    ok = true
+                }
+                // A last frame cut short by the end of the file still
+                // counts (decoders read zeros for the missing bytes).
+                if !ok && haveFirst && mpaSameStream(first, h) && next > d.count {
+                    out.append(at)
+                    out.append(d.count - at)
+                    break
+                }
+                if ok && next <= d.count {
+                    if !haveFirst {
+                        first = h
+                        haveFirst = true
+                    }
+                    out.append(at)
+                    out.append(h.frameSize)
+                    at = next
+                    continue
+                }
+            }
+        }
+        at += 1
+    }
+    out
+}
+
+// What the first frame of an encoder's stream may say about the stream.
+public struct MpaTag {
+    // "Xing", "Info" or "VBRI".
+    kind: String = ""
+    // Frames in the stream (the tag frame not counted), 0 when unknown.
+    frames: Int = 0
+    bytes: Int = 0
+    // LAME tag: encoder delay and padding in samples (-1 when absent),
+    // and the encoder's name ("LAME3.100", "Lavc62.28").
+    encoderDelay: Int = -1
+    encoderPadding: Int = -1
+    encoder: String = ""
+}
+
+// The Xing/Info (with an optional LAME extension) or VBRI tag in a frame,
+// or nil when the frame is ordinary audio.
+public fn parseTag(_ frame: Data) -> MpaTag? {
+    if let h = headerAt(frame, 0) {
+        if h.layer != 3 {
+            return nil
+        }
+        // Xing/Info sits right after the side information.
+        let side = if h.lsf { if h.channels == 1 { 9 } else { 17 } } else { if h.channels == 1 { 17 } else { 32 } }
+        // Encoders differ on whether a CRC word moves it: try both.
+        var x = 4 + side + (if h.crc { 2 } else { 0 })
+        if h.crc && x + 4 <= frame.count {
+            let id0 = frame.slice(from: x - 2, to: x + 2).latin1
+            if id0 == "Xing" || id0 == "Info" {
+                x -= 2
+            }
+        }
+        if x + 8 <= frame.count {
+            let id = frame.slice(from: x, to: x + 4).latin1
+            if id == "Xing" || id == "Info" {
+                var t = MpaTag(kind: id)
+                let flags = frame.uint32(at: x + 4, bigEndian: true)
+                var p = x + 8
+                if flags & 1 != 0 && p + 4 <= frame.count {
+                    t.frames = frame.uint32(at: p, bigEndian: true)
+                    p += 4
+                }
+                if flags & 2 != 0 && p + 4 <= frame.count {
+                    t.bytes = frame.uint32(at: p, bigEndian: true)
+                    p += 4
+                }
+                if flags & 4 != 0 {
+                    p += 100
+                }
+                if flags & 8 != 0 {
+                    p += 4
+                }
+                // LAME extension: 9 characters of encoder name, then
+                // revision, lowpass, peak, two gains, flags, bitrate, and
+                // 12 bits of delay + 12 bits of padding.
+                if p + 24 <= frame.count {
+                    let name = frame.slice(from: p, to: p + 9).latin1
+                    if name.hasPrefix("LAME") || name.hasPrefix("Lavc") || name.hasPrefix("Lavf") || name.hasPrefix("L3.99") || name.hasPrefix("GOGO") {
+                        t.encoder = name.trim()
+                        let dp = p + 21
+                        let v = (frame[dp] << 16) | (frame[dp + 1] << 8) | frame[dp + 2]
+                        t.encoderDelay = v >> 12
+                        t.encoderPadding = v & 0xfff
+                    }
+                }
+                return t
+            }
+        }
+        // VBRI (Fraunhofer) is always 32 bytes after the header.
+        let v = 4 + 32
+        if v + 18 <= frame.count && frame.slice(from: v, to: v + 4).latin1 == "VBRI" {
+            var t = MpaTag(kind: "VBRI")
+            t.bytes = frame.uint32(at: v + 10, bigEndian: true)
+            t.frames = frame.uint32(at: v + 14, bigEndian: true)
+            return t
+        }
+    }
+    nil
+}
+
+// Whether a frame is an encoder's tag frame rather than audio.
+public fn isTagFrame(_ frame: Data) -> Bool {
+    parseTag(frame) != nil
+}

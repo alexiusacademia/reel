@@ -1,0 +1,587 @@
+// Intra prediction (ITU-T H.264 8.3): Intra_4x4 and Intra_8x8 (with the
+// reference sample filtering of 8.3.2.2.1), Intra_16x16 and chroma, and
+// the residual transforms they are combined with: inverse 4x4 and 8x8
+// transforms (8.5.12, 8.5.13), the luma DC Hadamard (8.5.10) and chroma
+// DC transform (8.5.11.1), and I_PCM samples.
+//
+// Neighbouring samples of an NxN block are gathered into an "edge" list:
+// edge[N - 1 - y] = p[-1, y], edge[N] = p[-1, -1], edge[N + 1 + x] =
+// p[x, -1] (x up to 2N - 1), so every directional formula of 8.3.1.2.x
+// reads one list.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../core"
+
+fn h264Clip(_ v: Int) -> Int {
+    if v < 0 { return 0 }
+    if v > 255 { return 255 }
+    v
+}
+
+// The sample p[x, y] of the edge (x or y is -1).
+fn h264Pe(_ edge: [Int], _ n: Int, _ x: Int, _ y: Int) -> Int {
+    if y < 0 { edge[n + 1 + x] } else { edge[n - 1 - y] }
+}
+
+// Fills the edge list for an NxN block at plane index `at` (stride s).
+// top-right samples missing (or not available) repeat p[N-1, -1].
+fn h264GatherEdge(_ edge: bind [Int], _ p: [Int], _ at: Int, _ s: Int, n: Int, left: Bool, top: Bool, topLeft: Bool, topRight: Bool) {
+    if left {
+        for y in 0..n {
+            edge[n - 1 - y] = p[at + y * s - 1]
+        }
+    }
+    if topLeft {
+        edge[n] = p[at - s - 1]
+    }
+    if top {
+        for x in 0..n {
+            edge[n + 1 + x] = p[at - s + x]
+        }
+        if topRight {
+            for x in n..(2 * n) {
+                edge[n + 1 + x] = p[at - s + x]
+            }
+        } else {
+            let v = edge[n + n]
+            for x in n..(2 * n) {
+                edge[n + 1 + x] = v
+            }
+        }
+    }
+}
+
+// Reference sample filtering for Intra_8x8 (8.3.2.2.1), from edge into f.
+fn h264Filter8x8Edge(_ f: bind [Int], _ edge: [Int], left: Bool, top: Bool, topLeft: Bool) {
+    // edge layout with n = 8: left at 7 - y, corner 8, top at 9 + x.
+    if top {
+        let t0 = if topLeft { edge[8] } else { edge[9] }
+        f[9] = (t0 + 2 * edge[9] + edge[10] + 2) >> 2
+        for x in 1..15 {
+            f[9 + x] = (edge[8 + x] + 2 * edge[9 + x] + edge[10 + x] + 2) >> 2
+        }
+        f[24] = (edge[23] + 3 * edge[24] + 2) >> 2
+    }
+    if topLeft {
+        if top && left {
+            f[8] = (edge[9] + 2 * edge[8] + edge[7] + 2) >> 2
+        } else if top {
+            f[8] = (3 * edge[8] + edge[9] + 2) >> 2
+        } else if left {
+            f[8] = (3 * edge[8] + edge[7] + 2) >> 2
+        } else {
+            f[8] = edge[8]
+        }
+    }
+    if left {
+        let l0 = if topLeft { edge[8] } else { edge[7] }
+        f[7] = (l0 + 2 * edge[7] + edge[6] + 2) >> 2
+        for y in 1..7 {
+            f[7 - y] = (edge[8 - y] + 2 * edge[7 - y] + edge[6 - y] + 2) >> 2
+        }
+        f[0] = (edge[1] + 3 * edge[0] + 2) >> 2
+    }
+}
+
+// Intra_4x4 / Intra_8x8 prediction of an NxN block (8.3.1.2, 8.3.2.2)
+// written to p at `at`.
+fn h264PredNxN(_ p: bind [Int], _ at: Int, _ s: Int, _ edge: [Int], _ fa: bind [Int], _ ff: bind [Int], n: Int, mode: Int, left: Bool, top: Bool) {
+    if mode == 0 {
+        for y in 0..n {
+            for x in 0..n {
+                p[at + y * s + x] = edge[n + 1 + x]
+            }
+        }
+        return
+    }
+    if mode == 1 {
+        for y in 0..n {
+            let v = edge[n - 1 - y]
+            for x in 0..n {
+                p[at + y * s + x] = v
+            }
+        }
+        return
+    }
+    if mode == 2 {
+        var dc = 128
+        let sh = if n == 4 { 2 } else { 3 }
+        if left && top {
+            var sum = 0
+            for i in 0..n {
+                sum += edge[i] + edge[n + 1 + i]
+            }
+            dc = (sum + n) >> (sh + 1)
+        } else if left {
+            var sum = 0
+            for i in 0..n {
+                sum += edge[i]
+            }
+            dc = (sum + (n >> 1)) >> sh
+        } else if top {
+            var sum = 0
+            for i in 0..n {
+                sum += edge[n + 1 + i]
+            }
+            dc = (sum + (n >> 1)) >> sh
+        }
+        for y in 0..n {
+            for x in 0..n {
+                p[at + y * s + x] = dc
+            }
+        }
+        return
+    }
+    // The directional modes (3 to 8) only take two-tap averages A[i] =
+    // (E[i] + E[i+1] + 1) >> 1 and three-tap values F[i] = (E[i-1] +
+    // 2 E[i] + E[i+1] + 2) >> 2 of the edge E (left from the bottom up,
+    // the corner, then the top: p[-1, n-1-i], p[-1, -1] at n, p[i-n-1, -1]),
+    // so they are worked out once (8.3.1.2.4 - 8.3.1.2.9, 8.3.2.2.5 -
+    // 8.3.2.2.10).
+    let last = 3 * n
+    for i in 0..last {
+        fa[i] = (edge[i] + edge[i + 1] + 1) >> 1
+    }
+    for i in 1..last {
+        ff[i] = (edge[i - 1] + 2 * edge[i] + edge[i + 1] + 2) >> 2
+    }
+    if mode == 3 {
+        // Diagonal down left.
+        for y in 0..n {
+            let r = at + y * s
+            for x in 0..n {
+                p[r + x] = ff[n + 2 + x + y]
+            }
+        }
+        p[at + (n - 1) * s + n - 1] = (edge[3 * n - 1] + 3 * edge[3 * n] + 2) >> 2
+    } else if mode == 4 {
+        // Diagonal down right.
+        for y in 0..n {
+            let r = at + y * s
+            for x in 0..n {
+                p[r + x] = ff[n + x - y]
+            }
+        }
+    } else if mode == 5 {
+        // Vertical right.
+        for y in 0..n {
+            let r = at + y * s
+            for x in 0..n {
+                let z = 2 * x - y
+                if z < 0 {
+                    p[r + x] = ff[n + 1 + z]
+                } else if (z & 1) == 0 {
+                    p[r + x] = fa[n + x - (y >> 1)]
+                } else {
+                    p[r + x] = ff[n + x - (y >> 1)]
+                }
+            }
+        }
+    } else if mode == 6 {
+        // Horizontal down.
+        for y in 0..n {
+            let r = at + y * s
+            for x in 0..n {
+                let z = 2 * y - x
+                if z < 0 {
+                    p[r + x] = ff[n - 1 - z]
+                } else if (z & 1) == 0 {
+                    p[r + x] = fa[n - 1 - y + (x >> 1)]
+                } else {
+                    p[r + x] = ff[n - y + (x >> 1)]
+                }
+            }
+        }
+    } else if mode == 7 {
+        // Vertical left.
+        for y in 0..n {
+            let r = at + y * s
+            for x in 0..n {
+                if (y & 1) == 0 {
+                    p[r + x] = fa[n + 1 + x + (y >> 1)]
+                } else {
+                    p[r + x] = ff[n + 2 + x + (y >> 1)]
+                }
+            }
+        }
+    } else {
+        // Horizontal up.
+        let lim = 2 * n - 3
+        for y in 0..n {
+            let r = at + y * s
+            for x in 0..n {
+                let z = x + 2 * y
+                let k = y + (x >> 1)
+                if z > lim {
+                    p[r + x] = edge[0]
+                } else if z == lim {
+                    p[r + x] = (edge[1] + 3 * edge[0] + 2) >> 2
+                } else if (z & 1) == 0 {
+                    p[r + x] = fa[n - 2 - k]
+                } else {
+                    p[r + x] = ff[n - 2 - k]
+                }
+            }
+        }
+    }
+}
+
+// Intra_16x16 prediction (8.3.3).
+fn h264Pred16x16(_ p: bind [Int], _ at: Int, _ s: Int, mode: Int, left: Bool, top: Bool, topLeft: Bool) {
+    if mode == 0 {
+        for y in 0..16 {
+            for x in 0..16 {
+                p[at + y * s + x] = p[at - s + x]
+            }
+        }
+    } else if mode == 1 {
+        for y in 0..16 {
+            let v = p[at + y * s - 1]
+            for x in 0..16 {
+                p[at + y * s + x] = v
+            }
+        }
+    } else if mode == 2 {
+        var dc = 128
+        var sum = 0
+        if left {
+            for y in 0..16 {
+                sum += p[at + y * s - 1]
+            }
+        }
+        if top {
+            for x in 0..16 {
+                sum += p[at - s + x]
+            }
+        }
+        if left && top {
+            dc = (sum + 16) >> 5
+        } else if left || top {
+            dc = (sum + 8) >> 4
+        }
+        for y in 0..16 {
+            for x in 0..16 {
+                p[at + y * s + x] = dc
+            }
+        }
+    } else {
+        var hh = 0
+        var vv = 0
+        for i in 0..8 {
+            let a = p[at - s + 8 + i]
+            let b = if i == 7 { p[at - s - 1] } else { p[at - s + 6 - i] }
+            hh += (i + 1) * (a - b)
+            let c = p[at + (8 + i) * s - 1]
+            let d = if i == 7 { p[at - s - 1] } else { p[at + (6 - i) * s - 1] }
+            vv += (i + 1) * (c - d)
+        }
+        let a = 16 * (p[at + 15 * s - 1] + p[at - s + 15])
+        let b = (5 * hh + 32) >> 6
+        let c = (5 * vv + 32) >> 6
+        for y in 0..16 {
+            for x in 0..16 {
+                p[at + y * s + x] = h264Clip((a + b * (x - 7) + c * (y - 7) + 16) >> 5)
+            }
+        }
+    }
+}
+
+// Chroma intra prediction for 4:2:0 (8.3.4): mode 0 DC, 1 horizontal,
+// 2 vertical, 3 plane, on an 8x8 block.
+fn h264PredChroma(_ p: bind [Int], _ at: Int, _ s: Int, mode: Int, left: Bool, top: Bool) {
+    if mode == 0 {
+        for b in 0..4 {
+            let xo = (b & 1) * 4
+            let yo = (b >> 1) * 4
+            var st = 0
+            var sl = 0
+            if top {
+                for i in 0..4 {
+                    st += p[at - s + xo + i]
+                }
+            }
+            if left {
+                for i in 0..4 {
+                    sl += p[at + (yo + i) * s - 1]
+                }
+            }
+            var dc = 128
+            if b == 0 || b == 3 {
+                if left && top {
+                    dc = (st + sl + 4) >> 3
+                } else if left {
+                    dc = (sl + 2) >> 2
+                } else if top {
+                    dc = (st + 2) >> 2
+                }
+            } else if b == 1 {
+                if top {
+                    dc = (st + 2) >> 2
+                } else if left {
+                    dc = (sl + 2) >> 2
+                }
+            } else {
+                if left {
+                    dc = (sl + 2) >> 2
+                } else if top {
+                    dc = (st + 2) >> 2
+                }
+            }
+            for y in 0..4 {
+                for x in 0..4 {
+                    p[at + (yo + y) * s + xo + x] = dc
+                }
+            }
+        }
+    } else if mode == 1 {
+        for y in 0..8 {
+            let v = p[at + y * s - 1]
+            for x in 0..8 {
+                p[at + y * s + x] = v
+            }
+        }
+    } else if mode == 2 {
+        for y in 0..8 {
+            for x in 0..8 {
+                p[at + y * s + x] = p[at - s + x]
+            }
+        }
+    } else {
+        var hh = 0
+        var vv = 0
+        for i in 0..4 {
+            let a = p[at - s + 4 + i]
+            let b = if i == 3 { p[at - s - 1] } else { p[at - s + 2 - i] }
+            hh += (i + 1) * (a - b)
+            let c = p[at + (4 + i) * s - 1]
+            let d = if i == 3 { p[at - s - 1] } else { p[at + (2 - i) * s - 1] }
+            vv += (i + 1) * (c - d)
+        }
+        let a = 16 * (p[at + 7 * s - 1] + p[at - s + 7])
+        let b = (34 * hh + 32) >> 6
+        let c = (34 * vv + 32) >> 6
+        for y in 0..8 {
+            for x in 0..8 {
+                p[at + y * s + x] = h264Clip((a + b * (x - 3) + c * (y - 3) + 16) >> 5)
+            }
+        }
+    }
+}
+
+// Inverse 4x4 transform of coef[c..c+16] (raster) added to p at `at`
+// (8.5.12.2, rows first), then the coefficients are cleared.
+fn h264Idct4Add(_ p: bind [Int], _ at: Int, _ s: Int, _ k: bind [Int], _ c: Int) {
+    var i = 0
+    while i < 4 {
+        let r = c + i * 4
+        let d0 = k[r]
+        let d1 = k[r + 1]
+        let d2 = k[r + 2]
+        let d3 = k[r + 3]
+        let e0 = d0 + d2
+        let e1 = d0 - d2
+        let e2 = (d1 >> 1) - d3
+        let e3 = d1 + (d3 >> 1)
+        k[r] = e0 + e3
+        k[r + 1] = e1 + e2
+        k[r + 2] = e1 - e2
+        k[r + 3] = e0 - e3
+        i += 1
+    }
+    i = 0
+    while i < 4 {
+        let d0 = k[c + i]
+        let d1 = k[c + 4 + i]
+        let d2 = k[c + 8 + i]
+        let d3 = k[c + 12 + i]
+        let e0 = d0 + d2
+        let e1 = d0 - d2
+        let e2 = (d1 >> 1) - d3
+        let e3 = d1 + (d3 >> 1)
+        let q = at + i
+        p[q] = h264Clip(p[q] + ((e0 + e3 + 32) >> 6))
+        p[q + s] = h264Clip(p[q + s] + ((e1 + e2 + 32) >> 6))
+        p[q + 2 * s] = h264Clip(p[q + 2 * s] + ((e1 - e2 + 32) >> 6))
+        p[q + 3 * s] = h264Clip(p[q + 3 * s] + ((e0 - e3 + 32) >> 6))
+        k[c + i] = 0
+        k[c + 4 + i] = 0
+        k[c + 8 + i] = 0
+        k[c + 12 + i] = 0
+        i += 1
+    }
+}
+
+// A 4x4 block with only its DC coefficient: every sample gets
+// (dc + 32) >> 6 (the same result as the full transform).
+fn h264DcAdd(_ p: bind [Int], _ at: Int, _ s: Int, _ k: bind [Int], _ c: Int) {
+    let d = (k[c] + 32) >> 6
+    k[c] = 0
+    for y in 0..4 {
+        for x in 0..4 {
+            p[at + y * s + x] = h264Clip(p[at + y * s + x] + d)
+        }
+    }
+}
+
+// Inverse 8x8 transform (8.5.13.2) of coef[c..c+64] added to p.
+fn h264Idct8Add(_ p: bind [Int], _ at: Int, _ s: Int, _ k: bind [Int], _ c: Int) {
+    for pass in 0..2 {
+        for i in 0..8 {
+            let base = if pass == 0 { c + i * 8 } else { c + i }
+            let st = if pass == 0 { 1 } else { 8 }
+            let d0 = k[base]
+            let d1 = k[base + st]
+            let d2 = k[base + 2 * st]
+            let d3 = k[base + 3 * st]
+            let d4 = k[base + 4 * st]
+            let d5 = k[base + 5 * st]
+            let d6 = k[base + 6 * st]
+            let d7 = k[base + 7 * st]
+            let a0 = d0 + d4
+            let a4 = d0 - d4
+            let a2 = (d2 >> 1) - d6
+            let a6 = d2 + (d6 >> 1)
+            let b0 = a0 + a6
+            let b2 = a4 + a2
+            let b4 = a4 - a2
+            let b6 = a0 - a6
+            let a1 = -d3 + d5 - d7 - (d7 >> 1)
+            let a3 = d1 + d7 - d3 - (d3 >> 1)
+            let a5 = -d1 + d7 + d5 + (d5 >> 1)
+            let a7 = d3 + d5 + d1 + (d1 >> 1)
+            let b1 = a1 + (a7 >> 2)
+            let b7 = a7 - (a1 >> 2)
+            let b3 = a3 + (a5 >> 2)
+            let b5 = (a3 >> 2) - a5
+            if pass == 0 {
+                k[base] = b0 + b7
+                k[base + 1] = b2 + b5
+                k[base + 2] = b4 + b3
+                k[base + 3] = b6 + b1
+                k[base + 4] = b6 - b1
+                k[base + 5] = b4 - b3
+                k[base + 6] = b2 - b5
+                k[base + 7] = b0 - b7
+            } else {
+                let q = at + i
+                p[q] = h264Clip(p[q] + ((b0 + b7 + 32) >> 6))
+                p[q + s] = h264Clip(p[q + s] + ((b2 + b5 + 32) >> 6))
+                p[q + 2 * s] = h264Clip(p[q + 2 * s] + ((b4 + b3 + 32) >> 6))
+                p[q + 3 * s] = h264Clip(p[q + 3 * s] + ((b6 + b1 + 32) >> 6))
+                p[q + 4 * s] = h264Clip(p[q + 4 * s] + ((b6 - b1 + 32) >> 6))
+                p[q + 5 * s] = h264Clip(p[q + 5 * s] + ((b4 - b3 + 32) >> 6))
+                p[q + 6 * s] = h264Clip(p[q + 6 * s] + ((b2 - b5 + 32) >> 6))
+                p[q + 7 * s] = h264Clip(p[q + 7 * s] + ((b0 - b7 + 32) >> 6))
+            }
+        }
+    }
+    for i in 0..64 {
+        k[c + i] = 0
+    }
+}
+
+// Luma DC of Intra_16x16 (8.5.10): Hadamard transform of dcY, scaled by
+// m (dq4 at position 0: LevelScale << (qp / 6 + 2)), into the DC position
+// of each 4x4 block's coefficients.
+fn h264LumaDc(_ k: bind [Int], _ dc: bind [Int], _ m: Int) {
+    var t: [Int] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    for y in 0..4 {
+        let a = dc[y * 4]
+        let b = dc[y * 4 + 1]
+        let c = dc[y * 4 + 2]
+        let d = dc[y * 4 + 3]
+        t[y * 4] = a + b + c + d
+        t[y * 4 + 1] = a + b - c - d
+        t[y * 4 + 2] = a - b - c + d
+        t[y * 4 + 3] = a - b + c - d
+    }
+    for x in 0..4 {
+        let a = t[x]
+        let b = t[4 + x]
+        let c = t[8 + x]
+        let d = t[12 + x]
+        let f0 = a + b + c + d
+        let f1 = a + b - c - d
+        let f2 = a - b - c + d
+        let f3 = a - b + c - d
+        // Block at (x, y) has luma4x4BlkIdx from the inverse of blkX/blkY.
+        k[16 * h264BlkIdx[x]] = (f0 * m + 128) >> 8
+        k[16 * h264BlkIdx[4 + x]] = (f1 * m + 128) >> 8
+        k[16 * h264BlkIdx[8 + x]] = (f2 * m + 128) >> 8
+        k[16 * h264BlkIdx[12 + x]] = (f3 * m + 128) >> 8
+    }
+    for i in 0..16 {
+        dc[i] = 0
+    }
+}
+
+// luma4x4BlkIdx of the block at raster position x + 4y.
+let h264BlkIdx: [Int] = [0, 1, 4, 5, 2, 3, 6, 7, 8, 9, 12, 13, 10, 11, 14, 15]
+
+// Chroma DC of 4:2:0 (8.5.11): 2x2 transform of dcC[4c..4c+4] scaled by
+// m (dq4 at position 0), into the DC positions of the four chroma blocks.
+fn h264ChromaDc(_ k: bind [Int], _ dc: bind [Int], _ c: Int, _ m: Int) {
+    let a = dc[c * 4]
+    let b = dc[c * 4 + 1]
+    let cc = dc[c * 4 + 2]
+    let d = dc[c * 4 + 3]
+    let base = 256 + 64 * c
+    k[base] = ((a + b + cc + d) * m) >> 7
+    k[base + 16] = ((a - b + cc - d) * m) >> 7
+    k[base + 32] = ((a + b - cc - d) * m) >> 7
+    k[base + 48] = ((a - b - cc + d) * m) >> 7
+    for i in 0..4 {
+        dc[c * 4 + i] = 0
+    }
+}
+
+// Chroma DC prediction when only one half of the left neighbours may be
+// used (MBAFF with constrained_intra_pred: the left pair is half intra).
+// variant 0: upper left half and top usable; 1: lower half and top; 2:
+// upper half only; 3: lower half only. These follow the reference
+// decoder's handling of the case.
+fn h264PredChromaHalfLeft(_ p: bind [Int], _ at: Int, _ s: Int, _ variant: Int) {
+    var t0 = 0
+    var t1 = 0
+    var l0 = 0
+    var l1 = 0
+    if variant < 2 {
+        for i in 0..4 {
+            t0 += p[at - s + i]
+            t1 += p[at - s + 4 + i]
+        }
+    }
+    for i in 0..4 {
+        l0 += p[at + i * s - 1]
+        l1 += p[at + (4 + i) * s - 1]
+    }
+    for b in 0..4 {
+        let xo = (b & 1) * 4
+        let yo = (b >> 1) * 4
+        var dc = 128
+        if variant == 0 {
+            dc = if b == 0 { (t0 + l0 + 4) >> 3 } else if (b & 1) == 0 { (t0 + 2) >> 2 } else { (t1 + 2) >> 2 }
+        } else if variant == 1 {
+            if b == 0 {
+                dc = (t0 + 2) >> 2
+            } else if b == 1 {
+                dc = (t1 + 2) >> 2
+            } else if b == 2 {
+                dc = (l1 + 2) >> 2
+            } else {
+                dc = (t1 + l1 + 4) >> 3
+            }
+        } else if variant == 2 {
+            dc = if b < 2 { (l0 + 2) >> 2 } else { 128 }
+        } else {
+            dc = if b < 2 { 128 } else { (l1 + 2) >> 2 }
+        }
+        for y in 0..4 {
+            for x in 0..4 {
+                p[at + (yo + y) * s + xo + x] = dc
+            }
+        }
+    }
+}

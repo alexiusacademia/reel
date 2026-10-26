@@ -1,0 +1,1980 @@
+// MP4 and QuickTime files: .mp4 .m4a .m4v .mov .3gp, plain and fragmented.
+//
+// The format (ISO/IEC 14496-12, "ISO base media file format", and Apple's
+// QuickTime File Format) is a tree of boxes: each starts with a 32-bit size
+// and a four-letter type. The header box `moov` describes every track
+// (`trak`); its sample tables (`stbl`) say where each sample (a video
+// frame, a block of audio) is in the file, how big it is and when it plays.
+// The samples themselves sit in `mdat` boxes, often interleaved. A
+// fragmented file (ISO 14496-12 §8.8) keeps an empty or partial `moov` and
+// puts the tables for each piece in `moof` boxes, before that piece's data.
+//
+// mp4Open reads the boxes, turns the tables into one PacketRef per sample,
+// and lists all packets in file order. Times follow ffmpeg's reading of
+// edit lists (§8.6.6): the first edit's media time is taken off every pts
+// and dts, so the first sample shown is at 0 and audio priming samples
+// (encoder delay) get negative times.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../core"
+
+// One track while it's being read: what the boxes said, and its tables.
+struct Mp4Trak {
+    id: Int = 0
+    handler: String = ""
+    fourcc: String = ""
+    codec: String = ""
+    kind: core.TrackKind = .other
+    timescale: Int = 0
+    mdhdDuration: Int = 0
+    language: String = ""
+    title: String = ""
+    enabled: Bool = false
+    width: Int = 0
+    height: Int = 0
+    rotation: Int = 0
+    sarNum: Int = 1
+    sarDen: Int = 1
+    // From 'colr' (§12.1.5): the YCbCr matrix and video/full range.
+    matrix: core.ColorMatrix = .unknown
+    fullRange: Bool = false
+    extra: Data = Data()
+    sampleRate: Int = 0
+    channels: Int = 0
+    bits: Int = 0
+    pcm: core.PcmFormat = core.PcmFormat()
+    bitrate: Int = 0
+    // An esds objectTypeIndication (ISO 14496-1 §7.2.6.6), 0 when none.
+    objectType: Int = 0
+    // QuickTime sound description version 1 (QTFF "Sound sample
+    // description, version 1"): frames per packet and bytes per packet.
+    qtSamplesPerPacket: Int = 0
+    qtBytesPerFrame: Int = 0
+    descriptions: Int = 0
+    // Sample tables (§8.7): stsz/stz2, stco/co64, stsc, stts, ctts, stss.
+    sampleSize: Int = 0
+    sampleCount: Int = 0
+    sizes: [Int] = []
+    chunks: [Int] = []
+    stsc: [Int] = []
+    stts: [Int] = []
+    ctts: [Int] = []
+    hasStss: Bool = false
+    stss: [Int] = []
+    // Edit list (§8.6.6), in the movie's timescale (durations) and the
+    // track's (media time).
+    hasEdit: Bool = false
+    editDuration: Int = 0
+    // A media edit of duration 0 (fragmented files, whose length isn't
+    // known when the moov is written): the presentation runs to the end.
+    editOpenEnded: Bool = false
+    emptyDuration: Int = 0
+    mediaTime: Int = 0
+    chapterIds: [Int] = []
+    // Defaults from mvex/trex (§8.8.3) for fragments.
+    trexDuration: Int = 0
+    trexSize: Int = 0
+    trexFlags: Int = 0
+    // Samples found in fragments (moof/traf/trun).
+    fOffsets: [Int] = []
+    fSizes: [Int] = []
+    fDts: [Int] = []
+    fDurations: [Int] = []
+    fCts: [Int] = []
+    fKeys: [Bool] = []
+    fNextDts: Int = 0
+}
+
+// The whole file while it's being read.
+struct Mp4State {
+    traks: [Mp4Trak] = []
+    movieTimescale: Int = 1000
+    movieDuration: Int = 0
+    tags: [String: String] = [:]
+    cover: Data = Data()
+    chapters: [core.Chapter] = []
+    warnings: [String] = []
+    format: String = "mp4"
+}
+
+// A track's samples as parallel lists.
+struct Mp4Samples {
+    offsets: [Int] = []
+    sizes: [Int] = []
+    dts: [Int] = []
+    cts: [Int] = []
+    durations: [Int] = []
+    keys: [Bool] = []
+}
+
+public fn mp4Open(_ file: Data) -> Result<core.Media> {
+    var st = Mp4State()
+    var moofs: [Int] = []
+    var sawMoov = false
+    var p = 0
+    let n = file.count
+    while p + 8 <= n {
+        let (type, body, end) = mp4Box(file, p, n)
+        if end < 0 {
+            break
+        }
+        match type {
+            "ftyp" -> mp4ParseFtyp(file, body, end, st)
+            "moov" -> {
+                mp4ParseMoov(file, body, end, st)
+                sawMoov = true
+            }
+            "moof" -> {
+                moofs.append(p)
+                moofs.append(end)
+            }
+            _ -> {}
+        }
+        if end <= p {
+            break
+        }
+        p = end
+    }
+    if !sawMoov {
+        return Result.failure(error: Error("this MP4 file has no movie header (moov box)"))
+    }
+    var i = 0
+    while i + 1 < moofs.count {
+        mp4ParseMoof(file, moofs[i], moofs[i + 1], st)
+        i += 2
+    }
+    Result.ok(value: mp4Finish(file, st))
+}
+
+// ---------------------------------------------------------------------------
+// Boxes (ISO 14496-12 §4.2): size, type, then the body. Size 1 means a
+// 64-bit size follows; size 0 means "to the end of the enclosing box".
+
+// The box at p: (type, start of body, end), or end -1 when there's none.
+fn mp4Box(_ d: Data, _ p: Int, _ e: Int) -> (String, Int, Int) {
+    if p + 8 > e {
+        return ("", -1, -1)
+    }
+    var size = d.uint32(at: p, bigEndian: true)
+    let type = mp4Fourcc(d, p + 4)
+    var body = p + 8
+    if size == 1 {
+        if p + 16 > e {
+            return ("", -1, -1)
+        }
+        size = mp4U64(d, p + 8)
+        body = p + 16
+    } else if size == 0 {
+        size = e - p
+    }
+    if size < body - p {
+        return ("", -1, -1)
+    }
+    // A box running past its parent (a cut-off file) is read up to the end.
+    let end = if size > e - p { e } else { p + size }
+    (type, body, end)
+}
+
+// Four bytes as text; bytes that aren't printable keep their Latin-1 form.
+fn mp4Fourcc(_ d: Data, _ p: Int) -> String {
+    if p + 4 > d.count {
+        return ""
+    }
+    if d[p] == 0 || d[p + 1] == 0 || d[p + 2] == 0 || d[p + 3] == 0 {
+        // latin1 stops at a zero byte; spell such codes out by hand.
+        var s = ""
+        for k in 0..4 {
+            let b = d[p + k]
+            s += if b == 0 { "\\0" } else { d.slice(from: p + k, to: p + k + 1).latin1 }
+        }
+        return s
+    }
+    d.slice(from: p, to: p + 4).latin1
+}
+
+fn mp4U8(_ d: Data, _ p: Int) -> Int {
+    if p < 0 || p >= d.count { 0 } else { d[p] }
+}
+
+fn mp4U16(_ d: Data, _ p: Int) -> Int {
+    if p < 0 || p + 2 > d.count { 0 } else { d.uint16(at: p, bigEndian: true) }
+}
+
+fn mp4U24(_ d: Data, _ p: Int) -> Int {
+    (mp4U8(d, p) << 16) | (mp4U8(d, p + 1) << 8) | mp4U8(d, p + 2)
+}
+
+fn mp4U32(_ d: Data, _ p: Int) -> Int {
+    if p < 0 || p + 4 > d.count { 0 } else { d.uint32(at: p, bigEndian: true) }
+}
+
+fn mp4I32(_ d: Data, _ p: Int) -> Int {
+    let v = mp4U32(d, p)
+    if v >= 2147483648 { v - 4294967296 } else { v }
+}
+
+fn mp4I16(_ d: Data, _ p: Int) -> Int {
+    let v = mp4U16(d, p)
+    if v >= 32768 { v - 65536 } else { v }
+}
+
+// A 64-bit number (values of 2^63 and over stop at 2^63 - 1).
+fn mp4U64(_ d: Data, _ p: Int) -> Int {
+    let hi = mp4U32(d, p)
+    let lo = mp4U32(d, p + 4)
+    if hi >= 0x80000000 {
+        return 9223372036854775807
+    }
+    (hi << 32) | lo
+}
+
+fn mp4I64(_ d: Data, _ p: Int) -> Int {
+    let hi = mp4U32(d, p)
+    let lo = mp4U32(d, p + 4)
+    if hi >= 0x80000000 {
+        // Negative: -(2^64 - value), done without overflowing.
+        let nhi = 0xffffffff - hi
+        let nlo = 0xffffffff - lo
+        return -((nhi << 32) | nlo) - 1
+    }
+    (hi << 32) | lo
+}
+
+// ---------------------------------------------------------------------------
+// ftyp (§4.3): the brands say which flavour of the format this is.
+
+fn mp4ParseFtyp(_ d: Data, _ s: Int, _ e: Int, _ st: bind Mp4State) {
+    if s + 8 > e {
+        return
+    }
+    let major = d.slice(from: s, to: s + 4).latin1
+    st.tags["major_brand"] = major
+    st.tags["minor_version"] = "{mp4U32(d, s + 4)}"
+    var brands = ""
+    var p = s + 8
+    while p + 4 <= e {
+        brands += d.slice(from: p, to: p + 4).latin1
+        p += 4
+    }
+    st.tags["compatible_brands"] = brands
+    if major == "qt  " {
+        st.format = "mov"
+    }
+}
+
+// ---------------------------------------------------------------------------
+// moov (§8.2.1): mvhd, trak…, mvex, udta.
+
+fn mp4ParseMoov(_ d: Data, _ s: Int, _ e: Int, _ st: bind Mp4State) {
+    var p = s
+    while p + 8 <= e {
+        let (type, body, end) = mp4Box(d, p, e)
+        if end < 0 {
+            break
+        }
+        match type {
+            "mvhd" -> {
+                // §8.2.2: version 1 has 64-bit times.
+                if mp4U8(d, body) == 1 {
+                    st.movieTimescale = mp4U32(d, body + 20)
+                    st.movieDuration = mp4Clamp(mp4U64(d, body + 24))
+                } else {
+                    st.movieTimescale = mp4U32(d, body + 12)
+                    st.movieDuration = mp4U32(d, body + 16)
+                }
+                if st.movieTimescale <= 0 {
+                    st.movieTimescale = 1000
+                }
+            }
+            "trak" -> {
+                var t = Mp4Trak()
+                mp4ParseTrak(d, body, end, t, st)
+                st.traks.append(t)
+            }
+            "mvex" -> mp4ParseMvex(d, body, end, st)
+            "udta" -> mp4ParseUdta(d, body, end, st)
+            "meta" -> mp4ParseMeta(d, body, end, st)
+            "cmov" -> mp4ParseCmov(d, body, end, st)
+            _ -> {}
+        }
+        p = end
+    }
+}
+
+// QuickTime compressed movie header: cmov { dcom "zlib", cmvd { size, data } }.
+fn mp4ParseCmov(_ d: Data, _ s: Int, _ e: Int, _ st: bind Mp4State) {
+    var method = ""
+    var p = s
+    while p + 8 <= e {
+        let (type, body, end) = mp4Box(d, p, e)
+        if end < 0 {
+            break
+        }
+        if type == "dcom" {
+            method = d.slice(from: body, to: body + 4).latin1
+        } else if type == "cmvd" && method == "zlib" {
+            if let moov = d.slice(from: body + 4, to: end).decompressed("zlib") {
+                // The result is a whole moov box.
+                let (t2, b2, e2) = mp4Box(moov, 0, moov.count)
+                if t2 == "moov" {
+                    mp4ParseMoov(moov, b2, e2, st)
+                }
+            } else {
+                st.warnings.append("the compressed movie header couldn't be unpacked")
+            }
+        }
+        p = end
+    }
+}
+
+fn mp4ParseMvex(_ d: Data, _ s: Int, _ e: Int, _ st: bind Mp4State) {
+    var p = s
+    while p + 8 <= e {
+        let (type, body, end) = mp4Box(d, p, e)
+        if end < 0 {
+            break
+        }
+        if type == "trex" {
+            // §8.8.3: track_ID, default sample description, duration, size, flags.
+            let id = mp4U32(d, body + 4)
+            for t in st.traks {
+                if t.id == id {
+                    t.trexDuration = mp4U32(d, body + 12)
+                    t.trexSize = mp4U32(d, body + 16)
+                    t.trexFlags = mp4U32(d, body + 20)
+                }
+            }
+        }
+        p = end
+    }
+}
+
+fn mp4ParseTrak(_ d: Data, _ s: Int, _ e: Int, _ t: bind Mp4Trak, _ st: bind Mp4State) {
+    var p = s
+    while p + 8 <= e {
+        let (type, body, end) = mp4Box(d, p, e)
+        if end < 0 {
+            break
+        }
+        match type {
+            "tkhd" -> mp4ParseTkhd(d, body, end, t)
+            "edts" -> {
+                var q = body
+                while q + 8 <= end {
+                    let (t2, b2, e2) = mp4Box(d, q, end)
+                    if e2 < 0 {
+                        break
+                    }
+                    if t2 == "elst" {
+                        mp4ParseElst(d, b2, e2, t)
+                    }
+                    q = e2
+                }
+            }
+            "tref" -> {
+                var q = body
+                while q + 8 <= end {
+                    let (t2, b2, e2) = mp4Box(d, q, end)
+                    if e2 < 0 {
+                        break
+                    }
+                    if t2 == "chap" {
+                        var r = b2
+                        while r + 4 <= e2 {
+                            t.chapterIds.append(mp4U32(d, r))
+                            r += 4
+                        }
+                    }
+                    q = e2
+                }
+            }
+            "mdia" -> mp4ParseMdia(d, body, end, t, st)
+            "udta" -> {
+                var q = body
+                while q + 8 <= end {
+                    let (t2, b2, e2) = mp4Box(d, q, end)
+                    if e2 < 0 {
+                        break
+                    }
+                    if t2 == "name" {
+                        t.title = rawUtf8(d.slice(from: b2, to: e2))
+                    }
+                    q = e2
+                }
+            }
+            _ -> {}
+        }
+        p = end
+    }
+}
+
+// tkhd (§8.3.2): track id, enabled flag, the display matrix (rotation).
+fn mp4ParseTkhd(_ d: Data, _ s: Int, _ e: Int, _ t: bind Mp4Trak) {
+    let version = mp4U8(d, s)
+    t.enabled = (mp4U24(d, s + 1) & 1) == 1
+    let m = if version == 1 { s + 52 } else { s + 40 }
+    t.id = if version == 1 { mp4U32(d, s + 20) } else { mp4U32(d, s + 12) }
+    if m + 36 > e {
+        return
+    }
+    // The matrix is { a b u, c d v, x y w } in 16.16 fixed point; a pure
+    // rotation by θ clockwise has a = cos θ, b = sin θ.
+    let a = mp4I32(d, m)
+    let b = mp4I32(d, m + 4)
+    if a == 0 && b > 0 {
+        t.rotation = 90
+    } else if a == 0 && b < 0 {
+        t.rotation = 270
+    } else if a < 0 && b == 0 {
+        t.rotation = 180
+    }
+}
+
+// elst (§8.6.6): segments of the presentation. An empty edit (media time
+// -1) delays the start; the first real edit says where in the media the
+// presentation starts.
+fn mp4ParseElst(_ d: Data, _ s: Int, _ e: Int, _ t: bind Mp4Trak) {
+    let version = mp4U8(d, s)
+    let count = mp4U32(d, s + 4)
+    var p = s + 8
+    var foundMedia = false
+    for _ in 0..count {
+        if p + (if version == 1 { 20 } else { 12 }) > e {
+            break
+        }
+        let dur = mp4Clamp(if version == 1 { mp4U64(d, p) } else { mp4U32(d, p) })
+        let time = mp4Clamp(if version == 1 { mp4I64(d, p + 8) } else { mp4I32(d, p + 4) })
+        p += if version == 1 { 20 } else { 12 }
+        t.hasEdit = true
+        t.editDuration += dur
+        if time == -1 {
+            if !foundMedia {
+                t.emptyDuration += dur
+            }
+        } else {
+            if dur == 0 {
+                t.editOpenEnded = true
+            }
+            if !foundMedia {
+                t.mediaTime = time
+                foundMedia = true
+            }
+        }
+    }
+}
+
+fn mp4ParseMdia(_ d: Data, _ s: Int, _ e: Int, _ t: bind Mp4Trak, _ st: bind Mp4State) {
+    var p = s
+    while p + 8 <= e {
+        let (type, body, end) = mp4Box(d, p, e)
+        if end < 0 {
+            break
+        }
+        match type {
+            "mdhd" -> {
+                // §8.4.2: timescale, duration, language (ISO 639-2/T packed
+                // as three 5-bit letters, or a Macintosh language code).
+                let version = mp4U8(d, body)
+                var lang = 0
+                if version == 1 {
+                    t.timescale = mp4U32(d, body + 20)
+                    t.mdhdDuration = mp4Clamp(mp4U64(d, body + 24))
+                    lang = mp4U16(d, body + 32)
+                } else {
+                    t.timescale = mp4U32(d, body + 12)
+                    t.mdhdDuration = mp4U32(d, body + 16)
+                    lang = mp4U16(d, body + 20)
+                }
+                t.language = mp4Language(lang)
+            }
+            "hdlr" -> { t.handler = d.slice(from: body + 8, to: body + 12).latin1 }
+            "elng" -> {
+                // Extended language (§8.4.6): a BCP 47 tag; use it when it's
+                // a plain three-letter code.
+                let tag = rawUtf8(d.slice(from: body + 4, to: end))
+                if tag.count == 3 {
+                    t.language = tag.lowercase()
+                }
+            }
+            "minf" -> {
+                var q = body
+                while q + 8 <= end {
+                    let (t2, b2, e2) = mp4Box(d, q, end)
+                    if e2 < 0 {
+                        break
+                    }
+                    if t2 == "stbl" {
+                        mp4ParseStbl(d, b2, e2, t, st)
+                    }
+                    q = e2
+                }
+            }
+            _ -> {}
+        }
+        p = end
+    }
+}
+
+// Macintosh language codes used by old QuickTime files (QTFF "Language
+// code values"), for the first few.
+let mp4MacLanguages = ["eng", "fra", "deu", "ita", "nld", "swe", "spa", "dan", "por", "nor", "heb", "jpn", "ara", "fin", "ell", "isl", "mlt", "tur", "hrv", "zho", "urd", "hin", "tha", "kor", "lit", "pol", "hun", "est", "lav", "sme", "fao", "fas", "rus", "zho", "nld", "gle", "sqi", "ron", "ces", "slk", "slv", "yid", "srp", "mkd", "bul", "ukr", "bel", "uzb", "kaz", "aze", "aze", "hye", "kat", "mol", "kir", "tgk", "tuk", "mon", "mon", "pus", "kur", "kas", "snd", "bod", "nep", "san", "mar", "ben", "asm", "guj", "pan", "ori", "mal", "kan", "tam", "tel", "sin", "mya", "khm", "lao", "vie", "ind", "tgl", "msa", "msa", "amh", "tir", "orm", "som", "swa", "kin", "run", "nya", "mlg", "epo"]
+
+fn mp4Language(_ code: Int) -> String {
+    if code == 0x7fff {
+        return ""
+    }
+    if code < 0x400 {
+        if code < mp4MacLanguages.count {
+            return mp4MacLanguages[code]
+        }
+        return ""
+    }
+    var s = Data()
+    s.append(byte: ((code >> 10) & 31) + 0x60)
+    s.append(byte: ((code >> 5) & 31) + 0x60)
+    s.append(byte: (code & 31) + 0x60)
+    let text = s.latin1
+    if text == "und" { "" } else { text }
+}
+
+// ---------------------------------------------------------------------------
+// stbl (§8.5, §8.6, §8.7): the sample description and the sample tables.
+
+fn mp4ParseStbl(_ d: Data, _ s: Int, _ e: Int, _ t: bind Mp4Trak, _ st: bind Mp4State) {
+    var p = s
+    while p + 8 <= e {
+        let (type, body, end) = mp4Box(d, p, e)
+        if end < 0 {
+            break
+        }
+        match type {
+            "stsd" -> mp4ParseStsd(d, body, end, t, st)
+            "stsz" -> {
+                // §8.7.3.2: a size for all samples, or a size each.
+                t.sampleSize = mp4U32(d, body + 4)
+                let count = mp4U32(d, body + 8)
+                t.sampleCount = count
+                if t.sampleSize == 0 {
+                    let avail = (end - body - 12) / 4
+                    let k = min(count, avail)
+                    var sizes: [Int] = []
+                    var q = body + 12
+                    for _ in 0..k {
+                        sizes.append(d.uint32(at: q, bigEndian: true))
+                        q += 4
+                    }
+                    t.sizes = sizes
+                    t.sampleCount = k
+                }
+            }
+            "stz2" -> {
+                // §8.7.3.3: compact sizes of 4, 8 or 16 bits.
+                let field = mp4U8(d, body + 7)
+                let count = mp4U32(d, body + 8)
+                var sizes: [Int] = []
+                var q = body + 12
+                for i in 0..count {
+                    if field == 4 {
+                        if q >= end {
+                            break
+                        }
+                        let b = d[q]
+                        if i % 2 == 0 {
+                            sizes.append(b >> 4)
+                        } else {
+                            sizes.append(b & 15)
+                            q += 1
+                        }
+                    } else if field == 8 {
+                        if q >= end {
+                            break
+                        }
+                        sizes.append(d[q])
+                        q += 1
+                    } else {
+                        if q + 2 > end {
+                            break
+                        }
+                        sizes.append(d.uint16(at: q, bigEndian: true))
+                        q += 2
+                    }
+                }
+                t.sampleSize = 0
+                t.sizes = sizes
+                t.sampleCount = sizes.count
+            }
+            "stco" -> {
+                // §8.7.5: 32-bit chunk offsets.
+                let count = min(mp4U32(d, body + 4), (end - body - 8) / 4)
+                var chunks: [Int] = []
+                var q = body + 8
+                for _ in 0..count {
+                    chunks.append(d.uint32(at: q, bigEndian: true))
+                    q += 4
+                }
+                t.chunks = chunks
+            }
+            "co64" -> {
+                let count = min(mp4U32(d, body + 4), (end - body - 8) / 8)
+                var chunks: [Int] = []
+                var q = body + 8
+                for _ in 0..count {
+                    chunks.append(mp4Clamp(mp4U64(d, q)))
+                    q += 8
+                }
+                t.chunks = chunks
+            }
+            "stsc" -> {
+                // §8.7.4: runs of (first chunk, samples per chunk, description).
+                let count = min(mp4U32(d, body + 4), (end - body - 8) / 12)
+                var runs: [Int] = []
+                var q = body + 8
+                for _ in 0..count {
+                    runs.append(d.uint32(at: q, bigEndian: true))
+                    runs.append(d.uint32(at: q + 4, bigEndian: true))
+                    runs.append(d.uint32(at: q + 8, bigEndian: true))
+                    q += 12
+                }
+                t.stsc = runs
+            }
+            "stts" -> {
+                // §8.6.1.2: runs of (sample count, sample duration).
+                let count = min(mp4U32(d, body + 4), (end - body - 8) / 8)
+                var runs: [Int] = []
+                var q = body + 8
+                for _ in 0..count {
+                    runs.append(d.uint32(at: q, bigEndian: true))
+                    runs.append(d.uint32(at: q + 4, bigEndian: true))
+                    q += 8
+                }
+                t.stts = runs
+            }
+            "ctts" -> {
+                // §8.6.1.3: runs of (sample count, composition offset). The
+                // offset is signed in version 1; ffmpeg reads version 0 as
+                // signed too, as writers put negative offsets there.
+                let count = min(mp4U32(d, body + 4), (end - body - 8) / 8)
+                var runs: [Int] = []
+                var q = body + 8
+                for _ in 0..count {
+                    runs.append(d.uint32(at: q, bigEndian: true))
+                    runs.append(mp4I32(d, q + 4))
+                    q += 8
+                }
+                t.ctts = runs
+            }
+            "stss" -> {
+                // §8.6.2: the sync samples (keyframes), numbered from 1.
+                let count = min(mp4U32(d, body + 4), (end - body - 8) / 4)
+                var keys: [Int] = []
+                var q = body + 8
+                for _ in 0..count {
+                    keys.append(d.uint32(at: q, bigEndian: true))
+                    q += 4
+                }
+                t.stss = keys
+                t.hasStss = true
+            }
+            _ -> {}
+        }
+        p = end
+    }
+}
+
+// stsd (§8.5.2): the sample descriptions. Reel reads the first one (a track
+// that switches descriptions mid-way gets a warning).
+fn mp4ParseStsd(_ d: Data, _ s: Int, _ e: Int, _ t: bind Mp4Trak, _ st: bind Mp4State) {
+    let count = mp4U32(d, s + 4)
+    t.descriptions = count
+    let (type, body, end) = mp4Box(d, s + 8, e)
+    if end < 0 {
+        return
+    }
+    t.fourcc = type
+    // Every sample entry starts with 6 reserved bytes and a data reference
+    // index (§8.5.2.2).
+    let entry = body + 8
+    if t.handler == "vide" {
+        mp4ParseVisualEntry(d, entry, end, t)
+    } else if t.handler == "soun" {
+        mp4ParseAudioEntry(d, entry, end, t)
+    } else {
+        mp4ParseOtherEntry(d, body, entry, end, t)
+    }
+}
+
+// VisualSampleEntry (§12.1.3): 70 bytes of fields, then boxes.
+fn mp4ParseVisualEntry(_ d: Data, _ s: Int, _ e: Int, _ t: bind Mp4Trak) {
+    t.kind = .video
+    t.width = mp4U16(d, s + 16)
+    t.height = mp4U16(d, s + 18)
+    t.codec = match t.fourcc {
+        "avc1", "avc2", "avc3", "avc4" -> "h264"
+        "hvc1", "hev1" -> "hevc"
+        "mp4v" -> "mpeg4"
+        "jpeg", "mjpa", "AVDJ", "dmb1" -> "mjpeg"
+        "mjpb" -> "mjpeg"
+        "vp08" -> "vp8"
+        "vp09" -> "vp9"
+        "av01" -> "av1"
+        "apch", "apcn", "apcs", "apco", "ap4h", "ap4x" -> "prores"
+        "AVdn", "AVdh" -> "dnxhd"
+        "WVC1" -> "vc1"
+        "mp2v", "m2v1", "xdv2", "xdv3", "xdv5", "xdva", "xdvb", "xdvc", "xdvd", "xdve", "xdvf", "xd54", "xd55", "xd59", "xd5a", "xd5b", "xd5c", "xd5d", "xd5e", "xd5f", "hdv1", "hdv2", "hdv3", "hdv5", "hdv6", "hdv7", "hdv8", "hdv9" -> "mpeg2"
+        "mp1v" -> "mpeg1"
+        "raw " -> "rawvideo"
+        _ -> "unknown:{t.fourcc}"
+    }
+    var p = s + 70
+    while p + 8 <= e {
+        let (type, body, end) = mp4Box(d, p, e)
+        if end < 0 {
+            break
+        }
+        match type {
+            "avcC", "hvcC", "vpcC", "av1C" -> { t.extra = d.slice(from: body, to: end) }
+            "esds" -> mp4ParseEsds(d, body, end, t)
+            "colr" -> {
+                // §12.1.5 'nclx' (ISO) or QuickTime 'nclc': primaries,
+                // transfer, matrix coefficients (ISO 23091-2 §8.3), then for
+                // nclx a full-range flag.
+                let ctype = d.slice(from: body, to: body + 4).latin1
+                if (ctype == "nclx" || ctype == "nclc") && body + 10 <= end {
+                    let mc = mp4U16(d, body + 8)
+                    t.matrix = if mc == 1 { .bt709 } else if mc == 5 || mc == 6 { .bt601 } else if mc == 9 || mc == 10 { .bt2020 } else { .unknown }
+                    if ctype == "nclx" && body + 11 <= end {
+                        t.fullRange = (mp4U8(d, body + 10) & 0x80) != 0
+                    }
+                }
+            }
+            "pasp" -> {
+                // §12.1.4: pixel aspect ratio.
+                let h = mp4U32(d, body)
+                let v = mp4U32(d, body + 4)
+                if h > 0 && v > 0 {
+                    let g = mp4Gcd(h, v)
+                    t.sarNum = h / g
+                    t.sarDen = v / g
+                }
+            }
+            "btrt" -> { t.bitrate = mp4U32(d, body + 8) }
+            _ -> {}
+        }
+        p = end
+    }
+    if t.fourcc == "mp4v" && t.objectType > 0 {
+        t.codec = mp4VideoObjectType(t.objectType)
+    }
+}
+
+fn mp4VideoObjectType(_ oti: Int) -> String {
+    if oti == 0x20 {
+        return "mpeg4"
+    }
+    if oti == 0x21 {
+        return "h264"
+    }
+    if oti >= 0x60 && oti <= 0x65 {
+        return "mpeg2"
+    }
+    if oti == 0x6a {
+        return "mpeg1"
+    }
+    if oti == 0x6c {
+        return "mjpeg"
+    }
+    "mpeg4"
+}
+
+// AudioSampleEntry (§12.2.3), with QuickTime's sound description versions
+// 1 and 2 (QTFF "Sound sample descriptions").
+fn mp4ParseAudioEntry(_ d: Data, _ s: Int, _ e: Int, _ t: bind Mp4Trak) {
+    t.kind = .audio
+    let version = mp4U16(d, s)
+    t.channels = mp4U16(d, s + 8)
+    t.bits = mp4U16(d, s + 10)
+    t.sampleRate = mp4U32(d, s + 16) >> 16
+    var boxes = s + 20
+    var lpcmFlags = 0
+    if version == 1 {
+        t.qtSamplesPerPacket = mp4U32(d, s + 20)
+        t.qtBytesPerFrame = mp4U32(d, s + 28)
+        boxes = s + 36
+    } else if version == 2 {
+        // sizeOfStructOnly, audioSampleRate (64-bit float), channels,
+        // always7F000000, constBitsPerChannel, formatSpecificFlags,
+        // constBytesPerAudioPacket, constLPCMFramesPerAudioPacket.
+        if s + 56 <= e {
+            t.sampleRate = Int(d.float64(at: s + 24, bigEndian: true))
+        }
+        t.channels = mp4U32(d, s + 32)
+        t.bits = mp4U32(d, s + 40)
+        lpcmFlags = mp4U32(d, s + 44)
+        t.qtBytesPerFrame = mp4U32(d, s + 48)
+        t.qtSamplesPerPacket = mp4U32(d, s + 52)
+        boxes = s + 56
+    }
+    let f = t.fourcc
+    t.codec = match f {
+        "mp4a" -> "aac"
+        "alac" -> "alac"
+        "fLaC" -> "flac"
+        "Opus" -> "opus"
+        "ac-3" -> "ac3"
+        "ec-3" -> "eac3"
+        "mlpa" -> "truehd"
+        ".mp3", "ms\\0U" -> "mp3"
+        "ulaw" -> "ulaw"
+        "alaw" -> "alaw"
+        "dtsc", "dtsh", "dtsl", "dtse" -> "dts"
+        "lpcm", "twos", "sowt", "in24", "in32", "fl32", "fl64", "raw ", "NONE", "ipcm", "fpcm" -> "pcm"
+        _ -> "unknown:{f}"
+    }
+    // PCM storage (QTFF "Uncompressed audio formats").
+    if t.codec == "pcm" {
+        var bits = if t.bits > 0 { t.bits } else { 16 }
+        var float = false
+        var big = true
+        var signed = true
+        match f {
+            "sowt" -> { big = false }
+            "in24" -> { bits = 24 }
+            "in32" -> { bits = 32 }
+            "fl32" -> {
+                bits = 32
+                float = true
+            }
+            "fl64" -> {
+                bits = 64
+                float = true
+            }
+            "raw " -> {
+                bits = 8
+                signed = false
+            }
+            "lpcm" -> {
+                // formatSpecificFlags: 1 float, 2 big-endian, 4 signed.
+                float = (lpcmFlags & 1) != 0
+                big = (lpcmFlags & 2) != 0
+                signed = (lpcmFlags & 4) != 0 || float
+            }
+            _ -> {}
+        }
+        if bits == 8 && f != "lpcm" && f != "raw " {
+            // 8-bit twos/NONE are signed; QuickTime 'raw ' is unsigned.
+            signed = true
+        }
+        t.pcm = core.PcmFormat(bits: bits, float: float, bigEndian: big, signed: signed)
+        t.bits = bits
+    }
+    mp4ParseAudioBoxes(d, boxes, e, t)
+    if t.codec == "pcm" && t.channels > 0 {
+        t.bits = t.pcm.bits
+    }
+}
+
+fn mp4ParseAudioBoxes(_ d: Data, _ s: Int, _ e: Int, _ t: bind Mp4Trak) {
+    var p = s
+    while p + 8 <= e {
+        let (type, body, end) = mp4Box(d, p, e)
+        if end < 0 {
+            break
+        }
+        match type {
+            "esds" -> mp4ParseEsds(d, body, end, t)
+            "wave" -> mp4ParseAudioBoxes(d, body, end, t)
+            "alac" -> {
+                // ALACSpecificConfig after the FullBox header (24 bytes);
+                // inside a QuickTime 'wave' it's the same box.
+                if end - body >= 28 {
+                    t.extra = d.slice(from: body + 4, to: end)
+                    t.bits = mp4U8(d, body + 4 + 5)
+                    t.channels = mp4U8(d, body + 4 + 9)
+                    let rate = mp4U32(d, body + 4 + 20)
+                    if rate > 0 {
+                        t.sampleRate = rate
+                    }
+                }
+            }
+            "dfLa" -> {
+                // FLAC-in-ISOBMFF: FullBox, then the metadata blocks.
+                var x = Data(text: "fLaC")
+                x += d.slice(from: body + 4, to: end)
+                t.extra = x
+                // STREAMINFO: rate 20 bits, channels 3, bits 5.
+                let si = body + 8
+                if end - si >= 18 {
+                    let rate = (mp4U8(d, si + 10) << 12) | (mp4U8(d, si + 11) << 4) | (mp4U8(d, si + 12) >> 4)
+                    if rate > 0 {
+                        t.sampleRate = rate
+                    }
+                    t.channels = ((mp4U8(d, si + 12) >> 1) & 7) + 1
+                    t.bits = (((mp4U8(d, si + 12) & 1) << 4) | (mp4U8(d, si + 13) >> 4)) + 1
+                }
+            }
+            "dOps" -> { t.extra = mp4OpusHead(d, body, end) }
+            "enda" -> {
+                // QuickTime endianness atom: 1 = little-endian samples.
+                if mp4U16(d, body) == 1 {
+                    t.pcm.bigEndian = false
+                }
+            }
+            "pcmC" -> {
+                // ISO 23003-5 PCM: FullBox, format_flags (1 = little-endian), sample size.
+                t.pcm.bigEndian = (mp4U8(d, body + 4) & 1) == 0
+                let bits = mp4U8(d, body + 5)
+                if bits > 0 {
+                    t.pcm.bits = bits
+                }
+                t.pcm.float = t.fourcc == "fpcm"
+                t.pcm.signed = true
+            }
+            "btrt" -> { t.bitrate = mp4U32(d, body + 8) }
+            _ -> {}
+        }
+        p = end
+    }
+}
+
+// dOps (Opus in ISOBMFF §4.3.2) to the OpusHead packet (RFC 7845 §5.1):
+// the same fields, but little-endian and with the "OpusHead" magic.
+fn mp4OpusHead(_ d: Data, _ s: Int, _ e: Int) -> Data {
+    if e - s < 11 {
+        return Data()
+    }
+    var out = Data(text: "OpusHead")
+    out.append(byte: 1)
+    let channels = mp4U8(d, s + 1)
+    out.append(byte: channels)
+    let preSkip = mp4U16(d, s + 2)
+    out.append(byte: preSkip & 255)
+    out.append(byte: preSkip >> 8)
+    let rate = mp4U32(d, s + 4)
+    for k in 0..4 {
+        out.append(byte: (rate >> (8 * k)) & 255)
+    }
+    let gain = mp4U16(d, s + 8)
+    out.append(byte: gain & 255)
+    out.append(byte: gain >> 8)
+    let family = mp4U8(d, s + 10)
+    out.append(byte: family)
+    if family != 0 {
+        out += d.slice(from: s + 11, to: min(e, s + 13 + channels))
+    }
+    out
+}
+
+// esds (ISO 14496-14 §3.1.2): an ES_Descriptor holding a
+// DecoderConfigDescriptor (object type, bitrate) holding the
+// DecoderSpecificInfo (for AAC, the AudioSpecificConfig). ISO 14496-1 §7.2.6.
+fn mp4ParseEsds(_ d: Data, _ s: Int, _ e: Int, _ t: bind Mp4Trak) {
+    var p = s + 4
+    var (tag, body, end) = mp4Descriptor(d, p, e)
+    if tag == 3 {
+        // ES_ID, flags: streamDependence (+2), URL (+length+1), OCR (+2).
+        let flags = mp4U8(d, body + 2)
+        p = body + 3
+        if (flags & 0x80) != 0 {
+            p += 2
+        }
+        if (flags & 0x40) != 0 {
+            p += 1 + mp4U8(d, p)
+        }
+        if (flags & 0x20) != 0 {
+            p += 2
+        }
+        let (t2, b2, e2) = mp4Descriptor(d, p, end)
+        tag = t2
+        body = b2
+        end = e2
+    }
+    if tag != 4 {
+        return
+    }
+    t.objectType = mp4U8(d, body)
+    let avg = mp4U32(d, body + 9)
+    if avg > 0 {
+        t.bitrate = avg
+    }
+    var q = body + 13
+    while q + 2 <= end {
+        let (t3, b3, e3) = mp4Descriptor(d, q, end)
+        if t3 < 0 {
+            break
+        }
+        if t3 == 5 {
+            t.extra = d.slice(from: b3, to: e3)
+        }
+        q = e3
+    }
+    if t.kind == .audio {
+        let oti = t.objectType
+        if oti == 0x40 || (oti >= 0x66 && oti <= 0x68) {
+            t.codec = "aac"
+            // The AudioSpecificConfig's channel configuration, when it has one.
+            if t.extra.count >= 2 {
+                var objType = t.extra[0] >> 3
+                var bitPos = 5
+                if objType == 31 {
+                    bitPos = 11
+                }
+                let freqIdx = mp4Bits(t.extra, bitPos, 4)
+                bitPos += if freqIdx == 15 { 28 } else { 4 }
+                let chans = mp4Bits(t.extra, bitPos, 4)
+                if chans >= 1 && chans <= 6 {
+                    t.channels = chans
+                } else if chans == 7 {
+                    t.channels = 8
+                }
+            }
+        } else if oti == 0x69 || oti == 0x6b {
+            t.codec = "mp3"
+            t.extra = Data()
+        } else if oti == 0xa5 {
+            t.codec = "ac3"
+        } else if oti == 0xa6 {
+            t.codec = "eac3"
+        } else if oti == 0xdd {
+            t.codec = "vorbis"
+        } else if oti == 0xad {
+            t.codec = "opus"
+        } else if oti == 0xa9 {
+            t.codec = "dts"
+        }
+    }
+}
+
+// n bits at bit position `at` of d (MSB first).
+fn mp4Bits(_ d: Data, _ at: Int, _ n: Int) -> Int {
+    var v = 0
+    for k in 0..n {
+        let bit = at + k
+        let byte = bit / 8
+        let b = if byte < d.count { (d[byte] >> (7 - bit % 8)) & 1 } else { 0 }
+        v = (v << 1) | b
+    }
+    v
+}
+
+// A descriptor (ISO 14496-1 §8.3.3): tag, then a size in 7-bit pieces.
+fn mp4Descriptor(_ d: Data, _ p: Int, _ e: Int) -> (Int, Int, Int) {
+    if p + 2 > e {
+        return (-1, e, e)
+    }
+    let tag = d[p]
+    var size = 0
+    var q = p + 1
+    for _ in 0..4 {
+        if q >= e {
+            break
+        }
+        let b = d[q]
+        q += 1
+        size = (size << 7) | (b & 0x7f)
+        if (b & 0x80) == 0 {
+            break
+        }
+    }
+    let end = min(e, q + size)
+    (tag, q, end)
+}
+
+// Subtitle, text, timecode and other sample entries.
+fn mp4ParseOtherEntry(_ d: Data, _ box: Int, _ s: Int, _ e: Int, _ t: bind Mp4Trak) {
+    let f = t.fourcc
+    if f == "tx3g" || f == "text" {
+        // 3GPP timed text / QuickTime text: samples are a 16-bit length,
+        // the text, then style boxes (3GPP TS 26.245 §5.17). The rest of
+        // the entry (display flags, colours, font table) is the setup.
+        t.kind = .subtitle
+        t.codec = "tx3g"
+        t.extra = d.slice(from: s, to: e)
+    } else if f == "wvtt" {
+        // WebVTT in ISOBMFF (ISO 14496-30): the vttC box holds the header.
+        t.kind = .subtitle
+        t.codec = "webvtt"
+        var p = s
+        while p + 8 <= e {
+            let (type, body, end) = mp4Box(d, p, e)
+            if end < 0 {
+                break
+            }
+            if type == "vttC" {
+                t.extra = d.slice(from: body, to: end)
+            }
+            p = end
+        }
+    } else if f == "stpp" {
+        t.kind = .subtitle
+        t.codec = "unknown:stpp"
+    } else {
+        t.codec = "unknown:{f}"
+        t.kind = .other
+    }
+    if t.handler == "sbtl" || t.handler == "subt" || t.handler == "text" || t.handler == "clcp" {
+        if t.kind == .other && f == "c608" {
+            t.kind = .subtitle
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tags: iTunes metadata (moov/udta/meta/ilst) and QuickTime udta strings.
+
+fn mp4ParseUdta(_ d: Data, _ s: Int, _ e: Int, _ st: bind Mp4State) {
+    var p = s
+    while p + 8 <= e {
+        let (type, body, end) = mp4Box(d, p, e)
+        if end < 0 {
+            break
+        }
+        if type == "meta" {
+            mp4ParseMeta(d, body, end, st)
+        } else if type == "chpl" {
+            mp4ParseChpl(d, body, end, st)
+        } else if type.hasPrefix("©") {
+            // QuickTime user data text (QTFF "User data text strings"):
+            // 16-bit length, 16-bit language, the text.
+            let key = mp4TagKey(type)
+            if !key.isEmpty && st.tags[key] == nil && body + 4 <= end {
+                let len = mp4U16(d, body)
+                let text = rawUtf8(d.slice(from: body + 4, to: min(end, body + 4 + len)))
+                if !text.isEmpty {
+                    st.tags[key] = text
+                }
+            }
+        }
+        p = end
+    }
+}
+
+// meta (§8.11.1) holding ilst (iTunes "Metadata item list"). In ISO files
+// meta is a FullBox; in some QuickTime files it isn't.
+fn mp4ParseMeta(_ d: Data, _ s: Int, _ e: Int, _ st: bind Mp4State) {
+    var p = s
+    if mp4U32(d, s) == 0 {
+        p = s + 4
+    }
+    while p + 8 <= e {
+        let (type, body, end) = mp4Box(d, p, e)
+        if end < 0 {
+            break
+        }
+        if type == "ilst" {
+            mp4ParseIlst(d, body, end, st)
+        }
+        p = end
+    }
+}
+
+fn mp4TagKey(_ type: String) -> String {
+    match type {
+        "©nam" -> "title"
+        "©ART" -> "artist"
+        "aART" -> "albumartist"
+        "©alb" -> "album"
+        "©day" -> "date"
+        "©gen" -> "genre"
+        "gnre" -> "genre"
+        "trkn" -> "track"
+        "disk" -> "disc"
+        "©cmt" -> "comment"
+        "©wrt" -> "composer"
+        "©too" -> "encoder"
+        "©swr" -> "encoder"
+        "©enc" -> "encoder"
+        "cprt" -> "copyright"
+        "©cpy" -> "copyright"
+        "desc" -> "description"
+        "ldes" -> "synopsis"
+        "©lyr" -> "lyrics"
+        "©grp" -> "grouping"
+        "tvsh" -> "show"
+        "©des" -> "description"
+        "©inf" -> "comment"
+        "©aut" -> "artist"
+        "©dir" -> "director"
+        "©prd" -> "producer"
+        "©xyz" -> "location"
+        _ -> ""
+    }
+}
+
+fn mp4ParseIlst(_ d: Data, _ s: Int, _ e: Int, _ st: bind Mp4State) {
+    var p = s
+    while p + 8 <= e {
+        let (type, body, end) = mp4Box(d, p, e)
+        if end < 0 {
+            break
+        }
+        // Each item holds 'data' boxes: type indicator (1 UTF-8, 2 UTF-16,
+        // 13 JPEG, 14 PNG, 21 signed integer, 0 binary), locale, value.
+        // Freeform '----' items name themselves with 'mean' and 'name'.
+        var freeName = ""
+        var q = body
+        while q + 8 <= end {
+            let (t2, b2, e2) = mp4Box(d, q, end)
+            if e2 < 0 {
+                break
+            }
+            if t2 == "name" {
+                freeName = rawUtf8(d.slice(from: b2 + 4, to: e2)).lowercase()
+            } else if t2 == "data" {
+                let kind = mp4U32(d, b2) & 0xffffff
+                let value = d.slice(from: b2 + 8, to: e2)
+                if type == "covr" {
+                    if st.cover.isEmpty {
+                        st.cover = value
+                    }
+                } else if type == "trkn" || type == "disk" {
+                    let n = mp4U16(value, 2)
+                    let total = mp4U16(value, 4)
+                    if n > 0 {
+                        st.tags[mp4TagKey(type)] = if total > 0 { "{n}/{total}" } else { "{n}" }
+                    }
+                } else if type == "gnre" {
+                    let g = mp4U16(value, 0)
+                    if g >= 1 && g <= rawGenres.count {
+                        st.tags["genre"] = rawGenres[g - 1]
+                    }
+                } else if type == "----" {
+                    if !freeName.isEmpty {
+                        st.tags[freeName] = rawUtf8(value)
+                    }
+                } else {
+                    let key = mp4TagKey(type)
+                    if !key.isEmpty {
+                        var text = ""
+                        if kind == 1 || kind == 0 {
+                            text = rawUtf8(value)
+                        } else if kind == 2 {
+                            text = rawUtf16(value, bigEndian: true)
+                        } else if kind == 21 || kind == 22 {
+                            var v = 0
+                            for k in 0..min(value.count, 8) {
+                                v = (v << 8) | value[k]
+                            }
+                            text = "{v}"
+                        }
+                        if !text.isEmpty {
+                            st.tags[key] = text
+                        }
+                    }
+                }
+            }
+            q = e2
+        }
+        p = end
+    }
+}
+
+// Nero chapters (udta/chpl): version, flags, (version 1: 4 more bytes),
+// count, then per chapter a start in 100 ns units and a Pascal string.
+fn mp4ParseChpl(_ d: Data, _ s: Int, _ e: Int, _ st: bind Mp4State) {
+    let version = mp4U8(d, s)
+    var p = s + 4
+    if version == 1 {
+        p += 4
+    }
+    let count = mp4U8(d, p)
+    p += 1
+    var chapters: [core.Chapter] = []
+    for _ in 0..count {
+        if p + 9 > e {
+            break
+        }
+        let start = mp4U64(d, p)
+        let len = mp4U8(d, p + 8)
+        let title = rawUtf8(d.slice(from: p + 9, to: min(e, p + 9 + len)))
+        p += 9 + len
+        chapters.append(core.Chapter(start: Float(start) / 10000000.0, title: title))
+    }
+    st.chapters = chapters
+}
+
+// ---------------------------------------------------------------------------
+// Fragments (§8.8): moof { mfhd, traf { tfhd, tfdt, trun… }… }.
+
+fn mp4ParseMoof(_ d: Data, _ s: Int, _ e: Int, _ st: bind Mp4State) {
+    // The end of the previous track fragment's data: the default base for
+    // a traf that names none (§8.8.7.1).
+    var lastEnd = s
+    var first = true
+    var p = s + 8
+    while p + 8 <= e {
+        let (type, body, end) = mp4Box(d, p, e)
+        if end < 0 {
+            break
+        }
+        if type == "traf" {
+            lastEnd = mp4ParseTraf(d, body, end, s, if first { s } else { lastEnd }, st)
+            first = false
+        }
+        p = end
+    }
+}
+
+// Reads one traf; gives the end of its last sample's bytes.
+fn mp4ParseTraf(_ d: Data, _ s: Int, _ e: Int, _ moof: Int, _ defaultBase: Int, _ st: bind Mp4State) -> Int {
+    var ti = -1
+    var base = defaultBase
+    var defDur = 0
+    var defSize = 0
+    var defFlags = 0
+    var dataEnd = defaultBase
+    var p = s
+    while p + 8 <= e {
+        let (type, body, end) = mp4Box(d, p, e)
+        if end < 0 {
+            break
+        }
+        if type == "tfhd" {
+            // §8.8.7: flags 0x1 base data offset, 0x2 description index,
+            // 0x8 duration, 0x10 size, 0x20 flags, 0x20000 base is moof.
+            let flags = mp4U24(d, body + 1)
+            let id = mp4U32(d, body + 4)
+            for (i, t) in st.traks.enumerated() {
+                if t.id == id {
+                    ti = i
+                }
+            }
+            if ti < 0 {
+                return dataEnd
+            }
+            defDur = st.traks[ti].trexDuration
+            defSize = st.traks[ti].trexSize
+            defFlags = st.traks[ti].trexFlags
+            var q = body + 8
+            if (flags & 0x1) != 0 {
+                base = mp4Clamp(mp4U64(d, q))
+                q += 8
+            } else if (flags & 0x20000) != 0 {
+                base = moof
+            }
+            if (flags & 0x2) != 0 {
+                q += 4
+            }
+            if (flags & 0x8) != 0 {
+                defDur = mp4U32(d, q)
+                q += 4
+            }
+            if (flags & 0x10) != 0 {
+                defSize = mp4U32(d, q)
+                q += 4
+            }
+            if (flags & 0x20) != 0 {
+                defFlags = mp4U32(d, q)
+                q += 4
+            }
+            dataEnd = base
+        } else if type == "tfdt" && ti >= 0 {
+            // §8.8.12: the decode time of the fragment's first sample.
+            st.traks[ti].fNextDts = mp4Clamp(if mp4U8(d, body) == 1 { mp4U64(d, body + 4) } else { mp4U32(d, body + 4) })
+        } else if type == "trun" && ti >= 0 {
+            dataEnd = mp4ParseTrun(d, body, end, base, dataEnd, defDur, defSize, defFlags, st.traks[ti])
+        }
+        p = end
+    }
+    dataEnd
+}
+
+// trun (§8.8.8): flags 0x1 data offset, 0x4 first sample flags, then per
+// sample 0x100 duration, 0x200 size, 0x400 flags, 0x800 composition offset.
+// Sample flags (§8.8.3.1): 0x10000 is "not a sync sample", 0x1000000
+// "depends on others".
+fn mp4ParseTrun(_ d: Data, _ s: Int, _ e: Int, _ base: Int, _ next: Int, _ defDur: Int, _ defSize: Int, _ defFlags: Int, _ t: bind Mp4Trak) -> Int {
+    let version = mp4U8(d, s)
+    let flags = mp4U24(d, s + 1)
+    let count = mp4U32(d, s + 4)
+    var p = s + 8
+    var offset = next
+    if (flags & 0x1) != 0 {
+        offset = base + mp4I32(d, p)
+        p += 4
+    }
+    var firstFlags = -1
+    if (flags & 0x4) != 0 {
+        firstFlags = mp4U32(d, p)
+        p += 4
+    }
+    let perSample = (if (flags & 0x100) != 0 { 4 } else { 0 }) + (if (flags & 0x200) != 0 { 4 } else { 0 }) + (if (flags & 0x400) != 0 { 4 } else { 0 }) + (if (flags & 0x800) != 0 { 4 } else { 0 })
+    let audio = t.kind == .audio
+    for i in 0..count {
+        if perSample > 0 && p + perSample > e {
+            break
+        }
+        // A sample can't start past the end of the file; a damaged count
+        // with no per-sample fields would otherwise run on and on.
+        if offset < 0 || offset > d.count || t.fOffsets.count > 50000000 {
+            break
+        }
+        var dur = defDur
+        var size = defSize
+        var sflags = if i == 0 && firstFlags >= 0 { firstFlags } else { defFlags }
+        var cto = 0
+        if (flags & 0x100) != 0 {
+            dur = d.uint32(at: p, bigEndian: true)
+            p += 4
+        }
+        if (flags & 0x200) != 0 {
+            size = d.uint32(at: p, bigEndian: true)
+            p += 4
+        }
+        if (flags & 0x400) != 0 {
+            sflags = d.uint32(at: p, bigEndian: true)
+            p += 4
+        }
+        if (flags & 0x800) != 0 {
+            // Signed in version 1; read as signed in version 0 too, as
+            // ffmpeg does (writers put negative offsets there).
+            cto = mp4I32(d, p)
+            p += 4
+        }
+        let key = audio || (sflags & 0x10000) == 0 && (sflags & 0x3000000) != 0x1000000
+        t.fOffsets.append(offset)
+        t.fSizes.append(size)
+        t.fDts.append(t.fNextDts)
+        t.fDurations.append(dur)
+        t.fCts.append(t.fNextDts + cto)
+        t.fKeys.append(key)
+        t.fNextDts += dur
+        offset += size
+    }
+    offset
+}
+
+// ---------------------------------------------------------------------------
+// Turning the tables into packets.
+
+fn mp4Gcd(_ a: Int, _ b: Int) -> Int {
+    var x = abs(a)
+    var y = abs(b)
+    while y != 0 {
+        let r = x % y
+        x = y
+        y = r
+    }
+    if x == 0 { 1 } else { x }
+}
+
+// a * b / c rounded to the nearest, without overflow for media times.
+fn mp4Rescale(_ a: Int, _ b: Int, _ c: Int) -> Int {
+    if c <= 0 {
+        return 0
+    }
+    // Damaged files can hold any numbers: work in floating point when the
+    // exact way could overflow, and keep the result in range.
+    if abs(a) > 2147483648 || abs(b) > 2147483648 || c > 2147483648 {
+        let f = Float(a) * Float(b) / Float(c)
+        if !f.isFinite || abs(f) > 281474976710656.0 {
+            return if f < 0.0 { -281474976710656 } else { 281474976710656 }
+        }
+        return Int(f + (if f < 0.0 { -0.5 } else { 0.5 }))
+    }
+    let whole = a / c
+    let rest = a % c
+    whole * b + (rest * b + c / 2) / c
+}
+
+// Keeps a number read from a damaged file within ±2^48, where sums of
+// such numbers can't overflow.
+fn mp4Clamp(_ v: Int) -> Int {
+    max(-281474976710656, min(v, 281474976710656))
+}
+
+// The samples of a track's sample tables (§8.7), in decode order.
+fn mp4TableSamples(_ t: Mp4Trak, _ limit: Int) -> Mp4Samples {
+    var o = Mp4Samples()
+    let nChunks = t.chunks.count
+    let runs = t.stsc.count / 3
+    if nChunks == 0 || runs == 0 {
+        return o
+    }
+    // Old QuickTime uncompressed sound (and any audio whose stts gives one
+    // tick per sample): a "sample" is one frame, so whole chunks are read,
+    // cut into packets of up to 1024 frames as ffmpeg does.
+    let chunkMode = t.kind == .audio && t.stts.count == 2 && t.stts[1] == 1 && (t.sampleSize > 0 || t.qtBytesPerFrame > 0)
+    if chunkMode {
+        var bytesPerFrame = t.sampleSize
+        if t.codec == "pcm" && t.channels > 0 {
+            bytesPerFrame = t.channels * t.pcm.bits / 8
+        } else if (t.codec == "alaw" || t.codec == "ulaw") && t.channels > 0 {
+            bytesPerFrame = t.channels
+        }
+        let spp = t.qtSamplesPerPacket
+        let bpp = t.qtBytesPerFrame
+        var dts = 0
+        var run = 0
+        var left = t.sampleCount
+        if left <= 0 {
+            left = t.stts[0]
+        }
+        for c in 0..nChunks {
+            while run + 1 < runs && t.stsc[(run + 1) * 3] - 1 <= c {
+                run += 1
+            }
+            var frames = min(t.stsc[run * 3 + 1], left)
+            var off = t.chunks[c]
+            if bytesPerFrame <= 0 && !(spp > 1 && bpp > 0) {
+                break
+            }
+            while frames > 0 && off >= 0 && off <= limit {
+                var k = min(1024, frames)
+                var size = k * bytesPerFrame
+                if spp > 1 && bpp > 0 && t.codec != "pcm" {
+                    k = min((1024 / spp) * spp, frames)
+                    if k <= 0 {
+                        k = min(spp, frames)
+                    }
+                    size = (k + spp - 1) / spp * bpp
+                }
+                o.offsets.append(off)
+                o.sizes.append(size)
+                o.dts.append(dts)
+                o.cts.append(dts)
+                o.durations.append(k)
+                o.keys.append(true)
+                off += size
+                dts += k
+                frames -= k
+                left -= k
+            }
+            if left <= 0 {
+                break
+            }
+        }
+        return o
+    }
+    let n = t.sampleCount
+    let constSize = t.sampleSize
+    var sample = 0
+    var run = 0
+    var c = 0
+    while c < nChunks && sample < n {
+        while run + 1 < runs && t.stsc[(run + 1) * 3] - 1 <= c {
+            run += 1
+        }
+        let perChunk = t.stsc[run * 3 + 1]
+        var off = t.chunks[c]
+        var k = 0
+        // Samples past the end of the file (a cut-off or damaged file)
+        // aren't listed.
+        while k < perChunk && sample < n {
+            if off < 0 || off > limit {
+                // Samples past the end of the file (a cut-off or damaged
+                // file) aren't listed: skip the rest of this chunk.
+                sample = min(n, sample + (perChunk - k))
+                break
+            }
+            let size = if constSize > 0 { constSize } else { t.sizes[sample] }
+            o.offsets.append(off)
+            o.sizes.append(size)
+            off += size
+            sample += 1
+            k += 1
+        }
+        c += 1
+    }
+    let count = o.offsets.count
+    // Decode times (stts) and durations.
+    var dts = 0
+    var i = 0
+    var r = 0
+    while r + 1 < t.stts.count && i < count {
+        let runCount = t.stts[r]
+        let delta = t.stts[r + 1]
+        var k = 0
+        while k < runCount && i < count {
+            o.dts.append(dts)
+            o.durations.append(delta)
+            dts += delta
+            i += 1
+            k += 1
+        }
+        r += 2
+    }
+    while i < count {
+        // A short stts: carry on with the last duration.
+        let delta = if o.durations.isEmpty { 1 } else { o.durations[o.durations.count - 1] }
+        o.dts.append(dts)
+        o.durations.append(delta)
+        dts += delta
+        i += 1
+    }
+    // Composition times (ctts).
+    i = 0
+    r = 0
+    while r + 1 < t.ctts.count && i < count {
+        let runCount = t.ctts[r]
+        let offset = t.ctts[r + 1]
+        var k = 0
+        while k < runCount && i < count {
+            o.cts.append(o.dts[i] + offset)
+            i += 1
+            k += 1
+        }
+        r += 2
+    }
+    while i < count {
+        o.cts.append(o.dts[i])
+        i += 1
+    }
+    // Keyframes (stss); without one, every sample is a keyframe.
+    if t.hasStss && t.kind != .audio {
+        var next = 0
+        for j in 0..count {
+            while next < t.stss.count && t.stss[next] < j + 1 {
+                next += 1
+            }
+            o.keys.append(next < t.stss.count && t.stss[next] == j + 1)
+        }
+    } else {
+        for _ in 0..count {
+            o.keys.append(true)
+        }
+    }
+    o
+}
+
+// A QuickTime/3GPP text sample as text: 16-bit length, then UTF-8 or
+// UTF-16 (with a byte order mark).
+fn mp4TextSample(_ d: Data, _ off: Int, _ size: Int) -> String {
+    if size < 2 || off + 2 > d.count {
+        return ""
+    }
+    let len = min(mp4U16(d, off), size - 2)
+    let body = d.slice(from: off + 2, to: off + 2 + len)
+    if body.count >= 2 && body[0] == 0xfe && body[1] == 0xff {
+        return rawUtf16(body, bigEndian: true)
+    }
+    rawUtf8(body)
+}
+
+fn mp4Finish(_ file: Data, _ st: Mp4State) -> core.Media {
+    var media = core.Media(format: st.format)
+    media.tags = st.tags
+    media.cover = st.cover
+    media.warnings = st.warnings
+    // Tracks named by a tref/chap are QuickTime chapter lists.
+    var chapterIds: [Int: Bool] = [:]
+    for t in st.traks {
+        for id in t.chapterIds {
+            chapterIds[id] = true
+        }
+    }
+    var perTrack: [Mp4Samples] = []
+    var duration = 0.0
+    var chapterTrack = -1
+    for (index, t0) in st.traks.enumerated() {
+        var t = t0
+        if t.timescale <= 0 {
+            t.timescale = 1000
+            media.warnings.append("track {t.id} has no timescale; using 1000")
+        }
+        let isChapters = chapterIds[t.id] != nil && (t.kind == .subtitle || t.handler == "text")
+        var kind = t.kind
+        if isChapters {
+            kind = .other
+            chapterTrack = index
+        }
+        var s = mp4TableSamples(t, file.count)
+        // Samples from fragments follow the ones in moov.
+        if !t.fOffsets.isEmpty {
+            var base = 0
+            if !s.dts.isEmpty {
+                base = s.dts[s.dts.count - 1] + s.durations[s.durations.count - 1]
+            }
+            let shift = if t.fDts.isEmpty || s.dts.isEmpty { 0 } else { max(0, base - t.fDts[0]) }
+            for j in 0..t.fOffsets.count {
+                s.offsets.append(t.fOffsets[j])
+                s.sizes.append(t.fSizes[j])
+                s.dts.append(t.fDts[j] + shift)
+                s.cts.append(t.fCts[j] + shift)
+                s.durations.append(t.fDurations[j])
+                s.keys.append(t.fKeys[j])
+            }
+        }
+        // Edit list: take the first edit's media time off, and add any
+        // empty edit before it (converted to the track's clock).
+        let shift = t.mediaTime - mp4Rescale(t.emptyDuration, t.timescale, st.movieTimescale)
+        if t.hasEdit && shift != 0 {
+            for j in 0..s.dts.count {
+                s.dts[j] -= shift
+                s.cts[j] -= shift
+            }
+        }
+        // Samples that start after the edit list's end are never shown;
+        // ffmpeg leaves them out (an empty closing subtitle sample, say).
+        if t.hasEdit && t.editDuration > 0 && !t.editOpenEnded {
+            let end = mp4Rescale(t.editDuration - t.emptyDuration, t.timescale, st.movieTimescale) + mp4Rescale(t.emptyDuration, t.timescale, st.movieTimescale)
+            var cut = false
+            for j in 0..s.cts.count {
+                if s.cts[j] >= end {
+                    cut = true
+                }
+            }
+            if cut {
+                var kept = Mp4Samples()
+                for j in 0..s.cts.count {
+                    if s.cts[j] < end {
+                        kept.offsets.append(s.offsets[j])
+                        kept.sizes.append(s.sizes[j])
+                        kept.dts.append(s.dts[j])
+                        kept.cts.append(s.cts[j])
+                        kept.durations.append(s.durations[j])
+                        kept.keys.append(s.keys[j])
+                    }
+                }
+                s = kept
+            }
+        }
+        var mediaTicks = 0
+        for dur in s.durations {
+            mediaTicks += dur
+        }
+        // The track's length: the edit's when there is one plain edit (as
+        // ffmpeg reads it), else the media's.
+        var trackDuration = if t.mdhdDuration > 0 && t.fOffsets.isEmpty { t.mdhdDuration } else { mediaTicks }
+        if t.hasEdit && t.editDuration > 0 && t.emptyDuration == 0 && !t.editOpenEnded {
+            trackDuration = mp4Rescale(t.editDuration, t.timescale, st.movieTimescale)
+        }
+        var tr = core.Track(index: index, kind: kind, codec: t.codec)
+        tr.tag = t.fourcc
+        tr.id = t.id
+        tr.timescale = t.timescale
+        tr.duration = trackDuration
+        tr.language = t.language
+        tr.title = t.title
+        tr.isDefault = t.enabled
+        tr.extra = t.extra
+        tr.width = t.width
+        tr.height = t.height
+        tr.sarNum = t.sarNum
+        tr.sarDen = t.sarDen
+        tr.rotation = t.rotation
+        tr.sampleRate = t.sampleRate
+        tr.channels = t.channels
+        tr.bitsPerSample = t.bits
+        tr.pcm = t.pcm
+        tr.matrix = t.matrix
+        tr.fullRange = t.fullRange
+        if tr.codec != "pcm" && tr.codec != "alac" && tr.codec != "flac" && kind == .audio {
+            // A sample entry's sample size means nothing for coded audio.
+            tr.bitsPerSample = 0
+        }
+        if isChapters {
+            tr.codec = "text"
+            tr.title = "chapters"
+        }
+        if kind == .video && mediaTicks > 0 && !s.offsets.isEmpty {
+            // Average frame rate: frames per second of media time.
+            var num = s.offsets.count * t.timescale
+            var den = mediaTicks
+            let g = mp4Gcd(num, den)
+            num = num / g
+            den = den / g
+            if den > 60000 {
+                num = mp4Rescale(num, 1000, den)
+                den = 1000
+                let g2 = mp4Gcd(num, den)
+                num = num / g2
+                den = den / g2
+            }
+            tr.fpsNum = num
+            tr.fpsDen = den
+        }
+        var bytes = 0
+        for size in s.sizes {
+            bytes += size
+        }
+        let seconds = Float(trackDuration) / Float(t.timescale)
+        tr.bitrate = if seconds > 0.0 { Int(Float(bytes) * 8.0 / seconds) } else { t.bitrate }
+        // The file lasts until its last track ends, counting a track's
+        // delay (an empty edit) before it starts.
+        let ends = seconds + Float(t.emptyDuration) / Float(st.movieTimescale)
+        if ends > duration && kind != .other {
+            duration = ends
+        }
+        // MPEG audio in MP4 (object types 0x69, 0x6B): the layer is in the
+        // first frame's header (ISO 11172-3 §2.4.2.3).
+        if tr.codec == "mp3" && !s.offsets.isEmpty {
+            let off = s.offsets[0]
+            if off + 2 <= file.count && file[off] == 0xff && (file[off + 1] & 0xe0) == 0xe0 {
+                let layer = (file[off + 1] >> 1) & 3
+                tr.codec = if layer == 3 { "mp1" } else if layer == 2 { "mp2" } else { "mp3" }
+            }
+        }
+        if t.fourcc == "mjpb" {
+            media.warnings.append("track {t.id} is Motion JPEG format B, which the MJPEG decoder may not read")
+        }
+        if t.descriptions > 1 {
+            media.warnings.append("track {t.id} has {t.descriptions} sample descriptions; only the first is used")
+        }
+        if tr.codec == "webvtt" {
+            s = mp4WebVttSamples(file, s)
+        }
+        media.tracks.append(tr)
+        perTrack.append(s)
+    }
+    if duration == 0.0 && st.movieDuration > 0 {
+        duration = Float(st.movieDuration) / Float(st.movieTimescale)
+    }
+    media.duration = if duration > 0.0 { duration } else { -1.0 }
+    // Chapters: the QuickTime chapter track first (it has each chapter's
+    // end), else Nero chpl.
+    if chapterTrack < 0 {
+        media.chapters = st.chapters
+    } else {
+        let s = perTrack[chapterTrack]
+        let scale = media.tracks[chapterTrack].timescale
+        for j in 0..s.offsets.count {
+            let title = mp4TextSample(file, s.offsets[j], s.sizes[j])
+            let start = Float(s.cts[j]) / Float(scale)
+            media.chapters.append(core.Chapter(start: start, end: start + Float(s.durations[j]) / Float(scale), title: title))
+        }
+    }
+    for j in 0..media.chapters.count {
+        if media.chapters[j].end < 0.0 {
+            media.chapters[j].end = if j + 1 < media.chapters.count { media.chapters[j + 1].start } else { media.duration }
+        }
+    }
+    // The chapter track's samples are read above; like ffmpeg, Reel lists
+    // no packets for it.
+    if chapterTrack >= 0 {
+        perTrack[chapterTrack] = Mp4Samples()
+    }
+    // Packets whose bytes aren't all in the file (a cut-off download, a
+    // damaged table) are left out.
+    var outside = 0
+    for k in 0..perTrack.count {
+        let s = perTrack[k]
+        var bad = false
+        for j in 0..s.offsets.count {
+            if s.offsets[j] < 0 || s.sizes[j] < 0 || s.offsets[j] + s.sizes[j] > file.count {
+                bad = true
+            }
+        }
+        if bad {
+            var kept = Mp4Samples()
+            for j in 0..s.offsets.count {
+                if s.offsets[j] < 0 || s.sizes[j] < 0 || s.offsets[j] + s.sizes[j] > file.count {
+                    outside += 1
+                } else {
+                    kept.offsets.append(s.offsets[j])
+                    kept.sizes.append(s.sizes[j])
+                    kept.dts.append(s.dts[j])
+                    kept.cts.append(s.cts[j])
+                    kept.durations.append(s.durations[j])
+                    kept.keys.append(s.keys[j])
+                }
+            }
+            perTrack[k] = kept
+        }
+    }
+    if outside > 0 {
+        media.warnings.append("{outside} packets lie past the end of the file or are damaged and were left out (is the file cut short?)")
+    }
+    media.packets = mp4Interleave(perTrack)
+    media
+}
+
+// WebVTT samples are boxes (ISO 14496-30 §5.6): vttc holds a cue whose
+// text is in payl; vtte is an empty gap. Each packet is pointed at the
+// first cue's text, and gaps are left out.
+fn mp4WebVttSamples(_ file: Data, _ s: Mp4Samples) -> Mp4Samples {
+    var o = Mp4Samples()
+    for j in 0..s.offsets.count {
+        let start = s.offsets[j]
+        let end = min(file.count, start + s.sizes[j])
+        var p = start
+        var found = false
+        while p + 8 <= end && !found {
+            let (type, body, e2) = mp4Box(file, p, end)
+            if e2 < 0 {
+                break
+            }
+            if type == "vttc" {
+                var q = body
+                while q + 8 <= e2 {
+                    let (t2, b2, e3) = mp4Box(file, q, e2)
+                    if e3 < 0 {
+                        break
+                    }
+                    if t2 == "payl" {
+                        o.offsets.append(b2)
+                        o.sizes.append(e3 - b2)
+                        o.dts.append(s.dts[j])
+                        o.cts.append(s.cts[j])
+                        o.durations.append(s.durations[j])
+                        o.keys.append(true)
+                        found = true
+                        break
+                    }
+                    q = e3
+                }
+            }
+            p = e2
+        }
+    }
+    o
+}
+
+// All tracks' packets in file order: a merge of the tracks' lists (each
+// already in file order in a well-made file; a track that isn't is sorted).
+fn mp4Interleave(_ tracks: [Mp4Samples]) -> [core.PacketRef] {
+    var orders: [[Int]] = []
+    var total = 0
+    for s in tracks {
+        let n = s.offsets.count
+        total += n
+        var sorted = true
+        for j in 1..max(1, n) {
+            if s.offsets[j] < s.offsets[j - 1] {
+                sorted = false
+                break
+            }
+        }
+        if sorted {
+            orders.append([])
+        } else {
+            var idx: [Int] = []
+            for j in 0..n {
+                idx.append(j)
+            }
+            let offs = s.offsets
+            orders.append(idx.sorted(by: { a, b in offs[a] < offs[b] }))
+        }
+    }
+    var out: [core.PacketRef] = []
+    var next: [Int] = []
+    for _ in tracks {
+        next.append(0)
+    }
+    let nt = tracks.count
+    for _ in 0..total {
+        var best = -1
+        var bestOff = 0
+        for k in 0..nt {
+            let j = next[k]
+            if j < tracks[k].offsets.count {
+                let idx = if orders[k].isEmpty { j } else { orders[k][j] }
+                let off = tracks[k].offsets[idx]
+                if best < 0 || off < bestOff {
+                    best = k
+                    bestOff = off
+                }
+            }
+        }
+        if best < 0 {
+            break
+        }
+        let j = next[best]
+        let idx = if orders[best].isEmpty { j } else { orders[best][j] }
+        let s = tracks[best]
+        out.append(core.PacketRef(track: best, pts: s.cts[idx], dts: s.dts[idx], duration: s.durations[idx], key: s.keys[idx], offset: s.offsets[idx], size: s.sizes[idx]))
+        next[best] = j + 1
+    }
+    out
+}

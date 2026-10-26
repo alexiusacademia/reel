@@ -1,0 +1,395 @@
+// Tests the MPEG-4 Part 2 decoder (module mpeg4) against ffmpeg's answers:
+// every picture's md5 (framemd5, made with -flags +bitexact) and the PSNR
+// of the first pictures (.v.yuv), for the shared fixture mpeg4.avi and the
+// extra clips in tests/mpeg4/fixtures (quarter-pel with B-frames,
+// interlaced with alternate scan, data partitioning with resync markers,
+// MPEG quantisation with custom matrices and four vectors in MP4, and short
+// pieces of real Xvid, DivX 5 and MoMuSys streams). Also a DivX packed
+// bitstream made from mpeg4.avi, a not-coded VOP, a damaged packet, a seek,
+// skipping B-VOPs, and, when they have been downloaded into
+// build/conformance/mpeg4 (see build/scratch/mpeg4/tools/make.sh), the
+// whole clips from samples.ffmpeg.org: Xvid with GMC (three warping points)
+// and quarter-pel, DivX 5 with B-frames, and a data-partitioned stream.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../../mpeg4"
+import "../../core"
+import "../../testkit"
+
+struct Run {
+    pictures: Int = 0
+    md5s: [String] = []
+    first: [core.Picture] = []
+    pts: [Int] = []
+    keys: Int = 0
+    warnings: [String] = []
+    ms: Float = 0.0
+    width: Int = 0
+    height: Int = 0
+    sarNum: Int = 1
+    sarDen: Int = 1
+}
+
+// Decodes a list of packets (already cut out) with one decoder.
+fn runPackets(_ track: core.Track, _ packets: [Data], _ pts: [Int], _ dts: [Int], keep: Int) -> Run {
+    var r = Run()
+    var d: mpeg4.Decoder = mpeg4.newDecoder(track).valueOr(mpeg4.Decoder())
+    // Only the decoder's time counts (not the md5s).
+    var spent = 0.0
+    for i in 0..packets.count {
+        let t0 = now()
+        let got = d.decode(packets[i], pts: pts[i], dts: dts[i], key: false)
+        spent += now() - t0
+        for p in got {
+            take(r, p, keep: keep)
+        }
+    }
+    let t1 = now()
+    let rest = d.flush()
+    spent += now() - t1
+    for p in rest {
+        take(r, p, keep: keep)
+    }
+    r.ms = spent * 1000.0
+    r.warnings = d.warnings
+    r
+}
+
+fn take(_ r: bind Run, _ p: core.Picture, keep: Int) {
+    r.pictures += 1
+    r.md5s.append(testkit.pictureMd5(p))
+    r.pts.append(p.pts)
+    if p.key {
+        r.keys += 1
+    }
+    r.width = p.width
+    r.height = p.height
+    r.sarNum = p.sarNum
+    r.sarDen = p.sarDen
+    if r.first.count < keep {
+        r.first.append(p)
+    }
+}
+
+struct Clip {
+    track: core.Track = core.Track(index: 0, kind: .video, codec: "")
+    packets: [Data] = []
+    pts: [Int] = []
+    dts: [Int] = []
+    ok: Bool = false
+}
+
+fn loadClip(_ name: String, limit: Int = 1000000) -> Clip {
+    var c = Clip()
+    let file = testkit.fixture(name)
+    if file.isEmpty {
+        return c
+    }
+    let ref = testkit.loadRef(name)
+    let m = testkit.mediaFromRef(file, ref)
+    var vi = -1
+    for t in m.tracks {
+        if t.kind == .video && vi < 0 {
+            vi = t.index
+        }
+    }
+    if vi < 0 {
+        return c
+    }
+    c.track = m.tracks[vi]
+    for p in m.packets {
+        if p.track == vi && c.packets.count < limit {
+            c.packets.append(core.packetBytes(file, m, p))
+            c.pts.append(p.pts)
+            c.dts.append(p.dts)
+        }
+    }
+    c.ok = true
+    c
+}
+
+fn matches(_ got: [String], _ want: [String]) -> Int {
+    var n = 0
+    for i in 0..min(got.count, want.count) {
+        if got[i] == want[i] {
+            n += 1
+        }
+    }
+    n
+}
+
+fn minPsnr(_ got: [core.Picture], _ want: [core.Picture]) -> Float {
+    var worst = 99.0
+    for i in 0..min(got.count, want.count) {
+        worst = min(worst, testkit.psnr(got[i], want[i]))
+    }
+    if got.isEmpty || want.isEmpty {
+        return 0.0
+    }
+    worst
+}
+
+// The VOP coding type of a packet (0 I, 1 P, 2 B, 3 S), or -1.
+fn vopType(_ d: Data) -> Int {
+    var i = 0
+    while i + 4 < d.count {
+        if d[i] == 0 && d[i + 1] == 0 && d[i + 2] == 1 && d[i + 3] == 0xB6 {
+            return d[i + 4] >> 6
+        }
+        i += 1
+    }
+    -1
+}
+
+fn main() {
+    var passed = 0
+    var total = 0
+    fn check(_ ok: Bool, _ what: String) {
+        total += 1
+        if ok { passed += 1 } else { print("FAIL: {what}") }
+    }
+
+    // --- mpeg4.avi: Xvid-tagged ASP with two B-frames, ffmpeg's encoder ---
+    let main = loadClip("mpeg4.avi")
+    check(main.ok && main.packets.count == 50, "mpeg4.avi packets: {main.packets.count}")
+    let opened = mpeg4.newDecoder(main.track)
+    check(opened.isOk(), "newDecoder")
+    check(mpeg4.newDecoder(core.Track(index: 0, kind: .video, codec: "h264")).error() != nil, "newDecoder refuses h264")
+    if let d0 = opened.value() {
+        check(d0.width == 320 && d0.height == 240, "VOL from extra: {d0.width}x{d0.height}")
+    }
+    let want = testkit.frameMd5s("mpeg4.avi")
+    let r = runPackets(main.track, main.packets, main.pts, main.dts, keep: 10)
+    check(r.pictures == want.count, "mpeg4.avi pictures {r.pictures} of {want.count}")
+    let same = matches(r.md5s, want)
+    check(same == want.count, "mpeg4.avi bit-exact pictures: {same} of {want.count}")
+    var yuv = testkit.referenceYuv("mpeg4.avi", width: 320, height: 240)
+    // The fixture's first two pictures are the same: ffmpeg repeated the
+    // first one (its time stamp is 1, the dump starts at 0).
+    if yuv.count > 1 && testkit.psnr(yuv[0], yuv[1]) == 99.0 {
+        yuv.remove(at: 0)
+    }
+    let ps = minPsnr(r.first, yuv)
+    check(ps >= 45.0, "mpeg4.avi PSNR {ps}")
+    print("mpeg4.avi: {same} of {want.count} pictures bit-exact, PSNR of first 10 >= {ps.formatted(decimals: 2)} dB")
+    var ordered = true
+    for i in 1..r.pts.count {
+        if r.pts[i] != r.pts[i - 1] + 1 {
+            ordered = false
+        }
+    }
+    check(ordered && r.pts.count > 0 && r.pts[0] == 0, "pts in display order 0, 1, 2…")
+    check(r.keys == 5, "key pictures: {r.keys}")
+    check(r.sarNum == 1 && r.sarDen == 1 && r.width == 320, "sar and size")
+    check(r.warnings.isEmpty, "no warnings: {r.warnings.joined(separator: "; ")}")
+    print("time mpeg4.avi 320x240: {(r.ms / Float(max(r.pictures, 1))).formatted(decimals: 2)} ms")
+
+    // --- The extra clips: ffmpeg's encoder with quarter-pel, interlacing,
+    // data partitioning, MPEG quantisation; and pieces of real Xvid
+    // (quarter-pel, B-VOPs, its IDCT), DivX 5 and MoMuSys (data
+    // partitioning) streams ---
+    for name in ["qpel_b.avi", "ilace_b.avi", "dp_rm.avi", "mq_4mv.mp4", "xvid_qpel.avi", "divx5.avi", "datapart.m4v"] {
+        let path = "../mpeg4/fixtures/" + name
+        let c = loadClip(path)
+        check(c.ok, "{name} loads")
+        let w = testkit.frameMd5s(path)
+        let rr = runPackets(c.track, c.packets, c.pts, c.dts, keep: 2)
+        let s = matches(rr.md5s, w)
+        check(rr.pictures == w.count && w.count > 0, "{name} pictures {rr.pictures} of {w.count}")
+        check(s == w.count, "{name} bit-exact {s} of {w.count}")
+        check(rr.warnings.isEmpty, "{name} warnings: {rr.warnings.joined(separator: "; ")}")
+        var note = ""
+        let ref = testkit.referenceYuv(path, width: rr.width, height: rr.height)
+        if !ref.isEmpty {
+            let p = minPsnr(rr.first, ref)
+            check(p >= 45.0, "{name} PSNR {p}")
+            note = ", PSNR >= {p.formatted(decimals: 2)} dB"
+        }
+        print("{name}: {s} of {w.count} bit-exact{note}, {(rr.ms / Float(max(rr.pictures, 1))).formatted(decimals: 2)} ms per picture")
+    }
+
+    // --- DivX packed bitstream made from mpeg4.avi: each reference with the
+    // B-VOP after it in one chunk, then a not-coded placeholder ---
+    var pk: [Data] = []
+    var pkTimes: [Int] = []
+    var i = 0
+    while i < main.packets.count {
+        let t = vopType(main.packets[i])
+        if t != 2 && i + 1 < main.packets.count && vopType(main.packets[i + 1]) == 2 {
+            pk.append(main.packets[i] + main.packets[i + 1])
+            pkTimes.append(pkTimes.count)
+            i += 2
+            while i < main.packets.count && vopType(main.packets[i]) == 2 {
+                pk.append(main.packets[i])
+                pkTimes.append(pkTimes.count)
+                i += 1
+            }
+            // N-VOP: P, modulo 0, marker, increment (5 bits), marker,
+            // vop_coded 0, stuffing.
+            pk.append(Data(bytes: [0, 0, 1, 0xB6, 0x50, 0x4F]))
+            pkTimes.append(pkTimes.count)
+        } else {
+            pk.append(main.packets[i])
+            pkTimes.append(pkTimes.count)
+            i += 1
+        }
+    }
+    var noTimes: [Int] = []
+    for _ in 0..pk.count {
+        noTimes.append(core.noTime)
+    }
+    let rp = runPackets(main.track, pk, noTimes, pkTimes, keep: 0)
+    let sp = matches(rp.md5s, want)
+    check(rp.pictures == want.count && sp == want.count, "packed bitstream: {rp.pictures} pictures, {sp} bit-exact")
+    var packedOrder = true
+    for k in 1..rp.pts.count {
+        if rp.pts[k] <= rp.pts[k - 1] {
+            packedOrder = false
+        }
+    }
+    check(packedOrder, "packed bitstream times increase")
+
+    // --- A VOP that isn't coded repeats the reference ---
+    var dn: mpeg4.Decoder = mpeg4.newDecoder(main.track).valueOr(mpeg4.Decoder())
+    var nv: [core.Picture] = []
+    for p in dn.decode(main.packets[0], pts: 0, dts: 0, key: true) {
+        nv.append(p)
+    }
+    for p in dn.decode(Data(bytes: [0, 0, 1, 0xB6, 0x50, 0x4F]), pts: 1, dts: 1, key: false) {
+        nv.append(p)
+    }
+    for p in dn.flush() {
+        nv.append(p)
+    }
+    check(nv.count == 2 && testkit.pictureMd5(nv[0]) == want[0] && testkit.pictureMd5(nv[1]) == want[0] && nv[1].pts == 1, "not-coded VOP repeats the picture")
+
+    // --- A damaged packet: decoding goes on, with a warning ---
+    var dmg = main.packets
+    var bad = dmg[4].bytes
+    for k in 200..260 {
+        bad[k] = (bad[k] * 7 + 13) & 255
+    }
+    dmg[4] = Data(bytes: bad)
+    let rd = runPackets(main.track, dmg, main.pts, main.dts, keep: 0)
+    check(rd.pictures == want.count && !rd.warnings.isEmpty, "damaged packet: {rd.pictures} pictures, {rd.warnings.count} warnings")
+    let sd = matches(rd.md5s, want)
+    check(sd >= 10, "pictures before the damage and after the next I-VOP still exact: {sd}")
+
+    // --- Fuzzing: damaged and cut packets in every kind of clip never
+    // stop the program ---
+    var seed = 12345
+    var fuzzed = 0
+    for name in ["mpeg4.avi", "../mpeg4/fixtures/qpel_b.avi", "../mpeg4/fixtures/ilace_b.avi", "../mpeg4/fixtures/dp_rm.avi", "../mpeg4/fixtures/mq_4mv.mp4", "../mpeg4/fixtures/xvid_qpel.avi", "../mpeg4/fixtures/datapart.m4v"] {
+        let c = loadClip(name)
+        for round in 0..3 {
+            var pk2: [Data] = []
+            for k in 0..c.packets.count {
+                var b = c.packets[k].bytes
+                // Change a few bytes (not the start codes' first bytes).
+                for _ in 0..(1 + round * 3) {
+                    seed = (seed * 1103515245 + 12345) & 0x7fffffff
+                    let at = 8 + seed % max(b.count - 8, 1)
+                    if at < b.count {
+                        b[at] = (seed >> 8) & 255
+                    }
+                }
+                if round == 2 && k % 3 == 0 {
+                    b = b.slice(from: 0, to: b.count / 2)
+                }
+                pk2.append(Data(bytes: b))
+            }
+            let rf = runPackets(c.track, pk2, c.pts, c.dts, keep: 0)
+            fuzzed += rf.pictures
+        }
+    }
+    check(fuzzed > 300, "fuzzed clips decode: {fuzzed} pictures")
+
+    // --- Seek: reset, then from the second keyframe ---
+    var ds: mpeg4.Decoder = mpeg4.newDecoder(main.track).valueOr(mpeg4.Decoder())
+    for k in 0..5 {
+        ds.decode(main.packets[k], pts: main.pts[k], dts: main.dts[k], key: false)
+    }
+    ds.reset()
+    var after: [String] = []
+    var afterPts: [Int] = []
+    for k in 10..main.packets.count {
+        for p in ds.decode(main.packets[k], pts: main.pts[k], dts: main.dts[k], key: k == 10) {
+            after.append(testkit.pictureMd5(p))
+            afterPts.append(p.pts)
+        }
+    }
+    for p in ds.flush() {
+        after.append(testkit.pictureMd5(p))
+        afterPts.append(p.pts)
+    }
+    var inOrder = after.count > 0
+    var at = 0
+    for m in after {
+        var found = false
+        while at < want.count {
+            if want[at] == m {
+                found = true
+                at += 1
+                break
+            }
+            at += 1
+        }
+        if !found {
+            inOrder = false
+        }
+    }
+    check(inOrder && after.count >= 38, "after a seek: {after.count} pictures, all exact and in order")
+    var seekOrder = true
+    for k in 1..afterPts.count {
+        if afterPts[k] <= afterPts[k - 1] {
+            seekOrder = false
+        }
+    }
+    check(seekOrder, "after a seek the times increase")
+
+    // --- skipNonReference drops B-VOPs ---
+    var dk: mpeg4.Decoder = mpeg4.newDecoder(main.track).valueOr(mpeg4.Decoder())
+    dk.skipNonReference = true
+    var refsOnly = 0
+    var refsWanted = 0
+    for k in 0..main.packets.count {
+        if vopType(main.packets[k]) != 2 {
+            refsWanted += 1
+        }
+        refsOnly += dk.decode(main.packets[k], pts: main.pts[k], dts: main.dts[k], key: false).count
+    }
+    refsOnly += dk.flush().count
+    check(refsOnly == refsWanted, "skipNonReference: {refsOnly} pictures, {refsWanted} wanted")
+
+    // --- The whole conformance clips, when downloaded (the first 330
+    // packets, which hold gmcqpel.avi's first S-VOPs; the last picture
+    // then differs from ffmpeg's, which comes from later packets) ---
+    let conf = "../../build/conformance/mpeg4/"
+    for name in ["gmcqpel.avi", "divx5_b.avi", "datapart_qcif.m4v"] {
+        let path = conf + name
+        let c = loadClip(path, limit: 330)
+        if !c.ok {
+            print("note: {path} not found, skipped")
+            continue
+        }
+        let w = testkit.frameMd5s(path)
+        let rr = runPackets(c.track, c.packets, c.pts, c.dts, keep: 0)
+        let s = matches(rr.md5s, w)
+        print("{name}: {s} of the first {rr.pictures - 1} pictures bit-exact, {(rr.ms / Float(max(rr.pictures, 1))).formatted(decimals: 2)} ms per picture, {rr.warnings.count} warnings")
+        check(s >= rr.pictures - 1 && rr.pictures > 100, "{name}: {s} of {rr.pictures - 1} bit-exact")
+    }
+
+    // --- Speed at 640×480 ---
+    let big = loadClip("../../build/scratch/mpeg4/fx/speed640.avi")
+    if big.ok {
+        let rb = runPackets(big.track, big.packets, big.pts, big.dts, keep: 10)
+        let wb = testkit.frameMd5s("../../build/scratch/mpeg4/fx/speed640.avi")
+        let sb = matches(rb.md5s, wb)
+        print("speed640.avi: {sb} of {wb.count} bit-exact")
+        print("time 640x480 per picture: {(rb.ms / Float(max(rb.pictures, 1))).formatted(decimals: 2)} ms")
+    }
+
+    print("mpeg4: {passed} of {total} passed")
+}

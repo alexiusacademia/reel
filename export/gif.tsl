@@ -1,0 +1,913 @@
+// Animated GIF: an encoder and a small decoder, written from the GIF89a
+// specification (CompuServe, 1990: blocks §17–26, LZW in Appendix F).
+//
+// Encoding a frame (RGBA pixels as render.toRgba gives them, packed
+// r<<24|g<<16|b<<8|a):
+//   1. Palette: when the frame has no more distinct colours than allowed,
+//      exactly those (so flat graphics come back unchanged); else a
+//      median-cut quantiser of our own: colours counted in a 32×32×32
+//      histogram, boxes split at the population median along their widest
+//      channel, the box with the most pixels × widest range split next,
+//      each palette entry the mean of its box's pixels.
+//   2. Mapping: nearest palette entry (squared RGB distance), cached per
+//      6-bit-per-channel colour; optionally Floyd–Steinberg error diffusion
+//      (7/16 right, 3/16 below-left, 5/16 below, 1/16 below-right).
+//   3. Only the rectangle that changed since the previous frame is stored
+//      (disposal "do not dispose"), each frame with its own palette unless
+//      a global one is asked for.
+//   4. LZW with variable code sizes up to 12 bits, a clear code when the
+//      table fills, data in sub-blocks of 255 bytes.
+// Looping uses the NETSCAPE2.0 application extension; delays are in
+// hundredths of a second, rounded so their sum follows the real times.
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+public struct GifOptions {
+    // Palette size, 2 to 256.
+    colors: Int = 256
+    // Floyd–Steinberg dithering.
+    dither: Bool = false
+    // 0: loop forever; n > 0: play n + 1 times; -1: play once.
+    loop: Int = 0
+    // One palette for every frame (made from the first frame unless
+    // `palette` gives one) instead of a palette per frame.
+    globalPalette: Bool = false
+    // A fixed palette (0xRRGGBB values) to use instead of quantising.
+    palette: [Int] = []
+    // Pixels with alpha below 128 become transparent.
+    transparent: Bool = false
+    // Store only the changed rectangle of each frame.
+    optimize: Bool = true
+}
+
+public struct GifEncoder {
+    width: Int
+    height: Int
+    options: GifOptions = GifOptions()
+    // Output so far (header written by newGifEncoder). A caller writing a
+    // big GIF can take it with `takeData()` and append it to a file.
+    data: Data = Data()
+    frames: Int = 0
+    // The global palette (when used) and the previous frame's pixels.
+    global: [Int] = []
+    prev: [Int] = []
+    // Times: seconds asked for so far and centiseconds written.
+    askedTime: Float = 0.0
+    writtenCs: Int = 0
+    // Quantiser scratch (reused between frames).
+    histCount: [Int] = []
+    histR: [Int] = []
+    histG: [Int] = []
+    histB: [Int] = []
+    cacheKey: [Int] = []
+    cacheGen: [Int] = []
+    gen: Int = 0
+    // LZW table (open addressing): keys, codes, generation marks.
+    lzKeys: [Int] = []
+    lzCodes: [Int] = []
+    lzGen: [Int] = []
+    lzMark: Int = 0
+    // Bit output.
+    acc: Int = 0
+    accBits: Int = 0
+    block: Data = Data()
+    // The encoded frame not yet written (see flushPending).
+    pendingBody: Data = Data()
+    pendingCs: Int = 0
+    pendingTrans: Int = -1
+    hasPending: Bool = false
+    // Last frame's index pixels (for tests and previews).
+    lastIndexes: [Int] = []
+    lastPalette: [Int] = []
+
+    // Adds a frame shown for `delay` seconds.
+    fn addFrame(_ rgba: [Int], delay: Float) {
+        let w = width
+        let h = height
+        if rgba.count < w * h {
+            return
+        }
+        // The rectangle that changed.
+        var x0 = 0
+        var y0 = 0
+        var x1 = w
+        var y1 = h
+        if options.optimize && frames > 0 && prev.count == w * h && !options.transparent {
+            x0 = w
+            y0 = h
+            x1 = 0
+            y1 = 0
+            for y in 0..h {
+                let row = y * w
+                for x in 0..w {
+                    if rgba[row + x] != prev[row + x] {
+                        x0 = min(x0, x)
+                        x1 = max(x1, x + 1)
+                        y0 = min(y0, y)
+                        y1 = max(y1, y + 1)
+                    }
+                }
+            }
+            if x1 <= x0 {
+                // Nothing changed: the frame before just stays longer.
+                pendingCs += centiseconds(delay)
+                return
+            }
+        }
+        flushPending()
+        let rw = x1 - x0
+        let rh = y1 - y0
+        var sub: [Int] = []
+        if rw == w && rh == h {
+            sub = rgba
+        } else {
+            for y in y0..y1 {
+                let row = y * w
+                for x in x0..x1 {
+                    sub.append(rgba[row + x])
+                }
+            }
+        }
+        prev = rgba
+        // Palette.
+        let transparent = options.transparent
+        let maxColors = max(2, min(256, options.colors)) - (if transparent { 1 } else { 0 })
+        var palette: [Int] = []
+        var local = true
+        if !options.palette.isEmpty {
+            palette = options.palette
+            local = !options.globalPalette
+        } else if options.globalPalette && !global.isEmpty {
+            palette = global
+            local = false
+        } else {
+            palette = gifPalette(sub, maxColors)
+        }
+        if options.globalPalette && global.isEmpty {
+            global = palette
+        }
+        if options.globalPalette {
+            local = false
+        }
+        var transIndex = -1
+        if transparent {
+            transIndex = palette.count
+            palette.append(0)
+        }
+        let indexes = mapPixels(sub, rw, rh, palette, transIndex)
+        lastIndexes = indexes
+        lastPalette = palette
+        if frames == 0 {
+            writeHeader(if local { [] } else { palette })
+        }
+        // The frame waits until the next one (or finish) to be written, so
+        // unchanged frames that follow can add to its delay.
+        pendingCs = centiseconds(delay)
+        pendingTrans = transIndex
+        hasPending = true
+        let mark = data.count
+        // Image Descriptor (§20) and the local colour table (§21).
+        let bits = gifTableBits(palette.count)
+        var desc = Data(bytes: [0x2C, x0 & 255, x0 >> 8, y0 & 255, y0 >> 8, rw & 255, rw >> 8, rh & 255, rh >> 8])
+        desc.append(byte: if local { 0x80 | (bits - 1) } else { 0 })
+        data += desc
+        if local {
+            data += gifColorTable(palette, bits)
+        }
+        let globalBits = if local { bits } else { gifTableBits(global.count + (if transparent { 1 } else { 0 })) }
+        lzw(indexes, max(2, if local { bits } else { globalBits }))
+        pendingBody = data.slice(from: mark, to: data.count)
+        data = data.slice(from: 0, to: mark)
+        frames += 1
+    }
+
+    // Delay in centiseconds, rounded so the total follows the times
+    // asked for (at least 2: viewers show 0 and 1 as 10).
+    fn centiseconds(_ delay: Float) -> Int {
+        askedTime += max(0.0, delay)
+        let cs = max(2, Int(floor(askedTime * 100.0 + 0.5)) - writtenCs)
+        writtenCs += cs
+        cs
+    }
+
+    // Writes the waiting frame: Graphic Control Extension (§23, disposal
+    // 1: leave in place) with its delay, then its image.
+    fn flushPending() {
+        if !hasPending {
+            return
+        }
+        var cs = pendingCs
+        // A delay is 16 bits (655 s); longer ones are cut there.
+        cs = min(cs, 65535)
+        let t = pendingTrans
+        data += Data(bytes: [0x21, 0xF9, 4, (1 << 2) | (if t >= 0 { 1 } else { 0 }), cs & 255, (cs >> 8) & 255, max(0, t), 0])
+        data += pendingBody
+        pendingBody = Data()
+        hasPending = false
+    }
+
+    // The GIF so far, emptied (for writing a long GIF in pieces).
+    fn takeData() -> Data {
+        let d = data
+        data = Data()
+        d
+    }
+
+    // Ends the file; returns what's left of it.
+    fn finish() -> Data {
+        if frames == 0 {
+            writeHeader([])
+        }
+        flushPending()
+        data.append(byte: 0x3B)
+        takeData()
+    }
+
+    fn writeHeader(_ globalTable: [Int]) {
+        var d = Data(text: "GIF89a")
+        d += Data(bytes: [width & 255, width >> 8, height & 255, height >> 8])
+        if globalTable.isEmpty {
+            d += Data(bytes: [0x70, 0, 0])
+        } else {
+            let bits = gifTableBits(globalTable.count)
+            d += Data(bytes: [0x80 | 0x70 | (bits - 1), 0, 0])
+            d += gifColorTable(globalTable, bits)
+        }
+        if options.loop >= 0 {
+            // NETSCAPE2.0 looping extension.
+            d += Data(bytes: [0x21, 0xFF, 11])
+            d += Data(text: "NETSCAPE2.0")
+            d += Data(bytes: [3, 1, options.loop & 255, (options.loop >> 8) & 255, 0])
+        }
+        data += d
+    }
+
+    // Palette indexes for the pixels (nearest colour, optional dithering).
+    fn mapPixels(_ px: [Int], _ w: Int, _ h: Int, _ palette: [Int], _ transIndex: Int) -> [Int] {
+        gen += 1
+        if cacheKey.count != 262144 {
+            cacheKey = []
+            cacheGen = []
+            for _ in 0..262144 {
+                cacheKey.append(0)
+                cacheGen.append(0)
+            }
+        }
+        let n = palette.count - (if transIndex >= 0 { 1 } else { 0 })
+        var pr: [Int] = []
+        var pg: [Int] = []
+        var pb: [Int] = []
+        for i in 0..n {
+            pr.append((palette[i] >> 16) & 255)
+            pg.append((palette[i] >> 8) & 255)
+            pb.append(palette[i] & 255)
+        }
+        var out = px
+        // Exact colours: a palette entry equal to the pixel wins.
+        var exact: [Int: Int] = [:]
+        if !options.dither {
+            for i in 0..n {
+                if exact[palette[i]] == nil {
+                    exact[palette[i]] = i
+                }
+            }
+        }
+        let dither = options.dither
+        // Error rows, ×16, three channels, with one cell of margin each side.
+        var errCur: [Int] = []
+        var errNext: [Int] = []
+        if dither {
+            for _ in 0..((w + 2) * 3) {
+                errCur.append(0)
+                errNext.append(0)
+            }
+        }
+        var lastRgb = -1
+        var lastIdx = 0
+        for y in 0..h {
+            for x in 0..w {
+                let i = y * w + x
+                let v = px[i]
+                if transIndex >= 0 && (v & 255) < 128 {
+                    out[i] = transIndex
+                    continue
+                }
+                var r = (v >> 24) & 255
+                var g = (v >> 16) & 255
+                var b = (v >> 8) & 255
+                if dither {
+                    let e = (x + 1) * 3
+                    r = max(0, min(255, r + (errCur[e] + 8) / 16))
+                    g = max(0, min(255, g + (errCur[e + 1] + 8) / 16))
+                    b = max(0, min(255, b + (errCur[e + 2] + 8) / 16))
+                }
+                let rgb = (r << 16) | (g << 8) | b
+                var idx = 0
+                if rgb == lastRgb {
+                    idx = lastIdx
+                } else if let k = exact[rgb] {
+                    idx = k
+                } else {
+                    let key = ((r >> 2) << 12) | ((g >> 2) << 6) | (b >> 2)
+                    if cacheGen[key] == gen {
+                        idx = cacheKey[key]
+                    } else {
+                        // Nearest to the cell's centre.
+                        let cr = (r & 0xFC) | 2
+                        let cg = (g & 0xFC) | 2
+                        let cb = (b & 0xFC) | 2
+                        var best = 0
+                        var bestD = 1 << 40
+                        for k in 0..n {
+                            let dr = pr[k] - cr
+                            let dg = pg[k] - cg
+                            let db = pb[k] - cb
+                            let d = dr * dr * 3 + dg * dg * 4 + db * db * 2
+                            if d < bestD {
+                                bestD = d
+                                best = k
+                            }
+                        }
+                        cacheKey[key] = best
+                        cacheGen[key] = gen
+                        idx = best
+                    }
+                    lastRgb = rgb
+                    lastIdx = idx
+                }
+                out[i] = idx
+                if dither {
+                    let er = r - pr[idx]
+                    let eg = g - pg[idx]
+                    let eb = b - pb[idx]
+                    let e = (x + 1) * 3
+                    errCur[e + 3] += er * 7
+                    errCur[e + 4] += eg * 7
+                    errCur[e + 5] += eb * 7
+                    errNext[e - 3] += er * 3
+                    errNext[e - 2] += eg * 3
+                    errNext[e - 1] += eb * 3
+                    errNext[e] += er * 5
+                    errNext[e + 1] += eg * 5
+                    errNext[e + 2] += eb * 5
+                    errNext[e + 3] += er
+                    errNext[e + 4] += eg
+                    errNext[e + 5] += eb
+                }
+            }
+            if dither {
+                let t = errCur
+                errCur = errNext
+                errNext = t
+                for k in 0..errNext.count {
+                    errNext[k] = 0
+                }
+                lastRgb = -1
+            }
+        }
+        out
+    }
+
+    // LZW-compressed image data (Appendix F) in sub-blocks.
+    fn lzw(_ idx: [Int], _ minSize: Int) {
+        data.append(byte: minSize)
+        if lzKeys.count != 16384 {
+            lzKeys = []
+            lzCodes = []
+            lzGen = []
+            for _ in 0..16384 {
+                lzKeys.append(0)
+                lzCodes.append(0)
+                lzGen.append(0)
+            }
+        }
+        let clear = 1 << minSize
+        let eoi = clear + 1
+        var size = minSize + 1
+        var next = clear + 2
+        lzMark += 1
+        acc = 0
+        accBits = 0
+        block = Data()
+        put(clear, size)
+        if idx.isEmpty {
+            put(eoi, size)
+            flushBits()
+            return
+        }
+        var prefix = idx[0]
+        for i in 1..idx.count {
+            let c = idx[i]
+            let key = (prefix << 8) | c
+            var h = ((key * 40503) >> 4) & 16383
+            var found = -1
+            while lzGen[h] == lzMark {
+                if lzKeys[h] == key {
+                    found = lzCodes[h]
+                    break
+                }
+                h = (h + 1) & 16383
+            }
+            if found >= 0 {
+                prefix = found
+                continue
+            }
+            put(prefix, size)
+            if next < 4096 {
+                lzGen[h] = lzMark
+                lzKeys[h] = key
+                lzCodes[h] = next
+                if next == (1 << size) && size < 12 {
+                    size += 1
+                }
+                next += 1
+            } else {
+                put(clear, size)
+                lzMark += 1
+                size = minSize + 1
+                next = clear + 2
+            }
+            prefix = c
+        }
+        put(prefix, size)
+        // The decoder adds one more entry on reading the last code.
+        if next < 4096 && next == (1 << size) && size < 12 {
+            size += 1
+        }
+        put(eoi, size)
+        flushBits()
+    }
+
+    fn put(_ code: Int, _ size: Int) {
+        acc = acc | (code << accBits)
+        accBits += size
+        while accBits >= 8 {
+            block.append(byte: acc & 255)
+            acc = acc >> 8
+            accBits -= 8
+            if block.count == 255 {
+                data.append(byte: 255)
+                data += block
+                block = Data()
+            }
+        }
+    }
+
+    fn flushBits() {
+        if accBits > 0 {
+            block.append(byte: acc & 255)
+            acc = 0
+            accBits = 0
+        }
+        if !block.isEmpty {
+            data.append(byte: block.count)
+            data += block
+            block = Data()
+        }
+        data.append(byte: 0)
+    }
+
+    // Median-cut palette (or the exact colours when few enough).
+    fn gifPalette(_ px: [Int], _ maxColors: Int) -> [Int] {
+        // Exact colours, when there are few enough.
+        var seen: [Int: Int] = [:]
+        var distinct: [Int] = []
+        var last = -1
+        var tooMany = false
+        for v in px {
+            let rgb = (v >> 8) & 0xFFFFFF
+            if rgb == last {
+                continue
+            }
+            last = rgb
+            if seen[rgb] == nil {
+                seen[rgb] = 1
+                distinct.append(rgb)
+                if distinct.count > maxColors {
+                    tooMany = true
+                    break
+                }
+            }
+        }
+        if !tooMany {
+            return distinct
+        }
+        return medianCut(px, maxColors)
+    }
+
+    fn medianCut(_ px: [Int], _ maxColors: Int) -> [Int] {
+        if histCount.count != 32768 {
+            histCount = []
+            histR = []
+            histG = []
+            histB = []
+            for _ in 0..32768 {
+                histCount.append(0)
+                histR.append(0)
+                histG.append(0)
+                histB.append(0)
+            }
+        } else {
+            for i in 0..32768 {
+                histCount[i] = 0
+                histR[i] = 0
+                histG[i] = 0
+                histB[i] = 0
+            }
+        }
+        for v in px {
+            let r = (v >> 24) & 255
+            let g = (v >> 16) & 255
+            let b = (v >> 8) & 255
+            let k = ((r >> 3) << 10) | ((g >> 3) << 5) | (b >> 3)
+            histCount[k] += 1
+            histR[k] += r
+            histG[k] += g
+            histB[k] += b
+        }
+        var bins: [Int] = []
+        for k in 0..32768 {
+            if histCount[k] > 0 {
+                bins.append(k)
+            }
+        }
+        // Boxes: start, end into `bins`, with their split score and axis.
+        var starts: [Int] = [0]
+        var ends: [Int] = [bins.count]
+        var scores: [Int] = []
+        var axes: [Int] = []
+        let (s0, a0) = boxStats(bins, 0, bins.count)
+        scores.append(s0)
+        axes.append(a0)
+        while starts.count < maxColors {
+            var best = -1
+            var bestScore = 0
+            for bi in 0..starts.count {
+                if scores[bi] > bestScore {
+                    bestScore = scores[bi]
+                    best = bi
+                }
+            }
+            if best < 0 {
+                break
+            }
+            let s = starts[best]
+            let e = ends[best]
+            let shift = if axes[best] == 0 { 10 } else if axes[best] == 1 { 5 } else { 0 }
+            var part = bins.slice(from: s, to: e)
+            part = part.sorted(by: { a, b in ((a >> shift) & 31) < ((b >> shift) & 31) })
+            var total = 0
+            for k in part {
+                total += histCount[k]
+            }
+            var run = 0
+            var cut = 1
+            for (j, k) in part.enumerated() {
+                run += histCount[k]
+                if run * 2 >= total {
+                    cut = j + 1
+                    break
+                }
+            }
+            cut = max(1, min(part.count - 1, cut))
+            for j in 0..part.count {
+                bins[s + j] = part[j]
+            }
+            ends[best] = s + cut
+            starts.append(s + cut)
+            ends.append(e)
+            let (sa, aa) = boxStats(bins, s, s + cut)
+            scores[best] = sa
+            axes[best] = aa
+            let (sb, ab) = boxStats(bins, s + cut, e)
+            scores.append(sb)
+            axes.append(ab)
+        }
+        var palette: [Int] = []
+        for bi in 0..starts.count {
+            var n = 0
+            var r = 0
+            var g = 0
+            var b = 0
+            for j in starts[bi]..ends[bi] {
+                let k = bins[j]
+                n += histCount[k]
+                r += histR[k]
+                g += histG[k]
+                b += histB[k]
+            }
+            if n > 0 {
+                palette.append(((r / n) << 16) | ((g / n) << 8) | (b / n))
+            }
+        }
+        palette
+    }
+
+    // A box's split score (pixels × widest range; 0 when it can't be
+    // split) and its widest axis (0 red, 1 green, 2 blue).
+    fn boxStats(_ bins: [Int], _ s: Int, _ e: Int) -> (Int, Int) {
+        if e - s < 2 {
+            return (0, 0)
+        }
+        var loR = 31
+        var loG = 31
+        var loB = 31
+        var hiR = 0
+        var hiG = 0
+        var hiB = 0
+        var count = 0
+        for j in s..e {
+            let k = bins[j]
+            let r = (k >> 10) & 31
+            let g = (k >> 5) & 31
+            let b = k & 31
+            loR = min(loR, r)
+            hiR = max(hiR, r)
+            loG = min(loG, g)
+            hiG = max(hiG, g)
+            loB = min(loB, b)
+            hiB = max(hiB, b)
+            count += histCount[k]
+        }
+        var axis = 0
+        var range = hiR - loR
+        if hiG - loG >= range {
+            axis = 1
+            range = hiG - loG
+        }
+        if hiB - loB > range {
+            axis = 2
+            range = hiB - loB
+        }
+        if range == 0 {
+            return (0, 0)
+        }
+        (count * (range + 1), axis)
+    }
+}
+
+// An encoder for frames of width × height; the header is written with
+// the first frame.
+public fn newGifEncoder(width: Int, height: Int, options: GifOptions = GifOptions()) -> GifEncoder {
+    GifEncoder(width: max(1, min(65535, width)), height: max(1, min(65535, height)), options: options)
+}
+
+// A whole GIF from frames (RGBA pixel lists) and their delays (seconds;
+// the last delay is used for frames beyond the list).
+public fn encodeGif(_ frames: [[Int]], width: Int, height: Int, delays: [Float], options: GifOptions = GifOptions()) -> Data {
+    var enc = newGifEncoder(width: width, height: height, options: options)
+    for (i, f) in frames.enumerated() {
+        let d = if i < delays.count { delays[i] } else if delays.isEmpty { 0.1 } else { delays[delays.count - 1] }
+        enc.addFrame(f, delay: d)
+    }
+    var out = enc.takeData()
+    out += enc.finish()
+    out
+}
+
+// Bits for a colour table of at least n entries (2^bits ≥ n, 1…8).
+fn gifTableBits(_ n: Int) -> Int {
+    var bits = 1
+    while (1 << bits) < n && bits < 8 {
+        bits += 1
+    }
+    bits
+}
+
+fn gifColorTable(_ palette: [Int], _ bits: Int) -> Data {
+    var d = Data()
+    for i in 0..(1 << bits) {
+        let c = if i < palette.count { palette[i] } else { 0 }
+        d.append(byte: (c >> 16) & 255)
+        d.append(byte: (c >> 8) & 255)
+        d.append(byte: c & 255)
+    }
+    d
+}
+
+// ---------------------------------------------------------------------------
+// Decoding
+
+// A decoded GIF: every frame as the whole screen (RGBA, packed like
+// render.toRgba), with its delay in seconds.
+public struct GifImage {
+    width: Int = 0
+    height: Int = 0
+    frames: [[Int]] = []
+    delays: [Float] = []
+    loop: Int = -1
+}
+
+// Decodes a GIF (87a or 89a): frames composed onto the screen with their
+// disposal methods (§23), interlaced images (§20 Appendix E) included.
+public fn decodeGif(_ d: Data) -> Result<GifImage> {
+    if d.count < 13 || d.slice(from: 0, to: 3).latin1 != "GIF" {
+        return Result.failure(error: Error("not a GIF"))
+    }
+    var img = GifImage()
+    img.width = d.uint16(at: 6)
+    img.height = d.uint16(at: 8)
+    let w = img.width
+    let h = img.height
+    let flags = d[10]
+    var p = 13
+    var global: [Int] = []
+    if (flags & 0x80) != 0 {
+        let n = 1 << ((flags & 7) + 1)
+        for i in 0..n {
+            global.append((d[p + 3 * i] << 16) | (d[p + 3 * i + 1] << 8) | d[p + 3 * i + 2])
+        }
+        p += 3 * n
+    }
+    var screen: [Int] = []
+    for _ in 0..(w * h) {
+        screen.append(0)
+    }
+    var delay = 0
+    var trans = -1
+    var disposal = 0
+    while p < d.count {
+        let b = d[p]
+        if b == 0x3B {
+            break
+        }
+        if b == 0x21 && p + 1 < d.count {
+            let label = d[p + 1]
+            p += 2
+            if label == 0xF9 && p + 5 < d.count {
+                let pk = d[p + 1]
+                disposal = (pk >> 2) & 7
+                delay = d.uint16(at: p + 2)
+                trans = if (pk & 1) != 0 { d[p + 4] } else { -1 }
+            } else if label == 0xFF && p + 12 < d.count && d.slice(from: p + 1, to: p + 12).latin1 == "NETSCAPE2.0" {
+                img.loop = d.uint16(at: p + 14)
+            }
+            // Skip the extension's sub-blocks.
+            while p < d.count && d[p] != 0 {
+                p += d[p] + 1
+            }
+            p += 1
+            continue
+        }
+        if b != 0x2C || p + 10 > d.count {
+            return Result.failure(error: Error("damaged GIF block at {p}"))
+        }
+        let x0 = d.uint16(at: p + 1)
+        let y0 = d.uint16(at: p + 3)
+        let iw = d.uint16(at: p + 5)
+        let ih = d.uint16(at: p + 7)
+        let pk = d[p + 9]
+        p += 10
+        var table = global
+        if (pk & 0x80) != 0 {
+            table = []
+            let n = 1 << ((pk & 7) + 1)
+            for i in 0..n {
+                table.append((d[p + 3 * i] << 16) | (d[p + 3 * i + 1] << 8) | d[p + 3 * i + 2])
+            }
+            p += 3 * n
+        }
+        let interlaced = (pk & 0x40) != 0
+        let minSize = d[p]
+        p += 1
+        var lz = Data()
+        while p < d.count && d[p] != 0 {
+            lz += d.slice(from: p + 1, to: p + 1 + d[p])
+            p += d[p] + 1
+        }
+        p += 1
+        let idx = gifLzwDecode(lz, minSize, iw * ih)
+        let before = screen
+        // Row order of interlaced images: every 8th from 0, every 8th
+        // from 4, every 4th from 2, every 2nd from 1.
+        var rows: [Int] = []
+        if interlaced {
+            for (start, step) in [(0, 8), (4, 8), (2, 4), (1, 2)] {
+                var r = start
+                while r < ih {
+                    rows.append(r)
+                    r += step
+                }
+            }
+        } else {
+            for r in 0..ih {
+                rows.append(r)
+            }
+        }
+        for (k, row) in rows.enumerated() {
+            let y = y0 + row
+            if y >= h {
+                continue
+            }
+            for x in 0..iw {
+                let j = k * iw + x
+                if j >= idx.count || x0 + x >= w {
+                    continue
+                }
+                let c = idx[j]
+                if c == trans || c >= table.count {
+                    continue
+                }
+                let rgb = table[c]
+                screen[y * w + x0 + x] = (rgb << 8) | 255
+            }
+        }
+        img.frames.append(screen)
+        img.delays.append(Float(delay) / 100.0)
+        if disposal == 2 {
+            for y in y0..min(h, y0 + ih) {
+                for x in x0..min(w, x0 + iw) {
+                    screen[y * w + x] = 0
+                }
+            }
+        } else if disposal == 3 {
+            screen = before
+        }
+        trans = -1
+        disposal = 0
+        delay = 0
+    }
+    Result.ok(value: img)
+}
+
+// LZW decoding (Appendix F): codes LSB first, growing to 12 bits.
+fn gifLzwDecode(_ d: Data, _ minSize: Int, _ want: Int) -> [Int] {
+    var out: [Int] = []
+    let clear = 1 << minSize
+    let eoi = clear + 1
+    var prefix: [Int] = []
+    var suffix: [Int] = []
+    for i in 0..4096 {
+        prefix.append(-1)
+        suffix.append(if i < clear { i } else { 0 })
+    }
+    var size = minSize + 1
+    var next = clear + 2
+    var old = -1
+    var acc = 0
+    var bits = 0
+    var p = 0
+    var stack: [Int] = []
+    while out.count < want {
+        while bits < size && p < d.count {
+            acc = acc | (d[p] << bits)
+            bits += 8
+            p += 1
+        }
+        if bits < size {
+            break
+        }
+        let code = acc & ((1 << size) - 1)
+        acc = acc >> size
+        bits -= size
+        if code == clear {
+            size = minSize + 1
+            next = clear + 2
+            old = -1
+            continue
+        }
+        if code == eoi {
+            break
+        }
+        var first = 0
+        if old < 0 {
+            if code >= clear {
+                break
+            }
+            out.append(code)
+            old = code
+            continue
+        }
+        var c = code
+        if code >= next {
+            // The KwKwK case: old's string + its own first byte.
+            c = old
+        }
+        stack = []
+        while c >= clear && c < 4096 && prefix[c] >= 0 {
+            stack.append(suffix[c])
+            c = prefix[c]
+        }
+        stack.append(c)
+        first = c
+        var k = stack.count - 1
+        while k >= 0 {
+            out.append(stack[k])
+            k -= 1
+        }
+        if code >= next {
+            out.append(first)
+        }
+        if next < 4096 {
+            prefix[next] = old
+            suffix[next] = first
+            next += 1
+            if next == (1 << size) && size < 12 {
+                size += 1
+            }
+        }
+        old = code
+    }
+    out
+}

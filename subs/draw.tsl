@@ -1,0 +1,378 @@
+// Drawing cues over a video with Tessel's Graphics (a Canvas block, or
+// renderImage): text laid out in lines (wrapped to the margins, balanced
+// like VSFilter/libass "smart" wrapping), placed by alignment, margins or
+// an explicit position (\pos, \move), with fill, outline and shadow
+// colours, bold/italic/underline/strike, font and size changes, fades, and
+// the opaque box of ASS BorderStyle 3. Bitmap cues (PGS, DVD) are scaled
+// from the frame they were made for to the video's rectangle.
+//
+// Sizes follow libass's idea of a font size: the size is the height of a
+// line (the font's ascent + descent), not its em size, so "Arial 16 at
+// PlayResY 288" fills the same part of the picture at any window size.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../core"
+
+// One piece of laid-out text: a word, a run of spaces, or a line break.
+struct SubsPiece {
+    text: String
+    span: Int
+    width: Float = 0.0
+    em: Float = 0.0
+    ascent: Float = 0.0
+    descent: Float = 0.0
+    space: Bool = false
+    newline: Bool = false
+}
+
+struct SubsLine {
+    pieces: [SubsPiece] = []
+    width: Float = 0.0
+    ascent: Float = 0.0
+    descent: Float = 0.0
+}
+
+fn subsColor(_ packed: Int, _ fade: Float) -> Color {
+    let a = Float(packed & 255) / 255.0 * fade
+    Color.rgba(packed >> 24 & 255, packed >> 16 & 255, packed >> 8 & 255, a)
+}
+
+fn subsFamily(_ s: Span) -> String {
+    if s.font.isEmpty { "system" } else { s.font }
+}
+
+fn subsWeight(_ s: Span) -> Weight {
+    if s.bold { .bold } else { .regular }
+}
+
+// How opaque a cue is at a time: its fade in and fade out.
+public fn fadeAt(_ c: Cue, at: Float) -> Float {
+    var f = 1.0
+    let t = at - c.start
+    if c.fadeIn > 0.0 && t < c.fadeIn {
+        f = min(f, max(0.0, t / c.fadeIn))
+    }
+    let left = c.end - at
+    if c.fadeOut > 0.0 && left < c.fadeOut {
+        f = min(f, max(0.0, left / c.fadeOut))
+    }
+    f
+}
+
+// Where a cue's position is at a time (\move), as fractions; (−1, −1)
+// when it isn't positioned.
+public fn positionAt(_ c: Cue, at: Float) -> (Float, Float) {
+    if c.moveX < 0.0 && c.moveY < 0.0 {
+        return (c.x, c.y)
+    }
+    var t1 = c.moveT1
+    var t2 = c.moveT2
+    if t1 == 0.0 && t2 == 0.0 {
+        t2 = c.end - c.start
+    }
+    if t2 < t1 {
+        let k = t1
+        t1 = t2
+        t2 = k
+    }
+    let t = at - c.start
+    var k = 0.0
+    if t >= t2 {
+        k = 1.0
+    } else if t > t1 && t2 > t1 {
+        k = (t - t1) / (t2 - t1)
+    }
+    (c.x + (c.moveX - c.x) * k, c.y + (c.moveY - c.y) * k)
+}
+
+// Splits a cue's spans into words, spaces and line breaks, measured.
+fn subsPieces(_ g: Graphics, _ cue: Cue, lineH: Float, height: Float, scale: Float) -> [SubsPiece] {
+    var out: [SubsPiece] = []
+    // Ascent and descent per point of em size, per font.
+    var ascents: [String: Float] = [:]
+    var descents: [String: Float] = [:]
+    for (si, sp) in cue.spans.enumerated() {
+        let family = subsFamily(sp)
+        let key = "{family}|{sp.bold}|{sp.italic}"
+        if ascents[key] == nil {
+            let m = fontMetrics(size: 100.0, weight: subsWeight(sp), italic: sp.italic, family: family)
+            let total = m.ascent + m.descent
+            ascents[key] = if total > 0.0 { m.ascent / 100.0 } else { 0.8 }
+            descents[key] = if total > 0.0 { m.descent / 100.0 } else { 0.2 }
+        }
+        let au = ascents[key] ?? 0.8
+        let du = descents[key] ?? 0.2
+        // The em size whose ascent + descent is the wanted line height.
+        let em = max(1.0, lineH * sp.size * sp.scaleY / (au + du))
+        let ascent = em * au
+        let descent = em * du
+        if sp.text == "\n" {
+            out.append(SubsPiece(text: "", span: si, em: em, ascent: ascent, descent: descent, newline: true))
+            continue
+        }
+        let tracking = sp.spacing * height * scale
+        var word = ""
+        var inSpace = false
+        for c in sp.text.characters {
+            let isSpace = c == " " || c == "\t"
+            if c == "\n" {
+                if !word.isEmpty {
+                    out.append(SubsPiece(text: word, span: si, em: em, ascent: ascent, descent: descent, space: inSpace))
+                    word = ""
+                }
+                out.append(SubsPiece(text: "", span: si, em: em, ascent: ascent, descent: descent, newline: true))
+                continue
+            }
+            if !word.isEmpty && isSpace != inSpace {
+                out.append(SubsPiece(text: word, span: si, em: em, ascent: ascent, descent: descent, space: inSpace))
+                word = ""
+            }
+            inSpace = isSpace
+            word += c
+        }
+        if !word.isEmpty {
+            out.append(SubsPiece(text: word, span: si, em: em, ascent: ascent, descent: descent, space: inSpace))
+        }
+        // Measure.
+        var i = 0
+        while i < out.count {
+            if out[i].span == si && !out[i].newline && out[i].width == 0.0 {
+                out[i].width = g.textWidth(out[i].text, size: em, weight: subsWeight(sp), italic: sp.italic, family: family, tracking: tracking)
+            }
+            i += 1
+        }
+    }
+    out
+}
+
+// Greedy line filling of one paragraph (pieces without line breaks) to
+// `limit` points; returns the lines.
+fn subsFill(_ ps: [SubsPiece], limit: Float, wrap: Bool) -> [SubsLine] {
+    var lines: [SubsLine] = []
+    var cur = SubsLine()
+    var hasWord = false
+    for p in ps {
+        if p.space && !hasWord {
+            continue
+        }
+        if !p.space && wrap && hasWord && cur.width + p.width > limit {
+            lines.append(subsTrim(cur))
+            cur = SubsLine()
+            hasWord = false
+        }
+        if p.space && !hasWord {
+            continue
+        }
+        cur.pieces.append(p)
+        cur.width += p.width
+        cur.ascent = max(cur.ascent, p.ascent)
+        cur.descent = max(cur.descent, p.descent)
+        if !p.space {
+            hasWord = true
+        }
+    }
+    lines.append(subsTrim(cur))
+    lines
+}
+
+// Drops spaces at the end of a line.
+fn subsTrim(_ l: SubsLine) -> SubsLine {
+    var out = l
+    while !out.pieces.isEmpty && out.pieces[out.pieces.count - 1].space {
+        let p = out.pieces.removeLast()
+        out.width -= p.width
+    }
+    out
+}
+
+// The lines of a cue: hard breaks, then wrapping. Smart wrapping (styles
+// 0 and 3) narrows the limit as far as it can without adding a line, so
+// the lines come out about equally long.
+fn subsLayout(_ pieces: [SubsPiece], limit: Float, wrapStyle: Int) -> [SubsLine] {
+    var out: [SubsLine] = []
+    var para: [SubsPiece] = []
+    var paras: [[SubsPiece]] = []
+    var breaks: [SubsPiece] = []
+    for p in pieces {
+        if p.newline {
+            paras.append(para)
+            breaks.append(p)
+            para = []
+        } else {
+            para.append(p)
+        }
+    }
+    paras.append(para)
+    let wrap = wrapStyle != 2
+    for (k, ps) in paras.enumerated() {
+        var lines = subsFill(ps, limit: limit, wrap: wrap)
+        if wrap && wrapStyle != 1 && lines.count > 1 {
+            let n = lines.count
+            var lo = 0.0
+            var hi = limit
+            for _ in 0..12 {
+                let mid = (lo + hi) / 2.0
+                if subsFill(ps, limit: mid, wrap: true).count > n {
+                    lo = mid
+                } else {
+                    hi = mid
+                }
+            }
+            lines = subsFill(ps, limit: hi, wrap: true)
+        }
+        for l in lines {
+            var line = l
+            // An empty line takes the height of the break that made it.
+            if line.pieces.isEmpty {
+                let b = if k < breaks.count { breaks[k] } else { if k > 0 { breaks[k - 1] } else { SubsPiece(text: "", span: 0) } }
+                line.ascent = b.ascent
+                line.descent = b.descent
+            }
+            out.append(line)
+        }
+    }
+    out
+}
+
+// Draws the cues showing at `at` over a video shown in the rectangle
+// (x, y, width, height): white text with a dark outline unless the cue's
+// style says otherwise. `scale` enlarges text (a user setting).
+public fn draw(_ g: Graphics, _ cues: [Cue], at: Float, x: Float, y: Float, width: Float, height: Float, scale: Float = 1.0) {
+    if width <= 0.0 || height <= 0.0 {
+        return
+    }
+    var showing: [Cue] = []
+    for c in cues {
+        if c.start <= at && at < c.end {
+            showing.append(c)
+        }
+    }
+    // Unpositioned cues of the same alignment stack up instead of
+    // overlapping: the earlier one nearest the edge (libass collisions).
+    var stack: [Float] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    for c in sortCues(showing) {
+        let used = drawCue(g, c, at: at, x: x, y: y, width: width, height: height, scale: scale, offset: stack[c.align.clamped(min: 1, max: 9)])
+        if c.x < 0.0 && c.y < 0.0 {
+            let a = c.align.clamped(min: 1, max: 9)
+            stack[a] = stack[a] + used
+        }
+    }
+}
+
+// Draws one cue; returns the height of text it took (for stacking).
+fn drawCue(_ g: Graphics, _ c: Cue, at: Float, x: Float, y: Float, width: Float, height: Float, scale: Float, offset: Float) -> Float {
+    let fade = fadeAt(c, at: at)
+    if fade <= 0.0 {
+        return 0.0
+    }
+    let bm = c.bitmap
+    if !bm.pixels.isEmpty && bm.w > 0 && bm.h > 0 {
+        let fw = if bm.frameWidth > 0 { Float(bm.frameWidth) } else { width }
+        let fh = if bm.frameHeight > 0 { Float(bm.frameHeight) } else { height }
+        let sx = width / fw
+        let sy = height / fh
+        g.image(pixels: bm.pixels, pixelWidth: bm.w, pixelHeight: bm.h, x: x + Float(bm.x) * sx, y: y + Float(bm.y) * sy, width: Float(bm.w) * sx, height: Float(bm.h) * sy, opacity: fade)
+        return 0.0
+    }
+    if c.spans.isEmpty {
+        return 0.0
+    }
+    let lineH = c.fontSize * height * scale
+    let pieces = subsPieces(g, c, lineH: lineH, height: height, scale: scale)
+    let col = (c.align - 1) % 3
+    let row = (c.align - 1) / 3
+    let (px, py) = positionAt(c, at: at)
+    let left = x + c.marginL * width
+    let right = x + width - c.marginR * width
+    var limit = max(1.0, right - left)
+    if c.width > 0.0 {
+        limit = c.width * width
+    }
+    let lines = subsLayout(pieces, limit: limit, wrapStyle: c.wrapStyle)
+    var bw = 0.0
+    var bh = 0.0
+    for l in lines {
+        bw = max(bw, l.width)
+        bh += l.ascent + l.descent
+    }
+    // The block's left and top.
+    var bx = 0.0
+    var ax = 0.0
+    if px >= 0.0 {
+        ax = x + px * width
+        bx = if col == 0 { ax } else if col == 1 { ax - bw / 2.0 } else { ax - bw }
+    } else {
+        bx = if col == 0 { left } else if col == 1 { (left + right - bw) / 2.0 } else { right - bw }
+        ax = if col == 0 { bx } else if col == 1 { bx + bw / 2.0 } else { bx + bw }
+    }
+    var by = 0.0
+    var ay = 0.0
+    if py >= 0.0 {
+        ay = y + py * height
+        by = if row == 2 { ay } else if row == 1 { ay - bh / 2.0 } else { ay - bh }
+    } else {
+        by = if row == 0 { y + height - c.marginV * height - bh - offset } else if row == 2 { y + c.marginV * height + offset } else { y + (height - bh) / 2.0 }
+        ay = if row == 2 { by } else if row == 1 { by + bh / 2.0 } else { by + bh }
+    }
+    let rotated = c.angle != 0.0
+    if rotated {
+        g.save()
+        g.translate(ax, ay)
+        g.rotate(-c.angle * pi / 180.0)
+        g.translate(-ax, -ay)
+    }
+    var top = by
+    for (li, l) in lines.enumerated() {
+        let lx = if col == 0 { bx } else if col == 1 { bx + (bw - l.width) / 2.0 } else { bx + bw - l.width }
+        let base = top + l.ascent
+        if c.boxColor & 255 != 0 && !l.pieces.isEmpty {
+            // A TextStyle background: a box a little larger than the line.
+            let padX = (l.ascent + l.descent) * 0.18
+            // Lines touch, so only the block's top and bottom get room
+            // (overlapping boxes would show a darker band).
+            let padTop = if li == 0 { (l.ascent + l.descent) * 0.06 } else { 0.0 }
+            let padBottom = if li == lines.count - 1 { (l.ascent + l.descent) * 0.06 } else { 0.0 }
+            g.fillRect(x: lx - padX, y: top - padTop, width: l.width + 2.0 * padX, height: l.ascent + l.descent + padTop + padBottom, color: subsColor(c.boxColor, fade))
+        }
+        if c.borderStyle == 3 && !l.pieces.isEmpty {
+            let sp = c.spans[l.pieces[0].span]
+            let pad = sp.border * height * scale
+            g.fillRect(x: lx - pad, y: top - pad, width: l.width + 2.0 * pad, height: l.ascent + l.descent + 2.0 * pad, color: subsColor(sp.outline, fade))
+        }
+        // Shadows first, under every piece of the line.
+        var tx = lx
+        for p in l.pieces {
+            let sp = c.spans[p.span]
+            let sd = sp.shadowDepth * height * scale
+            if !p.space && sd > 0.0 && sp.shadow & 255 != 0 {
+                let bord = if c.borderStyle == 3 { 0.0 } else { sp.border * height * scale }
+                g.text(p.text, x: tx + sd, y: base - p.ascent + sd, size: p.em, color: subsColor(sp.shadow, fade), weight: subsWeight(sp), halo: subsColor(sp.shadow, fade), haloWidth: bord, italic: sp.italic, family: subsFamily(sp), tracking: sp.spacing * height * scale)
+            }
+            tx += p.width
+        }
+        tx = lx
+        for p in l.pieces {
+            let sp = c.spans[p.span]
+            if !p.space {
+                let bord = if c.borderStyle == 3 { 0.0 } else { sp.border * height * scale }
+                let halo = if bord > 0.0 { subsColor(sp.outline, fade) } else { Color.clear }
+                g.text(p.text, x: tx, y: base - p.ascent, size: p.em, color: subsColor(sp.color, fade), weight: subsWeight(sp), halo: halo, haloWidth: bord, italic: sp.italic, family: subsFamily(sp), tracking: sp.spacing * height * scale)
+            }
+            let thick = max(1.0, p.em * 0.06)
+            if sp.underline {
+                g.line(tx, base + p.em * 0.1, tx + p.width, base + p.em * 0.1, color: subsColor(sp.color, fade), width: thick)
+            }
+            if sp.strike {
+                g.line(tx, base - p.em * 0.28, tx + p.width, base - p.em * 0.28, color: subsColor(sp.color, fade), width: thick)
+            }
+            tx += p.width
+        }
+        top += l.ascent + l.descent
+    }
+    if rotated {
+        g.restore()
+    }
+    bh
+}

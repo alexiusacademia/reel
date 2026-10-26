@@ -1,0 +1,214 @@
+// The Subtitles page of the Preferences window: preferred languages for
+// the first and second track, when subtitles show, the text encoding of
+// subtitle files, and a style editor for each track's look with a live
+// preview drawn by subs.drawTracks over a sample frame (or a picture the
+// app passes in, such as the paused video).
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+import "../library"
+import "../subs"
+
+// Draws a sample scene to show subtitles over: a dusk sky, hills and a
+// sun, so both light and dark text can be judged.
+fn prefsSampleScene(_ g: Graphics, x: Float, y: Float, w: Float, h: Float) {
+    g.beginPath()
+    g.rect(x: x, y: y, width: w, height: h)
+    g.fillLinear(x1: x, y1: y, x2: x, y2: y + h, colors: [.rgb(40, 62, 110), .rgb(220, 140, 90), .rgb(250, 220, 160)], stops: [0.0, 0.62, 1.0])
+    g.fillCircle(x: x + w * 0.72, y: y + h * 0.55, radius: h * 0.11, color: .rgb(255, 236, 190))
+    g.beginPath()
+    g.moveTo(x, y + h * 0.7)
+    g.quadTo(x + w * 0.25, y + h * 0.5, x + w * 0.5, y + h * 0.68)
+    g.quadTo(x + w * 0.75, y + h * 0.82, x + w, y + h * 0.62)
+    g.lineTo(x + w, y + h)
+    g.lineTo(x, y + h)
+    g.closePath()
+    g.fill(.rgb(46, 52, 40))
+    g.beginPath()
+    g.moveTo(x, y + h * 0.86)
+    g.quadTo(x + w * 0.4, y + h * 0.74, x + w, y + h * 0.9)
+    g.lineTo(x + w, y + h)
+    g.lineTo(x, y + h)
+    g.closePath()
+    g.fill(.rgb(24, 28, 22))
+}
+
+// The largest 16:9 (or the picture's) rectangle in the canvas, centred.
+fn prefsFit(_ cw: Float, _ ch: Float, aspect: Float) -> (Float, Float, Float, Float) {
+    var w = cw
+    var h = cw / aspect
+    if h > ch {
+        h = ch
+        w = ch * aspect
+    }
+    ((cw - w) / 2.0, (ch - h) / 2.0, w, h)
+}
+
+// A live preview of subtitle styles: the first track's sample lines at the
+// bottom, and with `showSecondary` the second track's at the top.
+public view SubtitleStylePreview(primary: library.SubtitleStyle, secondary: library.SubtitleStyle, showSecondary: Bool = true, pixels: [Int] = [], pixelWidth: Int = 0, pixelHeight: Int = 0) {
+    let cues = prefsPreviewCues(primary, secondary, secondary: showSecondary)
+
+    Canvas { g in
+        let hasPicture = pixelWidth > 0 && pixelHeight > 0 && pixels.count >= pixelWidth * pixelHeight
+        let aspect = if hasPicture { Float(pixelWidth) / Float(pixelHeight) } else { 16.0 / 9.0 }
+        let (x, y, w, h) = prefsFit(g.width, g.height, aspect: aspect)
+        g.fillRect(x: 0, y: 0, width: g.width, height: g.height, color: .black, radius: 6)
+        if hasPicture {
+            g.image(pixels: pixels, pixelWidth: pixelWidth, pixelHeight: pixelHeight, x: x, y: y, width: w, height: h)
+        } else {
+            prefsSampleScene(g, x: x, y: y, w: w, h: h)
+        }
+        subs.drawTracks(g, primary: cues.0, secondary: cues.1, at: 1.0, x: x, y: y, width: w, height: h)
+    }
+    .frame(width: 400, height: 225)
+    .accessibilityLabel("Subtitle preview")
+}
+
+// The controls of one subtitle style.
+view PrefsStyleEditor(style: bind library.SubtitleStyle, isPrimary: Bool) {
+    Grid(spacing: 10) {
+        PrefsRow("Size") {
+            Slider(value: style.fontScale, from: 0.5, to: 3.0, step: 0.05)
+                .frame(width: 180)
+                .accessibilityLabel("Text size")
+            Text(prefsPercent(style.fontScale)).frame(width: 52, alignment: .leading)
+        }
+        PrefsRow("Font") {
+            FontPicker(family: style.font)
+                .frame(width: 180)
+                .accessibilityLabel("Font")
+            Toggle("Bold", isOn: style.bold)
+        }
+        PrefsRow("Text colour") {
+            PrefsColorField(color: style.color, label: "Text colour")
+        }
+        PrefsRow("Outline") {
+            Slider(value: style.outlineWidth, from: 0, to: 10, step: 0.5)
+                .frame(width: 180)
+                .accessibilityLabel("Outline width")
+            Text(style.outlineWidth.formatted(decimals: 1)).frame(width: 36, alignment: .leading)
+        }
+        PrefsRow("Outline colour", off: style.outlineWidth <= 0.0) {
+            PrefsColorField(color: style.outlineColor, label: "Outline colour")
+        }
+        PrefsRow("Shadow") {
+            Toggle("Shadow", isOn: style.shadow)
+            PrefsColorField(color: style.shadowColor, label: "Shadow colour")
+                .disabled(!style.shadow)
+        }
+        PrefsRow("Box") {
+            Toggle("Box behind the text", isOn: style.background)
+        }
+        PrefsRow("Box colour", off: !style.background) {
+            PrefsColorField(color: style.backgroundColor, label: "Box colour")
+        }
+        PrefsRow("Box opacity", off: !style.background) {
+            Slider(value: style.backgroundOpacity, from: 0, to: 1, step: 0.05)
+                .frame(width: 180)
+                .accessibilityLabel("Box opacity")
+            Text(prefsPercent(style.backgroundOpacity)).frame(width: 52, alignment: .leading)
+        }
+        PrefsRow("Distance from edge") {
+            Slider(value: style.marginV, from: 0, to: 0.3, step: 0.01)
+                .frame(width: 180)
+                .accessibilityLabel("Distance from the edge")
+            Text(prefsPercent(style.marginV)).frame(width: 52, alignment: .leading)
+        }
+        if isPrimary {
+            PrefsRow("Position") {
+                Picker(selection: style.position) {
+                    Text("Bottom").tag("bottom")
+                    Text("Top").tag("top")
+                }
+                .accessibilityLabel("Position")
+            }
+            PrefsRow("ASS/SSA") {
+                Toggle("Use this style for ASS subtitles too", isOn: style.overrideAss)
+            }
+            PrefsNote("ASS subtitles normally keep their own styles; signs and positions stay either way.")
+        }
+        PrefsRow("") {
+            Button("Reset Style") {
+                style = if isPrimary { library.SubtitleStyle() } else { PrefsExtra().secondaryStyle }
+            }
+        }
+    }
+}
+
+// Subtitles, in two parts chosen at the top: "Languages & Files" (when
+// subtitles show, preferred languages for the first and second track, the
+// text encoding) and "Look" (the style of each track, with the preview
+// kept in view above the controls).
+public view SubtitlePrefs(prefs: bind library.Preferences, extra: bind PrefsExtra, previewPixels: [Int] = [], previewWidth: Int = 0, previewHeight: Int = 0) {
+    state part = "languages"
+    state editing = "primary"
+
+    VStack(spacing: 0, alignment: .leading) {
+        HStack(spacing: 12) {
+            Picker(selection: part) {
+                Text("Languages & Files").tag("languages")
+                Text("Look").tag("look")
+            }
+            .accessibilityLabel("Subtitle settings")
+            Spacer()
+            if part == "look" {
+                Picker(selection: editing) {
+                    Text("First track").tag("primary")
+                    Text("Second track").tag("secondary")
+                }
+                .accessibilityLabel("Track to style")
+            }
+        }
+        .padding(top: 14, leading: 20, bottom: 6, trailing: 20)
+        if part == "look" {
+            SubtitleStylePreview(primary: prefs.subtitleStyle, secondary: extra.secondaryStyle, showSecondary: editing == "secondary" || !prefs.secondarySubtitleLanguages.isEmpty, pixels: previewPixels, pixelWidth: previewWidth, pixelHeight: previewHeight)
+                .padding(leading: 20, bottom: 4)
+            PrefsPage {
+                if editing == "primary" {
+                    PrefsStyleEditor(style: prefs.subtitleStyle, isPrimary: true)
+                } else {
+                    PrefsStyleEditor(style: extra.secondaryStyle, isPrimary: false)
+                }
+            }
+        } else {
+            PrefsPage {
+                Grid(spacing: 10) {
+                    PrefsHeader("Showing subtitles")
+                    PrefsRow("Show") {
+                        Picker(selection: prefs.subtitleMode, style: .radio) {
+                            Text("When the audio isn't in a preferred language").tag("auto")
+                            Text("Always").tag("always")
+                            Text("Forced subtitles only (signs, foreign dialogue)").tag("forced")
+                            Text("Never").tag("never")
+                        }
+                        .accessibilityLabel("When to show subtitles")
+                    }
+                    PrefsRow("Languages") {
+                        PrefsLanguageList(languages: prefs.subtitleLanguages, what: "subtitle languages", empty: "None: the audio's language is used.")
+                    }
+                    PrefsRow("Second track") {
+                        PrefsLanguageList(languages: prefs.secondarySubtitleLanguages, what: "second track languages", empty: "Off: no second track at the top.")
+                    }
+                    PrefsNote("A second track in one of these languages is shown at the top at the same time.")
+
+                    PrefsHeader("Files")
+                    PrefsRow("Text encoding") {
+                        Picker(selection: prefs.subtitleEncoding, style: .menu) {
+                            Text("Detect automatically").tag("auto")
+                            for name in subs.encodingList {
+                                Text(subs.encodingTitle(name)).tag(name)
+                            }
+                        }
+                        .frame(width: 280)
+                        .accessibilityLabel("Text encoding of subtitle files")
+                    }
+                    PrefsRow("Beside the video") {
+                        Toggle("Load subtitle files found next to the video", isOn: prefs.loadSiblingSubtitles)
+                    }
+                }
+            }
+        }
+    }
+}

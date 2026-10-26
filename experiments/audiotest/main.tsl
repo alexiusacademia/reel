@@ -1,0 +1,213 @@
+// A listening test for Reel's sound output. Tessel has no raw audio
+// output, so Reel plays decoded sound by writing WAV files and playing
+// them with playSound. This app tries four ways of doing that with a
+// smooth melody whose phase never jumps, so any gap or overlap between
+// pieces is heard as a click:
+//
+//   1. One long file        the baseline: should be perfect
+//   2. Back to back         1-second files started one after another
+//   3. Crossfaded           1-second files with 40 ms overlaps that fade
+//   4. Growing file         one file that keeps being appended to while
+//                           it plays
+//
+// Run it with `tessel run experiments/audiotest` from ~/Dev/reel.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+let rate = 48000
+let fade = 0.04
+
+// The melody's sample at frame n: notes that glide, with phase carried
+// through, so it's continuous everywhere.
+fn tone(_ n: Int) -> Float {
+    let t = Float(n) / Float(rate)
+    let f = 330.0 + 110.0 * sin(t * 0.9)
+    // Phase of a glide f(t) = 330 + 110 sin(0.9 t): the integral.
+    let phase = 2.0 * pi * (330.0 * t - 110.0 / 0.9 * cos(t * 0.9) + 110.0 / 0.9)
+    0.25 * sin(phase) + 0.0 * f
+}
+
+fn le(_ out: bind Data, _ v: Int, _ count: Int) {
+    for i in 0..count {
+        out.append(byte: (v >> (8 * i)) & 255)
+    }
+}
+
+fn wavHeader(_ frames: Int) -> Data {
+    var h = Data(text: "RIFF")
+    le(h, 36 + frames * 4, 4)
+    h += Data(text: "WAVEfmt ")
+    le(h, 16, 4)
+    le(h, 1, 2)
+    le(h, 2, 2)
+    le(h, rate, 4)
+    le(h, rate * 4, 4)
+    le(h, 4, 2)
+    le(h, 16, 2)
+    h += Data(text: "data")
+    le(h, frames * 4, 4)
+    h
+}
+
+// Frames from..<to of the melody as 16-bit stereo; with fades, the first
+// and last `fadeFrames` fade in and out.
+fn pcm(from: Int, to: Int, fadeIn: Int, fadeOut: Int) -> Data {
+    var out = Data()
+    for n in from..to {
+        var g = 1.0
+        if n - from < fadeIn {
+            g = Float(n - from) / Float(fadeIn)
+        }
+        if to - n <= fadeOut {
+            g = min(g, Float(to - n) / Float(fadeOut))
+        }
+        let s = Int(round(tone(n) * g * 32767.0))
+        let v = s & 0xffff
+        out.append(byte: v & 255)
+        out.append(byte: v >> 8)
+        out.append(byte: v & 255)
+        out.append(byte: v >> 8)
+    }
+    out
+}
+
+fn writePiece(_ path: String, from: Int, to: Int, fadeIn: Int = 0, fadeOut: Int = 0) {
+    writeData(path: path, data: wavHeader(to - from) + pcm(from: from, to: to, fadeIn: fadeIn, fadeOut: fadeOut))
+}
+
+app AudioTest(title: "Reel sound test", width: 460, height: 360) {
+    state log: [String] = []
+    state current: Sound? = nil
+    state next: Sound? = nil
+    state timer = -1
+    state piece = 0
+    state started = 0.0
+    state method = 0
+
+    VStack(spacing: 10, alignment: .leading) {
+        Text("Listen for clicks or gaps once a second.").font(size: 14)
+        Button("1. One long file (baseline)") { start(1) }
+        Button("2. Back to back, 1-second files") { start(2) }
+        Button("3. Crossfaded, 1-second files") { start(3) }
+        Button("4. One growing file") { start(4) }
+        Button("Stop") { stopAll() }
+        Divider()
+        Scroll {
+            VStack(alignment: .leading) {
+                for line in log {
+                    Text(line).font(size: 11)
+                }
+            }
+        }
+    }
+    .padding(16)
+
+    fn folder() -> String {
+        let f = joinPath(appDataFolder("ReelSoundTest"), "pieces")
+        createFolder(f)
+        f
+    }
+
+    fn path(_ k: Int) -> String {
+        joinPath(folder(), "p{k}.wav")
+    }
+
+    fn note(_ s: String) {
+        log.append(s)
+        if log.count > 40 {
+            log.removeFirst()
+        }
+    }
+
+    fn stopAll() {
+        if timer >= 0 {
+            stopTimer(timer)
+            timer = -1
+        }
+        current?.stop()
+        next?.stop()
+        current = nil
+        next = nil
+    }
+
+    fn start(_ m: Int) {
+        stopAll()
+        method = m
+        piece = 0
+        log = []
+        let t0 = now()
+        match m {
+            1 -> {
+                writePiece(path(0), from: 0, to: rate * 12)
+                note("wrote 12 s in {Int((now() - t0) * 1000.0)} ms")
+                current = playSound(path(0))
+            }
+            2 -> {
+                writePiece(path(0), from: 0, to: rate)
+                writePiece(path(1), from: rate, to: 2 * rate)
+                current = playSound(path(0))
+                started = now()
+                timer = every(seconds: 0.005) { tick() }
+            }
+            3 -> {
+                let f = Int(fade * Float(rate))
+                writePiece(path(0), from: 0, to: rate + f, fadeOut: f)
+                writePiece(path(1), from: rate, to: 2 * rate + f, fadeIn: f, fadeOut: f)
+                current = playSound(path(0))
+                started = now()
+                timer = every(seconds: 0.005) { tick() }
+            }
+            _ -> {
+                // A header that claims 12 s; the samples arrive a second
+                // at a time.
+                writeData(path: path(0), data: wavHeader(rate * 12) + pcm(from: 0, to: rate * 2, fadeIn: 0, fadeOut: 0))
+                piece = 2
+                current = playSound(path(0))
+                started = now()
+                timer = every(seconds: 0.5) { grow() }
+            }
+        }
+    }
+
+    // Methods 2 and 3: start the next piece when this one reaches its
+    // nominal end (1 s), and write the one after it.
+    fn tick() {
+        if let cur = current {
+            advance(cur)
+        }
+    }
+
+    fn advance(_ cur: Sound) {
+        if cur.position() >= 1.0 - 0.003 || (!cur.isPlaying() && cur.duration() > 0.0) {
+            let late = (now() - started) - Float(piece + 1)
+            piece += 1
+            current = playSound(path(piece))
+            note("piece {piece} started at {Int(cur.position() * 1000.0)} ms of the last ({Int(late * 1000.0)} ms off the wall clock)")
+            if piece >= 11 {
+                stopTimer(timer)
+                timer = -1
+                return
+            }
+            let f = Int(fade * Float(rate))
+            let from = (piece + 1) * rate
+            if method == 2 {
+                writePiece(path(piece + 1), from: from, to: from + rate)
+            } else {
+                writePiece(path(piece + 1), from: from, to: from + rate + f, fadeIn: f, fadeOut: f)
+            }
+        }
+    }
+
+    // Method 4: append the next second of samples.
+    fn grow() {
+        if piece >= 12 {
+            stopTimer(timer)
+            timer = -1
+            return
+        }
+        appendData(path: path(0), data: pcm(from: piece * rate, to: (piece + 1) * rate, fadeIn: 0, fadeOut: 0))
+        piece += 1
+        note("appended second {piece}; playing at {Int((current?.position() ?? 0.0) * 1000.0)} ms, sound says {current?.duration() ?? 0.0} s long")
+    }
+}

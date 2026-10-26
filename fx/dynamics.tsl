@@ -1,0 +1,390 @@
+// Dynamics: a compressor and a look-ahead peak limiter.
+//
+// Compressor: feed-forward with a peak envelope taken over all channels
+// (so the stereo image stays put), attack/release one-pole smoothing of
+// the envelope, and the soft-knee static curve described by Giannoulis,
+// Massberg and Reiss, "Digital Dynamic Range Compressor Design — A
+// Tutorial and Analysis" (JAES 60(6), 2012), §2.2:
+//   2(x − T) < −W:    y = x
+//   2|x − T| ≤ W:     y = x + (1/R − 1)(x − T + W/2)² / (2W)
+//   2(x − T) > W:     y = T + (x − T)/R
+// (x, y, T in dB, W the knee width, R the ratio). The gain is worked out
+// every 16 frames and ramped linearly in between, and it moves at most
+// 1 dB per 16 frames, so changing the threshold or ratio never clicks.
+//
+// Limiter (Reel's design): with a look-ahead of L frames, the gain each
+// frame needs is g = min(1, ceiling / peak). Its minimum over the last
+// L + 1 frames (a monotonic queue), smoothed for release by a one-pole
+// that only rises, then averaged over L frames, is applied to the input
+// delayed by L. Every value averaged comes from a window that holds the
+// delayed frame, so the gain is never above what that frame needs: the
+// output never passes the ceiling, and the gain reaches each peak by a
+// smooth L-frame ramp. When nothing comes near the ceiling the limiter
+// is a plain delay.
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+let compSegment = 16
+let compMaxStepDb = 1.0
+
+public struct Compressor {
+    rate: Int = 48000
+    channels: Int = 2
+    on: Bool = false
+    threshold: Float = -20.0
+    ratio: Float = 3.0
+    knee: Float = 6.0
+    attackMs: Float = 10.0
+    releaseMs: Float = 150.0
+    makeup: Float = 0.0
+    env: Float = 0.0
+    // The gain being applied (linear) and its smoothed dB value.
+    gain: Float = 1.0
+    gainDb: Float = 0.0
+    // The gain reduction at the last update, dB (≥ 0), for a meter.
+    reduction: Float = 0.0
+    // The parameters in use, gliding to the ones set above over about
+    // 20 ms (threshold, 1/ratio, knee, makeup), and how much of the
+    // compressor is in (0 = off … 1 = on), so changes never jump.
+    cT: Float = -20.0
+    cS: Float = 0.333333
+    cW: Float = 6.0
+    cM: Float = 0.0
+    mix: Float = 0.0
+    started: Bool = false
+
+    fn setup(_ r: Int, _ c: Int) {
+        self.rate = r
+        self.channels = c
+        clear()
+    }
+
+    fn clear() {
+        env = 0.0
+    }
+
+    // The static curve: the gain in dB for an input level in dB, with the
+    // parameters as set.
+    fn curve(_ x: Float) -> Float {
+        compCurve(x, threshold, 1.0 / max(1.0, ratio), max(0.0, knee))
+    }
+
+    // Whether it would leave the sound untouched.
+    fn idle() -> Bool {
+        !on && mix == 0.0 && gain == 1.0
+    }
+
+    // Moves the parameters in use towards the set ones (one segment).
+    fn glide() {
+        let s = 1.0 / max(1.0, ratio)
+        let w = max(0.0, knee)
+        if !started {
+            started = true
+            cT = threshold
+            cS = s
+            cW = w
+            cM = makeup
+            mix = if on { 1.0 } else { 0.0 }
+            return
+        }
+        let k = 1.0 - exp(-Float(compSegment) / (0.02 * Float(rate)))
+        cT += (threshold - cT) * k
+        cS += (s - cS) * k
+        cW += (w - cW) * k
+        cM += (makeup - cM) * k
+        if abs(cT - threshold) < 1e-6 {
+            cT = threshold
+        }
+        if abs(cS - s) < 1e-9 {
+            cS = s
+        }
+        if abs(cW - w) < 1e-6 {
+            cW = w
+        }
+        if abs(cM - makeup) < 1e-6 {
+            cM = makeup
+        }
+        let step = Float(compSegment) / (0.02 * Float(rate))
+        if on {
+            mix = min(1.0, mix + step)
+        } else {
+            mix = max(0.0, mix - step)
+        }
+    }
+
+    fn process(_ d: bind [Float]) {
+        if idle() {
+            env = 0.0
+            return
+        }
+        let c = channels
+        let n = d.count / c
+        let att = exp(-1000.0 / (max(0.01, attackMs) * Float(rate)))
+        let rel = exp(-1000.0 / (max(0.01, releaseMs) * Float(rate)))
+        var e = env
+        var g = gain
+        var f = 0
+        while f < n {
+            // The gain to reach by the end of this segment.
+            glide()
+            let cg = compCurve(toDb(e), cT, cS, cW)
+            let targetDb = mix * (cg + cM)
+            reduction = -mix * cg
+            let diff = targetDb - gainDb
+            if abs(diff) > compMaxStepDb {
+                gainDb += if diff > 0.0 { compMaxStepDb } else { -compMaxStepDb }
+            } else {
+                gainDb = targetDb
+            }
+            var target = fromDb(gainDb)
+            if mix == 0.0 && abs(gainDb) < 1e-4 {
+                gainDb = 0.0
+                target = 1.0
+            }
+            let end = min(n, f + compSegment)
+            let dg = (target - g) / Float(end - f)
+            var i = f * c
+            while f < end {
+                // Envelope over the frame's channels.
+                var p = 0.0
+                for ch in 0..c {
+                    let a = abs(d[i + ch])
+                    if a > p {
+                        p = a
+                    }
+                }
+                if p > e {
+                    e = att * e + (1.0 - att) * p
+                } else {
+                    e = rel * e + (1.0 - rel) * p
+                }
+                g += dg
+                for ch in 0..c {
+                    d[i + ch] = d[i + ch] * g
+                }
+                i += c
+                f += 1
+            }
+            g = target
+        }
+        env = e
+        gain = g
+    }
+}
+
+// The soft-knee curve: gain in dB at level x for threshold t, slope
+// s = 1/ratio and knee width w.
+fn compCurve(_ x: Float, _ t: Float, _ s: Float, _ w: Float) -> Float {
+    let over = x - t
+    var y = x
+    if 2.0 * over < -w {
+        y = x
+    } else if w > 0.0 && 2.0 * abs(over) <= w {
+        let q = over + w / 2.0
+        y = x + (s - 1.0) * q * q / (2.0 * w)
+    } else {
+        y = t + over * s
+    }
+    y - x
+}
+
+public struct Limiter {
+    rate: Int = 48000
+    channels: Int = 2
+    look: Int = 240
+    ceiling: Float = 1.0
+    releaseMs: Float = 80.0
+    // Delay line of the last `look` input frames (a ring).
+    dl: [Float] = []
+    dlPos: Int = 0
+    // Monotonic queue of (gain, frame) for the window minimum.
+    qv: [Float] = []
+    qi: [Int] = []
+    qHead: Int = 0
+    qLen: Int = 0
+    // The release-smoothed minimum, the box average's ring and sum.
+    hs: Float = 1.0
+    box: [Float] = []
+    boxPos: Int = 0
+    boxSum: Float = 0.0
+    // Frames seen.
+    at: Int = 0
+    // The gain applied to the last frame, for a meter.
+    gain: Float = 1.0
+
+    fn setup(_ r: Int, _ c: Int, _ lookMs: Float) {
+        self.rate = r
+        self.channels = c
+        look = max(1, Int(floor(lookMs * 0.001 * Float(r) + 0.5)))
+        clear()
+    }
+
+    fn clear() {
+        dl = []
+        for _ in 0..(look * channels) {
+            dl.append(0.0)
+        }
+        dlPos = 0
+        qv = []
+        qi = []
+        for _ in 0..(look + 2) {
+            qv.append(1.0)
+            qi.append(0)
+        }
+        qHead = 0
+        qLen = 0
+        hs = 1.0
+        box = []
+        for _ in 0..look {
+            box.append(1.0)
+        }
+        boxPos = 0
+        boxSum = Float(look)
+        at = 0
+        gain = 1.0
+    }
+
+    // Frames of delay.
+    latency: Int { look }
+
+    fn resting() -> Bool {
+        hs == 1.0 && boxSum == Float(look) && (qLen == 0 || qv[qHead] == 1.0)
+    }
+
+    // Limits the block in place (it comes out `look` frames late).
+    fn process(_ d: bind [Float]) {
+        let c = channels
+        let n = d.count / c
+        let top = ceiling
+        var big = 0.0
+        for x in d {
+            let a = abs(x)
+            if a > big {
+                big = a
+            }
+        }
+        if big <= top && resting() {
+            delayOnly(d)
+            at += n
+            qLen = 0
+            gain = 1.0
+            return
+        }
+        let L = look
+        let cap = L + 2
+        let rc = 1.0 - exp(-1000.0 / (max(1.0, releaseMs) * Float(rate)))
+        var h = hs
+        var sum = boxSum
+        var bp = boxPos
+        var head = qHead
+        var len = qLen
+        var pos = dlPos
+        var g = 1.0
+        for f in 0..n {
+            let base = f * c
+            var p = 0.0
+            for ch in 0..c {
+                let a = abs(d[base + ch])
+                if a > p {
+                    p = a
+                }
+            }
+            let need = if p > top { top / p } else { 1.0 }
+            let t = at + f
+            // Window minimum over frames now − L … now.
+            while len > 0 && qv[(head + len - 1) % cap] >= need {
+                len -= 1
+            }
+            let tail = (head + len) % cap
+            qv[tail] = need
+            qi[tail] = t
+            len += 1
+            while qi[head] < t - L {
+                head = (head + 1) % cap
+                len -= 1
+            }
+            let m = qv[head]
+            // Instant down, smooth up.
+            if m < h {
+                h = m
+            } else {
+                h += (m - h) * rc
+                if 1.0 - h < 1e-9 && m == 1.0 {
+                    h = 1.0
+                }
+            }
+            sum += h - box[bp]
+            box[bp] = h
+            bp += 1
+            if bp == L {
+                bp = 0
+                // Re-add exactly now and then (no drift).
+                var s = 0.0
+                for k in 0..L {
+                    s += box[k]
+                }
+                sum = s
+            }
+            g = min(sum / Float(L), m)
+            // Out goes the frame from L ago; in goes this one.
+            let dp = pos * c
+            for ch in 0..c {
+                let x = d[base + ch]
+                var y = dl[dp + ch] * g
+                if y > top {
+                    y = top
+                } else if y < -top {
+                    y = -top
+                }
+                d[base + ch] = y
+                dl[dp + ch] = x
+            }
+            pos += 1
+            if pos == L {
+                pos = 0
+            }
+        }
+        hs = h
+        boxSum = sum
+        boxPos = bp
+        qHead = head
+        qLen = len
+        dlPos = pos
+        at += n
+        gain = g
+    }
+
+    fn delayOnly(_ d: bind [Float]) {
+        let c = channels
+        let n = d.count / c
+        let L = look
+        var pos = dlPos
+        var i = 0
+        for _ in 0..n {
+            let dp = pos * c
+            for ch in 0..c {
+                let x = d[i + ch]
+                d[i + ch] = dl[dp + ch]
+                dl[dp + ch] = x
+            }
+            i += c
+            pos += 1
+            if pos == L {
+                pos = 0
+            }
+        }
+        dlPos = pos
+    }
+
+    // The frames still in the delay line, in order (at the end of a
+    // stream), limited like the rest; the line is left empty (zeros).
+    fn drain() -> [Float] {
+        var tail: [Float] = []
+        for _ in 0..(look * channels) {
+            tail.append(0.0)
+        }
+        process(tail)
+        tail
+    }
+}

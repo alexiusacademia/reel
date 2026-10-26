@@ -1,0 +1,165 @@
+// Raw TrueHD and MLP streams (.thd, .mlp), also Blu-ray's .thd+ac3 form
+// where AC-3 syncframes are interleaved with the TrueHD access units.
+//
+// The stream is a run of access units (truehd/header.tsl), each starting
+// with its length in 16-bit words. Units with a major sync are where
+// decoding can start; the major sync gives the rate, channels and the
+// number of samples per unit (40 at 48 kHz). Bytes before the first
+// major sync are skipped (as FFmpeg's parser does).
+//
+// A packet is a run of up to 16 access units (a 2-hour 7.1 film has 8.6
+// million units; one PacketRef each would be a lot of memory), started
+// afresh at every major sync so that each keyframe begins a packet; pts
+// counts samples (the track's timescale is the sample rate). AC-3 frames,
+// when present, become a second track ("ac3", one frame per packet, pts
+// in samples of its own rate).
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../core"
+import "../truehd"
+
+let thdUnitsPerPacket = 16
+
+public fn thdOpen(_ file: Data) -> Result<core.Media> {
+    var m = core.Media(format: "thd")
+    let n = file.count
+    let start = truehd.thdFindMajorSync(file, 0)
+    if start < 0 {
+        return Result.failure(error: Error("no TrueHD or MLP major sync found"))
+    }
+    let first = truehd.thdReadMajorSync(file, start + 4)
+    if !first.ok {
+        return Result.failure(error: Error("damaged TrueHD major sync: {first.problem}"))
+    }
+    // AC-3 frames before the first major sync are kept; other bytes are
+    // skipped.
+    var at = if truehd.thdAc3FrameSize(file, 0) > 0 { 0 } else { start }
+    if at > 0 {
+        m.warnings.append("skipped {at} bytes before the first major sync")
+    }
+    var seenMajor = false
+    var t = core.Track(index: 0, kind: .audio, codec: if first.streamType == truehd.thdSyncMlp { "mlp" } else { "truehd" })
+    t.timescale = first.group1Rate
+    t.sampleRate = first.group1Rate
+    t.channels = truehd.thdPopCount(first.mask)
+    t.layout = truehd.thdLayoutNames(first.mask)
+    t.bitsPerSample = first.group1Bits
+    if first.atmos {
+        t.tag = "atmos"
+    }
+    if !first.vbr && first.peakBitrate > 0 {
+        t.bitrate = first.peakBitrate
+    }
+    var auSize = first.auSize
+    var pts = 0
+    // The packet being gathered.
+    var pStart = -1
+    var pSize = 0
+    var pUnits = 0
+    var pKey = false
+    var pPts = 0
+    // The AC-3 track, made when the first AC-3 frame turns up.
+    var ac3Track = -1
+    var ac3Pts = 0
+    var skipped = 0
+    var units = 0
+    while at + 4 <= n {
+        let ac3 = truehd.thdAc3FrameSize(file, at)
+        if ac3 > 0 && !truehd.thdIsMajorSync(file, at + 4) && at + ac3 <= n {
+            if pStart >= 0 {
+                m.packets.append(core.PacketRef(track: 0, pts: pPts, dts: pPts, duration: pts - pPts, key: pKey, offset: pStart, size: pSize))
+                pStart = -1
+            }
+            let fscod = file[at + 4] >> 6
+            let rate = if fscod == 0 { 48000 } else if fscod == 1 { 44100 } else { 32000 }
+            if ac3Track < 0 {
+                ac3Track = 1
+                var a = core.Track(index: 1, id: 1, kind: .audio, codec: "ac3")
+                a.timescale = rate
+                a.sampleRate = rate
+                m.tracks.append(a)
+            }
+            m.packets.append(core.PacketRef(track: ac3Track, pts: ac3Pts, dts: ac3Pts, duration: 1536, key: true, offset: at, size: ac3))
+            ac3Pts += 1536
+            at += ac3
+            continue
+        }
+        if !seenMajor {
+            if truehd.thdIsMajorSync(file, at + 4) {
+                seenMajor = true
+            } else {
+                // Before the first major sync: on to it, or to an AC-3 frame.
+                var k = at + 1
+                while k + 8 <= n && truehd.thdAc3FrameSize(file, k) == 0 && !truehd.thdIsMajorSync(file, k + 4) {
+                    k += 1
+                }
+                skipped += k - at
+                at = k
+                continue
+            }
+        }
+        let len = truehd.thdAccessUnitLength(file, at)
+        if len == 0 || at + len > n {
+            if len > 0 {
+                m.warnings.append("the last access unit is cut off")
+                break
+            }
+            let next = truehd.thdFindMajorSync(file, at + 1)
+            if pStart >= 0 {
+                m.packets.append(core.PacketRef(track: 0, pts: pPts, dts: pPts, duration: pts - pPts, key: pKey, offset: pStart, size: pSize))
+                pStart = -1
+            }
+            if next < 0 {
+                skipped += n - at
+                break
+            }
+            skipped += next - at
+            at = next
+            continue
+        }
+        let major = len >= 8 && truehd.thdIsMajorSync(file, at + 4)
+        if major {
+            let mh = truehd.thdReadMajorSync(file, at + 4)
+            if mh.ok {
+                auSize = mh.auSize
+            }
+        }
+        if pStart >= 0 && (major || pUnits >= thdUnitsPerPacket) {
+            m.packets.append(core.PacketRef(track: 0, pts: pPts, dts: pPts, duration: pts - pPts, key: pKey, offset: pStart, size: pSize))
+            pStart = -1
+        }
+        if pStart < 0 {
+            pStart = at
+            pSize = 0
+            pUnits = 0
+            pKey = major
+            pPts = pts
+        }
+        pSize += len
+        pUnits += 1
+        units += 1
+        pts += auSize
+        at += len
+    }
+    if pStart >= 0 {
+        m.packets.append(core.PacketRef(track: 0, pts: pPts, dts: pPts, duration: pts - pPts, key: pKey, offset: pStart, size: pSize))
+    }
+    if skipped > 0 {
+        m.warnings.append("skipped {skipped} bytes that are not access units")
+    }
+    t.duration = pts
+    if t.bitrate == 0 && pts > 0 && t.sampleRate > 0 {
+        t.bitrate = Int(Float(n) * 8.0 * Float(t.sampleRate) / Float(pts))
+    }
+    var tracks = [t]
+    if ac3Track >= 0 {
+        var a = m.tracks[0]
+        a.duration = ac3Pts
+        tracks.append(a)
+    }
+    m.tracks = tracks
+    m.duration = if t.sampleRate > 0 { Float(pts) / Float(t.sampleRate) } else { -1.0 }
+    Result.ok(value: m)
+}

@@ -1,0 +1,3855 @@
+// The first stage of the AV1 decoder: everything that reads the bitstream.
+// It splits temporal units into OBUs (5.3), reads the sequence and frame
+// headers (obu.tsl), sets up the CDFs (load_cdfs, init_*_cdfs, 7.20
+// save_cdfs, frame_end_update_cdf), decodes every tile's superblocks:
+// partitions (5.11.4), mode info (5.11.5–5.11.33), palette tokens, transform
+// sizes and types, coefficients (5.11.39) with their dequantisation
+// (7.12.3 step 1), CDEF indices and loop restoration units, runs motion
+// vector prediction and warp estimation (mvpred.tsl), and keeps the state
+// later frames predict from (segmentation maps, saved motion vectors).
+// It produces ParsedFrames (frame.tsl): a list of operation records in the
+// order the spec's syntax tables call predict_intra, predict_inter,
+// predict_palette and reconstruct, plus the per 4x4 mode info the
+// reconstructor's filters need. It never touches samples.
+//
+// Names of syntax elements and variables follow the spec.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../core"
+
+public struct Parser {
+    skipNonReference: Bool = false
+    warnings: [String] = []
+    // Packets are Annex B temporal units (length-delimited OBUs) rather
+    // than low-overhead OBUs.
+    annexB: Bool = false
+    // Counts of the coding tools seen (for tests; see av1StatNames).
+    stats: [Int] = []
+
+    hd: Av1Headers = Av1Headers()
+    mvp: Av1Mvp = Av1Mvp()
+    sym: Av1Sym = Av1Sym()
+    ready: Bool = false
+    haveSeq: Bool = false
+    waitKey: Bool = true
+    seenFrameHeader: Bool = false
+    frameOpen: Bool = false
+    frameDamaged: Bool = false
+    // The tile being decoded has invalid data: stop decoding it.
+    tileBad: Bool = false
+    tileNum: Int = 0
+
+    // Frame CDFs (the spec's CDF arrays without prefix), the copy saved at
+    // the end of tile context_update_tile_id, and the 8 saved contexts.
+    frameCdf: [Int] = []
+    savedCdf: [Int] = []
+    slotCdf: [[Int]] = []
+    slotCdfOk: [Int] = [0, 0, 0, 0, 0, 0, 0, 0]
+    // Saved per slot: SegmentIds, MfRefFrames, MfMvs.
+    slotSeg: [[Int]] = []
+    slotMfRef: [[Int]] = []
+    slotMfMvR: [[Int]] = []
+    slotMfMvC: [[Int]] = []
+
+    // Tables (copies; module lists are slow to read).
+    tW4: [Int] = []
+    tH4: [Int] = []
+    tWLog2: [Int] = []
+    tHLog2: [Int] = []
+    tSizeGroup: [Int] = []
+    tMaxTxRect: [Int] = []
+    tMaxTxDepth: [Int] = []
+    tPartSub: [Int] = []
+    tSplitTx: [Int] = []
+    tTxW: [Int] = []
+    tTxH: [Int] = []
+    tTxWLog2: [Int] = []
+    tTxHLog2: [Int] = []
+    tTxSqr: [Int] = []
+    tTxSqrUp: [Int] = []
+    tAdjTx: [Int] = []
+    tSubSize: [Int] = []
+    tModeToTxfm: [Int] = []
+    tWedgeBits: [Int] = []
+    tIntraModeCtx: [Int] = []
+    tCompModeCtxMap: [Int] = []
+    tCoeffBaseCtxOff: [Int] = []
+    tSigRefDiff: [Int] = []
+    tMagRef: [Int] = []
+    tDcQ: [Int] = []
+    tAcQ: [Int] = []
+    tQm: [Int] = []
+    tQmOffset: [Int] = []
+    tPalCtx: [Int] = []
+    tSgrParams: [Int] = []
+    tInSetIntra: [Int] = []
+    tInSetInter: [Int] = []
+    tIntraInv1: [Int] = []
+    tIntraInv2: [Int] = []
+    tInterInv1: [Int] = []
+    tInterInv2: [Int] = []
+    tInterInv3: [Int] = []
+    tFilterIntraDir: [Int] = []
+    // All scan tables back to back, and the offset of each.
+    tScan: [Int] = []
+    // scanOff[ txSz * 3 + kind ], kind 0 default, 1 mrow, 2 mcol.
+    scanOff: [Int] = []
+
+    // The frame being decoded.
+    fh: Av1Fh = Av1Fh()
+    miCols: Int = 0
+    miRows: Int = 0
+    subX: Int = 1
+    subY: Int = 1
+    numPlanes: Int = 3
+    bitDepth: Int = 8
+    use128: Bool = false
+    sbSize4: Int = 16
+    sbMask: Int = 15
+    frameIsIntra: Bool = false
+    segEnabled: Bool = false
+    featureEnabled: [Int] = []
+    featureData: [Int] = []
+    allowScreenContent: Bool = false
+    // Grids not kept by mvp (index row * miCols + col).
+    gUVMode: [Int] = []
+    gSkip: [Int] = []
+    gSkipMode: [Int] = []
+    gSeg: [Int] = []
+    gInterTx: [Int] = []
+    gPalSize: [Int] = []
+    gPalColY: [Int] = []
+    gPalColUV: [Int] = []
+    gCompGroup: [Int] = []
+    gCompoundIdx: [Int] = []
+    gFilt: [Int] = []
+    gTxType: [Int] = []
+    gLfTxY: [Int] = []
+    gLfTxUV: [Int] = []
+    gDeltaLf: [Int] = []
+    // The packed grids handed to the reconstructor (frame.tsl gInfo, gMv).
+    gInfoP: [Int] = []
+    gMvP: [Int] = []
+    prevSegIds: [Int] = []
+    gridCols: Int = 0
+    gridRows: Int = 0
+    cdefIdx: [Int] = []
+    cdefStride: Int = 0
+    lrData: [Int] = []
+    lrOff: [Int] = [0, 0, 0]
+    lrRows: [Int] = [0, 0, 0]
+    lrCols: [Int] = [0, 0, 0]
+    // Output being built.
+    ops: [Int] = []
+    coefs: [Int] = []
+    palette: [Int] = []
+
+    // Tile state.
+    miRowStart: Int = 0
+    miRowEnd: Int = 0
+    miColStart: Int = 0
+    miColEnd: Int = 0
+    currentQIndex: Int = 0
+    deltaLF: [Int] = [0, 0, 0, 0]
+    readDeltas: Bool = false
+    refSgrXqd: [Int] = [0, 0, 0, 0, 0, 0]
+    refLrWiener: [Int] = []
+    // Above/left contexts: per plane, at plane * ctxCap + index.
+    ctxCap: Int = 0
+    aboveLevel: [Int] = []
+    aboveDc: [Int] = []
+    leftLevel: [Int] = []
+    leftDc: [Int] = []
+    aboveSegPred: [Int] = []
+    leftSegPred: [Int] = []
+    // BlockDecoded[ plane ][ y ][ x ] for y, x in -1 … 32 at
+    // plane * 1156 + (y + 1) * 34 + (x + 1).
+    blockDecoded: [Int] = []
+
+    // The block being decoded.
+    miRow: Int = 0
+    miCol: Int = 0
+    miSize: Int = 0
+    bw4: Int = 1
+    bh4: Int = 1
+    hasChroma: Bool = false
+    availU: Bool = false
+    availL: Bool = false
+    availUChroma: Bool = false
+    availLChroma: Bool = false
+    skip: Int = 0
+    skipMode: Int = 0
+    segmentId: Int = 0
+    lossless: Bool = false
+    isInter: Int = 0
+    useIntrabc: Int = 0
+    yMode: Int = 0
+    uvMode: Int = 0
+    angleDeltaY: Int = 0
+    angleDeltaUV: Int = 0
+    useFilterIntra: Int = 0
+    filterIntraMode: Int = 0
+    cflAlphaU: Int = 0
+    cflAlphaV: Int = 0
+    paletteSizeY: Int = 0
+    paletteSizeUV: Int = 0
+    palColorsY: [Int] = []
+    palColorsU: [Int] = []
+    palColorsV: [Int] = []
+    palCache: [Int] = []
+    colorMapY: [Int] = []
+    colorMapUV: [Int] = []
+    palOffY: Int = -1
+    palOffU: Int = -1
+    palOffV: Int = -1
+    refFrame: [Int] = [0, -1]
+    mvR: [Int] = [0, 0]
+    mvC: [Int] = [0, 0]
+    predMvR: [Int] = [0, 0]
+    predMvC: [Int] = [0, 0]
+    interpFilter: [Int] = [0, 0]
+    motionMode: Int = 0
+    interintra: Int = 0
+    interintraMode: Int = 0
+    wedgeInterintra: Int = 0
+    wedgeIndex: Int = 0
+    wedgeSign: Int = 0
+    maskType: Int = 0
+    compGroupIdx: Int = 0
+    compoundIdx: Int = 0
+    compoundType: Int = 2
+    txSize: Int = 0
+    maxLumaW: Int = 0
+    maxLumaH: Int = 0
+    refMvIdx: Int = 0
+    leftRefFrame: [Int] = [0, -1]
+    aboveRefFrame: [Int] = [0, -1]
+    leftIntra: Bool = false
+    aboveIntra: Bool = false
+    leftSingle: Bool = false
+    aboveSingle: Bool = false
+    // Coefficients: Quant (levels then signed values) and the scratch of
+    // the palette color context.
+    quant: [Int] = []
+    scores: [Int] = [0, 0, 0, 0, 0, 0, 0, 0]
+    colorOrder: [Int] = [0, 0, 0, 0, 0, 0, 0, 0]
+    colorCtxHash: Int = 0
+    planeTxType: Int = 0
+
+    fn setup() {
+        if ready {
+            return
+        }
+        ready = true
+        hd.setup()
+        mvp.setup()
+        sym.setup()
+        tW4 = av1Num4x4BlocksWide
+        tH4 = av1Num4x4BlocksHigh
+        tWLog2 = av1MiWidthLog2
+        tHLog2 = av1MiHeightLog2
+        tSizeGroup = av1SizeGroup
+        tMaxTxRect = av1MaxTxSizeRect
+        tMaxTxDepth = av1MaxTxDepth
+        tPartSub = av1PartitionSubsize
+        tSplitTx = av1SplitTxSize
+        tTxW = av1TxWidth
+        tTxH = av1TxHeight
+        tTxWLog2 = av1TxWidthLog2
+        tTxHLog2 = av1TxHeightLog2
+        tTxSqr = av1TxSizeSqr
+        tTxSqrUp = av1TxSizeSqrUp
+        tAdjTx = av1AdjustedTxSize
+        tSubSize = av1SubsampledSize
+        tModeToTxfm = av1ModeToTxfm
+        tWedgeBits = av1WedgeBits
+        tIntraModeCtx = av1IntraModeContext
+        tCompModeCtxMap = av1CompoundModeCtxMap
+        tCoeffBaseCtxOff = av1CoeffBaseCtxOffset
+        tSigRefDiff = av1SigRefDiffOffset
+        tMagRef = av1MagRefOffsetWithTxClass
+        tDcQ = av1DcQlookup
+        tAcQ = av1AcQlookup
+        tQm = av1QuantizerMatrix
+        tQmOffset = av1QmOffset
+        tPalCtx = av1PaletteColorContext
+        tSgrParams = av1SgrParams
+        tInSetIntra = av1TxTypeInSetIntra
+        tInSetInter = av1TxTypeInSetInter
+        tIntraInv1 = av1TxTypeIntraInvSet1
+        tIntraInv2 = av1TxTypeIntraInvSet2
+        tInterInv1 = av1TxTypeInterInvSet1
+        tInterInv2 = av1TxTypeInterInvSet2
+        tInterInv3 = av1TxTypeInterInvSet3
+        tFilterIntraDir = av1FilterIntraModeToIntraDir
+        // Scans, per tx size: default, mrow, mcol (the 64 sizes and the
+        // ones without row/column scans point at the default one).
+        let def: [[Int]] = [av1DefaultScan4x4, av1DefaultScan8x8, av1DefaultScan16x16, av1DefaultScan32x32, av1DefaultScan32x32,
+                            av1DefaultScan4x8, av1DefaultScan8x4, av1DefaultScan8x16, av1DefaultScan16x8,
+                            av1DefaultScan16x32, av1DefaultScan32x16, av1DefaultScan32x32, av1DefaultScan32x32,
+                            av1DefaultScan4x16, av1DefaultScan16x4, av1DefaultScan8x32, av1DefaultScan32x8,
+                            av1DefaultScan16x32, av1DefaultScan32x16]
+        let mrow: [[Int]] = [av1MrowScan4x4, av1MrowScan8x8, av1MrowScan16x16, [], [], av1MrowScan4x8, av1MrowScan8x4,
+                             av1MrowScan8x16, av1MrowScan16x8, [], [], [], [], av1MrowScan4x16, av1MrowScan16x4, [], [], [], []]
+        let mcol: [[Int]] = [av1McolScan4x4, av1McolScan8x8, av1McolScan16x16, [], [], av1McolScan4x8, av1McolScan8x4,
+                             av1McolScan8x16, av1McolScan16x8, [], [], [], [], av1McolScan4x16, av1McolScan16x4, [], [], [], []]
+        tScan = []
+        scanOff = []
+        for t in 0..19 {
+            let d = tScan.count
+            tScan += def[t]
+            var r = d
+            if !mrow[t].isEmpty {
+                r = tScan.count
+                tScan += mrow[t]
+            }
+            var c = d
+            if !mcol[t].isEmpty {
+                c = tScan.count
+                tScan += mcol[t]
+            }
+            scanOff += [d, r, c]
+        }
+        for _ in 0..8 {
+            slotCdf.append([])
+            slotSeg.append([])
+            slotMfRef.append([])
+            slotMfMvR.append([])
+            slotMfMvC.append([])
+        }
+        quant = av1Zeros(1024)
+        palColorsY = av1Zeros(8)
+        palColorsU = av1Zeros(8)
+        palColorsV = av1Zeros(8)
+        palCache = av1Zeros(16)
+        colorMapY = av1Zeros(64 * 64)
+        colorMapUV = av1Zeros(64 * 64)
+        blockDecoded = av1Zeros(3 * 1156)
+        refLrWiener = av1Zeros(18)
+        featureEnabled = av1Zeros(64)
+        featureData = av1Zeros(64)
+        stats = av1Zeros(40)
+    }
+
+    fn stat(_ i: Int) {
+        stats[i] += 1
+    }
+
+    fn warn(_ s: String) {
+        if warnings.count < 200 {
+            warnings.append(s)
+        }
+    }
+
+    // After a seek: forget references and wait for a keyframe.
+    fn reset() {
+        setup()
+        hd.reset()
+        slotCdfOk = [0, 0, 0, 0, 0, 0, 0, 0]
+        waitKey = true
+        seenFrameHeader = false
+        frameOpen = false
+    }
+
+    // Parses the sequence header in an av1C box body's configOBUs (or
+    // nothing when there is none).
+    fn configure(_ extra: Data) {
+        setup()
+        if extra.count > 4 && (extra[0] & 0x80) != 0 {
+            let rest = extra.slice(from: 4, to: extra.count)
+            let wasAnnexB = annexB
+            annexB = false
+            obus(rest, pts: core.noTime, key: true, collect: false)
+            annexB = wasAnnexB
+        }
+    }
+
+    // Splits a temporal unit into OBUs and parses each; returns the
+    // frames it completes, in decoding order.
+    fn parse(_ packet: Data, pts: Int, dts: Int, key: Bool) -> [ParsedFrame] {
+        setup()
+        obus(packet, pts: pts, key: key, collect: true)
+    }
+
+    fn flush() -> [ParsedFrame] {
+        []
+    }
+
+    // The OBU loop (5.3.1).
+    fn obus(_ d: Data, pts: Int, key: Bool, collect: Bool) -> [ParsedFrame] {
+        var out: [ParsedFrame] = []
+        let n = d.count
+        var p = 0
+        var bytes: [Int] = []
+        var haveBytes = false
+        // Annex B (length-delimited) units: the OBUs' byte ranges, from
+        // temporal_unit( sz ) / frame_unit( sz ) / obu_length.
+        var bounds: [Int] = []
+        if annexB {
+            var q = 0
+            while q < n {
+                let (fus, q1) = av1Leb128(d, q)
+                let fuEnd = min(n, q1 + fus)
+                var r = q1
+                while r < fuEnd {
+                    let (ol, r1) = av1Leb128(d, r)
+                    if ol <= 0 {
+                        break
+                    }
+                    bounds.append(r1)
+                    bounds.append(min(fuEnd, r1 + ol))
+                    r = r1 + ol
+                }
+                q = fuEnd
+                if fus <= 0 {
+                    break
+                }
+            }
+        }
+        var bi = 0
+        while (annexB && bi + 1 < bounds.count) || (!annexB && p < n) {
+            var lim = n
+            if annexB {
+                p = bounds[bi]
+                lim = bounds[bi + 1]
+                bi += 2
+                if p >= lim {
+                    continue
+                }
+            }
+            let h = d[p]
+            let type = (h >> 3) & 15
+            let ext = (h >> 2) & 1
+            let hasSize = (h >> 1) & 1
+            var q = p + 1
+            var temporalId = 0
+            var spatialId = 0
+            if ext == 1 {
+                if q >= n {
+                    break
+                }
+                temporalId = (d[q] >> 5) & 7
+                spatialId = (d[q] >> 3) & 3
+                q += 1
+            }
+            var size = lim - q
+            if hasSize == 1 {
+                var v = 0
+                var i = 0
+                while i < 8 && q < lim {
+                    let b = d[q]
+                    q += 1
+                    v |= (b & 0x7f) << (i * 7)
+                    i += 1
+                    if (b & 0x80) == 0 {
+                        break
+                    }
+                }
+                size = v
+            }
+            if q + size > lim {
+                warn("av1: an OBU runs past the end of the packet")
+                size = lim - q
+            }
+            let start = q
+            let end = q + size
+            p = end
+            // Operating point selection (drop_obu).
+            if type != obuSequenceHeader && type != obuTemporalDelimiter && hd.seq.opIdc != 0 && ext == 1 {
+                let inT = (hd.seq.opIdc >> temporalId) & 1
+                let inS = (hd.seq.opIdc >> (spatialId + 8)) & 1
+                if inT == 0 || inS == 0 {
+                    continue
+                }
+            }
+            if type == obuSequenceHeader {
+                let s = av1ParseSequenceHeader(d, start, end)
+                if s.ok {
+                    hd.seq = s
+                    haveSeq = true
+                } else {
+                    warn("av1: damaged sequence header")
+                }
+            } else if type == obuTemporalDelimiter {
+                seenFrameHeader = false
+            } else if type == obuFrameHeader || type == obuRedundantFrameHeader || type == obuFrame {
+                if !haveSeq {
+                    continue
+                }
+                if seenFrameHeader && type != obuFrame {
+                    continue
+                }
+                if !haveBytes {
+                    bytes = d.bytes
+                    haveBytes = true
+                }
+                hd.r = core.bitReaderRange(d, from: start, to: end)
+                seenFrameHeader = true
+                let ok = hd.frameHeader(temporalId: temporalId, spatialId: spatialId)
+                if !ok {
+                    warn("av1: " + hd.error)
+                    seenFrameHeader = false
+                    if collect {
+                        out.append(ParsedFrame(kind: 2, hdr: hd.fh.h, pts: pts))
+                    }
+                    continue
+                }
+                fh = hd.fh
+                if fh.h.showExistingFrame {
+                    stat(3)
+                    seenFrameHeader = false
+                    let f = showExisting(pts)
+                    if collect {
+                        out.append(f)
+                    }
+                    continue
+                }
+                if waitKey && fh.h.frameType != av1KeyFrame && !(fh.h.frameType == av1IntraOnlyFrame) {
+                    // Can't decode without references; skip.
+                    seenFrameHeader = false
+                    continue
+                }
+                beginFrame()
+                if type == obuFrame {
+                    hd.r.alignToByte()
+                    let tgStart = hd.r.position / 8
+                    let f = tileGroup(bytes, tgStart, end, pts, key)
+                    if f.count > 0 && collect {
+                        out += f
+                    }
+                }
+            } else if type == obuTileGroup {
+                if !frameOpen {
+                    continue
+                }
+                if !haveBytes {
+                    bytes = d.bytes
+                    haveBytes = true
+                }
+                hd.r = core.bitReaderRange(d, from: start, to: end)
+                let f = tileGroup(bytes, start, end, pts, key)
+                if f.count > 0 && collect {
+                    out += f
+                }
+            }
+        }
+        out
+    }
+
+    // show_existing_frame (7.21 for key frames, then 7.20).
+    fn showExisting(_ pts: Int) -> ParsedFrame {
+        var f = ParsedFrame(kind: 1, hdr: fh.h, pts: pts)
+        let idx = fh.h.frameToShowMapIdx
+        if waitKey && fh.h.frameType != av1KeyFrame {
+            f.kind = 3
+            return f
+        }
+        if fh.h.frameType == av1KeyFrame {
+            f.key = true
+            waitKey = false
+            hd.showExistingKey()
+            for i in 0..8 {
+                if i != idx {
+                    slotCdf[i] = slotCdf[idx]
+                    slotCdfOk[i] = slotCdfOk[idx]
+                    slotSeg[i] = slotSeg[idx]
+                    slotMfRef[i] = slotMfRef[idx]
+                    slotMfMvR[i] = slotMfMvR[idx]
+                    slotMfMvC[i] = slotMfMvC[idx]
+                }
+            }
+        }
+        f
+    }
+
+    // Sets up the frame after its header: CDFs, previous segment ids,
+    // motion field, grids.
+    fn beginFrame() {
+        let h = fh.h
+        miCols = h.miCols
+        miRows = h.miRows
+        subX = h.subX
+        subY = h.subY
+        numPlanes = h.numPlanes
+        bitDepth = h.bitDepth
+        use128 = h.use128
+        sbSize4 = if use128 { 32 } else { 16 }
+        sbMask = sbSize4 - 1
+        frameIsIntra = fh.frameIsIntra
+        segEnabled = h.segmentationEnabled
+        featureEnabled = hd.featureEnabled
+        featureData = hd.featureData
+        allowScreenContent = fh.allowScreenContentTools
+        frameOpen = true
+        frameDamaged = false
+        tileNum = 0
+        stat(0)
+        if h.frameType == av1KeyFrame { stat(1) }
+        if h.frameType == av1IntraOnlyFrame { stat(2) }
+        if h.frameType == av1SwitchFrame { stat(33) }
+        if h.errorResilientMode { stat(4) }
+        if h.useSuperres { stat(5) }
+        if h.use128 { stat(6) }
+        stats[7] = max(stats[7], fh.tileCols * fh.tileRows)
+        if segEnabled { stat(9) }
+        if fh.deltaQPresent { stat(10) }
+        if h.deltaLfPresent { stat(11) }
+        if fh.usingQmatrix { stat(12) }
+        if h.enableCdef && h.cdefBits + h.cdefYPriStrength[0] + h.cdefYSecStrength[0] + h.cdefUVPriStrength[0] + h.cdefUVSecStrength[0] > 0 { stat(15) }
+        for k in 1..8 {
+            if h.gmType[k] > 0 {
+                stat(22)
+                break
+            }
+        }
+        if h.grain.applyGrain { stat(30) }
+        if h.codedLossless { stat(31) }
+        if fh.disableCdfUpdate { stat(34) }
+        if fh.useRefFrameMvs { stat(35) }
+        if h.monochrome { stat(36) }
+        if h.subX == 0 { stat(37) }
+        if h.bitDepth > 8 { stat(38) }
+        // CDFs.
+        if fh.primaryRefFrame == av1PrimaryRefNone || slotCdfOk[h.refFrameIdx[fh.primaryRefFrame]] == 0 {
+            if fh.primaryRefFrame != av1PrimaryRefNone {
+                warn("av1: primary reference frame has no CDFs; using defaults")
+            }
+            let q = fh.baseQIdx
+            let idx = if q <= 20 { 0 } else if q <= 60 { 1 } else if q <= 120 { 2 } else { 3 }
+            var c = av1CdfDefault
+            if idx == 0 {
+                c += av1CoeffCdfDefault0
+            } else if idx == 1 {
+                c += av1CoeffCdfDefault1
+            } else if idx == 2 {
+                c += av1CoeffCdfDefault2
+            } else {
+                c += av1CoeffCdfDefault3
+            }
+            frameCdf = c
+        } else {
+            // load_cdfs( ctx ): the counters start at zero again.
+            var c = slotCdf[h.refFrameIdx[fh.primaryRefFrame]]
+            let counters = av1CdfCounters
+            for k in counters {
+                c[k] = 0
+            }
+            frameCdf = c
+        }
+        // Grids.
+        let n = miCols * miRows
+        mvp.beginFrame(miCols, miRows)
+        if miCols != gridCols || miRows != gridRows || gSkip.isEmpty {
+            gridCols = miCols
+            gridRows = miRows
+            gUVMode = av1Zeros(n)
+            gSkip = av1Zeros(n)
+            gSkipMode = av1Zeros(n)
+            gSeg = av1Zeros(n)
+            gInterTx = av1Zeros(n)
+            gPalSize = av1Zeros(n)
+            gPalColY = av1Zeros(n * 8)
+            gPalColUV = av1Zeros(n * 8)
+            gCompGroup = av1Zeros(n)
+            gCompoundIdx = av1Zeros(n)
+            gFilt = av1Zeros(n)
+            gTxType = av1Zeros(n)
+            gLfTxY = av1Zeros(n)
+            gLfTxUV = av1Zeros(n)
+            gDeltaLf = av1Zeros(n)
+            gInfoP = av1Zeros(n)
+            gMvP = av1Zeros(n)
+            ctxCap = miCols + miRows + 64
+            aboveLevel = av1Zeros(3 * ctxCap)
+            aboveDc = av1Zeros(3 * ctxCap)
+            leftLevel = av1Zeros(3 * ctxCap)
+            leftDc = av1Zeros(3 * ctxCap)
+            aboveSegPred = av1Zeros(ctxCap)
+            leftSegPred = av1Zeros(ctxCap)
+        }
+        // PrevSegmentIds (setup_past_independence / load_previous_segment_ids).
+        var prevOk = false
+        if fh.primaryRefFrame != av1PrimaryRefNone && segEnabled {
+            let pf = h.refFrameIdx[fh.primaryRefFrame]
+            let sl = hd.slots[pf]
+            if sl.miCols == miCols && sl.miRows == miRows && slotSeg[pf].count == n {
+                prevSegIds = slotSeg[pf]
+                prevOk = true
+            }
+        }
+        if !prevOk && segEnabled {
+            if prevSegIds.count != n {
+                prevSegIds = av1Zeros(n)
+            } else {
+                for i in 0..n {
+                    prevSegIds[i] = 0
+                }
+            }
+        }
+        // MV prediction frame state.
+        mvp.gmType = h.gmType
+        mvp.gmParams = h.gmParams
+        mvp.allowHighPrecisionMv = h.allowHighPrecisionMv
+        mvp.forceIntegerMv = h.forceIntegerMv
+        mvp.signBias = fh.refFrameSignBias
+        mvp.useRefFrameMvs = fh.useRefFrameMvs
+        if fh.useRefFrameMvs {
+            var smr: [Int] = []
+            var smc: [Int] = []
+            var sin: [Int] = []
+            var soh: [Int] = []
+            for i in 0..8 {
+                let sl = hd.slots[i]
+                smr.append(sl.miRows)
+                smc.append(sl.miCols)
+                sin.append(if sl.frameType == av1KeyFrame || sl.frameType == av1IntraOnlyFrame { 1 } else { 0 })
+                soh += sl.savedOrderHints
+            }
+            mvp.motionFieldEstimation(h.orderHint, h.orderHints, h.refFrameIdx, smr, smc, sin, soh,
+                                      slotMfRef, slotMfMvR, slotMfMvC, h.enableOrderHint, h.orderHintBits)
+        }
+        // CDEF and LR storage.
+        cdefStride = (miCols + 15) >> 4
+        let cdefN = cdefStride * ((miRows + 15) >> 4)
+        cdefIdx = []
+        for _ in 0..cdefN {
+            cdefIdx.append(-1)
+        }
+        var total = 0
+        for plane in 0..3 {
+            lrOff[plane] = total
+            lrRows[plane] = 0
+            lrCols[plane] = 0
+            if plane < numPlanes && h.frameRestorationType[plane] != 0 {
+                let sx = if plane == 0 { 0 } else { subX }
+                let sy = if plane == 0 { 0 } else { subY }
+                let unitSize = h.loopRestorationSize[plane]
+                lrRows[plane] = av1CountUnits(unitSize, av1Round2(h.frameHeight, sy))
+                lrCols[plane] = av1CountUnits(unitSize, av1Round2(h.upscaledWidth, sx))
+                total += lrRows[plane] * lrCols[plane] * 10
+            }
+        }
+        lrData = av1Zeros(total)
+        ops = []
+        coefs = []
+        palette = []
+    }
+
+    // tile_group_obu( sz ) (5.11.1) over bytes[from ..< to], with hd.r at
+    // its first bit.
+    fn tileGroup(_ bytes: [Int], _ from: Int, _ to: Int, _ pts: Int, _ key: Bool) -> [ParsedFrame] {
+        var out: [ParsedFrame] = []
+        let numTiles = fh.tileCols * fh.tileRows
+        var startAndEnd = false
+        if numTiles > 1 {
+            startAndEnd = hd.r.flag()
+        }
+        var tgStart = 0
+        var tgEnd = numTiles - 1
+        if numTiles > 1 && startAndEnd {
+            let tileBits = fh.tileColsLog2 + fh.tileRowsLog2
+            tgStart = hd.r.bits(tileBits)
+            tgEnd = hd.r.bits(tileBits)
+        }
+        hd.r.alignToByte()
+        var p = hd.r.position / 8
+        if tgEnd >= numTiles || tgStart > tgEnd {
+            warn("av1: bad tile group")
+            frameDamaged = true
+            tgEnd = numTiles - 1
+        }
+        var tn = tgStart
+        while tn <= tgEnd {
+            let tileRow = tn / fh.tileCols
+            let tileCol = tn % fh.tileCols
+            let last = tn == tgEnd
+            var tileSize = to - p
+            if !last {
+                var v = 0
+                for i in 0..fh.tileSizeBytes {
+                    if p + i < to {
+                        v |= bytes[p + i] << (8 * i)
+                    }
+                }
+                tileSize = v + 1
+                p += fh.tileSizeBytes
+            }
+            if tileSize <= 0 || p + tileSize > to {
+                warn("av1: tile data cut short")
+                frameDamaged = true
+                tileSize = max(0, to - p)
+            }
+            miRowStart = fh.miRowStarts[tileRow]
+            miRowEnd = fh.miRowStarts[tileRow + 1]
+            miColStart = fh.miColStarts[tileCol]
+            miColEnd = fh.miColStarts[tileCol + 1]
+            currentQIndex = fh.baseQIdx
+            // init_symbol( tileSize )
+            sym.start(bytes, p, tileSize)
+            sym.disableUpdate = fh.disableCdfUpdate
+            sym.cdf = frameCdf + av1DefaultIntraFrameYModeCdf
+            tileBad = false
+            decodeTile()
+            if sym.damaged() || tileBad {
+                warn("av1: tile {tn} read past its end")
+                frameDamaged = true
+            }
+            // exit_symbol( ): keep the CDFs of the context update tile.
+            if !fh.disableFrameEndUpdateCdf && tn == fh.contextUpdateTileId {
+                savedCdf = sym.cdf
+            }
+            p += tileSize
+            tn += 1
+        }
+        tileNum = tgEnd + 1
+        if tgEnd == numTiles - 1 {
+            out.append(finishFrame(pts, key))
+        }
+        out
+    }
+
+    // decode_tile( ) (5.11.2).
+    fn decodeTile() {
+        mvp.miRowStart = miRowStart
+        mvp.miRowEnd = miRowEnd
+        mvp.miColStart = miColStart
+        mvp.miColEnd = miColEnd
+        // clear_above_context( )
+        for i in 0..(3 * ctxCap) {
+            aboveLevel[i] = 0
+            aboveDc[i] = 0
+        }
+        for i in 0..ctxCap {
+            aboveSegPred[i] = 0
+        }
+        deltaLF = [0, 0, 0, 0]
+        for plane in 0..numPlanes {
+            refSgrXqd[plane * 2] = -32
+            refSgrXqd[plane * 2 + 1] = 31
+            for pass in 0..2 {
+                refLrWiener[(plane * 2 + pass) * 3] = 3
+                refLrWiener[(plane * 2 + pass) * 3 + 1] = -7
+                refLrWiener[(plane * 2 + pass) * 3 + 2] = 15
+            }
+        }
+        let sbSize = if use128 { 15 } else { 12 }
+        var r = miRowStart
+        while r < miRowEnd {
+            // clear_left_context( )
+            for i in 0..(3 * ctxCap) {
+                leftLevel[i] = 0
+                leftDc[i] = 0
+            }
+            for i in 0..ctxCap {
+                leftSegPred[i] = 0
+            }
+            var c = miColStart
+            while c < miColEnd {
+                readDeltas = fh.deltaQPresent
+                clearCdef(r, c)
+                clearBlockDecoded(r, c)
+                readLr(r, c, sbSize)
+                decodePartition(r, c, sbSize)
+                if sym.damaged() || tileBad {
+                    return
+                }
+                c += sbSize4
+            }
+            r += sbSize4
+        }
+    }
+
+    fn clearCdef(_ r: Int, _ c: Int) {
+        cdefIdx[(r >> 4) * cdefStride + (c >> 4)] = -1
+        if use128 {
+            if (c >> 4) + 1 < cdefStride {
+                cdefIdx[(r >> 4) * cdefStride + (c >> 4) + 1] = -1
+            }
+            if ((r >> 4) + 1) * cdefStride < cdefIdx.count {
+                cdefIdx[((r >> 4) + 1) * cdefStride + (c >> 4)] = -1
+                if (c >> 4) + 1 < cdefStride {
+                    cdefIdx[((r >> 4) + 1) * cdefStride + (c >> 4) + 1] = -1
+                }
+            }
+        }
+    }
+
+    // clear_block_decoded_flags( r, c, sbSize4 ) (5.11.3).
+    fn clearBlockDecoded(_ r: Int, _ c: Int) {
+        for plane in 0..numPlanes {
+            let sx = if plane > 0 { subX } else { 0 }
+            let sy = if plane > 0 { subY } else { 0 }
+            let sbWidth4 = (miColEnd - c) >> sx
+            let sbHeight4 = (miRowEnd - r) >> sy
+            let base = plane * 1156
+            var y = -1
+            while y <= (sbSize4 >> sy) {
+                var x = -1
+                while x <= (sbSize4 >> sx) {
+                    var v = 0
+                    if y < 0 && x < sbWidth4 {
+                        v = 1
+                    } else if x < 0 && y < sbHeight4 {
+                        v = 1
+                    }
+                    blockDecoded[base + (y + 1) * 34 + (x + 1)] = v
+                    x += 1
+                }
+                y += 1
+            }
+            blockDecoded[base + ((sbSize4 >> sy) + 1) * 34] = 0
+        }
+    }
+
+    fn blockDecodedAt(_ plane: Int, _ y: Int, _ x: Int) -> Int {
+        if y < -1 || x < -1 || y > 32 || x > 32 {
+            return 0
+        }
+        blockDecoded[plane * 1156 + (y + 1) * 34 + (x + 1)]
+    }
+
+    fn isInside(_ r: Int, _ c: Int) -> Bool {
+        c >= miColStart && c < miColEnd && r >= miRowStart && r < miRowEnd
+    }
+
+    // ---- loop restoration units (5.11.57, 5.11.58) ----------------------
+
+    fn readLr(_ r: Int, _ c: Int, _ bSize: Int) {
+        if fh.h.allowIntrabc {
+            return
+        }
+        let w = tW4[bSize]
+        let h = tH4[bSize]
+        for plane in 0..numPlanes {
+            if fh.h.frameRestorationType[plane] != 0 {
+                let sx = if plane == 0 { 0 } else { subX }
+                let sy = if plane == 0 { 0 } else { subY }
+                let unitSize = fh.h.loopRestorationSize[plane]
+                let unitRows = lrRows[plane]
+                let unitCols = lrCols[plane]
+                let unitRowStart = (r * (4 >> sy) + unitSize - 1) / unitSize
+                let unitRowEnd = min(unitRows, ((r + h) * (4 >> sy) + unitSize - 1) / unitSize)
+                var numerator = 4 >> sx
+                var denominator = unitSize
+                if fh.h.useSuperres {
+                    numerator = (4 >> sx) * fh.h.superresDenom
+                    denominator = unitSize * 8
+                }
+                let unitColStart = (c * numerator + denominator - 1) / denominator
+                let unitColEnd = min(unitCols, ((c + w) * numerator + denominator - 1) / denominator)
+                var unitRow = unitRowStart
+                while unitRow < unitRowEnd {
+                    var unitCol = unitColStart
+                    while unitCol < unitColEnd {
+                        readLrUnit(plane, unitRow, unitCol)
+                        unitCol += 1
+                    }
+                    unitRow += 1
+                }
+            }
+        }
+    }
+
+    fn readLrUnit(_ plane: Int, _ unitRow: Int, _ unitCol: Int) {
+        let frt = fh.h.frameRestorationType[plane]
+        var rtype = 0
+        if frt == 1 {
+            rtype = if sym.read(cfUseWiener, 2) == 1 { 1 } else { 0 }
+        } else if frt == 2 {
+            rtype = if sym.read(cfUseSgrproj, 2) == 1 { 2 } else { 0 }
+        } else {
+            rtype = sym.read(cfRestorationType, 3)
+        }
+        let at = lrOff[plane] + (unitRow * lrCols[plane] + unitCol) * 10
+        lrData[at] = rtype
+        if rtype == 1 { stat(13) }
+        if rtype == 2 { stat(14) }
+        if rtype == 1 {
+            let tMin = [-5, -23, -17]
+            let tMax = [10, 8, 46]
+            let tK = [1, 2, 3]
+            for pass in 0..2 {
+                var first = 0
+                if plane > 0 {
+                    first = 1
+                    lrData[at + 4 + pass * 3] = 0
+                }
+                for j in first..3 {
+                    let ri = (plane * 2 + pass) * 3 + j
+                    let v = decodeSignedSubexpWithRefBool(tMin[j], tMax[j] + 1, tK[j], refLrWiener[ri])
+                    lrData[at + 4 + pass * 3 + j] = v
+                    refLrWiener[ri] = v
+                }
+            }
+        } else if rtype == 2 {
+            let set = sym.literal(4)
+            lrData[at + 1] = set
+            let xMin = [-96, -32]
+            let xMax = [31, 95]
+            for i in 0..2 {
+                let radius = tSgrParams[set * 4 + i * 2]
+                var v = 0
+                if radius != 0 {
+                    v = decodeSignedSubexpWithRefBool(xMin[i], xMax[i] + 1, 4, refSgrXqd[plane * 2 + i])
+                } else {
+                    v = 0
+                    if i == 1 {
+                        v = min(max((1 << 7) - refSgrXqd[plane * 2], xMin[i]), xMax[i])
+                    }
+                }
+                lrData[at + 2 + i] = v
+                refSgrXqd[plane * 2 + i] = v
+            }
+        }
+    }
+
+    fn decodeSignedSubexpWithRefBool(_ low: Int, _ high: Int, _ k: Int, _ r: Int) -> Int {
+        let x = decodeUnsignedSubexpWithRefBool(high - low, k, r - low)
+        x + low
+    }
+
+    fn decodeUnsignedSubexpWithRefBool(_ mx: Int, _ k: Int, _ r: Int) -> Int {
+        let v = decodeSubexpBool(mx, k)
+        if (r << 1) <= mx {
+            return av1InverseRecenter(r, v)
+        }
+        mx - 1 - av1InverseRecenter(mx - 1 - r, v)
+    }
+
+    fn decodeSubexpBool(_ numSyms: Int, _ k: Int) -> Int {
+        var i = 0
+        var mk = 0
+        while true {
+            let b2 = if i > 0 { k + i - 1 } else { k }
+            let a = 1 << b2
+            if numSyms <= mk + 3 * a {
+                return sym.ns(numSyms - mk) + mk
+            } else {
+                if sym.bool() == 1 {
+                    i += 1
+                    mk += a
+                } else {
+                    return sym.literal(b2) + mk
+                }
+            }
+            if i > 24 {
+                return 0
+            }
+        }
+        0
+    }
+
+    // ---- partitions (5.11.4) --------------------------------------------
+
+    fn decodePartition(_ r: Int, _ c: Int, _ bSize: Int) {
+        if r >= miRows || c >= miCols || tileBad {
+            return
+        }
+        let avU = isInside(r - 1, c)
+        let avL = isInside(r, c - 1)
+        let num4x4 = tW4[bSize]
+        let half = num4x4 >> 1
+        let quarter = half >> 1
+        let hasRows = (r + half) < miRows
+        let hasCols = (c + half) < miCols
+        var partition = 0
+        if bSize < 3 {
+            partition = 0
+        } else {
+            let bsl = tWLog2[bSize]
+            var above = 0
+            var left = 0
+            if avU && tWLog2[mvp.gMiSize[(r - 1) * miCols + c]] < bsl {
+                above = 1
+            }
+            if avL && tHLog2[mvp.gMiSize[r * miCols + c - 1]] < bsl {
+                left = 1
+            }
+            let ctx = left * 2 + above
+            var off = 0
+            var nsym = 10
+            if bsl == 1 {
+                off = cfPartitionW8 + ctx * 5
+                nsym = 4
+            } else if bsl == 2 {
+                off = cfPartitionW16 + ctx * 11
+            } else if bsl == 3 {
+                off = cfPartitionW32 + ctx * 11
+            } else if bsl == 4 {
+                off = cfPartitionW64 + ctx * 11
+            } else {
+                off = cfPartitionW128 + ctx * 9
+                nsym = 8
+            }
+            if hasRows && hasCols {
+                partition = sym.read(off, nsym)
+            } else if hasCols {
+                // split_or_horz: P(VERT, SPLIT, HORZ_A, VERT_A, VERT_B, VERT_4).
+                let cdf = sym.cdf
+                var psum = cdf[off + 2] - cdf[off + 1] + cdf[off + 3] - cdf[off + 2] + cdf[off + 4] - cdf[off + 3] + cdf[off + 6] - cdf[off + 5] + cdf[off + 7] - cdf[off + 6]
+                if bSize != 15 {
+                    psum += cdf[off + 9] - cdf[off + 8]
+                }
+                let v = sym.readBin(psum)
+                partition = if v == 1 { 3 } else { 1 }
+            } else if hasRows {
+                // split_or_vert: P(HORZ, SPLIT, HORZ_A, HORZ_B, VERT_A, HORZ_4).
+                let cdf = sym.cdf
+                var psum = cdf[off + 1] - cdf[off] + cdf[off + 3] - cdf[off + 2] + cdf[off + 4] - cdf[off + 3] + cdf[off + 5] - cdf[off + 4] + cdf[off + 6] - cdf[off + 5]
+                if bSize != 15 {
+                    psum += cdf[off + 8] - cdf[off + 7]
+                }
+                let v = sym.readBin(psum)
+                partition = if v == 1 { 3 } else { 2 }
+            } else {
+                partition = 3
+            }
+        }
+        let subSize = tPartSub[partition * 22 + bSize]
+        let splitSize = tPartSub[3 * 22 + bSize]
+        if partition == 0 {
+            decodeBlock(r, c, subSize)
+        } else if partition == 1 {
+            decodeBlock(r, c, subSize)
+            if hasRows {
+                decodeBlock(r + half, c, subSize)
+            }
+        } else if partition == 2 {
+            decodeBlock(r, c, subSize)
+            if hasCols {
+                decodeBlock(r, c + half, subSize)
+            }
+        } else if partition == 3 {
+            decodePartition(r, c, subSize)
+            decodePartition(r, c + half, subSize)
+            decodePartition(r + half, c, subSize)
+            decodePartition(r + half, c + half, subSize)
+        } else if partition == 4 {
+            decodeBlock(r, c, splitSize)
+            decodeBlock(r, c + half, splitSize)
+            decodeBlock(r + half, c, subSize)
+        } else if partition == 5 {
+            decodeBlock(r, c, subSize)
+            decodeBlock(r + half, c, splitSize)
+            decodeBlock(r + half, c + half, splitSize)
+        } else if partition == 6 {
+            decodeBlock(r, c, splitSize)
+            decodeBlock(r + half, c, splitSize)
+            decodeBlock(r, c + half, subSize)
+        } else if partition == 7 {
+            decodeBlock(r, c, subSize)
+            decodeBlock(r, c + half, splitSize)
+            decodeBlock(r + half, c + half, splitSize)
+        } else if partition == 8 {
+            decodeBlock(r, c, subSize)
+            decodeBlock(r + quarter, c, subSize)
+            decodeBlock(r + quarter * 2, c, subSize)
+            if r + quarter * 3 < miRows {
+                decodeBlock(r + quarter * 3, c, subSize)
+            }
+        } else {
+            decodeBlock(r, c, subSize)
+            decodeBlock(r, c + quarter, subSize)
+            decodeBlock(r, c + quarter * 2, subSize)
+            if c + quarter * 3 < miCols {
+                decodeBlock(r, c + quarter * 3, subSize)
+            }
+        }
+    }
+
+    // ---- blocks (5.11.5) ------------------------------------------------
+
+    fn decodeBlock(_ r: Int, _ c: Int, _ subSize: Int) {
+        if sym.damaged() || tileBad {
+            return
+        }
+        if numPlanes > 1 && planeResidualSize(subSize, 1) == 22 {
+            // Not allowed (5.11.4): the chroma block would be too narrow.
+            warn("av1: invalid block size for the chroma format")
+            tileBad = true
+            frameDamaged = true
+            return
+        }
+        miRow = r
+        miCol = c
+        miSize = subSize
+        bw4 = tW4[subSize]
+        bh4 = tH4[subSize]
+        if bh4 == 1 && subY == 1 && (miRow & 1) == 0 {
+            hasChroma = false
+        } else if bw4 == 1 && subX == 1 && (miCol & 1) == 0 {
+            hasChroma = false
+        } else {
+            hasChroma = numPlanes > 1
+        }
+        availU = isInside(r - 1, c)
+        availL = isInside(r, c - 1)
+        availUChroma = availU
+        availLChroma = availL
+        if hasChroma {
+            if subY == 1 && bh4 == 1 {
+                availUChroma = isInside(r - 2, c)
+            }
+            if subX == 1 && bw4 == 1 {
+                availLChroma = isInside(r, c - 2)
+            }
+        } else {
+            availUChroma = false
+            availLChroma = false
+        }
+        mvp.miRow = r
+        mvp.miCol = c
+        mvp.miSize = subSize
+        mvp.bw4 = bw4
+        mvp.bh4 = bh4
+        // Defaults of a block.
+        useFilterIntra = 0
+        motionMode = 0
+        compoundType = 2
+        interintra = 0
+        paletteSizeY = 0
+        paletteSizeUV = 0
+        angleDeltaY = 0
+        angleDeltaUV = 0
+        cflAlphaU = 0
+        cflAlphaV = 0
+        compGroupIdx = 0
+        compoundIdx = 1
+        interpFilter[0] = 0
+        interpFilter[1] = 0
+        mvR[0] = 0
+        mvC[0] = 0
+        mvR[1] = 0
+        mvC[1] = 0
+        uvMode = 0
+        if frameIsIntra {
+            intraFrameModeInfo()
+        } else {
+            interFrameModeInfo()
+        }
+        paletteTokens()
+        readBlockTxSize()
+        if skip == 1 {
+            resetBlockContext()
+        }
+        let isCompound = refFrame[1] > 0
+        // Mode info written before prediction.
+        let rEnd = min(miRows, r + bh4)
+        let cEnd = min(miCols, c + bw4)
+        let st = mvp.stamp
+        for y in r..rEnd {
+            var at = y * miCols + c
+            for _ in c..cEnd {
+                mvp.gYMode[at] = yMode
+                if refFrame[0] == 0 && hasChroma {
+                    gUVMode[at] = uvMode
+                }
+                mvp.gRef0[at] = refFrame[0]
+                mvp.gRef1[at] = refFrame[1]
+                mvp.gStamp[at] = st
+                if isInter == 1 {
+                    if useIntrabc == 0 {
+                        gCompGroup[at] = compGroupIdx
+                        gCompoundIdx[at] = compoundIdx
+                    }
+                    gFilt[at] = interpFilter[0] * 4 + interpFilter[1]
+                    mvp.gMvR0[at] = mvR[0]
+                    mvp.gMvC0[at] = mvC[0]
+                    if isCompound {
+                        mvp.gMvR1[at] = mvR[1]
+                        mvp.gMvC1[at] = mvC[1]
+                    }
+                }
+                at += 1
+            }
+        }
+        if paletteSizeY > 0 || paletteSizeUV > 0 { stat(16) }
+        if useIntrabc == 1 { stat(17) }
+        if isInter == 0 && useFilterIntra == 1 { stat(18) }
+        if isInter == 0 && uvMode == 13 && hasChroma { stat(19) }
+        if isInter == 1 && useIntrabc == 0 {
+            if motionMode == 1 { stat(20) }
+            if motionMode == 2 { stat(21) }
+            if refFrame[1] > 0 {
+                stat(23 + min(compoundType, 4))
+            }
+            if refFrame[1] == 0 { stat(28) }
+            if skipMode == 1 { stat(29) }
+        }
+        emitBlock()
+        computePrediction()
+        residual()
+        let packed = miSize | ((refFrame[0] + 1) << 5) | ((refFrame[1] + 1) << 9) | (yMode << 13) | (skip << 18) |
+            (isInter << 19) | (segmentId << 20)
+        let packedMv = (mvR[0] & 0xffff) | ((mvC[0] & 0xffff) << 16) | ((mvR[1] & 0xffff) << 32) | ((mvC[1] & 0xffff) << 48)
+        for y in r..rEnd {
+            var at = y * miCols + c
+            for _ in c..cEnd {
+                let f = gFilt[at]
+                gInfoP[at] = packed | ((f >> 2) << 23) | ((f & 3) << 25) | (gLfTxY[at] << 27) | (gUVMode[at] << 32)
+                if isInter == 1 {
+                    gMvP[at] = packedMv
+                }
+                mvp.gIsInter[at] = isInter
+                gSkipMode[at] = skipMode
+                gSkip[at] = skip
+                mvp.gMiSize[at] = miSize
+                gSeg[at] = segmentId
+                gPalSize[at] = paletteSizeY | (paletteSizeUV << 4)
+                if paletteSizeY > 0 {
+                    for i in 0..paletteSizeY {
+                        gPalColY[at * 8 + i] = palColorsY[i]
+                    }
+                }
+                if paletteSizeUV > 0 {
+                    for i in 0..paletteSizeUV {
+                        gPalColUV[at * 8 + i] = palColorsU[i]
+                    }
+                }
+                gDeltaLf[at] = (deltaLF[0] + 64) | ((deltaLF[1] + 64) << 7) | ((deltaLF[2] + 64) << 14) | ((deltaLF[3] + 64) << 21)
+                at += 1
+            }
+        }
+    }
+
+    // reset_block_context( bw4, bh4 ).
+    fn resetBlockContext() {
+        let planes = if hasChroma { 3 } else { 1 }
+        for plane in 0..planes {
+            let sx = if plane > 0 { subX } else { 0 }
+            let sy = if plane > 0 { subY } else { 0 }
+            var i = miCol >> sx
+            while i < ((miCol + bw4) >> sx) {
+                aboveLevel[plane * ctxCap + i] = 0
+                aboveDc[plane * ctxCap + i] = 0
+                i += 1
+            }
+            i = miRow >> sy
+            while i < ((miRow + bh4) >> sy) {
+                leftLevel[plane * ctxCap + i] = 0
+                leftDc[plane * ctxCap + i] = 0
+                i += 1
+            }
+        }
+    }
+
+    // The opBlock record.
+    fn emitBlock() {
+        ops.append(opBlock)
+        ops.append(miRow)
+        ops.append(miCol)
+        ops.append(miSize)
+        ops.append(isInter)
+        ops.append(useIntrabc)
+        ops.append(yMode)
+        ops.append(uvMode)
+        ops.append(motionMode)
+        ops.append(compoundType)
+        ops.append(wedgeIndex)
+        ops.append(wedgeSign)
+        ops.append(maskType)
+        ops.append(if isInter == 1 && refFrame[1] == 0 { 1 } else { 0 })
+        ops.append(interintraMode)
+        ops.append(wedgeInterintra)
+        ops.append(if mvp.localValid { 1 } else { 0 })
+        for i in 0..6 {
+            ops.append(mvp.localWarpParams[i])
+        }
+        ops.append(if availU { 1 } else { 0 })
+        ops.append(if availL { 1 } else { 0 })
+        ops.append(if availUChroma { 1 } else { 0 })
+        ops.append(if availLChroma { 1 } else { 0 })
+        ops.append(if hasChroma { 1 } else { 0 })
+        ops.append(segmentId)
+        ops.append(skip)
+        ops.append(if lossless { 1 } else { 0 })
+        ops.append(refFrame[0])
+        ops.append(refFrame[1])
+        ops.append(interpFilter[0] * 4 + interpFilter[1])
+    }
+
+    // ---- intra frame mode info (5.11.7) ---------------------------------
+
+    fn intraFrameModeInfo() {
+        skip = 0
+        if fh.segIdPreSkip {
+            intraSegmentId()
+        }
+        skipMode = 0
+        readSkip()
+        if !fh.segIdPreSkip {
+            intraSegmentId()
+        }
+        readCdef()
+        readDeltaQIndex()
+        readDeltaLf()
+        readDeltas = false
+        refFrame[0] = 0
+        refFrame[1] = -1
+        mvp.refFrame0 = 0
+        mvp.refFrame1 = -1
+        mvp.localValid = false
+        if fh.h.allowIntrabc {
+            useIntrabc = sym.read(cfIntrabc, 2)
+        } else {
+            useIntrabc = 0
+        }
+        if useIntrabc == 1 {
+            isInter = 1
+            yMode = 0
+            uvMode = 0
+            motionMode = 0
+            compoundType = 2
+            paletteSizeY = 0
+            paletteSizeUV = 0
+            interpFilter[0] = 3
+            interpFilter[1] = 3
+            mvp.findMvStack(false)
+            assignMv(false)
+        } else {
+            isInter = 0
+            var above = 0
+            var left = 0
+            if availU {
+                above = tIntraModeCtx[mvp.gYMode[(miRow - 1) * miCols + miCol]]
+            }
+            if availL {
+                left = tIntraModeCtx[mvp.gYMode[miRow * miCols + miCol - 1]]
+            }
+            yMode = sym.read(av1CdfSize + (above * 5 + left) * 14, 13)
+            intraAngleInfoY()
+            if hasChroma {
+                readUVMode()
+            }
+            paletteSizeY = 0
+            paletteSizeUV = 0
+            if miSize >= 3 && bw4 <= 16 && bh4 <= 16 && allowScreenContent {
+                paletteModeInfo()
+            }
+            filterIntraModeInfo()
+        }
+    }
+
+    fn readUVMode() {
+        let cflAllowed = if lossless && planeResidualSize(miSize, 1) == 0 { true } else if !lossless && max(bw4, bh4) <= 8 { true } else { false }
+        if cflAllowed {
+            uvMode = sym.read(cfUVModeCflAllowed + yMode * 15, 14)
+        } else {
+            uvMode = sym.read(cfUVModeCflNotAllowed + yMode * 14, 13)
+        }
+        if uvMode == 13 {
+            readCflAlphas()
+        }
+        intraAngleInfoUV()
+    }
+
+    fn intraSegmentId() {
+        if segEnabled {
+            readSegmentId()
+        } else {
+            segmentId = 0
+        }
+        lossless = fh.losslessArray[segmentId] == 1
+    }
+
+    // read_segment_id( ) (5.11.9).
+    fn readSegmentId() {
+        var prevUL = -1
+        var prevU = -1
+        var prevL = -1
+        if availU && availL {
+            prevUL = gSeg[(miRow - 1) * miCols + miCol - 1]
+        }
+        if availU {
+            prevU = gSeg[(miRow - 1) * miCols + miCol]
+        }
+        if availL {
+            prevL = gSeg[miRow * miCols + miCol - 1]
+        }
+        var pred = 0
+        if prevU == -1 {
+            pred = if prevL == -1 { 0 } else { prevL }
+        } else if prevL == -1 {
+            pred = prevU
+        } else {
+            pred = if prevUL == prevU { prevU } else { prevL }
+        }
+        if skip == 1 {
+            segmentId = pred
+        } else {
+            var ctx = 0
+            if prevUL < 0 {
+                ctx = 0
+            } else if prevUL == prevU && prevUL == prevL {
+                ctx = 2
+            } else if prevUL == prevU || prevUL == prevL || prevU == prevL {
+                ctx = 1
+            }
+            let v = sym.read(cfSegmentId + ctx * 9, 8)
+            segmentId = av1NegDeinterleave(v, pred, fh.lastActiveSegId + 1)
+            segmentId = min(max(segmentId, 0), 7)
+        }
+    }
+
+    fn segFeatureActive(_ feature: Int) -> Bool {
+        segEnabled && featureEnabled[segmentId * 8 + feature] == 1
+    }
+
+    fn readSkipMode() {
+        if segFeatureActive(6) || segFeatureActive(5) || segFeatureActive(7) || !fh.skipModePresent || bw4 < 2 || bh4 < 2 {
+            skipMode = 0
+        } else {
+            var ctx = 0
+            if availU {
+                ctx += gSkipMode[(miRow - 1) * miCols + miCol]
+            }
+            if availL {
+                ctx += gSkipMode[miRow * miCols + miCol - 1]
+            }
+            skipMode = sym.read(cfSkipMode + ctx * 3, 2)
+        }
+    }
+
+    fn readSkip() {
+        if fh.segIdPreSkip && segFeatureActive(6) {
+            skip = 1
+        } else {
+            var ctx = 0
+            if availU {
+                ctx += gSkip[(miRow - 1) * miCols + miCol]
+            }
+            if availL {
+                ctx += gSkip[miRow * miCols + miCol - 1]
+            }
+            skip = sym.read(cfSkip + ctx * 3, 2)
+        }
+    }
+
+    // read_cdef( ) (5.11.56).
+    fn readCdef() {
+        if skip == 1 || fh.h.codedLossless || !fh.h.enableCdef || fh.h.allowIntrabc {
+            return
+        }
+        let r = miRow & ~15
+        let c = miCol & ~15
+        let at = (r >> 4) * cdefStride + (c >> 4)
+        if cdefIdx[at] == -1 {
+            let v = sym.literal(fh.h.cdefBits)
+            cdefIdx[at] = v
+            let w4 = bw4
+            let h4 = bh4
+            var i = r
+            while i < r + h4 {
+                var j = c
+                while j < c + w4 {
+                    let k = (i >> 4) * cdefStride + (j >> 4)
+                    if (j >> 4) < cdefStride && k < cdefIdx.count {
+                        cdefIdx[k] = v
+                    }
+                    j += 16
+                }
+                i += 16
+            }
+        }
+    }
+
+    // read_delta_qindex( ) (5.11.12).
+    fn readDeltaQIndex() {
+        let sbSize = if use128 { 15 } else { 12 }
+        if miSize == sbSize && skip == 1 {
+            return
+        }
+        if readDeltas {
+            var abs0 = sym.read(cfDeltaQ, 4)
+            if abs0 == 3 {
+                let remBits = sym.literal(3) + 1
+                let absBits = sym.literal(remBits)
+                abs0 = absBits + (1 << remBits) + 1
+            }
+            if abs0 != 0 {
+                let signBit = sym.literal(1)
+                let reduced = if signBit == 1 { -abs0 } else { abs0 }
+                currentQIndex = min(max(currentQIndex + (reduced << fh.deltaQRes), 1), 255)
+            }
+        }
+    }
+
+    // read_delta_lf( ) (5.11.13).
+    fn readDeltaLf() {
+        let sbSize = if use128 { 15 } else { 12 }
+        if miSize == sbSize && skip == 1 {
+            return
+        }
+        if readDeltas && fh.h.deltaLfPresent {
+            var frameLfCount = 1
+            if fh.h.deltaLfMulti {
+                frameLfCount = if numPlanes > 1 { 4 } else { 2 }
+            }
+            for i in 0..frameLfCount {
+                let off = if fh.h.deltaLfMulti { cfDeltaLFMulti + i * 5 } else { cfDeltaLF }
+                var abs0 = sym.read(off, 4)
+                if abs0 == 3 {
+                    let n = sym.literal(3) + 1
+                    let absBits = sym.literal(n)
+                    abs0 = absBits + (1 << n) + 1
+                }
+                if abs0 != 0 {
+                    let signBit = sym.literal(1)
+                    let reduced = if signBit == 1 { -abs0 } else { abs0 }
+                    deltaLF[i] = min(max(deltaLF[i] + (reduced << fh.deltaLfRes), -63), 63)
+                }
+            }
+        }
+    }
+
+    // ---- transform sizes (5.11.15–5.11.17) ------------------------------
+
+    fn readTxSize(_ allowSelect: Bool) {
+        if lossless {
+            txSize = 0
+            return
+        }
+        let maxRect = tMaxTxRect[miSize]
+        let maxDepth = tMaxTxDepth[miSize]
+        txSize = maxRect
+        if miSize > 0 && allowSelect && fh.txMode == 2 {
+            // tx_depth ctx.
+            let maxTxW = tTxW[maxRect]
+            let maxTxH = tTxH[maxRect]
+            var aboveW = 0
+            var leftH = 0
+            if availU {
+                let at = (miRow - 1) * miCols + miCol
+                if mvp.gIsInter[at] == 1 {
+                    aboveW = tW4[mvp.gMiSize[at]] * 4
+                } else {
+                    aboveW = aboveTxWidth(miRow, miCol)
+                }
+            }
+            if availL {
+                let at = miRow * miCols + miCol - 1
+                if mvp.gIsInter[at] == 1 {
+                    leftH = tH4[mvp.gMiSize[at]] * 4
+                } else {
+                    leftH = leftTxHeight(miRow, miCol)
+                }
+            }
+            let ctx = (if aboveW >= maxTxW { 1 } else { 0 }) + (if leftH >= maxTxH { 1 } else { 0 })
+            var depth = 0
+            if maxDepth == 4 {
+                depth = sym.read(cfTx64x64 + ctx * 4, 3)
+            } else if maxDepth == 3 {
+                depth = sym.read(cfTx32x32 + ctx * 4, 3)
+            } else if maxDepth == 2 {
+                depth = sym.read(cfTx16x16 + ctx * 4, 3)
+            } else {
+                depth = sym.read(cfTx8x8 + ctx * 3, 2)
+            }
+            for _ in 0..depth {
+                txSize = tSplitTx[txSize]
+            }
+        }
+    }
+
+    fn aboveTxWidth(_ row: Int, _ col: Int) -> Int {
+        if row == miRow {
+            if !availU {
+                return 64
+            }
+            let at = (row - 1) * miCols + col
+            if gSkip[at] == 1 && mvp.gIsInter[at] == 1 {
+                return tW4[mvp.gMiSize[at]] * 4
+            }
+        }
+        tTxW[gInterTx[(row - 1) * miCols + col]]
+    }
+
+    fn leftTxHeight(_ row: Int, _ col: Int) -> Int {
+        if col == miCol {
+            if !availL {
+                return 64
+            }
+            let at = row * miCols + col - 1
+            if gSkip[at] == 1 && mvp.gIsInter[at] == 1 {
+                return tH4[mvp.gMiSize[at]] * 4
+            }
+        }
+        tTxH[gInterTx[row * miCols + col - 1]]
+    }
+
+    fn readBlockTxSize() {
+        if fh.txMode == 2 && miSize > 0 && isInter == 1 && skip == 0 && !lossless {
+            let maxTxSz = tMaxTxRect[miSize]
+            let txW4 = tTxW[maxTxSz] / 4
+            let txH4 = tTxH[maxTxSz] / 4
+            var row = miRow
+            while row < miRow + bh4 {
+                var col = miCol
+                while col < miCol + bw4 {
+                    readVarTxSize(row, col, maxTxSz, 0)
+                    col += txW4
+                }
+                row += txH4
+            }
+        } else {
+            readTxSize(skip == 0 || isInter == 0)
+            let rEnd = min(miRows, miRow + bh4)
+            let cEnd = min(miCols, miCol + bw4)
+            for row in miRow..rEnd {
+                for col in miCol..cEnd {
+                    gInterTx[row * miCols + col] = txSize
+                }
+            }
+        }
+    }
+
+    fn readVarTxSize(_ row: Int, _ col: Int, _ txSz: Int, _ depth: Int) {
+        if row >= miRows || col >= miCols {
+            return
+        }
+        var split = 0
+        if txSz == 0 || depth == 2 {
+            split = 0
+        } else {
+            let above = if aboveTxWidth(row, col) < tTxW[txSz] { 1 } else { 0 }
+            let left = if leftTxHeight(row, col) < tTxH[txSz] { 1 } else { 0 }
+            let size = min(64, max(bw4 * 4, bh4 * 4))
+            let maxTxSz = av1FindTxSize(size, size)
+            let txSzSqrUp = tTxSqrUp[txSz]
+            let ctx = (if txSzSqrUp != maxTxSz { 1 } else { 0 }) * 3 + (4 - maxTxSz) * 6 + above + left
+            split = sym.read(cfTxfmSplit + ctx * 3, 2)
+        }
+        let w4 = tTxW[txSz] / 4
+        let h4 = tTxH[txSz] / 4
+        if split == 1 {
+            let subTxSz = tSplitTx[txSz]
+            let stepW = tTxW[subTxSz] / 4
+            let stepH = tTxH[subTxSz] / 4
+            var i = 0
+            while i < h4 {
+                var j = 0
+                while j < w4 {
+                    readVarTxSize(row + i, col + j, subTxSz, depth + 1)
+                    j += stepW
+                }
+                i += stepH
+            }
+        } else {
+            for i in 0..h4 {
+                for j in 0..w4 {
+                    if row + i < miRows && col + j < miCols {
+                        gInterTx[(row + i) * miCols + col + j] = txSz
+                    }
+                }
+            }
+            txSize = txSz
+        }
+    }
+
+    // ---- inter frame mode info (5.11.18) --------------------------------
+
+    fn interFrameModeInfo() {
+        useIntrabc = 0
+        if availL {
+            let at = miRow * miCols + miCol - 1
+            leftRefFrame[0] = mvp.gRef0[at]
+            leftRefFrame[1] = mvp.gRef1[at]
+        } else {
+            leftRefFrame[0] = 0
+            leftRefFrame[1] = -1
+        }
+        if availU {
+            let at = (miRow - 1) * miCols + miCol
+            aboveRefFrame[0] = mvp.gRef0[at]
+            aboveRefFrame[1] = mvp.gRef1[at]
+        } else {
+            aboveRefFrame[0] = 0
+            aboveRefFrame[1] = -1
+        }
+        leftIntra = leftRefFrame[0] <= 0
+        aboveIntra = aboveRefFrame[0] <= 0
+        leftSingle = leftRefFrame[1] <= 0
+        aboveSingle = aboveRefFrame[1] <= 0
+        skip = 0
+        interSegmentId(true)
+        readSkipMode()
+        if skipMode == 1 {
+            skip = 1
+        } else {
+            readSkip()
+        }
+        if !fh.segIdPreSkip {
+            interSegmentId(false)
+        }
+        lossless = fh.losslessArray[segmentId] == 1
+        readCdef()
+        readDeltaQIndex()
+        readDeltaLf()
+        readDeltas = false
+        readIsInter()
+        mvp.localValid = false
+        if isInter == 1 {
+            interBlockModeInfo()
+        } else {
+            intraBlockModeInfo()
+        }
+    }
+
+    // inter_segment_id( preSkip ) (5.11.19).
+    fn interSegmentId(_ preSkip: Bool) {
+        if segEnabled {
+            let predicted = getSegmentId()
+            if fh.segmentationUpdateMap {
+                if preSkip && !fh.segIdPreSkip {
+                    segmentId = 0
+                    return
+                }
+                if !preSkip {
+                    if skip == 1 {
+                        for i in 0..bw4 {
+                            aboveSegPred[miCol + i] = 0
+                        }
+                        for i in 0..bh4 {
+                            leftSegPred[miRow + i] = 0
+                        }
+                        readSegmentId()
+                        return
+                    }
+                }
+                if fh.segmentationTemporalUpdate {
+                    let ctx = leftSegPred[miRow] + aboveSegPred[miCol]
+                    let predFlag = sym.read(cfSegmentIdPredicted + ctx * 3, 2)
+                    if predFlag == 1 {
+                        segmentId = predicted
+                    } else {
+                        readSegmentId()
+                    }
+                    for i in 0..bw4 {
+                        aboveSegPred[miCol + i] = predFlag
+                    }
+                    for i in 0..bh4 {
+                        leftSegPred[miRow + i] = predFlag
+                    }
+                } else {
+                    readSegmentId()
+                }
+            } else {
+                segmentId = predicted
+            }
+        } else {
+            segmentId = 0
+        }
+    }
+
+    fn getSegmentId() -> Int {
+        let xMis = min(miCols - miCol, bw4)
+        let yMis = min(miRows - miRow, bh4)
+        var seg = 7
+        for y in 0..yMis {
+            for x in 0..xMis {
+                seg = min(seg, prevSegIds[(miRow + y) * miCols + miCol + x])
+            }
+        }
+        seg
+    }
+
+    fn readIsInter() {
+        if skipMode == 1 {
+            isInter = 1
+        } else if segFeatureActive(5) {
+            isInter = if featureData[segmentId * 8 + 5] != 0 { 1 } else { 0 }
+        } else if segFeatureActive(7) {
+            isInter = 1
+        } else {
+            var ctx = 0
+            if availU && availL {
+                ctx = if leftIntra && aboveIntra { 3 } else if leftIntra || aboveIntra { 1 } else { 0 }
+            } else if availU || availL {
+                let v = if availU { aboveIntra } else { leftIntra }
+                ctx = if v { 2 } else { 0 }
+            }
+            isInter = sym.read(cfIsInter + ctx * 3, 2)
+        }
+    }
+
+    // intra_block_mode_info( ) (5.11.22).
+    fn intraBlockModeInfo() {
+        refFrame[0] = 0
+        refFrame[1] = -1
+        mvp.refFrame0 = 0
+        mvp.refFrame1 = -1
+        yMode = sym.read(cfYMode + tSizeGroup[miSize] * 14, 13)
+        intraAngleInfoY()
+        if hasChroma {
+            readUVMode()
+        }
+        paletteSizeY = 0
+        paletteSizeUV = 0
+        if miSize >= 3 && bw4 <= 16 && bh4 <= 16 && allowScreenContent {
+            paletteModeInfo()
+        }
+        filterIntraModeInfo()
+    }
+
+    // inter_block_mode_info( ) (5.11.23).
+    fn interBlockModeInfo() {
+        paletteSizeY = 0
+        paletteSizeUV = 0
+        readRefFrames()
+        let isCompound = refFrame[1] > 0
+        mvp.refFrame0 = refFrame[0]
+        mvp.refFrame1 = refFrame[1]
+        mvp.findMvStack(isCompound)
+        if skipMode == 1 {
+            yMode = 18
+        } else if segFeatureActive(6) || segFeatureActive(7) {
+            yMode = 16
+        } else if isCompound {
+            let ctx = tCompModeCtxMap[(mvp.refMvContext >> 1) * 5 + min(mvp.newMvContext, 4)]
+            yMode = 18 + sym.read(cfCompoundMode + ctx * 9, 8)
+        } else {
+            let newMv = sym.read(cfNewMv + mvp.newMvContext * 3, 2)
+            if newMv == 0 {
+                yMode = 17
+            } else {
+                let zeroMv = sym.read(cfZeroMv + mvp.zeroMvContext * 3, 2)
+                if zeroMv == 0 {
+                    yMode = 16
+                } else {
+                    let refMv = sym.read(cfRefMv + mvp.refMvContext * 3, 2)
+                    yMode = if refMv == 0 { 14 } else { 15 }
+                }
+            }
+        }
+        refMvIdx = 0
+        if yMode == 17 || yMode == 25 {
+            for idx in 0..2 {
+                if mvp.numMvFound > idx + 1 {
+                    let drl = sym.read(cfDrlMode + mvp.drlCtxStack[idx] * 3, 2)
+                    if drl == 0 {
+                        refMvIdx = idx
+                        break
+                    }
+                    refMvIdx = idx + 1
+                }
+            }
+        } else if yMode == 15 || yMode == 19 || yMode == 22 || yMode == 23 {
+            refMvIdx = 1
+            for idx in 1..3 {
+                if mvp.numMvFound > idx + 1 {
+                    let drl = sym.read(cfDrlMode + mvp.drlCtxStack[idx] * 3, 2)
+                    if drl == 0 {
+                        refMvIdx = idx
+                        break
+                    }
+                    refMvIdx = idx + 1
+                }
+            }
+        }
+        assignMv(isCompound)
+        readInterintraMode(isCompound)
+        readMotionMode(isCompound)
+        readCompoundType(isCompound)
+        if fh.interpolationFilter == 4 {
+            let dirs = if hd.seq.enableDualFilter { 2 } else { 1 }
+            for dir in 0..dirs {
+                if needsInterpFilter() {
+                    var ctx = ((dir & 1) * 2 + (if refFrame[1] > 0 { 1 } else { 0 })) * 4
+                    var leftType = 3
+                    var aboveType = 3
+                    if availL {
+                        let at = miRow * miCols + miCol - 1
+                        if mvp.gRef0[at] == refFrame[0] || mvp.gRef1[at] == refFrame[0] {
+                            leftType = if dir == 0 { gFilt[at] >> 2 } else { gFilt[at] & 3 }
+                        }
+                    }
+                    if availU {
+                        let at = (miRow - 1) * miCols + miCol
+                        if mvp.gRef0[at] == refFrame[0] || mvp.gRef1[at] == refFrame[0] {
+                            aboveType = if dir == 0 { gFilt[at] >> 2 } else { gFilt[at] & 3 }
+                        }
+                    }
+                    if leftType == aboveType {
+                        ctx += leftType
+                    } else if leftType == 3 {
+                        ctx += aboveType
+                    } else if aboveType == 3 {
+                        ctx += leftType
+                    } else {
+                        ctx += 3
+                    }
+                    interpFilter[dir] = sym.read(cfInterpFilter + ctx * 4, 3)
+                } else {
+                    interpFilter[dir] = 0
+                }
+            }
+            if !hd.seq.enableDualFilter {
+                interpFilter[1] = interpFilter[0]
+            }
+        } else {
+            interpFilter[0] = fh.interpolationFilter
+            interpFilter[1] = fh.interpolationFilter
+        }
+    }
+
+    fn needsInterpFilter() -> Bool {
+        let large = min(bw4, bh4) >= 2
+        if skipMode == 1 || motionMode == 2 {
+            return false
+        } else if large && yMode == 16 {
+            return fh.h.gmType[refFrame[0]] == 1
+        } else if large && yMode == 24 {
+            return fh.h.gmType[refFrame[0]] == 1 || fh.h.gmType[refFrame[1]] == 1
+        }
+        true
+    }
+
+    fn filterIntraModeInfo() {
+        useFilterIntra = 0
+        if hd.seq.enableFilterIntra && yMode == 0 && paletteSizeY == 0 && max(bw4, bh4) <= 8 {
+            useFilterIntra = sym.read(cfFilterIntra + miSize * 3, 2)
+            if useFilterIntra == 1 {
+                filterIntraMode = sym.read(cfFilterIntraMode, 5)
+            }
+        }
+    }
+
+    // count_refs( frameType ).
+    fn countRefs(_ t: Int) -> Int {
+        var c = 0
+        if availU {
+            if aboveRefFrame[0] == t {
+                c += 1
+            }
+            if aboveRefFrame[1] == t {
+                c += 1
+            }
+        }
+        if availL {
+            if leftRefFrame[0] == t {
+                c += 1
+            }
+            if leftRefFrame[1] == t {
+                c += 1
+            }
+        }
+        c
+    }
+
+    fn ctxCompRef() -> Int {
+        av1RefCountCtx(countRefs(1) + countRefs(2), countRefs(3) + countRefs(4))
+    }
+
+    fn ctxCompRefP1() -> Int {
+        av1RefCountCtx(countRefs(1), countRefs(2))
+    }
+
+    fn ctxCompRefP2() -> Int {
+        av1RefCountCtx(countRefs(3), countRefs(4))
+    }
+
+    fn ctxCompBwdref() -> Int {
+        av1RefCountCtx(countRefs(5) + countRefs(6), countRefs(7))
+    }
+
+    fn ctxCompBwdrefP1() -> Int {
+        av1RefCountCtx(countRefs(5), countRefs(6))
+    }
+
+    fn ctxSingleRefP1() -> Int {
+        let fwd = countRefs(1) + countRefs(2) + countRefs(3) + countRefs(4)
+        let bwd = countRefs(5) + countRefs(6) + countRefs(7)
+        av1RefCountCtx(fwd, bwd)
+    }
+
+    fn ctxUniCompRefP1() -> Int {
+        av1RefCountCtx(countRefs(2), countRefs(3) + countRefs(4))
+    }
+
+    // read_ref_frames( ) (5.11.25).
+    fn readRefFrames() {
+        if skipMode == 1 {
+            refFrame[0] = fh.skipModeFrame[0]
+            refFrame[1] = fh.skipModeFrame[1]
+        } else if segFeatureActive(5) {
+            refFrame[0] = featureData[segmentId * 8 + 5]
+            refFrame[1] = -1
+        } else if segFeatureActive(6) || segFeatureActive(7) {
+            refFrame[0] = 1
+            refFrame[1] = -1
+        } else {
+            var compMode = 0
+            if fh.referenceSelect && min(bw4, bh4) >= 2 {
+                var ctx = 0
+                if availU && availL {
+                    if aboveSingle && leftSingle {
+                        ctx = av1CheckBackward(aboveRefFrame[0]) ^ av1CheckBackward(leftRefFrame[0])
+                    } else if aboveSingle {
+                        ctx = 2 + (if av1CheckBackward(aboveRefFrame[0]) == 1 || aboveIntra { 1 } else { 0 })
+                    } else if leftSingle {
+                        ctx = 2 + (if av1CheckBackward(leftRefFrame[0]) == 1 || leftIntra { 1 } else { 0 })
+                    } else {
+                        ctx = 4
+                    }
+                } else if availU {
+                    ctx = if aboveSingle { av1CheckBackward(aboveRefFrame[0]) } else { 3 }
+                } else if availL {
+                    ctx = if leftSingle { av1CheckBackward(leftRefFrame[0]) } else { 3 }
+                } else {
+                    ctx = 1
+                }
+                compMode = sym.read(cfCompMode + ctx * 3, 2)
+            }
+            if compMode == 1 {
+                let compRefType = sym.read(cfCompRefType + compRefTypeCtx() * 3, 2)
+                if compRefType == 0 {
+                    let uni = sym.read(cfUniCompRef + (ctxSingleRefP1() * 3) * 3, 2)
+                    if uni == 1 {
+                        refFrame[0] = 5
+                        refFrame[1] = 7
+                    } else {
+                        let p1 = sym.read(cfUniCompRef + (ctxUniCompRefP1() * 3 + 1) * 3, 2)
+                        if p1 == 1 {
+                            let p2 = sym.read(cfUniCompRef + (ctxCompRefP2() * 3 + 2) * 3, 2)
+                            if p2 == 1 {
+                                refFrame[0] = 1
+                                refFrame[1] = 4
+                            } else {
+                                refFrame[0] = 1
+                                refFrame[1] = 3
+                            }
+                        } else {
+                            refFrame[0] = 1
+                            refFrame[1] = 2
+                        }
+                    }
+                } else {
+                    let compRef = sym.read(cfCompRef + (ctxCompRef() * 3) * 3, 2)
+                    if compRef == 0 {
+                        let p1 = sym.read(cfCompRef + (ctxCompRefP1() * 3 + 1) * 3, 2)
+                        refFrame[0] = if p1 == 1 { 2 } else { 1 }
+                    } else {
+                        let p2 = sym.read(cfCompRef + (ctxCompRefP2() * 3 + 2) * 3, 2)
+                        refFrame[0] = if p2 == 1 { 4 } else { 3 }
+                    }
+                    let bwd = sym.read(cfCompBwdRef + (ctxCompBwdref() * 2) * 3, 2)
+                    if bwd == 0 {
+                        let p1 = sym.read(cfCompBwdRef + (ctxCompBwdrefP1() * 2 + 1) * 3, 2)
+                        refFrame[1] = if p1 == 1 { 6 } else { 5 }
+                    } else {
+                        refFrame[1] = 7
+                    }
+                }
+            } else {
+                let p1 = sym.read(cfSingleRef + (ctxSingleRefP1() * 6) * 3, 2)
+                if p1 == 1 {
+                    let p2 = sym.read(cfSingleRef + (ctxCompBwdref() * 6 + 1) * 3, 2)
+                    if p2 == 0 {
+                        let p6 = sym.read(cfSingleRef + (ctxCompBwdrefP1() * 6 + 5) * 3, 2)
+                        refFrame[0] = if p6 == 1 { 6 } else { 5 }
+                    } else {
+                        refFrame[0] = 7
+                    }
+                } else {
+                    let p3 = sym.read(cfSingleRef + (ctxCompRef() * 6 + 2) * 3, 2)
+                    if p3 == 1 {
+                        let p5 = sym.read(cfSingleRef + (ctxCompRefP2() * 6 + 4) * 3, 2)
+                        refFrame[0] = if p5 == 1 { 4 } else { 3 }
+                    } else {
+                        let p4 = sym.read(cfSingleRef + (ctxCompRefP1() * 6 + 3) * 3, 2)
+                        refFrame[0] = if p4 == 1 { 2 } else { 1 }
+                    }
+                }
+                refFrame[1] = -1
+            }
+        }
+    }
+
+    fn compRefTypeCtx() -> Int {
+        let above0 = aboveRefFrame[0]
+        let above1 = aboveRefFrame[1]
+        let left0 = leftRefFrame[0]
+        let left1 = leftRefFrame[1]
+        let aboveCompInter = availU && !aboveIntra && !aboveSingle
+        let leftCompInter = availL && !leftIntra && !leftSingle
+        let aboveUniComp = aboveCompInter && av1SameDir(above0, above1)
+        let leftUniComp = leftCompInter && av1SameDir(left0, left1)
+        var ctx = 0
+        if availU && !aboveIntra && availL && !leftIntra {
+            let samedir = if av1SameDir(above0, left0) { 1 } else { 0 }
+            if !aboveCompInter && !leftCompInter {
+                ctx = 1 + 2 * samedir
+            } else if !aboveCompInter {
+                ctx = if !leftUniComp { 1 } else { 3 + samedir }
+            } else if !leftCompInter {
+                ctx = if !aboveUniComp { 1 } else { 3 + samedir }
+            } else {
+                if !aboveUniComp && !leftUniComp {
+                    ctx = 0
+                } else if !aboveUniComp || !leftUniComp {
+                    ctx = 2
+                } else {
+                    ctx = 3 + (if (above0 == 5) == (left0 == 5) { 1 } else { 0 })
+                }
+            }
+        } else if availU && availL {
+            if aboveCompInter {
+                ctx = 1 + 2 * (if aboveUniComp { 1 } else { 0 })
+            } else if leftCompInter {
+                ctx = 1 + 2 * (if leftUniComp { 1 } else { 0 })
+            } else {
+                ctx = 2
+            }
+        } else if aboveCompInter {
+            ctx = 4 * (if aboveUniComp { 1 } else { 0 })
+        } else if leftCompInter {
+            ctx = 4 * (if leftUniComp { 1 } else { 0 })
+        } else {
+            ctx = 2
+        }
+        ctx
+    }
+
+    // get_mode( refList ) (5.11.30).
+    fn getMode(_ refList: Int) -> Int {
+        let m = yMode
+        if refList == 0 {
+            if m < 18 {
+                return m
+            } else if m == 25 || m == 21 || m == 23 {
+                return 17
+            } else if m == 18 || m == 20 {
+                return 14
+            } else if m == 19 || m == 22 {
+                return 15
+            }
+            return 16
+        }
+        if m == 25 || m == 20 || m == 22 {
+            return 17
+        } else if m == 18 || m == 21 {
+            return 14
+        } else if m == 19 || m == 23 {
+            return 15
+        }
+        16
+    }
+
+    // assign_mv( isCompound ) (5.11.26).
+    fn assignMv(_ isCompound: Bool) {
+        let n = if isCompound { 2 } else { 1 }
+        for i in 0..n {
+            var compMode = 0
+            if useIntrabc == 1 {
+                compMode = 17
+            } else {
+                compMode = getMode(i)
+            }
+            if useIntrabc == 1 {
+                predMvR[0] = mvp.stack[0]
+                predMvC[0] = mvp.stack[1]
+                if predMvR[0] == 0 && predMvC[0] == 0 {
+                    predMvR[0] = mvp.stack[4]
+                    predMvC[0] = mvp.stack[5]
+                }
+                if predMvR[0] == 0 && predMvC[0] == 0 {
+                    if miRow - sbSize4 < miRowStart {
+                        predMvR[0] = 0
+                        predMvC[0] = -(sbSize4 * 4 + 256) * 8
+                    } else {
+                        predMvR[0] = -(sbSize4 * 4 * 8)
+                        predMvC[0] = 0
+                    }
+                }
+            } else if compMode == 16 {
+                predMvR[i] = mvp.globalMvs[i * 2]
+                predMvC[i] = mvp.globalMvs[i * 2 + 1]
+            } else {
+                var pos = if compMode == 14 { 0 } else { refMvIdx }
+                if compMode == 17 && mvp.numMvFound <= 1 {
+                    pos = 0
+                }
+                predMvR[i] = mvp.stack[pos * 4 + i * 2]
+                predMvC[i] = mvp.stack[pos * 4 + i * 2 + 1]
+            }
+            if compMode == 17 {
+                readMv(i)
+            } else {
+                mvR[i] = predMvR[i]
+                mvC[i] = predMvC[i]
+            }
+        }
+    }
+
+    // read_mv( ref ) (5.11.31).
+    fn readMv(_ ref: Int) {
+        var dr = 0
+        var dc = 0
+        let mvCtx = if useIntrabc == 1 { 1 } else { 0 }
+        let joint = sym.read(cfMvJoint + mvCtx * 5, 4)
+        if joint == 2 || joint == 3 {
+            dr = readMvComponent(mvCtx, 0)
+        }
+        if joint == 1 || joint == 3 {
+            dc = readMvComponent(mvCtx, 1)
+        }
+        mvR[ref] = predMvR[ref] + dr
+        mvC[ref] = predMvC[ref] + dc
+    }
+
+    fn readMvComponent(_ ctx: Int, _ comp: Int) -> Int {
+        let k = ctx * 2 + comp
+        let sign = sym.read(cfMvSign + k * 3, 2)
+        let mvClass = sym.read(cfMvClass + k * 12, 11)
+        var mag = 0
+        if mvClass == 0 {
+            let class0Bit = sym.read(cfMvClass0Bit + k * 3, 2)
+            var fr = 3
+            if !fh.h.forceIntegerMv {
+                fr = sym.read(cfMvClass0Fr + (k * 2 + class0Bit) * 5, 4)
+            }
+            var hp = 1
+            if fh.h.allowHighPrecisionMv {
+                hp = sym.read(cfMvClass0Hp + k * 3, 2)
+            }
+            mag = ((class0Bit << 3) | (fr << 1) | hp) + 1
+        } else {
+            var d = 0
+            for i in 0..mvClass {
+                let b = sym.read(cfMvBit + (k * 10 + i) * 3, 2)
+                d |= b << i
+            }
+            mag = 2 << (mvClass + 2)
+            var fr = 3
+            if !fh.h.forceIntegerMv {
+                fr = sym.read(cfMvFr + k * 5, 4)
+            }
+            var hp = 1
+            if fh.h.allowHighPrecisionMv {
+                hp = sym.read(cfMvHp + k * 3, 2)
+            }
+            mag += ((d << 3) | (fr << 1) | hp) + 1
+        }
+        if sign == 1 { -mag } else { mag }
+    }
+
+    // read_interintra_mode( isCompound ) (5.11.28).
+    fn readInterintraMode(_ isCompound: Bool) {
+        if skipMode == 0 && hd.seq.enableInterintraCompound && !isCompound && miSize >= 3 && miSize <= 9 {
+            let ctx = tSizeGroup[miSize] - 1
+            interintra = sym.read(cfInterIntra + ctx * 3, 2)
+            if interintra == 1 {
+                interintraMode = sym.read(cfInterIntraMode + ctx * 5, 4)
+                refFrame[1] = 0
+                mvp.refFrame1 = 0
+                angleDeltaY = 0
+                angleDeltaUV = 0
+                useFilterIntra = 0
+                wedgeInterintra = sym.read(cfWedgeInterIntra + miSize * 3, 2)
+                if wedgeInterintra == 1 {
+                    wedgeIndex = sym.read(cfWedgeIndex + miSize * 17, 16)
+                    wedgeSign = 0
+                }
+            }
+        } else {
+            interintra = 0
+        }
+    }
+
+    // read_motion_mode( isCompound ) (5.11.27).
+    fn readMotionMode(_ isCompound: Bool) {
+        if skipMode == 1 {
+            motionMode = 0
+            return
+        }
+        if !fh.isMotionModeSwitchable {
+            motionMode = 0
+            return
+        }
+        if min(bw4, bh4) < 2 {
+            motionMode = 0
+            return
+        }
+        if !fh.h.forceIntegerMv && (yMode == 16 || yMode == 24) {
+            if fh.h.gmType[refFrame[0]] > 1 {
+                motionMode = 0
+                return
+            }
+        }
+        if isCompound || refFrame[1] == 0 || !mvp.hasOverlappableCandidates(availU, availL) {
+            motionMode = 0
+            return
+        }
+        mvp.findWarpSamples(availU, availL, mvR[0], mvC[0])
+        if fh.h.forceIntegerMv || mvp.numSamples == 0 || !fh.h.allowWarpedMotion || isScaled(refFrame[0]) {
+            let useObmc = sym.read(cfUseObmc + miSize * 3, 2)
+            motionMode = if useObmc == 1 { 1 } else { 0 }
+        } else {
+            motionMode = sym.read(cfMotionMode + miSize * 4, 3)
+        }
+        if motionMode == 2 {
+            mvp.warpEstimation(mvR[0], mvC[0])
+        }
+    }
+
+    fn isScaled(_ ref: Int) -> Bool {
+        let s = hd.slots[fh.h.refFrameIdx[ref - 1]]
+        let fw = fh.h.frameWidth
+        let fhh = fh.h.frameHeight
+        let xScale = ((s.upscaledWidth << 14) + (fw / 2)) / fw
+        let yScale = ((s.frameHeight << 14) + (fhh / 2)) / fhh
+        xScale != 16384 || yScale != 16384
+    }
+
+    // read_compound_type( isCompound ) (5.11.29).
+    fn readCompoundType(_ isCompound: Bool) {
+        compGroupIdx = 0
+        compoundIdx = 1
+        if skipMode == 1 {
+            compoundType = 2
+            return
+        }
+        if isCompound {
+            let n = tWedgeBits[miSize]
+            if hd.seq.enableMaskedCompound {
+                var ctx = 0
+                if availU {
+                    let at = (miRow - 1) * miCols + miCol
+                    if !aboveSingle {
+                        ctx += gCompGroup[at]
+                    } else if aboveRefFrame[0] == 7 {
+                        ctx += 3
+                    }
+                }
+                if availL {
+                    let at = miRow * miCols + miCol - 1
+                    if !leftSingle {
+                        ctx += gCompGroup[at]
+                    } else if leftRefFrame[0] == 7 {
+                        ctx += 3
+                    }
+                }
+                ctx = min(5, ctx)
+                compGroupIdx = sym.read(cfCompGroupIdx + ctx * 3, 2)
+            }
+            if compGroupIdx == 0 {
+                if hd.seq.enableJntComp {
+                    let fwd = abs(av1RelDist(fh.h.orderHints[refFrame[0]], fh.h.orderHint, fh.h.enableOrderHint, fh.h.orderHintBits))
+                    let bck = abs(av1RelDist(fh.h.orderHints[refFrame[1]], fh.h.orderHint, fh.h.enableOrderHint, fh.h.orderHintBits))
+                    var ctx = if fwd == bck { 3 } else { 0 }
+                    if availU {
+                        let at = (miRow - 1) * miCols + miCol
+                        if !aboveSingle {
+                            ctx += gCompoundIdx[at]
+                        } else if aboveRefFrame[0] == 7 {
+                            ctx += 1
+                        }
+                    }
+                    if availL {
+                        let at = miRow * miCols + miCol - 1
+                        if !leftSingle {
+                            ctx += gCompoundIdx[at]
+                        } else if leftRefFrame[0] == 7 {
+                            ctx += 1
+                        }
+                    }
+                    compoundIdx = sym.read(cfCompoundIdx + ctx * 3, 2)
+                    compoundType = if compoundIdx == 1 { 2 } else { 4 }
+                } else {
+                    compoundType = 2
+                }
+            } else {
+                if n == 0 {
+                    compoundType = 1
+                } else {
+                    compoundType = sym.read(cfCompoundType + miSize * 3, 2)
+                }
+            }
+            if compoundType == 0 {
+                wedgeIndex = sym.read(cfWedgeIndex + miSize * 17, 16)
+                wedgeSign = sym.literal(1)
+            } else if compoundType == 1 {
+                maskType = sym.literal(1)
+            }
+        } else {
+            if interintra == 1 {
+                compoundType = if wedgeInterintra == 1 { 0 } else { 3 }
+            } else {
+                compoundType = 2
+            }
+        }
+    }
+
+    fn intraAngleInfoY() {
+        angleDeltaY = 0
+        if miSize >= 3 && yMode >= 1 && yMode <= 8 {
+            angleDeltaY = sym.read(cfAngleDelta + (yMode - 1) * 8, 7) - 3
+        }
+    }
+
+    fn intraAngleInfoUV() {
+        angleDeltaUV = 0
+        if miSize >= 3 && uvMode >= 1 && uvMode <= 8 {
+            angleDeltaUV = sym.read(cfAngleDelta + (uvMode - 1) * 8, 7) - 3
+        }
+    }
+
+    // read_cfl_alphas( ) (5.11.45).
+    fn readCflAlphas() {
+        let signs = sym.read(cfCflSign, 8)
+        let signU = (signs + 1) / 3
+        let signV = (signs + 1) % 3
+        if signU != 0 {
+            let ctx = (signU - 1) * 3 + signV
+            cflAlphaU = 1 + sym.read(cfCflAlpha + ctx * 17, 16)
+            if signU == 1 {
+                cflAlphaU = -cflAlphaU
+            }
+        } else {
+            cflAlphaU = 0
+        }
+        if signV != 0 {
+            let ctx = (signV - 1) * 3 + signU
+            cflAlphaV = 1 + sym.read(cfCflAlpha + ctx * 17, 16)
+            if signV == 1 {
+                cflAlphaV = -cflAlphaV
+            }
+        } else {
+            cflAlphaV = 0
+        }
+    }
+
+    // ---- palette (5.11.46, 5.11.49, 5.11.50) -----------------------------
+
+    fn paletteModeInfo() {
+        let bsizeCtx = tWLog2[miSize] + tHLog2[miSize] - 2
+        if yMode == 0 {
+            var ctx = 0
+            if availU && (gPalSize[(miRow - 1) * miCols + miCol] & 15) > 0 {
+                ctx += 1
+            }
+            if availL && (gPalSize[miRow * miCols + miCol - 1] & 15) > 0 {
+                ctx += 1
+            }
+            let has = sym.read(cfPaletteYMode + (bsizeCtx * 3 + ctx) * 3, 2)
+            if has == 1 {
+                paletteSizeY = sym.read(cfPaletteYSize + bsizeCtx * 8, 7) + 2
+                let cacheN = getPaletteCache(0)
+                var idx = 0
+                var i = 0
+                while i < cacheN && idx < paletteSizeY {
+                    if sym.literal(1) == 1 {
+                        palColorsY[idx] = palCache[i]
+                        idx += 1
+                    }
+                    i += 1
+                }
+                if idx < paletteSizeY {
+                    palColorsY[idx] = sym.literal(bitDepth)
+                    idx += 1
+                }
+                var paletteBits = 0
+                if idx < paletteSizeY {
+                    let minBits = bitDepth - 3
+                    paletteBits = minBits + sym.literal(2)
+                }
+                while idx < paletteSizeY {
+                    var delta = sym.literal(paletteBits)
+                    delta += 1
+                    palColorsY[idx] = min(palColorsY[idx - 1] + delta, (1 << bitDepth) - 1)
+                    let range = (1 << bitDepth) - palColorsY[idx] - 1
+                    paletteBits = min(paletteBits, av1CeilLog2(range))
+                    idx += 1
+                }
+                sortPalette(0, paletteSizeY)
+            }
+        }
+        if hasChroma && uvMode == 0 {
+            let ctx = if paletteSizeY > 0 { 1 } else { 0 }
+            let has = sym.read(cfPaletteUVMode + ctx * 3, 2)
+            if has == 1 {
+                paletteSizeUV = sym.read(cfPaletteUVSize + bsizeCtx * 8, 7) + 2
+                let cacheN = getPaletteCache(1)
+                var idx = 0
+                var i = 0
+                while i < cacheN && idx < paletteSizeUV {
+                    if sym.literal(1) == 1 {
+                        palColorsU[idx] = palCache[i]
+                        idx += 1
+                    }
+                    i += 1
+                }
+                if idx < paletteSizeUV {
+                    palColorsU[idx] = sym.literal(bitDepth)
+                    idx += 1
+                }
+                var paletteBits = 0
+                if idx < paletteSizeUV {
+                    let minBits = bitDepth - 3
+                    paletteBits = minBits + sym.literal(2)
+                }
+                while idx < paletteSizeUV {
+                    let delta = sym.literal(paletteBits)
+                    palColorsU[idx] = min(palColorsU[idx - 1] + delta, (1 << bitDepth) - 1)
+                    let range = (1 << bitDepth) - palColorsU[idx]
+                    paletteBits = min(paletteBits, av1CeilLog2(range))
+                    idx += 1
+                }
+                sortPalette(1, paletteSizeUV)
+                if sym.literal(1) == 1 {
+                    let minBits = bitDepth - 4
+                    let maxVal = 1 << bitDepth
+                    let paletteBits2 = minBits + sym.literal(2)
+                    palColorsV[0] = sym.literal(bitDepth)
+                    for idx2 in 1..paletteSizeUV {
+                        var delta = sym.literal(paletteBits2)
+                        if delta != 0 {
+                            if sym.literal(1) == 1 {
+                                delta = -delta
+                            }
+                        }
+                        var val = palColorsV[idx2 - 1] + delta
+                        if val < 0 {
+                            val += maxVal
+                        }
+                        if val >= maxVal {
+                            val -= maxVal
+                        }
+                        palColorsV[idx2] = min(max(val, 0), (1 << bitDepth) - 1)
+                    }
+                } else {
+                    for idx2 in 0..paletteSizeUV {
+                        palColorsV[idx2] = sym.literal(bitDepth)
+                    }
+                }
+            }
+        }
+    }
+
+    fn sortPalette(_ which: Int, _ n: Int) {
+        var i = 1
+        while i < n {
+            var j = i
+            while j > 0 {
+                let a = if which == 0 { palColorsY[j - 1] } else { palColorsU[j - 1] }
+                let b = if which == 0 { palColorsY[j] } else { palColorsU[j] }
+                if a <= b {
+                    break
+                }
+                if which == 0 {
+                    palColorsY[j - 1] = b
+                    palColorsY[j] = a
+                } else {
+                    palColorsU[j - 1] = b
+                    palColorsU[j] = a
+                }
+                j -= 1
+            }
+            i += 1
+        }
+    }
+
+    // get_palette_cache( plane ).
+    fn getPaletteCache(_ plane: Int) -> Int {
+        var aboveN = 0
+        if ((miRow * 4) % 64) != 0 {
+            let at = (miRow - 1) * miCols + miCol
+            aboveN = if plane == 0 { gPalSize[at] & 15 } else { gPalSize[at] >> 4 }
+        }
+        var leftN = 0
+        if availL {
+            let at = miRow * miCols + miCol - 1
+            leftN = if plane == 0 { gPalSize[at] & 15 } else { gPalSize[at] >> 4 }
+        }
+        let aAt = ((miRow - 1) * miCols + miCol) * 8
+        let lAt = (miRow * miCols + miCol - 1) * 8
+        var aboveIdx = 0
+        var leftIdx = 0
+        var n = 0
+        while aboveIdx < aboveN && leftIdx < leftN {
+            let aboveC = if plane == 0 { gPalColY[aAt + aboveIdx] } else { gPalColUV[aAt + aboveIdx] }
+            let leftC = if plane == 0 { gPalColY[lAt + leftIdx] } else { gPalColUV[lAt + leftIdx] }
+            if leftC < aboveC {
+                if n == 0 || leftC != palCache[n - 1] {
+                    palCache[n] = leftC
+                    n += 1
+                }
+                leftIdx += 1
+            } else {
+                if n == 0 || aboveC != palCache[n - 1] {
+                    palCache[n] = aboveC
+                    n += 1
+                }
+                aboveIdx += 1
+                if leftC == aboveC {
+                    leftIdx += 1
+                }
+            }
+        }
+        while aboveIdx < aboveN {
+            let v = if plane == 0 { gPalColY[aAt + aboveIdx] } else { gPalColUV[aAt + aboveIdx] }
+            aboveIdx += 1
+            if n == 0 || v != palCache[n - 1] {
+                palCache[n] = v
+                n += 1
+            }
+        }
+        while leftIdx < leftN {
+            let v = if plane == 0 { gPalColY[lAt + leftIdx] } else { gPalColUV[lAt + leftIdx] }
+            leftIdx += 1
+            if n == 0 || v != palCache[n - 1] {
+                palCache[n] = v
+                n += 1
+            }
+        }
+        n
+    }
+
+    // palette_tokens( ) (5.11.49); appends the palette data blocks.
+    fn paletteTokens() {
+        palOffY = -1
+        palOffU = -1
+        palOffV = -1
+        var blockHeight = bh4 * 4
+        var blockWidth = bw4 * 4
+        var onscreenHeight = min(blockHeight, (miRows - miRow) * 4)
+        var onscreenWidth = min(blockWidth, (miCols - miCol) * 4)
+        if paletteSizeY > 0 {
+            let n = paletteSizeY
+            colorMapY[0] = sym.ns(n)
+            var i = 1
+            while i < onscreenHeight + onscreenWidth - 1 {
+                var j = min(i, onscreenWidth - 1)
+                while j >= max(0, i - onscreenHeight + 1) {
+                    paletteColorContext(0, i - j, j, n, blockWidth)
+                    let ctx = tPalCtx[colorCtxHash]
+                    let v = sym.read(paletteColorOff(0, n) + ctx * (n + 1), n)
+                    colorMapY[(i - j) * blockWidth + j] = colorOrder[v]
+                    j -= 1
+                }
+                i += 1
+            }
+            for y in 0..onscreenHeight {
+                for x in onscreenWidth..blockWidth {
+                    colorMapY[y * blockWidth + x] = colorMapY[y * blockWidth + onscreenWidth - 1]
+                }
+            }
+            for y in onscreenHeight..blockHeight {
+                for x in 0..blockWidth {
+                    colorMapY[y * blockWidth + x] = colorMapY[(onscreenHeight - 1) * blockWidth + x]
+                }
+            }
+            palOffY = palette.count
+            palette.append(n)
+            palette.append(blockWidth)
+            for k in 0..n {
+                palette.append(palColorsY[k])
+            }
+            for k in 0..(blockWidth * blockHeight) {
+                palette.append(colorMapY[k])
+            }
+        }
+        if paletteSizeUV > 0 {
+            let n = paletteSizeUV
+            colorMapUV[0] = sym.ns(n)
+            blockHeight = blockHeight >> subY
+            blockWidth = blockWidth >> subX
+            onscreenHeight = onscreenHeight >> subY
+            onscreenWidth = onscreenWidth >> subX
+            if blockWidth < 4 {
+                blockWidth += 2
+                onscreenWidth += 2
+            }
+            if blockHeight < 4 {
+                blockHeight += 2
+                onscreenHeight += 2
+            }
+            var i = 1
+            while i < onscreenHeight + onscreenWidth - 1 {
+                var j = min(i, onscreenWidth - 1)
+                while j >= max(0, i - onscreenHeight + 1) {
+                    paletteColorContext(1, i - j, j, n, blockWidth)
+                    let ctx = tPalCtx[colorCtxHash]
+                    let v = sym.read(paletteColorOff(1, n) + ctx * (n + 1), n)
+                    colorMapUV[(i - j) * blockWidth + j] = colorOrder[v]
+                    j -= 1
+                }
+                i += 1
+            }
+            for y in 0..onscreenHeight {
+                for x in onscreenWidth..blockWidth {
+                    colorMapUV[y * blockWidth + x] = colorMapUV[y * blockWidth + onscreenWidth - 1]
+                }
+            }
+            for y in onscreenHeight..blockHeight {
+                for x in 0..blockWidth {
+                    colorMapUV[y * blockWidth + x] = colorMapUV[(onscreenHeight - 1) * blockWidth + x]
+                }
+            }
+            for plane in 1..3 {
+                if plane == 1 {
+                    palOffU = palette.count
+                } else {
+                    palOffV = palette.count
+                }
+                palette.append(n)
+                palette.append(blockWidth)
+                for k in 0..n {
+                    palette.append(if plane == 1 { palColorsU[k] } else { palColorsV[k] })
+                }
+                for k in 0..(blockWidth * blockHeight) {
+                    palette.append(colorMapUV[k])
+                }
+            }
+        }
+    }
+
+    fn paletteColorOff(_ plane: Int, _ n: Int) -> Int {
+        if plane == 0 {
+            if n == 2 { return cfPaletteSize2YColor }
+            if n == 3 { return cfPaletteSize3YColor }
+            if n == 4 { return cfPaletteSize4YColor }
+            if n == 5 { return cfPaletteSize5YColor }
+            if n == 6 { return cfPaletteSize6YColor }
+            if n == 7 { return cfPaletteSize7YColor }
+            return cfPaletteSize8YColor
+        }
+        if n == 2 { return cfPaletteSize2UVColor }
+        if n == 3 { return cfPaletteSize3UVColor }
+        if n == 4 { return cfPaletteSize4UVColor }
+        if n == 5 { return cfPaletteSize5UVColor }
+        if n == 6 { return cfPaletteSize6UVColor }
+        if n == 7 { return cfPaletteSize7UVColor }
+        cfPaletteSize8UVColor
+    }
+
+    // get_palette_color_context( colorMap, r, c, n ) (5.11.50).
+    fn paletteColorContext(_ plane: Int, _ r: Int, _ c: Int, _ n: Int, _ stride: Int) {
+        for i in 0..8 {
+            scores[i] = 0
+            colorOrder[i] = i
+        }
+        if c > 0 {
+            let nb = if plane == 0 { colorMapY[r * stride + c - 1] } else { colorMapUV[r * stride + c - 1] }
+            scores[nb] += 2
+        }
+        if r > 0 && c > 0 {
+            let nb = if plane == 0 { colorMapY[(r - 1) * stride + c - 1] } else { colorMapUV[(r - 1) * stride + c - 1] }
+            scores[nb] += 1
+        }
+        if r > 0 {
+            let nb = if plane == 0 { colorMapY[(r - 1) * stride + c] } else { colorMapUV[(r - 1) * stride + c] }
+            scores[nb] += 2
+        }
+        for i in 0..3 {
+            var maxScore = scores[i]
+            var maxIdx = i
+            var j = i + 1
+            while j < n {
+                if scores[j] > maxScore {
+                    maxScore = scores[j]
+                    maxIdx = j
+                }
+                j += 1
+            }
+            if maxIdx != i {
+                maxScore = scores[maxIdx]
+                let maxColorOrder = colorOrder[maxIdx]
+                var k = maxIdx
+                while k > i {
+                    scores[k] = scores[k - 1]
+                    colorOrder[k] = colorOrder[k - 1]
+                    k -= 1
+                }
+                scores[i] = maxScore
+                colorOrder[i] = maxColorOrder
+            }
+        }
+        colorCtxHash = scores[0] * 1 + scores[1] * 2 + scores[2] * 2
+    }
+
+    // ---- prediction records (5.11.33) ------------------------------------
+
+    fn planeResidualSize(_ subsize: Int, _ plane: Int) -> Int {
+        let sx = if plane > 0 { subX } else { 0 }
+        let sy = if plane > 0 { subY } else { 0 }
+        tSubSize[subsize * 4 + sx * 2 + sy]
+    }
+
+    // get_filter_type( plane ) (7.11.2.8).
+    fn filterType(_ plane: Int) -> Int {
+        var aboveSmooth = false
+        var leftSmooth = false
+        if (if plane == 0 { availU } else { availUChroma }) {
+            var r = miRow - 1
+            var c = miCol
+            if plane > 0 {
+                if subX == 1 && (miCol & 1) == 0 {
+                    c += 1
+                }
+                if subY == 1 && (miRow & 1) == 1 {
+                    r -= 1
+                }
+            }
+            aboveSmooth = isSmooth(r, c, plane)
+        }
+        if (if plane == 0 { availL } else { availLChroma }) {
+            var r = miRow
+            var c = miCol - 1
+            if plane > 0 {
+                if subX == 1 && (miCol & 1) == 1 {
+                    c -= 1
+                }
+                if subY == 1 && (miRow & 1) == 0 {
+                    r += 1
+                }
+            }
+            leftSmooth = isSmooth(r, c, plane)
+        }
+        if aboveSmooth || leftSmooth { 1 } else { 0 }
+    }
+
+    fn isSmooth(_ row: Int, _ col: Int, _ plane: Int) -> Bool {
+        if row < 0 || col < 0 || row >= miRows || col >= miCols {
+            return false
+        }
+        let at = row * miCols + col
+        var mode = 0
+        if plane == 0 {
+            mode = mvp.gYMode[at]
+        } else {
+            if mvp.gRef0[at] > 0 {
+                return false
+            }
+            mode = gUVMode[at]
+        }
+        mode == 9 || mode == 10 || mode == 11
+    }
+
+    fn emitIntra(_ plane: Int, _ x: Int, _ y: Int, _ log2W: Int, _ log2H: Int, _ mode: Int, _ angleDelta: Int,
+                 _ haveLeft: Bool, _ haveAbove: Bool, _ haveAboveRight: Int, _ haveBelowLeft: Int,
+                 _ fim: Int, _ isCfl: Bool) {
+        ops.append(opIntra)
+        ops.append(plane)
+        ops.append(x)
+        ops.append(y)
+        ops.append(log2W)
+        ops.append(log2H)
+        ops.append(mode)
+        ops.append(angleDelta)
+        ops.append(if haveLeft { 1 } else { 0 })
+        ops.append(if haveAbove { 1 } else { 0 })
+        ops.append(haveAboveRight)
+        ops.append(haveBelowLeft)
+        ops.append(fim)
+        ops.append(filterType(plane))
+        ops.append(if plane == 1 { cflAlphaU } else { cflAlphaV })
+        ops.append(if isCfl { 1 } else { 0 })
+        ops.append(maxLumaW)
+        ops.append(maxLumaH)
+    }
+
+    // compute_prediction( ) (5.11.33): interintra and inter records.
+    fn computePrediction() {
+        if isInter == 0 {
+            return
+        }
+        let sbRow = miRow & sbMask
+        let sbCol = miCol & sbMask
+        let planes = if hasChroma { 3 } else { 1 }
+        for plane in 0..planes {
+            let planeSz = planeResidualSize(miSize, plane)
+            let num4x4W = tW4[planeSz]
+            let num4x4H = tH4[planeSz]
+            let log2W = 2 + tWLog2[planeSz]
+            let log2H = 2 + tHLog2[planeSz]
+            let sx = if plane > 0 { subX } else { 0 }
+            let sy = if plane > 0 { subY } else { 0 }
+            let baseX = (miCol >> sx) * 4
+            let baseY = (miRow >> sy) * 4
+            var candRow = (miRow >> sy) << sy
+            var candCol = (miCol >> sx) << sx
+            let isII = isInter == 1 && refFrame[1] == 0
+            if isII {
+                var mode = 9
+                if interintraMode == 0 {
+                    mode = 0
+                } else if interintraMode == 1 {
+                    mode = 1
+                } else if interintraMode == 2 {
+                    mode = 2
+                }
+                let hal = blockDecodedAt(plane, (sbRow >> sy) - 1, (sbCol >> sx) + num4x4W)
+                let hbl = blockDecodedAt(plane, (sbRow >> sy) + num4x4H, (sbCol >> sx) - 1)
+                emitIntra(plane, baseX, baseY, log2W, log2H, mode, 0,
+                          if plane == 0 { availL } else { availLChroma },
+                          if plane == 0 { availU } else { availUChroma }, hal, hbl, -1, false)
+            }
+            var predW = (bw4 * 4) >> sx
+            var predH = (bh4 * 4) >> sy
+            var someUseIntra = false
+            for r in 0..(num4x4H << sy) {
+                for c in 0..(num4x4W << sx) {
+                    let rr = candRow + r
+                    let cc = candCol + c
+                    if rr < miRows && cc < miCols && mvp.gRef0[rr * miCols + cc] == 0 {
+                        someUseIntra = true
+                    }
+                }
+            }
+            if someUseIntra {
+                predW = num4x4W * 4
+                predH = num4x4H * 4
+                candRow = miRow
+                candCol = miCol
+            }
+            var r = 0
+            var y = 0
+            while y < num4x4H * 4 {
+                var c = 0
+                var x = 0
+                while x < num4x4W * 4 {
+                    ops.append(opInter)
+                    ops.append(plane)
+                    ops.append(baseX + x)
+                    ops.append(baseY + y)
+                    ops.append(predW)
+                    ops.append(predH)
+                    ops.append(candRow + r)
+                    ops.append(candCol + c)
+                    x += predW
+                    c += 1
+                }
+                y += predH
+                r += 1
+            }
+        }
+    }
+
+    // ---- residual (5.11.34–5.11.38) ---------------------------------------
+
+    fn residual() {
+        let widthChunks = max(1, bw4 >> 4)
+        let heightChunks = max(1, bh4 >> 4)
+        let miSizeChunk = if widthChunks > 1 || heightChunks > 1 { 12 } else { miSize }
+        for chunkY in 0..heightChunks {
+            for chunkX in 0..widthChunks {
+                let miRowChunk = miRow + (chunkY << 4)
+                let miColChunk = miCol + (chunkX << 4)
+                let planes = if hasChroma { 3 } else { 1 }
+                for plane in 0..planes {
+                    let txSz = if lossless { 0 } else { getTxSize(plane, txSize) }
+                    let stepX = tTxW[txSz] >> 2
+                    let stepY = tTxH[txSz] >> 2
+                    let planeSz = planeResidualSize(miSizeChunk, plane)
+                    let num4x4W = tW4[planeSz]
+                    let num4x4H = tH4[planeSz]
+                    let sx = if plane > 0 { subX } else { 0 }
+                    let sy = if plane > 0 { subY } else { 0 }
+                    let baseX = (miColChunk >> sx) * 4
+                    let baseY = (miRowChunk >> sy) * 4
+                    if isInter == 1 && !lossless && plane == 0 {
+                        transformTree(baseX, baseY, num4x4W * 4, num4x4H * 4)
+                    } else {
+                        let baseXBlock = (miCol >> sx) * 4
+                        let baseYBlock = (miRow >> sy) * 4
+                        var y = 0
+                        while y < num4x4H {
+                            var x = 0
+                            while x < num4x4W {
+                                transformBlock(plane, baseXBlock, baseYBlock, txSz, x + ((chunkX << 4) >> sx), y + ((chunkY << 4) >> sy))
+                                x += stepX
+                            }
+                            y += stepY
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn getTxSize(_ plane: Int, _ txSz: Int) -> Int {
+        if plane == 0 {
+            return txSz
+        }
+        let uvTx = tMaxTxRect[planeResidualSize(miSize, plane)]
+        if tTxW[uvTx] == 64 || tTxH[uvTx] == 64 {
+            if tTxW[uvTx] == 16 {
+                return 9
+            }
+            if tTxH[uvTx] == 16 {
+                return 10
+            }
+            return 3
+        }
+        uvTx
+    }
+
+    fn transformTree(_ startX: Int, _ startY: Int, _ w: Int, _ h: Int) {
+        let maxX = miCols * 4
+        let maxY = miRows * 4
+        if startX >= maxX || startY >= maxY {
+            return
+        }
+        let row = startY >> 2
+        let col = startX >> 2
+        let lumaTxSz = gInterTx[row * miCols + col]
+        let lumaW = tTxW[lumaTxSz]
+        let lumaH = tTxH[lumaTxSz]
+        if w <= lumaW && h <= lumaH {
+            let txSz = av1FindTxSize(w, h)
+            transformBlock(0, startX, startY, txSz, 0, 0)
+        } else {
+            if w > h {
+                transformTree(startX, startY, w / 2, h)
+                transformTree(startX + w / 2, startY, w / 2, h)
+            } else if w < h {
+                transformTree(startX, startY, w, h / 2)
+                transformTree(startX, startY + h / 2, w, h / 2)
+            } else {
+                transformTree(startX, startY, w / 2, h / 2)
+                transformTree(startX + w / 2, startY, w / 2, h / 2)
+                transformTree(startX, startY + h / 2, w / 2, h / 2)
+                transformTree(startX + w / 2, startY + h / 2, w / 2, h / 2)
+            }
+        }
+    }
+
+    // transform_block( plane, baseX, baseY, txSz, x, y ) (5.11.35).
+    fn transformBlock(_ plane: Int, _ baseX: Int, _ baseY: Int, _ txSz: Int, _ x: Int, _ y: Int) {
+        let startX = baseX + 4 * x
+        let startY = baseY + 4 * y
+        let sx = if plane > 0 { subX } else { 0 }
+        let sy = if plane > 0 { subY } else { 0 }
+        let row = (startY << sy) >> 2
+        let col = (startX << sx) >> 2
+        let sbRow = row & sbMask
+        let sbCol = col & sbMask
+        let stepX = tTxW[txSz] >> 2
+        let stepY = tTxH[txSz] >> 2
+        let maxX = (miCols * 4) >> sx
+        let maxY = (miRows * 4) >> sy
+        if startX >= maxX || startY >= maxY {
+            return
+        }
+        if isInter == 0 {
+            let pal = if plane == 0 { paletteSizeY } else { paletteSizeUV }
+            if pal > 0 {
+                ops.append(opPalette)
+                ops.append(plane)
+                ops.append(startX)
+                ops.append(startY)
+                ops.append(tTxWLog2[txSz])
+                ops.append(tTxHLog2[txSz])
+                ops.append(if plane == 0 { palOffY } else if plane == 1 { palOffU } else { palOffV })
+                ops.append(x)
+                ops.append(y)
+            } else {
+                let isCfl = plane > 0 && uvMode == 13
+                var mode = yMode
+                if plane > 0 {
+                    mode = if isCfl { 0 } else { uvMode }
+                }
+                let haveLeft = (if plane == 0 { availL } else { availLChroma }) || x > 0
+                let haveAbove = (if plane == 0 { availU } else { availUChroma }) || y > 0
+                let hal = blockDecodedAt(plane, (sbRow >> sy) - 1, (sbCol >> sx) + stepX)
+                let hbl = blockDecodedAt(plane, (sbRow >> sy) + stepY, (sbCol >> sx) - 1)
+                let fim = if plane == 0 && useFilterIntra == 1 { filterIntraMode } else { -1 }
+                emitIntra(plane, startX, startY, tTxWLog2[txSz], tTxHLog2[txSz], mode,
+                          if plane == 0 { angleDeltaY } else { angleDeltaUV }, haveLeft, haveAbove, hal, hbl, fim, isCfl)
+            }
+            if plane == 0 {
+                maxLumaW = startX + stepX * 4
+                maxLumaH = startY + stepY * 4
+            }
+        }
+        if skip == 0 {
+            let coefAt = coefs.count
+            let eob = readCoeffs(plane, startX, startY, txSz)
+            if eob > 0 {
+                ops.append(opResidual)
+                ops.append(plane)
+                ops.append(startX)
+                ops.append(startY)
+                ops.append(txSz)
+                ops.append(planeTxType)
+                ops.append(coefAt)
+                ops.append(eob)
+                ops.append(if lossless { 1 } else { 0 })
+            }
+        }
+        for i in 0..stepY {
+            for j in 0..stepX {
+                let rr = (row >> sy) + i
+                let cc = (col >> sx) + j
+                if plane == 0 {
+                    if rr < miRows && cc < miCols {
+                        gLfTxY[rr * miCols + cc] = txSz
+                    }
+                } else if plane == 1 {
+                    if rr < miRows && cc < miCols {
+                        gLfTxUV[rr * miCols + cc] = txSz
+                    }
+                }
+                let by = (sbRow >> sy) + i
+                let bx = (sbCol >> sx) + j
+                if by <= 32 && bx <= 32 {
+                    blockDecoded[plane * 1156 + (by + 1) * 34 + (bx + 1)] = 1
+                }
+            }
+        }
+    }
+
+    // ---- transform type (5.11.47, 5.11.48, 5.11.40) -----------------------
+
+    fn getTxSet(_ txSz: Int) -> Int {
+        let sqr = tTxSqr[txSz]
+        let sqrUp = tTxSqrUp[txSz]
+        if sqrUp > 3 {
+            return 0
+        }
+        if isInter == 1 {
+            if fh.reducedTxSet || sqrUp == 3 {
+                return 3
+            } else if sqr == 2 {
+                return 2
+            }
+            return 1
+        }
+        if sqrUp == 3 {
+            return 0
+        } else if fh.reducedTxSet {
+            return 2
+        } else if sqr == 2 {
+            return 2
+        }
+        1
+    }
+
+    fn readTransformType(_ x4: Int, _ y4: Int, _ txSz: Int) {
+        let set = getTxSet(txSz)
+        var txType = 0
+        let q = if segEnabled { hd.qindex(true, segmentId, currentQIndex) } else { fh.baseQIdx }
+        if set > 0 && q > 0 {
+            if isInter == 1 {
+                if set == 1 {
+                    txType = tInterInv1[sym.read(cfInterTxTypeSet1 + tTxSqr[txSz] * 17, 16)]
+                } else if set == 2 {
+                    txType = tInterInv2[sym.read(cfInterTxTypeSet2, 12)]
+                } else {
+                    txType = tInterInv3[sym.read(cfInterTxTypeSet3 + tTxSqr[txSz] * 3, 2)]
+                }
+            } else {
+                let intraDir = if useFilterIntra == 1 { tFilterIntraDir[filterIntraMode] } else { yMode }
+                if set == 1 {
+                    txType = tIntraInv1[sym.read(cfIntraTxTypeSet1 + (tTxSqr[txSz] * 13 + intraDir) * 8, 7)]
+                } else {
+                    txType = tIntraInv2[sym.read(cfIntraTxTypeSet2 + (tTxSqr[txSz] * 13 + intraDir) * 6, 5)]
+                }
+            }
+        }
+        let w4 = tTxW[txSz] >> 2
+        let h4 = tTxH[txSz] >> 2
+        for i in 0..w4 {
+            for j in 0..h4 {
+                if y4 + j < miRows && x4 + i < miCols {
+                    gTxType[(y4 + j) * miCols + x4 + i] = txType
+                }
+            }
+        }
+    }
+
+    fn computeTxType(_ plane: Int, _ txSz: Int, _ blockX: Int, _ blockY: Int) -> Int {
+        let sqrUp = tTxSqrUp[txSz]
+        if lossless || sqrUp > 3 {
+            return 0
+        }
+        let set = getTxSet(txSz)
+        if plane == 0 {
+            return gTxType[blockY * miCols + blockX]
+        }
+        var txType = 0
+        if isInter == 1 {
+            let x4 = max(miCol, blockX << subX)
+            let y4 = max(miRow, blockY << subY)
+            txType = gTxType[y4 * miCols + x4]
+            if tInSetInter[set * 16 + txType] == 0 {
+                return 0
+            }
+            return txType
+        }
+        txType = tModeToTxfm[uvMode]
+        if tInSetIntra[set * 16 + txType] == 0 {
+            return 0
+        }
+        txType
+    }
+
+    // ---- coefficients (5.11.39) -------------------------------------------
+
+    // Reads one transform block's coefficients, appends the dequantised
+    // non-zero ones to `coefs` (count first) and returns eob.
+    fn readCoeffs(_ plane: Int, _ startX: Int, _ startY: Int, _ txSz: Int) -> Int {
+        let x4 = startX >> 2
+        let y4 = startY >> 2
+        let w4 = tTxW[txSz] >> 2
+        let h4 = tTxH[txSz] >> 2
+        let txSzCtx = (tTxSqr[txSz] + tTxSqrUp[txSz] + 1) >> 1
+        let ptype = if plane > 0 { 1 } else { 0 }
+        var eob = 0
+        var culLevel = 0
+        var dcCategory = 0
+        // all_zero context (8.3.2).
+        var maxX4 = miCols
+        var maxY4 = miRows
+        if plane > 0 {
+            maxX4 = maxX4 >> subX
+            maxY4 = maxY4 >> subY
+        }
+        let w = tTxW[txSz]
+        let h = tTxH[txSz]
+        let pBase = plane * ctxCap
+        var ctx = 0
+        let bsize = planeResidualSize(miSize, plane)
+        let bw = tW4[bsize] * 4
+        let bh = tH4[bsize] * 4
+        if plane == 0 {
+            var top = 0
+            var left = 0
+            for k in 0..w4 {
+                if x4 + k < maxX4 {
+                    top = max(top, aboveLevel[pBase + x4 + k])
+                }
+            }
+            for k in 0..h4 {
+                if y4 + k < maxY4 {
+                    left = max(left, leftLevel[pBase + y4 + k])
+                }
+            }
+            top = min(top, 255)
+            left = min(left, 255)
+            if bw == w && bh == h {
+                ctx = 0
+            } else if top == 0 && left == 0 {
+                ctx = 1
+            } else if top == 0 || left == 0 {
+                ctx = 2 + (if max(top, left) > 3 { 1 } else { 0 })
+            } else if max(top, left) <= 3 {
+                ctx = 4
+            } else if min(top, left) <= 3 {
+                ctx = 5
+            } else {
+                ctx = 6
+            }
+        } else {
+            var above = 0
+            var left = 0
+            for i in 0..w4 {
+                if x4 + i < maxX4 {
+                    above |= aboveLevel[pBase + x4 + i]
+                    above |= aboveDc[pBase + x4 + i]
+                }
+            }
+            for i in 0..h4 {
+                if y4 + i < maxY4 {
+                    left |= leftLevel[pBase + y4 + i]
+                    left |= leftDc[pBase + y4 + i]
+                }
+            }
+            ctx = (if above != 0 { 1 } else { 0 }) + (if left != 0 { 1 } else { 0 })
+            ctx += 7
+            if bw * bh > w * h {
+                ctx += 3
+            }
+        }
+        let allZero = sym.read(cfTxbSkip + (txSzCtx * 13 + ctx) * 3, 2)
+        if allZero == 1 {
+            if plane == 0 {
+                for i in 0..w4 {
+                    for j in 0..h4 {
+                        if y4 + j < miRows && x4 + i < miCols {
+                            gTxType[(y4 + j) * miCols + x4 + i] = 0
+                        }
+                    }
+                }
+            }
+            planeTxType = 0
+        } else {
+            if plane == 0 {
+                readTransformType(x4, y4, txSz)
+            }
+            planeTxType = computeTxType(plane, txSz, x4, y4)
+            let txType = planeTxType
+            let txClass = av1TxClass(txType)
+            // get_scan( txSz )
+            var kind = 0
+            if txSz == 17 || txSz == 18 || tTxSqrUp[txSz] == 4 || txType == 9 {
+                kind = 0
+            } else if txClass == 2 {
+                kind = 1
+            } else if txClass == 1 {
+                kind = 2
+            }
+            let scanAt = scanOff[txSz * 3 + kind]
+            let eobMultisize = min(tTxWLog2[txSz], 5) + min(tTxHLog2[txSz], 5) - 4
+            let eobCtx = if txClass == 0 { 0 } else { 1 }
+            var eobPt = 0
+            if eobMultisize == 0 {
+                eobPt = sym.read(cfEobPt16 + (ptype * 2 + eobCtx) * 6, 5) + 1
+            } else if eobMultisize == 1 {
+                eobPt = sym.read(cfEobPt32 + (ptype * 2 + eobCtx) * 7, 6) + 1
+            } else if eobMultisize == 2 {
+                eobPt = sym.read(cfEobPt64 + (ptype * 2 + eobCtx) * 8, 7) + 1
+            } else if eobMultisize == 3 {
+                eobPt = sym.read(cfEobPt128 + (ptype * 2 + eobCtx) * 9, 8) + 1
+            } else if eobMultisize == 4 {
+                eobPt = sym.read(cfEobPt256 + (ptype * 2 + eobCtx) * 10, 9) + 1
+            } else if eobMultisize == 5 {
+                eobPt = sym.read(cfEobPt512 + ptype * 11, 10) + 1
+            } else {
+                eobPt = sym.read(cfEobPt1024 + ptype * 12, 11) + 1
+            }
+            eob = if eobPt < 2 { eobPt } else { (1 << (eobPt - 2)) + 1 }
+            var eobShift = max(-1, eobPt - 3)
+            if eobShift >= 0 {
+                let extra = sym.read(cfEobExtra + ((txSzCtx * 2 + ptype) * 9 + (eobPt - 3)) * 3, 2)
+                if extra == 1 {
+                    eob += 1 << eobShift
+                }
+                var i = 1
+                while i < max(0, eobPt - 2) {
+                    eobShift = max(0, eobPt - 2) - 1 - i
+                    if sym.bool() == 1 {
+                        eob += 1 << eobShift
+                    }
+                    i += 1
+                }
+            }
+            let adj = tAdjTx[txSz]
+            let bwl = tTxWLog2[adj]
+            let width = 1 << bwl
+            let height = tTxH[adj]
+            let scan = tScan
+            var c = eob - 1
+            while c >= 0 {
+                let pos = scan[scanAt + c]
+                var level = 0
+                if c == eob - 1 {
+                    var ctxE = 3
+                    if c == 0 {
+                        ctxE = 0
+                    } else if c <= (height << bwl) / 8 {
+                        ctxE = 1
+                    } else if c <= (height << bwl) / 4 {
+                        ctxE = 2
+                    }
+                    level = sym.read(cfCoeffBaseEob + ((txSzCtx * 2 + ptype) * 4 + ctxE) * 4, 3) + 1
+                } else {
+                    let ctxB = coeffBaseCtx(txSz, txClass, bwl, width, height, pos)
+                    level = sym.read(cfCoeffBase + ((txSzCtx * 2 + ptype) * 42 + ctxB) * 5, 4)
+                }
+                if level > 2 {
+                    let ctxBr = coeffBrCtx(txClass, bwl, width, height, pos)
+                    let off = cfCoeffBr + ((min(txSzCtx, 3) * 2 + ptype) * 21 + ctxBr) * 5
+                    for _ in 0..4 {
+                        let br = sym.read(off, 4)
+                        level += br
+                        if br < 3 {
+                            break
+                        }
+                    }
+                }
+                quant[pos] = level
+                c -= 1
+            }
+            // Signs, Golomb tails and dequantisation.
+            let countAt = coefs.count
+            coefs.append(0)
+            var nz = 0
+            let dcQ = dcQuant(plane)
+            let acQ = acQuant(plane)
+            let qmLevel = if fh.usingQmatrix { fh.segQMLevel[plane * 8 + segmentId] } else { 15 }
+            let useQm = fh.usingQmatrix && txType < 9 && qmLevel < 15
+            let qmBase = (qmLevel * 2 + (if plane > 0 { 1 } else { 0 })) * 3344 + tQmOffset[txSz]
+            var dqDenom = 1
+            if txSz == 3 || txSz == 9 || txSz == 10 || txSz == 17 || txSz == 18 {
+                dqDenom = 2
+            } else if txSz == 4 || txSz == 11 || txSz == 12 {
+                dqDenom = 4
+            }
+            let lim = 1 << (7 + bitDepth)
+            for c2 in 0..eob {
+                let pos = scan[scanAt + c2]
+                var q = quant[pos]
+                if q != 0 {
+                    var sign = 0
+                    if c2 == 0 {
+                        var dcSign = 0
+                        for k in 0..w4 {
+                            if x4 + k < maxX4 {
+                                let s = aboveDc[pBase + x4 + k]
+                                if s == 1 {
+                                    dcSign -= 1
+                                } else if s == 2 {
+                                    dcSign += 1
+                                }
+                            }
+                        }
+                        for k in 0..h4 {
+                            if y4 + k < maxY4 {
+                                let s = leftDc[pBase + y4 + k]
+                                if s == 1 {
+                                    dcSign -= 1
+                                } else if s == 2 {
+                                    dcSign += 1
+                                }
+                            }
+                        }
+                        let ctxS = if dcSign < 0 { 1 } else if dcSign > 0 { 2 } else { 0 }
+                        sign = sym.read(cfDcSign + (ptype * 3 + ctxS) * 3, 2)
+                    } else {
+                        sign = sym.bool()
+                    }
+                    if q > 14 {
+                        var length = 0
+                        while true {
+                            length += 1
+                            if sym.bool() == 1 {
+                                break
+                            }
+                            if length > 32 {
+                                break
+                            }
+                        }
+                        var x = 1
+                        var i = length - 2
+                        while i >= 0 {
+                            x = (x << 1) | sym.bool()
+                            i -= 1
+                        }
+                        q = x + 14
+                    }
+                    if pos == 0 {
+                        dcCategory = if sign == 1 { 1 } else { 2 }
+                    }
+                    q = q & 0xFFFFF
+                    culLevel += q
+                    // Dequantisation (7.12.3 step 1).
+                    var qq = if pos == 0 { dcQ } else { acQ }
+                    if useQm {
+                        qq = av1Round2(qq * tQm[qmBase + pos], 5)
+                    }
+                    var dq = q * qq
+                    dq = (dq & 0xFFFFFF) / dqDenom
+                    if sign == 1 {
+                        dq = -dq
+                    }
+                    dq = min(max(dq, -lim), lim - 1)
+                    coefs.append(dq * 1024 + pos)
+                    nz += 1
+                }
+                quant[pos] = 0
+            }
+            coefs[countAt] = nz
+            culLevel = min(63, culLevel)
+        }
+        for i in 0..w4 {
+            aboveLevel[pBase + x4 + i] = culLevel
+            aboveDc[pBase + x4 + i] = dcCategory
+        }
+        for i in 0..h4 {
+            leftLevel[pBase + y4 + i] = culLevel
+            leftDc[pBase + y4 + i] = dcCategory
+        }
+        if allZero == 1 {
+            return 0
+        }
+        eob
+    }
+
+    // get_coeff_base_ctx( … isEob = 0 ).
+    fn coeffBaseCtx(_ txSz: Int, _ txClass: Int, _ bwl: Int, _ width: Int, _ height: Int, _ pos: Int) -> Int {
+        let row = pos >> bwl
+        let col = pos - (row << bwl)
+        var mag = 0
+        let base = txClass * 10
+        for idx in 0..5 {
+            let refRow = row + tSigRefDiff[base + idx * 2]
+            let refCol = col + tSigRefDiff[base + idx * 2 + 1]
+            if refRow >= 0 && refCol >= 0 && refRow < height && refCol < width {
+                mag += min(abs(quant[(refRow << bwl) + refCol]), 3)
+            }
+        }
+        let ctx = min((mag + 1) >> 1, 4)
+        if txClass == 0 {
+            if row == 0 && col == 0 {
+                return 0
+            }
+            return ctx + tCoeffBaseCtxOff[txSz * 25 + min(row, 4) * 5 + min(col, 4)]
+        }
+        let idx = if txClass == 2 { row } else { col }
+        ctx + 26 + 5 * min(idx, 2)
+    }
+
+    fn coeffBrCtx(_ txClass: Int, _ bwl: Int, _ txw: Int, _ txh: Int, _ pos: Int) -> Int {
+        let row = pos >> bwl
+        let col = pos - (row << bwl)
+        var mag = 0
+        let base = txClass * 6
+        for idx in 0..3 {
+            let refRow = row + tMagRef[base + idx * 2]
+            let refCol = col + tMagRef[base + idx * 2 + 1]
+            if refRow >= 0 && refCol >= 0 && refRow < txh && refCol < (1 << bwl) {
+                mag += min(quant[refRow * txw + refCol], 15)
+            }
+        }
+        mag = min((mag + 1) >> 1, 6)
+        if pos == 0 {
+            return mag
+        }
+        if txClass == 0 {
+            if row < 2 && col < 2 {
+                return mag + 7
+            }
+            return mag + 14
+        }
+        if txClass == 1 {
+            if col == 0 {
+                return mag + 7
+            }
+            return mag + 14
+        }
+        if row == 0 {
+            return mag + 7
+        }
+        mag + 14
+    }
+
+    fn dcQuant(_ plane: Int) -> Int {
+        let q = hd.qindex(false, segmentId, currentQIndex)
+        let delta = if plane == 0 { fh.deltaQYDc } else if plane == 1 { fh.deltaQUDc } else { fh.deltaQVDc }
+        tDcQ[((bitDepth - 8) >> 1) * 256 + min(max(q + delta, 0), 255)]
+    }
+
+    fn acQuant(_ plane: Int) -> Int {
+        let q = hd.qindex(false, segmentId, currentQIndex)
+        let delta = if plane == 0 { 0 } else if plane == 1 { fh.deltaQUAc } else { fh.deltaQVAc }
+        tAcQ[((bitDepth - 8) >> 1) * 256 + min(max(q + delta, 0), 255)]
+    }
+
+    // ---- end of frame ------------------------------------------------------
+
+    // decode_frame_wrapup's parser part: frame_end_update_cdf, motion
+    // field storage (7.19), segment ids, the reference update (7.20); then
+    // the ParsedFrame.
+    fn finishFrame(_ pts: Int, _ key: Bool) -> ParsedFrame {
+        frameOpen = false
+        seenFrameHeader = false
+        let h = fh.h
+        if !fh.disableFrameEndUpdateCdf && savedCdf.count >= av1CdfSize {
+            var c = savedCdf
+            // Drop the intra frame y mode part kept after the context.
+            while c.count > av1CdfSize {
+                c.removeLast()
+            }
+            frameCdf = c
+        }
+        let n = miCols * miRows
+        // (With segmentation off every block wrote segment_id 0.)
+        if segEnabled && !fh.segmentationUpdateMap {
+            for i in 0..n {
+                gSeg[i] = prevSegIds[i]
+            }
+        }
+        // Motion field motion vector storage (7.19). New lists start as
+        // copies of lists of the right size (a fast copy-on-write copy;
+        // building them item by item is slow).
+        var mfRef: [Int] = []
+        var mfR: [Int] = []
+        var mfC: [Int] = []
+        let refresh = h.refreshFrameFlags
+        if refresh != 0 {
+            mfRef = gFilt
+            mfR = gFilt
+            mfC = gFilt
+            var dist: [Int] = [0, 0, 0, 0, 0, 0, 0, 0]
+            for r in 1..8 {
+                let refIdx = h.refFrameIdx[r - 1]
+                dist[r] = av1RelDist(hd.slots[refIdx].orderHint, h.orderHint, h.enableOrderHint, h.orderHintBits)
+            }
+            let ref0 = mvp.gRef0
+            let ref1 = mvp.gRef1
+            let mr0 = mvp.gMvR0
+            let mc0 = mvp.gMvC0
+            let mr1 = mvp.gMvR1
+            let mc1 = mvp.gMvC1
+            let intra = frameIsIntra
+            for i in 0..n {
+                var outRef = -1
+                var orr = 0
+                var oc = 0
+                if !intra {
+                    let r0 = ref0[i]
+                    if r0 > 0 && dist[r0] < 0 {
+                        let mr = mr0[i]
+                        let mc = mc0[i]
+                        if abs(mr) <= 4095 && abs(mc) <= 4095 {
+                            outRef = r0
+                            orr = mr
+                            oc = mc
+                        }
+                    }
+                    let r1 = ref1[i]
+                    if r1 > 0 && dist[r1] < 0 {
+                        let mr = mr1[i]
+                        let mc = mc1[i]
+                        if abs(mr) <= 4095 && abs(mc) <= 4095 {
+                            outRef = r1
+                            orr = mr
+                            oc = mc
+                        }
+                    }
+                }
+                mfRef[i] = outRef
+                mfR[i] = orr
+                mfC[i] = oc
+            }
+        }
+        let damaged = frameDamaged
+        // Reference update (7.20), parser state.
+        hd.updateSlots()
+        for i in 0..8 {
+            if (refresh >> i) & 1 == 1 {
+                slotCdf[i] = frameCdf
+                slotCdfOk[i] = 1
+                slotSeg[i] = gSeg
+                slotMfRef[i] = mfRef
+                slotMfMvR[i] = mfR
+                slotMfMvC[i] = mfC
+            }
+        }
+        if h.frameType == av1KeyFrame {
+            waitKey = false
+        }
+        var pf = ParsedFrame(kind: 0, hdr: h, pts: pts, key: h.frameType == av1KeyFrame)
+        if damaged {
+            warn("av1: damaged frame")
+        }
+        if skipNonReference && refresh == 0 {
+            pf.kind = 3
+            return pf
+        }
+        pf.ops = ops
+        pf.coefs = coefs
+        pf.palette = palette
+        pf.miStride = miCols
+        pf.gInfo = gInfoP
+        pf.gMv = gMvP
+        pf.gTxUV = gLfTxUV
+        if h.deltaLfPresent {
+            pf.gDeltaLF = gDeltaLf
+        }
+        pf.cdefIdx = cdefIdx
+        pf.cdefStride = cdefStride
+        pf.lrData = lrData
+        pf.lrOff = lrOff
+        pf.lrRows = lrRows
+        pf.lrCols = lrCols
+        pf
+    }
+}
+
+fn av1NegDeinterleave(_ diff: Int, _ ref: Int, _ mx: Int) -> Int {
+    if ref == 0 {
+        return diff
+    }
+    if ref >= (mx - 1) {
+        return mx - diff - 1
+    }
+    if 2 * ref < mx {
+        if diff <= 2 * ref {
+            if (diff & 1) == 1 {
+                return ref + ((diff + 1) >> 1)
+            }
+            return ref - (diff >> 1)
+        }
+        return diff
+    }
+    if diff <= 2 * (mx - ref - 1) {
+        if (diff & 1) == 1 {
+            return ref + ((diff + 1) >> 1)
+        }
+        return ref - (diff >> 1)
+    }
+    mx - (diff + 1)
+}
+
+fn av1RefCountCtx(_ c0: Int, _ c1: Int) -> Int {
+    if c0 < c1 {
+        return 0
+    }
+    if c0 == c1 {
+        return 1
+    }
+    2
+}
+
+fn av1CheckBackward(_ r: Int) -> Int {
+    if r >= 5 && r <= 7 { 1 } else { 0 }
+}
+
+fn av1SameDir(_ a: Int, _ b: Int) -> Bool {
+    (a >= 5) == (b >= 5)
+}
+
+fn av1FindTxSize(_ w: Int, _ h: Int) -> Int {
+    let tw = [4, 8, 16, 32, 64, 4, 8, 8, 16, 16, 32, 32, 64, 4, 16, 8, 32, 16, 64]
+    let th = [4, 8, 16, 32, 64, 8, 4, 16, 8, 32, 16, 64, 32, 16, 4, 32, 8, 64, 16]
+    for t in 0..19 {
+        if tw[t] == w && th[t] == h {
+            return t
+        }
+    }
+    0
+}
+
+fn av1TxClass(_ t: Int) -> Int {
+    if t == 10 || t == 12 || t == 14 {
+        return 2
+    }
+    if t == 11 || t == 13 || t == 15 {
+        return 1
+    }
+    0
+}
+
+fn av1CountUnits(_ unitSize: Int, _ frameSize: Int) -> Int {
+    max((frameSize + (unitSize >> 1)) / unitSize, 1)
+}
+
+// What Parser.stats counts, by index.
+public let av1StatNames: [String] = ["frames", "key", "intraOnly", "showExisting", "errorResilient",
+    "superres", "sb128", "maxTiles", "-", "segmentation", "deltaQ", "deltaLf", "qmatrix", "lrWiener",
+    "lrSgr", "cdef", "palette", "intrabc", "filterIntra", "cfl", "obmc", "localWarp", "globalMotion",
+    "compWedge", "compDiffwtd", "compAverage", "-", "compDistance", "interintra", "skipMode",
+    "filmGrain", "lossless", "-", "switchFrame", "noCdfUpdate", "refFrameMvs", "mono", "444",
+    "highBitDepth", "-"]
+
+// leb128( ) (4.10.5) at d[at]: (value, position after it).
+fn av1Leb128(_ d: Data, _ at: Int) -> (Int, Int) {
+    var v = 0
+    var q = at
+    var i = 0
+    while i < 8 && q < d.count {
+        let b = d[q]
+        q += 1
+        v |= (b & 0x7f) << (i * 7)
+        i += 1
+        if (b & 0x80) == 0 {
+            break
+        }
+    }
+    (v, q)
+}

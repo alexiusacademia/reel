@@ -1,0 +1,240 @@
+// Interleaved DVD cells (multi-angle blocks and seamless branching): the
+// cell's sector range holds the interleaved units (ILVUs) of every angle
+// or branch, one after the other; only the NAV packs say which sectors
+// belong to the one being played.
+//
+// Followed: the public DVD-Video NAV pack description (mpucoder's "DSI
+// packet" page): a NAV pack is a pack header, a system header, the PCI
+// packet (private stream 2, substream 0x00) and the DSI packet (private
+// stream 2, substream 0x01, data usually at sector offset 0x407). DSI:
+//   0x00 DSI_GI: SCR (4), the pack's sector (4), VOBU end address (4,
+//        relative: last sector of this VOBU − this sector), …
+//   0x20 SML_PBI: category (2: bit 15 PREU, 14 ILVU, 13 unit start,
+//        12 unit end), ILVU end address (4, relative), next ILVU start
+//        address (4, relative; 0x7FFFFFFF = none), next ILVU size (2), …
+// Walking from the cell's first sector: an ILVU plays to its end address,
+// then playback jumps to the next ILVU's start; a VOBU outside an
+// interleaved unit plays to its end and the next one follows.
+//
+// This reads the VOB files (whole, one at a time: Tessel has no ranged
+// local reads), so it is a separate step the player takes for titles that
+// need it (`needsInterleave`).
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+// Whether a title has interleaved cells that `resolveInterleaved` must
+// sort out before it plays right.
+public fn needsInterleave(_ t: Title) -> Bool {
+    for s in t.segments {
+        if s.interleaved {
+            return true
+        }
+    }
+    false
+}
+
+// Reads 2048-byte sectors of a title set's VOB area, keeping one VOB file
+// in memory at a time.
+struct DvdSectorReader {
+    fs: DiscFs
+    vobs: [DiscFile]
+    cur: Int = -1
+    data: Data = Data()
+    base: Int = 0
+
+    fn sector(_ s: Int) -> Data {
+        let at = s * 2048
+        var b = 0
+        var i = 0
+        while i < vobs.count {
+            let f = vobs[i]
+            if at >= b && at < b + f.size {
+                if i != cur {
+                    data = discRead(fs, f) ?? Data()
+                    cur = i
+                    base = b
+                }
+                return dSlice(data, at - base, at - base + 2048)
+            }
+            b += f.size
+            i += 1
+        }
+        Data()
+    }
+}
+
+// The DSI fields of a NAV pack sector: [VOBU end, category, ILVU end,
+// next ILVU start], or [] when the sector isn't a NAV pack.
+fn dvdDsi(_ sec: Data) -> [Int] {
+    if sec.count < 2048 || dU32(sec, 0) != 0x000001BA {
+        return []
+    }
+    // Find the DSI packet: 00 00 01 BF, length, substream 0x01.
+    var p = 14
+    while p + 7 <= sec.count {
+        if dU32(sec, p) == 0x000001BF && dU8(sec, p + 6) == 0x01 {
+            let d = p + 7
+            if d + 0x2E > sec.count {
+                return []
+            }
+            return [dU32(sec, d + 0x08), dU16(sec, d + 0x20), dU32(sec, d + 0x22), dU32(sec, d + 0x26)]
+        }
+        if dU32(sec, p) >> 8 == 1 && p + 6 <= sec.count {
+            // Skip this packet (start code + 2-byte length).
+            let code = dU8(sec, p + 3)
+            if code == 0xBA {
+                return []
+            }
+            p += 6 + dU16(sec, p + 4)
+        } else {
+            p += 1
+        }
+    }
+    []
+}
+
+// The sector ranges (flat first, last pairs) that play of a cell whose
+// sectors are first…last.
+fn dvdWalkCell(_ r: DvdSectorReader, _ first: Int, _ last: Int) -> ([Int], DvdSectorReader) {
+    var rd = r
+    var out: [Int] = []
+    var at = first
+    var steps = 0
+    while at <= last && at >= first && steps < 2000000 {
+        steps += 1
+        let dsi = dvdDsi(rd.sector(at))
+        if dsi.isEmpty {
+            out = dvdAddRange(out, at, last)
+            break
+        }
+        let cat = dsi[1]
+        if cat & 0x4000 != 0 && dsi[2] > 0 {
+            let end = min(last, at + dsi[2])
+            out = dvdAddRange(out, at, end)
+            let next = dsi[3]
+            if next == 0 || next == 0x7FFFFFFF || cat & 0x1000 != 0 {
+                break
+            }
+            at += next
+        } else {
+            let end = min(last, at + dsi[0])
+            out = dvdAddRange(out, at, end)
+            at = end + 1
+        }
+    }
+    (out, rd)
+}
+
+fn dvdAddRange(_ list: [Int], _ a: Int, _ b: Int) -> [Int] {
+    var out = list
+    if out.count >= 2 && out[out.count - 1] + 1 == a {
+        out[out.count - 1] = b
+    } else {
+        out.append(a)
+        out.append(b)
+    }
+    out
+}
+
+// The title with each interleaved cell cut down to the ILVUs of its own
+// angle / branch (read from the NAV packs). Times inside a cell are spread
+// by bytes; each ILVU start becomes a seek point.
+public fn resolveInterleaved(_ fs: DiscFs, _ t: Title) -> Title {
+    if t.kind != "dvd" || !needsInterleave(t) {
+        return t
+    }
+    let info = readDvdInfo(fs).value() ?? DvdInfo()
+    if t.titleSet < 1 || t.titleSet > info.vobs.count {
+        return t
+    }
+    let vobs = info.vobs[t.titleSet - 1]
+    var reader = DvdSectorReader(fs: fs, vobs: vobs)
+    var out = t
+    out.segments = []
+    out.points = []
+    // Old segment index → new one (−1 when it was replaced).
+    var moved: [Int] = []
+    var i = 0
+    while i < t.segments.count {
+        let s = t.segments[i]
+        if !s.interleaved {
+            moved.append(out.segments.count)
+            out.segments.append(s)
+            i += 1
+            continue
+        }
+        // The pieces of this cell (split only at VOB file ends).
+        var j = i
+        var duration = 0.0
+        while j < t.segments.count && t.segments[j].interleaved && t.segments[j].pgc == s.pgc && t.segments[j].cell == s.cell {
+            duration += t.segments[j].duration
+            moved.append(-1)
+            j += 1
+        }
+        let (ranges, rd) = dvdWalkCell(reader, s.firstSector, t.segments[j - 1].lastSector)
+        reader = rd
+        var total = 0
+        var k = 0
+        while k + 1 < ranges.count {
+            total += (ranges[k + 1] - ranges[k] + 1) * 2048
+            k += 2
+        }
+        var done = 0
+        var firstPiece = true
+        k = 0
+        while k + 1 < ranges.count {
+            let rangeStart = s.start + duration * Float(done) / Float(max(1, total))
+            out.points.append(SeekPoint(time: rangeStart, pos: -out.segments.count - 1))
+            for (path, a, b, s0) in dvdRanges(vobs, ranges[k], ranges[k + 1]) {
+                var seg = s
+                seg.path = path
+                seg.from = a
+                seg.to = b
+                seg.firstSector = s0
+                seg.lastSector = s0 + (b - a) / 2048 - 1
+                seg.start = s.start + duration * Float(done) / Float(max(1, total))
+                seg.duration = duration * Float(b - a) / Float(max(1, total))
+                seg.discontinuity = firstPiece && s.discontinuity
+                seg.interleaved = false
+                out.segments.append(seg)
+                done += b - a
+                firstPiece = false
+            }
+            k += 2
+        }
+        i = j
+    }
+    // Positions, then the points: old ones follow their segment, new
+    // ones (pos −n−1 = start of new segment n) get its position.
+    var pos = 0
+    i = 0
+    while i < out.segments.count {
+        out.segments[i].pos = pos
+        pos += out.segments[i].to - out.segments[i].from
+        i += 1
+    }
+    i = 0
+    while i < out.points.count {
+        let p = out.points[i]
+        if p.pos < 0 && -p.pos - 1 < out.segments.count {
+            out.points[i].pos = out.segments[-p.pos - 1].pos
+        }
+        i += 1
+    }
+    for p in t.points {
+        var si = 0
+        while si < t.segments.count {
+            let s = t.segments[si]
+            if p.pos >= s.pos && p.pos < s.pos + (s.to - s.from) {
+                if moved[si] >= 0 {
+                    out.points.append(SeekPoint(time: p.time, pos: out.segments[moved[si]].pos + p.pos - s.pos))
+                }
+                break
+            }
+            si += 1
+        }
+    }
+    out.warnings = out.warnings.filter { w in !w.hasPrefix("interleaved") }
+    discFinishTitle(out)
+}

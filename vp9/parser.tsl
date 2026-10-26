@@ -1,0 +1,2732 @@
+// The first stage of the VP9 decoder: everything that reads the bitstream.
+// It splits superframes (Annex B), reads the uncompressed header (6.2) and
+// the compressed header (6.3, forward probability updates), decodes the
+// tiles' partitions, modes, motion vectors and coefficient tokens
+// (6.4, 9.3), runs backward probability adaptation (8.4.2) and keeps the
+// per-frame motion vectors and segmentation maps the next frame predicts
+// from. It produces ParsedFrames (frame.tsl); it never touches samples.
+//
+// The structure follows FFmpeg's vp9 decoder (vp9.c, vp9block.c,
+// vp9mvs.c, vp9prob.c), which is bit-exact with libvpx, including the
+// libvpx quirks it documents.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../core"
+
+public struct Parser {
+    // When true, frames with refresh_frame_flags == 0 are parsed (later
+    // frames depend on their probabilities and motion vectors) but not
+    // reconstructed.
+    skipNonReference: Bool = false
+    warnings: [String] = []
+    debug: Bool = false
+
+    bd: Vp9Bool = Vp9Bool()
+    ready: Bool = false
+    waitKey: Bool = true
+
+    // Table copies (module lists are slow to read).
+    tKfY: [Int] = []
+    tKfUv: [Int] = []
+    tKfPart: [Int] = []
+    tPareto: [Int] = []
+    tScan: [Int] = []
+    tNb: [Int] = []
+    tTreeIntra: [Int] = []
+    tTreeInter: [Int] = []
+    tTreePart: [Int] = []
+    tTreeSeg: [Int] = []
+    tTreeFilter: [Int] = []
+    tTreeMvJ: [Int] = []
+    tTreeMvC: [Int] = []
+    tTreeMvFp: [Int] = []
+    tTxType: [Int] = []
+    tBwh4: [Int] = []
+    tBwh8: [Int] = []
+
+    // Frame contexts: four saved sets (7.3), the active probabilities and
+    // the symbol counts of the frame being parsed.
+    ctxP: [Int] = []
+    ctxCoef: [Int] = []
+    p: [Int] = []
+    cnt: [Int] = []
+
+    // Header state that persists between frames.
+    hdr: FrameHeader = FrameHeader()
+    lastHdrValid: Bool = false
+    lastInvisible: Bool = false
+    lastKeyframe: Bool = false
+    lastW: Int = 0
+    lastH: Int = 0
+    lastDecoded: Bool = false
+    lfRef: [Int] = [1, 0, -1, -1]
+    lfMode: [Int] = [0, 0]
+    segQEn: [Int] = []
+    segQVal: [Int] = []
+    segLfEn: [Int] = []
+    segLfVal: [Int] = []
+    segRefEn: [Int] = []
+    segRefVal: [Int] = []
+    segSkip: [Int] = []
+    segAbs: Bool = false
+    segProb: [Int] = [255, 255, 255, 255, 255, 255, 255]
+    segPredProb: [Int] = [255, 255, 255]
+    prevSegEnabled: Bool = false
+    prevSegUpdateMap: Bool = false
+    // The reference slots as the parser needs them: size and format
+    // (bit depth * 4 + ssH * 2 + ssV), valid when decoded.
+    refW: [Int] = [0, 0, 0, 0, 0, 0, 0, 0]
+    refH: [Int] = [0, 0, 0, 0, 0, 0, 0, 0]
+    refFmt: [Int] = [0, 0, 0, 0, 0, 0, 0, 0]
+    refOk: [Int] = [0, 0, 0, 0, 0, 0, 0, 0]
+    // Profile-0 intra-only frames use the stream's last format.
+    // Scale state per active reference (0 none, 1 scaled, 2 invalid).
+    refScale: [Int] = [0, 0, 0]
+
+    // Frame geometry in 8x8 units and 64x64 superblocks.
+    cols: Int = 0
+    rows: Int = 0
+    sbCols: Int = 0
+    sbRows: Int = 0
+    useLastMvs: Bool = false
+    tileStart: Int = 0
+
+    // Above contexts (per 8x8 column, or per 4x4 column for nnz/mode/mv).
+    aPart: [Int] = []
+    aSkip: [Int] = []
+    aTx: [Int] = []
+    aMode: [Int] = []
+    aYnz: [Int] = []
+    aUnz: [Int] = []
+    aVnz: [Int] = []
+    aSegPred: [Int] = []
+    aIntra: [Int] = []
+    aComp: [Int] = []
+    aRef: [Int] = []
+    aFilter: [Int] = []
+    aMv: [Int] = []
+    // Left contexts (per 8x8 row of the superblock, or 4x4 row).
+    lPart: [Int] = []
+    lSkip: [Int] = []
+    lTx: [Int] = []
+    lMode: [Int] = []
+    lYnz: [Int] = []
+    lUnz: [Int] = []
+    lVnz: [Int] = []
+    lSegPred: [Int] = []
+    lIntra: [Int] = []
+    lComp: [Int] = []
+    lRef: [Int] = []
+    lFilter: [Int] = []
+    lMv: [Int] = []
+
+    // Per 8x8 position of this frame (stride sbCols * 8): the two
+    // reference frames (-1 none) and motion vectors, for motion vector
+    // prediction; and the previous decoded frame's, for the next frame.
+    mvRef0: [Int] = []
+    mvRef1: [Int] = []
+    mvA: [Int] = []
+    mvB: [Int] = []
+    pmvRef0: [Int] = []
+    pmvRef1: [Int] = []
+    pmvA: [Int] = []
+    pmvB: [Int] = []
+    pmvOk: Bool = false
+    mvW: Int = 0
+    mvH: Int = 0
+    // Segmentation maps: this frame's and the one predicted from.
+    segMap: [Int] = []
+    segPrev: [Int] = []
+    lastSegMap: [Int] = []
+    lastSegOk: Bool = false
+
+    // The block being parsed.
+    bRow: Int = 0
+    bCol: Int = 0
+    bBs: Int = 0
+    bTx: Int = 0
+    bUvTx: Int = 0
+    bSkip: Int = 0
+    bIntra: Int = 0
+    bComp: Int = 0
+    bRef: [Int] = [0, 0]
+    bMode: [Int] = [0, 0, 0, 0]
+    bUv: Int = 0
+    bFilter: Int = 0
+    bSeg: Int = 0
+    bMv: [Int] = [0, 0, 0, 0, 0, 0, 0, 0]
+    minMvX: Int = 0
+    minMvY: Int = 0
+    maxMvX: Int = 0
+    maxMvY: Int = 0
+    // find_ref_mvs scratch.
+    rmMem: Int = 0
+    rmMemSub: Int = 0
+    rmIdx: Int = 0
+    rmSb: Int = 0
+    rmOut: Int = 0
+    damagedRef: Bool = false
+
+    // The frame being built.
+    blocks: [Int] = []
+    nBlocks: Int = 0
+
+    // Bool decoder states of the tile columns of the current tile row.
+    tPos: [Int] = []
+    tEnd: [Int] = []
+    tValue: [Int] = []
+    tCount: [Int] = []
+    tRange: [Int] = []
+
+    fn setup() {
+        if ready {
+            return
+        }
+        ready = true
+        bd.setup()
+        tKfY = vp9KfYModeProbs
+        tKfUv = vp9KfUvModeProbs
+        tKfPart = vp9KfPartitionProbs
+        tPareto = vp9ParetoTable
+        tScan = vp9DefaultScan4 + vp9ColScan4 + vp9RowScan4 + vp9DefaultScan8 + vp9ColScan8 + vp9RowScan8 + vp9DefaultScan16 + vp9ColScan16 + vp9RowScan16 + vp9DefaultScan32
+        tNb = vp9DefaultNb4 + vp9ColNb4 + vp9RowNb4 + vp9DefaultNb8 + vp9ColNb8 + vp9RowNb8 + vp9DefaultNb16 + vp9ColNb16 + vp9RowNb16 + vp9DefaultNb32
+        tTreeIntra = treeIntraMode
+        tTreeInter = treeInterMode
+        tTreePart = treePartition
+        tTreeSeg = treeSegment
+        tTreeFilter = treeFilter
+        tTreeMvJ = treeMvJoint
+        tTreeMvC = treeMvClass
+        tTreeMvFp = treeMvFp
+        tTxType = vp9IntraTxType
+        tBwh4 = vp9Bwh4
+        tBwh8 = vp9Bwh8
+        ctxP = []
+        ctxCoef = []
+        for _ in 0..4 {
+            ctxP += vp9DefaultProbs
+            ctxCoef += vp9DefaultCoefProbs
+        }
+        p = vp9DefaultProbs
+        cnt = vp9Zeros(cCount)
+        segQEn = vp9Zeros(8)
+        segQVal = vp9Zeros(8)
+        segLfEn = vp9Zeros(8)
+        segLfVal = vp9Zeros(8)
+        segRefEn = vp9Zeros(8)
+        segRefVal = vp9Zeros(8)
+        segSkip = vp9Zeros(8)
+        lPart = vp9Zeros(8)
+        lSkip = vp9Zeros(8)
+        lTx = vp9Zeros(8)
+        lMode = vp9Zeros(16)
+        lYnz = vp9Zeros(16)
+        lUnz = vp9Zeros(16)
+        lVnz = vp9Zeros(16)
+        lSegPred = vp9Zeros(8)
+        lIntra = vp9Zeros(8)
+        lComp = vp9Zeros(8)
+        lRef = vp9Zeros(8)
+        lFilter = vp9Zeros(8)
+        lMv = vp9Zeros(32)
+    }
+
+    fn warn(_ s: String) {
+        if warnings.count < 200 {
+            warnings.append(s)
+        }
+    }
+
+    // After a seek: forget references and wait for a keyframe.
+    fn reset() {
+        setup()
+        refOk = [0, 0, 0, 0, 0, 0, 0, 0]
+        waitKey = true
+        lastDecoded = false
+        pmvOk = false
+        lastSegOk = false
+        lastInvisible = false
+    }
+
+    // Splits a packet into frames (Annex B superframes) and parses each.
+    fn parse(_ packet: Data, pts: Int, dts: Int, key: Bool) -> [ParsedFrame] {
+        setup()
+        var out: [ParsedFrame] = []
+        let n = packet.count
+        if n == 0 {
+            return out
+        }
+        let bytes = packet.bytes
+        var sizes: [Int] = []
+        let last = bytes[n - 1]
+        if (last & 0xe0) == 0xc0 {
+            let frames = (last & 7) + 1
+            let mag = ((last >> 3) & 3) + 1
+            let idx = 2 + mag * frames
+            if n >= idx && bytes[n - idx] == last {
+                var at = n - idx + 1
+                var total = 0
+                for _ in 0..frames {
+                    var sz = 0
+                    for b in 0..mag {
+                        sz = sz | (bytes[at + b] << (8 * b))
+                    }
+                    at += mag
+                    sizes.append(sz)
+                    total += sz
+                }
+                if total > n - idx {
+                    warn("vp9: superframe index larger than the packet")
+                    sizes = [n - idx]
+                }
+            }
+        }
+        if sizes.isEmpty {
+            sizes = [n]
+        }
+        var off = 0
+        for sz in sizes {
+            if sz > 0 && off + sz <= n {
+                let f = frame(packet, bytes, off, sz, pts)
+                out.append(f)
+            }
+            off += sz
+        }
+        out
+    }
+
+    // End of stream: VP9 holds no pictures back.
+    fn flush() -> [ParsedFrame] {
+        []
+    }
+
+    // ---- 6.2 uncompressed header -------------------------------------
+
+    fn colorConfig(_ r: bind core.BitReader, _ h: bind FrameHeader) -> Bool {
+        if h.profile >= 2 {
+            h.bitDepth = if r.bit() == 1 { 12 } else { 10 }
+        } else {
+            h.bitDepth = 8
+        }
+        h.colorSpace = r.bits(3)
+        if h.colorSpace == 7 {
+            h.fullRange = true
+            h.ssH = 0
+            h.ssV = 0
+            if (h.profile & 1) == 1 {
+                r.bit()
+            } else {
+                warn("vp9: RGB in profile {h.profile}")
+                return false
+            }
+        } else {
+            h.fullRange = r.bit() == 1
+            if (h.profile & 1) == 1 {
+                h.ssH = r.bit()
+                h.ssV = r.bit()
+                if h.ssH == 1 && h.ssV == 1 {
+                    warn("vp9: 4:2:0 in profile {h.profile}")
+                    return false
+                }
+                r.bit()
+            } else {
+                h.ssH = 1
+                h.ssV = 1
+            }
+        }
+        true
+    }
+
+    // Reads the headers and the tiles of one frame.
+    fn frame(_ packet: Data, _ bytes: [Int], _ off: Int, _ size: Int, _ pts: Int) -> ParsedFrame {
+        var pf = ParsedFrame()
+        pf.pts = pts
+        var r = core.bitReaderRange(packet, from: off, to: off + size)
+        var h = hdr
+        h.showExisting = false
+        if r.bits(2) != 2 {
+            warn("vp9: bad frame marker")
+            pf.kind = 2
+            return pf
+        }
+        h.profile = r.bit()
+        h.profile = h.profile | (r.bit() << 1)
+        if h.profile == 3 {
+            h.profile += r.bit()
+        }
+        if h.profile > 3 {
+            warn("vp9: profile {h.profile} isn't supported")
+            pf.kind = 2
+            return pf
+        }
+        if r.bit() == 1 {
+            // show_existing_frame
+            let idx = r.bits(3)
+            pf.kind = 1
+            h.showExisting = true
+            h.existingIdx = idx
+            pf.hdr = h
+            if refOk[idx] == 0 || waitKey {
+                pf.kind = 3
+                if !waitKey {
+                    warn("vp9: show_existing_frame of an empty slot")
+                }
+            }
+            return pf
+        }
+        let lastInv = lastInvisible
+        h.keyframe = r.bit() == 0
+        h.show = r.bit() == 1
+        h.errorRes = r.bit() == 1
+        h.intraOnly = false
+        h.resetCtx = 0
+        var w = 0
+        var ht = 0
+        if h.keyframe {
+            if r.bits(24) != 0x498342 {
+                warn("vp9: bad sync code")
+                pf.kind = 2
+                return pf
+            }
+            if !colorConfig(r, h) {
+                pf.kind = 2
+                return pf
+            }
+            h.refreshMask = 0xff
+            w = r.bits(16) + 1
+            ht = r.bits(16) + 1
+            if r.bit() == 1 {
+                r.bits(16)
+                r.bits(16)
+            }
+        } else {
+            if !h.show {
+                h.intraOnly = r.bit() == 1
+            }
+            if !h.errorRes {
+                h.resetCtx = r.bits(2)
+            }
+            if h.intraOnly {
+                if r.bits(24) != 0x498342 {
+                    warn("vp9: bad sync code")
+                    pf.kind = 2
+                    return pf
+                }
+                if h.profile >= 1 {
+                    if !colorConfig(r, h) {
+                        pf.kind = 2
+                        return pf
+                    }
+                } else {
+                    h.ssH = 1
+                    h.ssV = 1
+                    h.bitDepth = 8
+                    h.colorSpace = 1
+                    h.fullRange = false
+                }
+                h.refreshMask = r.bits(8)
+                w = r.bits(16) + 1
+                ht = r.bits(16) + 1
+                if r.bit() == 1 {
+                    r.bits(16)
+                    r.bits(16)
+                }
+            } else {
+                h.refreshMask = r.bits(8)
+                for i in 0..3 {
+                    h.refIdx[i] = r.bits(3)
+                    let sb = r.bit()
+                    h.signBias[i] = if h.errorRes { 0 } else { sb }
+                }
+                if waitKey {
+                    pf.kind = 3
+                    return pf
+                }
+                for i in 0..3 {
+                    if refOk[h.refIdx[i]] == 0 {
+                        warn("vp9: a reference frame is missing")
+                        pf.kind = 2
+                        return pf
+                    }
+                }
+                if r.bit() == 1 {
+                    w = refW[h.refIdx[0]]
+                    ht = refH[h.refIdx[0]]
+                } else if r.bit() == 1 {
+                    w = refW[h.refIdx[1]]
+                    ht = refH[h.refIdx[1]]
+                } else if r.bit() == 1 {
+                    w = refW[h.refIdx[2]]
+                    ht = refH[h.refIdx[2]]
+                } else {
+                    w = r.bits(16) + 1
+                    ht = r.bits(16) + 1
+                }
+                if r.bit() == 1 {
+                    r.bits(16)
+                    r.bits(16)
+                }
+                h.highPrecisionMv = r.bit() == 1
+                if r.bit() == 1 {
+                    h.interpFilter = filterSwitchable
+                } else {
+                    // literal_to_type: smooth, regular, sharp, bilinear,
+                    // which is FFmpeg's (and this decoder's) numbering.
+                    h.interpFilter = r.bits(2)
+                }
+                h.allowCompInter = h.signBias[0] != h.signBias[1] || h.signBias[0] != h.signBias[2]
+                if h.allowCompInter {
+                    if h.signBias[0] == h.signBias[1] {
+                        h.fixCompRef = 2
+                        h.varCompRef = [0, 1]
+                    } else if h.signBias[0] == h.signBias[2] {
+                        h.fixCompRef = 1
+                        h.varCompRef = [0, 2]
+                    } else {
+                        h.fixCompRef = 0
+                        h.varCompRef = [1, 2]
+                    }
+                }
+            }
+        }
+        if waitKey && !h.keyframe && !h.intraOnly {
+            pf.kind = 3
+            return pf
+        }
+        h.refreshCtx = if h.errorRes { false } else { r.bit() == 1 }
+        h.parallelMode = if h.errorRes { true } else { r.bit() == 1 }
+        let c = r.bits(2)
+        h.ctxRead = c
+        h.ctxId = c
+        if h.keyframe || h.intraOnly {
+            h.ctxId = 0
+        }
+        if h.keyframe || h.errorRes || h.intraOnly {
+            lfRef = [1, 0, -1, -1]
+            lfMode = [0, 0]
+            segQEn = vp9Zeros(8)
+            segQVal = vp9Zeros(8)
+            segLfEn = vp9Zeros(8)
+            segLfVal = vp9Zeros(8)
+            segRefEn = vp9Zeros(8)
+            segRefVal = vp9Zeros(8)
+            segSkip = vp9Zeros(8)
+        }
+        // 6.2.8 loop filter params.
+        h.filterLevel = r.bits(6)
+        h.sharpness = r.bits(3)
+        h.lfDeltaEnabled = r.bit() == 1
+        if h.lfDeltaEnabled {
+            if r.bit() == 1 {
+                for i in 0..4 {
+                    if r.bit() == 1 {
+                        lfRef[i] = vp9InvSigned(r, 6)
+                    }
+                }
+                for i in 0..2 {
+                    if r.bit() == 1 {
+                        lfMode[i] = vp9InvSigned(r, 6)
+                    }
+                }
+            }
+        }
+        h.lfRef = lfRef
+        h.lfMode = lfMode
+        // 6.2.9 quantization params.
+        h.baseQ = r.bits(8)
+        h.dqYDc = if r.bit() == 1 { vp9InvSigned(r, 4) } else { 0 }
+        h.dqUvDc = if r.bit() == 1 { vp9InvSigned(r, 4) } else { 0 }
+        h.dqUvAc = if r.bit() == 1 { vp9InvSigned(r, 4) } else { 0 }
+        h.lossless = h.baseQ == 0 && h.dqYDc == 0 && h.dqUvDc == 0 && h.dqUvAc == 0
+        // 6.2.11 segmentation params.
+        h.segEnabled = r.bit() == 1
+        h.segUpdateMap = false
+        h.segTemporal = false
+        if h.segEnabled {
+            h.segUpdateMap = r.bit() == 1
+            if h.segUpdateMap {
+                for i in 0..7 {
+                    segProb[i] = if r.bit() == 1 { r.bits(8) } else { 255 }
+                }
+                h.segTemporal = r.bit() == 1
+                if h.segTemporal {
+                    for i in 0..3 {
+                        segPredProb[i] = if r.bit() == 1 { r.bits(8) } else { 255 }
+                    }
+                }
+            }
+            if r.bit() == 1 {
+                segAbs = r.bit() == 1
+                for i in 0..8 {
+                    segQEn[i] = r.bit()
+                    if segQEn[i] == 1 {
+                        segQVal[i] = vp9InvSigned(r, 8)
+                    }
+                    segLfEn[i] = r.bit()
+                    if segLfEn[i] == 1 {
+                        segLfVal[i] = vp9InvSigned(r, 6)
+                    }
+                    segRefEn[i] = r.bit()
+                    if segRefEn[i] == 1 {
+                        segRefVal[i] = r.bits(2)
+                    }
+                    segSkip[i] = r.bit()
+                }
+            }
+        }
+        h.segAbs = segAbs
+        h.segProb = segProb
+        h.segPredProb = segPredProb
+        h.segQEn = segQEn
+        h.segQVal = segQVal
+        h.segLfEn = segLfEn
+        h.segLfVal = segLfVal
+        h.segRefEn = segRefEn
+        h.segRefVal = segRefVal
+        h.segSkip = segSkip
+        // Dequantisers and loop filter levels per segment (8.6.1, 8.8.1).
+        let bdi = (h.bitDepth - 8) / 2
+        let dcT = vp9DcQLookup
+        let acT = vp9AcQLookup
+        var qm: [Int] = []
+        var lv: [Int] = []
+        for i in 0..8 {
+            var qy = h.baseQ
+            if h.segEnabled && segQEn[i] == 1 {
+                qy = if segAbs { segQVal[i] } else { h.baseQ + segQVal[i] }
+            }
+            let qydc = vp9Clip(qy + h.dqYDc, 0, 255)
+            let quvdc = vp9Clip(qy + h.dqUvDc, 0, 255)
+            let quvac = vp9Clip(qy + h.dqUvAc, 0, 255)
+            let qyac = vp9Clip(qy, 0, 255)
+            qm.append(dcT[bdi * 256 + qydc])
+            qm.append(acT[bdi * 256 + qyac])
+            qm.append(dcT[bdi * 256 + quvdc])
+            qm.append(acT[bdi * 256 + quvac])
+            let sh = if h.filterLevel >= 32 { 1 } else { 0 }
+            var l = h.filterLevel
+            if h.segEnabled && segLfEn[i] == 1 {
+                l = if segAbs { vp9Clip(segLfVal[i], 0, 63) } else { vp9Clip(h.filterLevel + segLfVal[i], 0, 63) }
+            }
+            if h.lfDeltaEnabled {
+                let l0 = vp9Clip(l + lfRef[0] * (1 << sh), 0, 63)
+                lv.append(l0)
+                lv.append(l0)
+                for j in 1..4 {
+                    lv.append(vp9Clip(l + (lfRef[j] + lfMode[0]) * (1 << sh), 0, 63))
+                    lv.append(vp9Clip(l + (lfRef[j] + lfMode[1]) * (1 << sh), 0, 63))
+                }
+            } else {
+                for _ in 0..8 {
+                    lv.append(l)
+                }
+            }
+        }
+        h.qmul = qm
+        h.lflvl = lv
+        // Frame size and the tiles (6.2.13, 6.2.14).
+        if w <= 0 || ht <= 0 || w * ht > 8192 * 4352 {
+            warn("vp9: frame size {w}×{ht} is too large")
+            pf.kind = 2
+            return pf
+        }
+        h.width = w
+        h.height = ht
+        let fmt = h.bitDepth * 4 + h.ssH * 2 + h.ssV
+        cols = (w + 7) >> 3
+        rows = (ht + 7) >> 3
+        sbCols = (cols + 7) >> 3
+        sbRows = (rows + 7) >> 3
+        var minLog = 0
+        while (64 << minLog) < sbCols {
+            minLog += 1
+        }
+        var maxLog = 0
+        while (sbCols >> maxLog) >= 4 {
+            maxLog += 1
+        }
+        maxLog = max(0, maxLog - 1)
+        var log2 = minLog
+        while maxLog > log2 {
+            if r.bit() == 1 {
+                log2 += 1
+            } else {
+                break
+            }
+        }
+        h.tileColsLog2 = log2
+        h.tileRowsLog2 = 0
+        if r.bit() == 1 {
+            h.tileRowsLog2 = 1 + r.bit()
+        }
+        // Reference checks and scaling (8.5.2.3).
+        refScale = [0, 0, 0]
+        if !h.keyframe && !h.intraOnly {
+            var valid = 0
+            for i in 0..3 {
+                let s = h.refIdx[i]
+                if refFmt[s] != fmt {
+                    warn("vp9: a reference frame has another format")
+                    pf.kind = 2
+                    return pf
+                }
+                let rw = refW[s]
+                let rh = refH[s]
+                if rw == w && rh == ht {
+                    refScale[i] = 0
+                } else if w * 2 < rw || ht * 2 < rh || w > 16 * rw || ht > 16 * rh {
+                    refScale[i] = 2
+                    continue
+                } else {
+                    refScale[i] = 1
+                }
+                valid += 1
+            }
+            if valid == 0 {
+                warn("vp9: no usable reference frame")
+                pf.kind = 2
+                return pf
+            }
+        }
+        h.compressedBytes = r.bits(16)
+        r.alignToByte()
+        let hb = r.bytePosition - off
+        h.headerBytes = hb
+        if h.compressedBytes == 0 || hb + h.compressedBytes > size {
+            warn("vp9: bad compressed header size")
+            pf.kind = 2
+            return pf
+        }
+        // Probability contexts (setup_past_independence, 8.4.1).
+        if h.keyframe || h.errorRes || (h.intraOnly && h.resetCtx == 3) {
+            ctxP = []
+            ctxCoef = []
+            for _ in 0..4 {
+                ctxP += vp9DefaultProbs
+                ctxCoef += vp9DefaultCoefProbs
+            }
+        } else if h.intraOnly && h.resetCtx == 2 {
+            vp9Put(ctxP, c * pCount, vp9DefaultProbs)
+            vp9Put(ctxCoef, c * 1728, vp9DefaultCoefProbs)
+        }
+        // The segmentation map and motion vectors this frame predicts from.
+        let retain = !segPrev.isEmpty && (!prevSegEnabled || !prevSegUpdateMap)
+        let blank = h.keyframe || h.intraOnly || h.errorRes
+        let prevMvOk = lastDecoded && !blank
+        if !retain || h.keyframe || h.intraOnly {
+            if prevMvOk {
+                segPrev = lastSegMap
+            } else {
+                segPrev = []
+            }
+        }
+        if !prevMvOk || lastW != w || lastH != ht {
+            segPrev = []
+        }
+        useLastMvs = !h.errorRes && !lastInv && prevMvOk && lastW == w && lastH == ht && mvW == w && mvH == ht
+        if prevMvOk {
+            pmvRef0 = mvRef0
+            pmvRef1 = mvRef1
+            pmvA = mvA
+            pmvB = mvB
+        }
+        hdr = h
+        // 6.3 compressed header.
+        let n8 = sbCols * 8 * sbRows * 8
+        segMap = vp9Zeros(n8)
+        mvRef0 = vp9Zeros(n8)
+        mvRef1 = vp9Zeros(n8)
+        mvA = vp9Zeros(n8)
+        mvB = vp9Zeros(n8)
+        mvW = w
+        mvH = ht
+        bd.bitDepth = h.bitDepth
+        bd.start(bytes, off + hb, h.compressedBytes)
+        if bd.read(128) == 1 {
+            warn("vp9: compressed header marker bit set")
+            pf.kind = 2
+            return pf
+        }
+        compressedHeader(c)
+        h = hdr
+        if debug {
+            print("hdr {w}x{ht} tiles {h.tileColsLog2}/{h.tileRowsLog2} key {h.keyframe} show {h.show} io {h.intraOnly} ctx {c} refresh {h.refreshCtx} par {h.parallelMode} tx {h.txMode} comp {h.compPredMode} filt {h.interpFilter} q {h.baseQ} hp {h.highPrecisionMv} lastmv {useLastMvs} refs {h.refIdx[0]},{h.refIdx[1]},{h.refIdx[2]} bias {h.signBias[0]}{h.signBias[1]}{h.signBias[2]} lf {h.filterLevel} sharp {h.sharpness} seg {h.segEnabled} rmask {h.refreshMask} hb {hb} cb {h.compressedBytes} size {size}")
+        }
+        // Tiles.
+        blocks = []
+        nBlocks = 0
+        bd.coefs = []
+        bd.countOn = h.refreshCtx && !h.parallelMode
+        damagedRef = false
+        vp9Fill(cnt, 0)
+        vp9Fill(bd.cntCoef, 0)
+        vp9Fill(bd.cntEob, 0)
+        let ok = tiles(bytes, off + hb + h.compressedBytes, size - hb - h.compressedBytes)
+        if !ok || damagedRef {
+            if !ok {
+                warn("vp9: damaged tile data (frame {w}x{ht} key {h.keyframe} show {h.show} intraonly {h.intraOnly} blocks {nBlocks} tiles {h.tileColsLog2} comp {h.compPredMode} filt {h.interpFilter} tx {h.txMode} seg {h.segEnabled} q {h.baseQ} lossless {h.lossless} refresh {h.refreshMask} err {h.errorRes} par {h.parallelMode})")
+            } else {
+                warn("vp9: a block uses a reference of unusable size")
+            }
+            pf.kind = 2
+            return pf
+        }
+        // Context saving and backward adaptation (8.4.2).
+        if h.refreshCtx && h.parallelMode {
+            saveContext(h.ctxId)
+        } else if h.refreshCtx {
+            adapt()
+        }
+        // State for the next frame.
+        lastInvisible = !h.show
+        lastKeyframe = h.keyframe
+        lastW = w
+        lastH = ht
+        lastDecoded = true
+        lastSegMap = segMap
+        lastSegOk = true
+        prevSegEnabled = h.segEnabled
+        prevSegUpdateMap = h.segUpdateMap
+        for i in 0..8 {
+            if (h.refreshMask >> i) & 1 == 1 {
+                refW[i] = w
+                refH[i] = ht
+                refFmt[i] = fmt
+                refOk[i] = 1
+            }
+        }
+        if h.keyframe || h.intraOnly {
+            waitKey = false
+        }
+        pf.kind = if skipNonReference && h.refreshMask == 0 { 3 } else { 0 }
+        pf.hdr = h
+        pf.key = h.keyframe
+        pf.cols = cols
+        pf.rows = rows
+        pf.sbCols = sbCols
+        pf.sbRows = sbRows
+        pf.nBlocks = nBlocks
+        pf.blocks = blocks
+        pf.coefs = bd.coefs
+        blocks = []
+        bd.coefs = []
+        pf
+    }
+
+    // ---- 6.3 compressed header ---------------------------------------
+
+    // diff_update_prob (6.3.5) with inv_remap_prob (8.4.1 / FFmpeg's
+    // update_prob).
+    fn updateProb(_ old: Int) -> Int {
+        var d = 0
+        if bd.bit() == 0 {
+            d = bd.literal(4)
+        } else if bd.bit() == 0 {
+            d = bd.literal(4) + 16
+        } else if bd.bit() == 0 {
+            d = bd.literal(5) + 32
+        } else {
+            d = bd.literal(7)
+            if d >= 65 {
+                d = (d << 1) - 65 + bd.bit()
+            }
+            d += 64
+        }
+        let m = vp9InvMap[min(d, 253)]
+        if old <= 128 {
+            return 1 + vp9InvRecenter(m, old - 1)
+        }
+        255 - vp9InvRecenter(m, 255 - old)
+    }
+
+    fn maybeUpdate(_ i: Int) {
+        if bd.read(252) == 1 {
+            p[i] = updateProb(p[i])
+        }
+    }
+
+    // A motion vector probability update (6.3.17: 7-bit value * 2 + 1).
+    fn mvUpdate(_ i: Int) {
+        if bd.read(252) == 1 {
+            p[i] = (bd.literal(7) << 1) | 1
+        }
+    }
+
+    fn compressedHeader(_ c: Int) {
+        var h = hdr
+        // The active probabilities start as the selected context.
+        p = vp9Slice(ctxP, c * pCount, pCount)
+        // tx_mode (6.3.1).
+        if h.lossless {
+            h.txMode = 0
+        } else {
+            h.txMode = bd.literal(2)
+            if h.txMode == 3 {
+                h.txMode += bd.bit()
+            }
+            if h.txMode == 4 {
+                for i in 0..2 {
+                    maybeUpdate(pTx8 + i)
+                }
+                for i in 0..2 {
+                    for j in 0..2 {
+                        maybeUpdate(pTx16 + i * 2 + j)
+                    }
+                }
+                for i in 0..2 {
+                    for j in 0..3 {
+                        maybeUpdate(pTx32 + i * 3 + j)
+                    }
+                }
+            }
+        }
+        // Coefficient probabilities (6.3.7), expanded to 11 with the
+        // Pareto table (10.5).
+        let pareto = tPareto
+        for t in 0..4 {
+            let upd = bd.bit() == 1
+            for j in 0..2 {
+                for k in 0..2 {
+                    for l in 0..6 {
+                        for m in 0..6 {
+                            if l == 0 && m >= 3 {
+                                break
+                            }
+                            let ci = ((((t * 2 + j) * 2 + k) * 6 + l) * 6 + m)
+                            let rb = c * 1728 + ci * 3
+                            let pb = ci * 11
+                            for nn in 0..3 {
+                                var v = ctxCoef[rb + nn]
+                                if upd && bd.read(252) == 1 {
+                                    v = updateProb(v)
+                                }
+                                bd.coefP[pb + nn] = v
+                            }
+                            let p2 = bd.coefP[pb + 2]
+                            for nn in 0..8 {
+                                bd.coefP[pb + 3 + nn] = pareto[p2 * 8 + nn]
+                            }
+                        }
+                    }
+                }
+            }
+            if h.txMode == t {
+                break
+            }
+        }
+        for i in 0..3 {
+            maybeUpdate(pSkip + i)
+        }
+        if !h.keyframe && !h.intraOnly {
+            for i in 0..21 {
+                maybeUpdate(pMvMode + i)
+            }
+            if h.interpFilter == filterSwitchable {
+                for i in 0..8 {
+                    maybeUpdate(pFilter + i)
+                }
+            }
+            for i in 0..4 {
+                maybeUpdate(pIntra + i)
+            }
+            if h.allowCompInter {
+                h.compPredMode = bd.bit()
+                if h.compPredMode == 1 {
+                    h.compPredMode += bd.bit()
+                }
+                if h.compPredMode == 2 {
+                    for i in 0..5 {
+                        maybeUpdate(pComp + i)
+                    }
+                }
+            } else {
+                h.compPredMode = 0
+            }
+            if h.compPredMode != 1 {
+                for i in 0..5 {
+                    maybeUpdate(pSingleRef + i * 2)
+                    maybeUpdate(pSingleRef + i * 2 + 1)
+                }
+            }
+            if h.compPredMode != 0 {
+                for i in 0..5 {
+                    maybeUpdate(pCompRef + i)
+                }
+            }
+            for i in 0..4 {
+                for j in 0..9 {
+                    maybeUpdate(pYMode + i * 9 + j)
+                }
+            }
+            for i in 0..4 {
+                for j in 0..4 {
+                    for k in 0..3 {
+                        maybeUpdate(pPartition + (3 - i) * 12 + j * 3 + k)
+                    }
+                }
+            }
+            for i in 0..3 {
+                mvUpdate(pMvJoint + i)
+            }
+            for i in 0..2 {
+                let b = pMvComp + i * 33
+                mvUpdate(b + mvcSign)
+                for j in 0..10 {
+                    mvUpdate(b + mvcClasses + j)
+                }
+                mvUpdate(b + mvcClass0)
+                for j in 0..10 {
+                    mvUpdate(b + mvcBits + j)
+                }
+            }
+            for i in 0..2 {
+                let b = pMvComp + i * 33
+                for j in 0..6 {
+                    mvUpdate(b + mvcClass0Fp + j)
+                }
+                for j in 0..3 {
+                    mvUpdate(b + mvcFp + j)
+                }
+            }
+            if h.highPrecisionMv {
+                for i in 0..2 {
+                    let b = pMvComp + i * 33
+                    mvUpdate(b + mvcClass0Hp)
+                    mvUpdate(b + mvcHp)
+                }
+            }
+        }
+        hdr = h
+    }
+
+    // The forward-updated probabilities become the saved context
+    // (refresh_frame_context with frame_parallel_decoding_mode).
+    fn saveContext(_ id: Int) {
+        for t in 0..4 {
+            for ci in 0..(4 * 36) {
+                let g = t * 144 + ci
+                for nn in 0..3 {
+                    ctxCoef[id * 1728 + g * 3 + nn] = bd.coefP[g * 11 + nn]
+                }
+            }
+            if hdr.txMode == t {
+                break
+            }
+        }
+        vp9Put(ctxP, id * pCount, p)
+    }
+
+    // ---- tiles (6.4) ----------------------------------------------------
+
+    fn tiles(_ bytes: [Int], _ start: Int, _ size: Int) -> Bool {
+        let h = hdr
+        let tileCols = 1 << h.tileColsLog2
+        let tileRows = 1 << h.tileRowsLog2
+        // Above contexts for the whole frame.
+        aPart = vp9Zeros(cols + 8)
+        aSkip = vp9Zeros(cols + 8)
+        aTx = vp9Zeros(cols + 8)
+        aSegPred = vp9Zeros(cols + 8)
+        aIntra = vp9Zeros(cols + 8)
+        aComp = vp9Zeros(cols + 8)
+        aRef = vp9Zeros(cols + 8)
+        aFilter = vp9Zeros(cols + 8)
+        aYnz = vp9Zeros(sbCols * 16 + 16)
+        aUnz = vp9Zeros(sbCols * 16 + 16)
+        aVnz = vp9Zeros(sbCols * 16 + 16)
+        aMv = vp9Zeros(cols * 4 + 32)
+        let intra = h.keyframe || h.intraOnly
+        aMode = vp9Filled(cols * 2 + 16, if intra { modeDc } else { modeNearest })
+        tPos = vp9Zeros(tileCols)
+        tEnd = vp9Zeros(tileCols)
+        tValue = vp9Zeros(tileCols)
+        tCount = vp9Zeros(tileCols)
+        tRange = vp9Zeros(tileCols)
+        var at = start
+        var left = size
+        for tr in 0..tileRows {
+            let r0 = vp9TileOffset(tr, h.tileRowsLog2, sbRows)
+            let r1 = vp9TileOffset(tr + 1, h.tileRowsLog2, sbRows)
+            for tc in 0..tileCols {
+                var tsz = left
+                if !(tc == tileCols - 1 && tr == tileRows - 1) {
+                    if left < 4 {
+                        return false
+                    }
+                    tsz = (bytes[at] << 24) | (bytes[at + 1] << 16) | (bytes[at + 2] << 8) | bytes[at + 3]
+                    at += 4
+                    left -= 4
+                }
+                if tsz > left || tsz <= 0 {
+                    return false
+                }
+                bd.start(bytes, at, tsz)
+                if bd.read(128) == 1 {
+                    return false
+                }
+                saveTile(tc)
+                at += tsz
+                left -= tsz
+            }
+            var row = r0
+            while row < r1 {
+                for tc in 0..tileCols {
+                    let c0 = vp9TileOffset(tc, h.tileColsLog2, sbCols)
+                    let c1 = vp9TileOffset(tc + 1, h.tileColsLog2, sbCols)
+                    tileStart = c0
+                    vp9Fill(lPart, 0)
+                    vp9Fill(lSkip, 0)
+                    vp9Fill(lMode, if intra { modeDc } else { modeNearest })
+                    vp9Fill(lYnz, 0)
+                    vp9Fill(lUnz, 0)
+                    vp9Fill(lVnz, 0)
+                    vp9Fill(lSegPred, 0)
+                    loadTile(tc)
+                    var col = c0
+                    while col < c1 {
+                        decodeSb(row, col, 0)
+                        if bd.damaged() {
+                            return false
+                        }
+                        col += 8
+                    }
+                    saveTile(tc)
+                }
+                row += 8
+            }
+        }
+        true
+    }
+
+    fn saveTile(_ tc: Int) {
+        tPos[tc] = bd.pos
+        tEnd[tc] = bd.end
+        tValue[tc] = bd.value
+        tCount[tc] = bd.count
+        tRange[tc] = bd.range
+    }
+
+    fn loadTile(_ tc: Int) {
+        bd.pos = tPos[tc]
+        bd.end = tEnd[tc]
+        bd.value = tValue[tc]
+        bd.count = tCount[tc]
+        bd.range = tRange[tc]
+    }
+
+    // decode_partition (6.4.3), FFmpeg's decode_sb.
+    fn decodeSb(_ row: Int, _ col: Int, _ bl: Int) {
+        let c = ((aPart[col] >> (3 - bl)) & 1) | (((lPart[row & 7] >> (3 - bl)) & 1) << 1)
+        let intra = hdr.keyframe || hdr.intraOnly
+        let hbs = 4 >> bl
+        var bp = 0
+        if intra {
+            let base = bl * 12 + c * 3
+            if bl == 3 {
+                bp = bd.tree(tTreePart, tKfPart, base)
+                decodeBlock(row, col, bl, bp)
+            } else if col + hbs < cols {
+                if row + hbs < rows {
+                    bp = bd.tree(tTreePart, tKfPart, base)
+                    sbSplit(row, col, bl, bp, hbs)
+                } else if bd.read(tKfPart[base + 1]) == 1 {
+                    bp = 3
+                    decodeSb(row, col, bl + 1)
+                    decodeSb(row, col + hbs, bl + 1)
+                } else {
+                    bp = 1
+                    decodeBlock(row, col, bl, bp)
+                }
+            } else if row + hbs < rows {
+                if bd.read(tKfPart[base + 2]) == 1 {
+                    bp = 3
+                    decodeSb(row, col, bl + 1)
+                    decodeSb(row + hbs, col, bl + 1)
+                } else {
+                    bp = 2
+                    decodeBlock(row, col, bl, bp)
+                }
+            } else {
+                bp = 3
+                decodeSb(row, col, bl + 1)
+            }
+        } else {
+            let base = pPartition + bl * 12 + c * 3
+            if bl == 3 {
+                bp = bd.tree(tTreePart, p, base)
+                decodeBlock(row, col, bl, bp)
+            } else if col + hbs < cols {
+                if row + hbs < rows {
+                    bp = bd.tree(tTreePart, p, base)
+                    sbSplit(row, col, bl, bp, hbs)
+                } else if bd.read(p[base + 1]) == 1 {
+                    bp = 3
+                    decodeSb(row, col, bl + 1)
+                    decodeSb(row, col + hbs, bl + 1)
+                } else {
+                    bp = 1
+                    decodeBlock(row, col, bl, bp)
+                }
+            } else if row + hbs < rows {
+                if bd.read(p[base + 2]) == 1 {
+                    bp = 3
+                    decodeSb(row, col, bl + 1)
+                    decodeSb(row + hbs, col, bl + 1)
+                } else {
+                    bp = 2
+                    decodeBlock(row, col, bl, bp)
+                }
+            } else {
+                bp = 3
+                decodeSb(row, col, bl + 1)
+            }
+        }
+        cnt[cPartition + bl * 16 + c * 4 + bp] += 1
+    }
+
+    fn sbSplit(_ row: Int, _ col: Int, _ bl: Int, _ bp: Int, _ hbs: Int) {
+        if bp == 0 {
+            decodeBlock(row, col, bl, bp)
+        } else if bp == 1 {
+            decodeBlock(row, col, bl, bp)
+            decodeBlock(row + hbs, col, bl, bp)
+        } else if bp == 2 {
+            decodeBlock(row, col, bl, bp)
+            decodeBlock(row, col + hbs, bl, bp)
+        } else {
+            decodeSb(row, col, bl + 1)
+            decodeSb(row, col + hbs, bl + 1)
+            decodeSb(row + hbs, col, bl + 1)
+            decodeSb(row + hbs, col + hbs, bl + 1)
+        }
+    }
+
+    // decode_block (6.4.4): modes, coefficients and the block record.
+    fn decodeBlock(_ row: Int, _ col: Int, _ bl: Int, _ bp: Int) {
+        let bs = bl * 3 + bp
+        bRow = row
+        bCol = col
+        bBs = bs
+        let w8 = tBwh8[bs * 2]
+        let h8 = tBwh8[bs * 2 + 1]
+        minMvX = -(128 + col * 64)
+        minMvY = -(128 + row * 64)
+        maxMvX = 128 + (cols - col - w8) * 64
+        maxMvY = 128 + (rows - row - h8) * 64
+        decodeMode()
+        // uv transform size (get_uv_tx_size).
+        var uvtx = bTx
+        if (hdr.ssH == 1 && w8 * 2 == (1 << bTx)) || (hdr.ssV == 1 && h8 * 2 == (1 << bTx)) {
+            uvtx = bTx - 1
+        }
+        bUvTx = uvtx
+        let coefStart = bd.coefs.count
+        if bSkip == 0 {
+            let has = decodeCoefs()
+            if !has && bs <= bs8x8 && bIntra == 0 {
+                bSkip = 1
+                vp9Set(aSkip, col, w8, 1)
+                vp9Set(lSkip, row & 7, h8, 1)
+                bd.truncate(coefStart)
+            }
+        } else {
+            // Skipped: no coefficients, so zero the nnz contexts.
+            let ssH = hdr.ssH
+            let ssV = hdr.ssV
+            vp9Set(aYnz, col * 2, w8 * 2, 0)
+            vp9Set(lYnz, (row & 7) * 2, h8 * 2, 0)
+            if ssH == 1 {
+                vp9Set(aUnz, col, w8, 0)
+                vp9Set(aVnz, col, w8, 0)
+            } else {
+                vp9Set(aUnz, col * 2, w8 * 2, 0)
+                vp9Set(aVnz, col * 2, w8 * 2, 0)
+            }
+            if ssV == 1 {
+                vp9Set(lUnz, row & 7, h8, 0)
+                vp9Set(lVnz, row & 7, h8, 0)
+            } else {
+                vp9Set(lUnz, (row & 7) * 2, h8 * 2, 0)
+                vp9Set(lVnz, (row & 7) * 2, h8 * 2, 0)
+            }
+        }
+        // Loop filter level (8.8.1).
+        var lvl = 0
+        if hdr.filterLevel > 0 {
+            let refi = if bIntra == 1 { 0 } else { bRef[0] + 1 }
+            let mi = if bMode[3] != modeZero { 1 } else { 0 }
+            lvl = hdr.lflvl[bSeg * 8 + refi * 2 + mi]
+        }
+        if bIntra == 0 {
+            if refScale[bRef[0]] == 2 || (bComp == 1 && refScale[bRef[1]] == 2) {
+                damagedRef = true
+            }
+        }
+        blocks.append(row)
+        blocks.append(col)
+        blocks.append(bs)
+        blocks.append(bTx)
+        blocks.append(bUvTx)
+        blocks.append(bSkip)
+        blocks.append(bIntra)
+        blocks.append(bComp)
+        blocks.append(bRef[0])
+        blocks.append(bRef[1])
+        blocks.append(bMode[0])
+        blocks.append(bMode[1])
+        blocks.append(bMode[2])
+        blocks.append(bMode[3])
+        blocks.append(bUv)
+        blocks.append(bFilter)
+        blocks.append(lvl)
+        blocks.append(coefStart)
+        blocks.append(tileStart)
+        for i in 0..8 {
+            blocks.append(bMv[i])
+        }
+        nBlocks += 1
+    }
+
+    // ---- modes (6.4.5 … 6.4.20, FFmpeg's decode_mode) ----------------------
+
+    fn decodeMode() {
+        let h = hdr
+        let bs = bBs
+        let row = bRow
+        let col = bCol
+        let row7 = row & 7
+        let maxTx = vp9MaxTx(bs)
+        let w8 = tBwh8[bs * 2]
+        let h8 = tBwh8[bs * 2 + 1]
+        let w4 = min(cols - col, w8)
+        let h4 = min(rows - row, h8)
+        let haveA = row > 0
+        let haveL = col > tileStart
+        let intraFrame = h.keyframe || h.intraOnly
+        // Segment id (6.4.7, 6.4.12).
+        if !h.segEnabled {
+            bSeg = 0
+        } else if intraFrame {
+            bSeg = if h.segUpdateMap { bd.tree(tTreeSeg, h.segProb, 0) } else { 0 }
+        } else if !h.segUpdateMap || (h.segTemporal && bd.read(h.segPredProb[aSegPred[col] + lSegPred[row7]]) == 1) {
+            if !h.errorRes && !segPrev.isEmpty {
+                var pred = 8
+                for y in 0..h4 {
+                    let base = (y + row) * 8 * sbCols + col
+                    for x in 0..w4 {
+                        pred = min(pred, segPrev[base + x])
+                    }
+                }
+                bSeg = pred
+            } else {
+                bSeg = 0
+            }
+            vp9Set(aSegPred, col, w4, 1)
+            vp9Set(lSegPred, row7, h4, 1)
+        } else {
+            bSeg = bd.tree(tTreeSeg, h.segProb, 0)
+            vp9Set(aSegPred, col, w4, 0)
+            vp9Set(lSegPred, row7, h4, 0)
+        }
+        if h.segEnabled && (h.segUpdateMap || intraFrame) {
+            for y in 0..h8 {
+                let base = (row + y) * 8 * sbCols + col
+                for x in 0..w8 {
+                    if base + x < segMap.count {
+                        segMap[base + x] = bSeg
+                    }
+                }
+            }
+        }
+        // Skip (6.4.8).
+        bSkip = if h.segEnabled && h.segSkip[bSeg] == 1 { 1 } else { 0 }
+        if bSkip == 0 {
+            let c = lSkip[row7] + aSkip[col]
+            bSkip = bd.read(p[pSkip + c])
+            cnt[cSkip + c * 2 + bSkip] += 1
+        }
+        // Intra / inter (6.4.11).
+        if intraFrame {
+            bIntra = 1
+        } else if h.segEnabled && h.segRefEn[bSeg] == 1 {
+            bIntra = if h.segRefVal[bSeg] == 0 { 1 } else { 0 }
+        } else {
+            var c = 0
+            if haveA && haveL {
+                c = aIntra[col] + lIntra[row7]
+                if c == 2 {
+                    c = 3
+                }
+            } else if haveA {
+                c = 2 * aIntra[col]
+            } else if haveL {
+                c = 2 * lIntra[row7]
+            }
+            let bit = bd.read(p[pIntra + c])
+            cnt[cIntra + c * 2 + bit] += 1
+            bIntra = 1 - bit
+        }
+        // Transform size (6.4.10).
+        if (bIntra == 1 || bSkip == 0) && h.txMode == 4 {
+            var c = 1
+            if haveA {
+                if haveL {
+                    let a = if aSkip[col] == 1 { maxTx } else { aTx[col] }
+                    let l = if lSkip[row7] == 1 { maxTx } else { lTx[row7] }
+                    c = if a + l > maxTx { 1 } else { 0 }
+                } else {
+                    c = if aSkip[col] == 1 { 1 } else { if aTx[col] * 2 > maxTx { 1 } else { 0 } }
+                }
+            } else if haveL {
+                c = if lSkip[row7] == 1 { 1 } else { if lTx[row7] * 2 > maxTx { 1 } else { 0 } }
+            }
+            if maxTx == 3 {
+                bTx = bd.read(p[pTx32 + c * 3])
+                if bTx == 1 {
+                    bTx += bd.read(p[pTx32 + c * 3 + 1])
+                    if bTx == 2 {
+                        bTx += bd.read(p[pTx32 + c * 3 + 2])
+                    }
+                }
+                cnt[cTx32 + c * 4 + bTx] += 1
+            } else if maxTx == 2 {
+                bTx = bd.read(p[pTx16 + c * 2])
+                if bTx == 1 {
+                    bTx += bd.read(p[pTx16 + c * 2 + 1])
+                }
+                cnt[cTx16 + c * 3 + bTx] += 1
+            } else if maxTx == 1 {
+                bTx = bd.read(p[pTx8 + c])
+                cnt[cTx8 + c * 2 + bTx] += 1
+            } else {
+                bTx = 0
+            }
+        } else {
+            bTx = min(maxTx, h.txMode)
+        }
+        var vref = 0
+        var filterId = 0
+        if intraFrame {
+            // Keyframe / intra-only modes with above/left context (6.4.6).
+            bComp = 0
+            let ai = col * 2
+            let li = row7 * 2
+            if bs > bs8x8 {
+                let m0 = bd.tree(tTreeIntra, tKfY, (aMode[ai] * 10 + lMode[li]) * 9)
+                bMode[0] = m0
+                aMode[ai] = m0
+                if bs != bs8x4 {
+                    let m1 = bd.tree(tTreeIntra, tKfY, (aMode[ai + 1] * 10 + m0) * 9)
+                    bMode[1] = m1
+                    lMode[li] = m1
+                    aMode[ai + 1] = m1
+                } else {
+                    bMode[1] = m0
+                    lMode[li] = m0
+                    aMode[ai + 1] = m0
+                }
+                if bs != bs4x8 {
+                    let m2 = bd.tree(tTreeIntra, tKfY, (aMode[ai] * 10 + lMode[li + 1]) * 9)
+                    bMode[2] = m2
+                    aMode[ai] = m2
+                    if bs != bs8x4 {
+                        let m3 = bd.tree(tTreeIntra, tKfY, (aMode[ai + 1] * 10 + m2) * 9)
+                        bMode[3] = m3
+                        lMode[li + 1] = m3
+                        aMode[ai + 1] = m3
+                    } else {
+                        bMode[3] = m2
+                        lMode[li + 1] = m2
+                        aMode[ai + 1] = m2
+                    }
+                } else {
+                    bMode[2] = bMode[0]
+                    bMode[3] = bMode[1]
+                    lMode[li + 1] = bMode[1]
+                    aMode[ai + 1] = bMode[1]
+                }
+            } else {
+                let m = bd.tree(tTreeIntra, tKfY, (aMode[ai] * 10 + lMode[li]) * 9)
+                bMode[0] = m
+                bMode[1] = m
+                bMode[2] = m
+                bMode[3] = m
+                vp9Set(aMode, ai, tBwh4[bs * 2], m)
+                vp9Set(lMode, li, tBwh4[bs * 2 + 1], m)
+            }
+            bUv = bd.tree(tTreeIntra, tKfUv, bMode[3] * 9)
+        } else if bIntra == 1 {
+            bComp = 0
+            if bs > bs8x8 {
+                bMode[0] = bd.tree(tTreeIntra, p, pYMode)
+                cnt[cYMode + bMode[0]] += 1
+                if bs != bs8x4 {
+                    bMode[1] = bd.tree(tTreeIntra, p, pYMode)
+                    cnt[cYMode + bMode[1]] += 1
+                } else {
+                    bMode[1] = bMode[0]
+                }
+                if bs != bs4x8 {
+                    bMode[2] = bd.tree(tTreeIntra, p, pYMode)
+                    cnt[cYMode + bMode[2]] += 1
+                    if bs != bs8x4 {
+                        bMode[3] = bd.tree(tTreeIntra, p, pYMode)
+                        cnt[cYMode + bMode[3]] += 1
+                    } else {
+                        bMode[3] = bMode[2]
+                    }
+                } else {
+                    bMode[2] = bMode[0]
+                    bMode[3] = bMode[1]
+                }
+            } else {
+                let sz = vp9SizeGroup(bs)
+                let m = bd.tree(tTreeIntra, p, pYMode + sz * 9)
+                bMode[0] = m
+                bMode[1] = m
+                bMode[2] = m
+                bMode[3] = m
+                cnt[cYMode + sz * 10 + m] += 1
+            }
+            bUv = bd.tree(tTreeIntra, p, pUvMode + bMode[3] * 9)
+            cnt[cUvMode + bMode[3] * 10 + bUv] += 1
+        } else {
+            readRefs(haveA, haveL)
+            if bs <= bs8x8 {
+                if h.segEnabled && h.segSkip[bSeg] == 1 {
+                    bMode[0] = modeZero
+                    bMode[1] = modeZero
+                    bMode[2] = modeZero
+                    bMode[3] = modeZero
+                } else {
+                    let off = vp9ModeCtxOff(bs)
+                    let c = vp9InterModeCtx(aMode[col + off], lMode[row7 + off])
+                    let m = bd.tree(tTreeInter, p, pMvMode + c * 3)
+                    bMode[0] = m
+                    bMode[1] = m
+                    bMode[2] = m
+                    bMode[3] = m
+                    cnt[cMvMode + c * 4 + m - 10] += 1
+                }
+            }
+            if h.interpFilter == filterSwitchable {
+                var c = 3
+                if haveA && aMode[col] >= modeNearest {
+                    if haveL && lMode[row7] >= modeNearest {
+                        c = if aFilter[col] == lFilter[row7] { lFilter[row7] } else { 3 }
+                    } else {
+                        c = aFilter[col]
+                    }
+                } else if haveL && lMode[row7] >= modeNearest {
+                    c = lFilter[row7]
+                }
+                filterId = bd.tree(tTreeFilter, p, pFilter + c * 2)
+                cnt[cFilter + c * 3 + filterId] += 1
+                // filter_lut: regular, smooth, sharp.
+                bFilter = if filterId == 0 { 1 } else if filterId == 1 { 0 } else { 2 }
+            } else {
+                bFilter = h.interpFilter
+            }
+            if bs > bs8x8 {
+                let c = vp9InterModeCtx(aMode[col], lMode[row7])
+                bMode[0] = bd.tree(tTreeInter, p, pMvMode + c * 3)
+                cnt[cMvMode + c * 4 + bMode[0] - 10] += 1
+                fillMv(0, bMode[0], 0)
+                if bs != bs8x4 {
+                    bMode[1] = bd.tree(tTreeInter, p, pMvMode + c * 3)
+                    cnt[cMvMode + c * 4 + bMode[1] - 10] += 1
+                    fillMv(1, bMode[1], 1)
+                } else {
+                    bMode[1] = bMode[0]
+                    bMv[2] = bMv[0]
+                    bMv[3] = bMv[1]
+                }
+                if bs != bs4x8 {
+                    bMode[2] = bd.tree(tTreeInter, p, pMvMode + c * 3)
+                    cnt[cMvMode + c * 4 + bMode[2] - 10] += 1
+                    fillMv(2, bMode[2], 2)
+                    if bs != bs8x4 {
+                        bMode[3] = bd.tree(tTreeInter, p, pMvMode + c * 3)
+                        cnt[cMvMode + c * 4 + bMode[3] - 10] += 1
+                        fillMv(3, bMode[3], 3)
+                    } else {
+                        bMode[3] = bMode[2]
+                        bMv[6] = bMv[4]
+                        bMv[7] = bMv[5]
+                    }
+                } else {
+                    bMode[2] = bMode[0]
+                    bMv[4] = bMv[0]
+                    bMv[5] = bMv[1]
+                    bMode[3] = bMode[1]
+                    bMv[6] = bMv[2]
+                    bMv[7] = bMv[3]
+                }
+            } else {
+                fillMv(0, bMode[0], -1)
+                for b in 1..4 {
+                    bMv[b * 2] = bMv[0]
+                    bMv[b * 2 + 1] = bMv[1]
+                }
+            }
+            vref = if bComp == 1 { bRef[h.signBias[h.varCompRef[0]]] } else { bRef[0] }
+        }
+        // Above and left contexts.
+        let lc = vp9LeftCtx(bs)
+        let ac = vp9AboveCtx(bs)
+        vp9Set(aSkip, col, w8, bSkip)
+        vp9Set(aTx, col, w8, bTx)
+        vp9Set(aPart, col, w8, ac)
+        vp9Set(lSkip, row7, h8, bSkip)
+        vp9Set(lTx, row7, h8, bTx)
+        vp9Set(lPart, row7, h8, lc)
+        if !intraFrame {
+            vp9Set(aIntra, col, w8, bIntra)
+            vp9Set(aComp, col, w8, bComp)
+            vp9Set(aMode, col, w8, bMode[3])
+            vp9Set(lIntra, row7, h8, bIntra)
+            vp9Set(lComp, row7, h8, bComp)
+            vp9Set(lMode, row7, h8, bMode[3])
+            if bIntra == 0 {
+                vp9Set(aRef, col, w8, vref)
+                vp9Set(lRef, row7, h8, vref)
+                if h.interpFilter == filterSwitchable {
+                    vp9Set(aFilter, col, w8, filterId)
+                    vp9Set(lFilter, row7, h8, filterId)
+                }
+            }
+            if bs > bs8x8 {
+                lMv[(row7 * 2) * 2] = bMv[2]
+                lMv[(row7 * 2) * 2 + 1] = bMv[3]
+                lMv[(row7 * 2 + 1) * 2] = bMv[6]
+                lMv[(row7 * 2 + 1) * 2 + 1] = bMv[7]
+                aMv[(col * 2) * 2] = bMv[4]
+                aMv[(col * 2) * 2 + 1] = bMv[5]
+                aMv[(col * 2 + 1) * 2] = bMv[6]
+                aMv[(col * 2 + 1) * 2 + 1] = bMv[7]
+            } else {
+                let m0 = bMv[6]
+                let m1 = bMv[7]
+                for n in 0..(w4 * 2) {
+                    aMv[(col * 2 + n) * 2] = m0
+                    aMv[(col * 2 + n) * 2 + 1] = m1
+                }
+                for n in 0..(h4 * 2) {
+                    lMv[(row7 * 2 + n) * 2] = m0
+                    lMv[(row7 * 2 + n) * 2 + 1] = m1
+                }
+            }
+        }
+        // The motion vectors of this frame per 8x8 position.
+        for y in 0..h4 {
+            let o = (row + y) * sbCols * 8 + col
+            for x in 0..w4 {
+                if bIntra == 1 {
+                    mvRef0[o + x] = -1
+                    mvRef1[o + x] = -1
+                } else if bComp == 1 {
+                    mvRef0[o + x] = bRef[0]
+                    mvRef1[o + x] = bRef[1]
+                    mvA[o + x] = bMv[6]
+                    mvB[o + x] = bMv[7]
+                } else {
+                    mvRef0[o + x] = bRef[0]
+                    mvRef1[o + x] = -1
+                    mvA[o + x] = bMv[6]
+                }
+            }
+        }
+    }
+
+    // The reference frames of an inter block (6.4.17, 6.4.18 with the
+    // contexts of 9.3.2 as FFmpeg writes them).
+    fn readRefs(_ haveA: Bool, _ haveL: Bool) {
+        let h = hdr
+        let col = bCol
+        let row7 = bRow & 7
+        if h.segEnabled && h.segRefEn[bSeg] == 1 {
+            bComp = 0
+            bRef[0] = h.segRefVal[bSeg] - 1
+            return
+        }
+        let fix = h.fixCompRef
+        if h.compPredMode != 2 {
+            bComp = if h.compPredMode == 1 { 1 } else { 0 }
+        } else {
+            var c = 1
+            if haveA {
+                if haveL {
+                    if aComp[col] == 1 && lComp[row7] == 1 {
+                        c = 4
+                    } else if aComp[col] == 1 {
+                        c = 2 + vp9B(lIntra[row7] == 1 || lRef[row7] == fix)
+                    } else if lComp[row7] == 1 {
+                        c = 2 + vp9B(aIntra[col] == 1 || aRef[col] == fix)
+                    } else {
+                        c = vp9B(aIntra[col] == 0 && aRef[col] == fix) ^ vp9B(lIntra[row7] == 0 && lRef[row7] == fix)
+                    }
+                } else {
+                    c = if aComp[col] == 1 { 3 } else { vp9B(aIntra[col] == 0 && aRef[col] == fix) }
+                }
+            } else if haveL {
+                c = if lComp[row7] == 1 { 3 } else { vp9B(lIntra[row7] == 0 && lRef[row7] == fix) }
+            }
+            bComp = bd.read(p[pComp + c])
+            cnt[cComp + c * 2 + bComp] += 1
+        }
+        if bComp == 1 {
+            let fixIdx = h.signBias[fix]
+            let varIdx = 1 - fixIdx
+            let var1 = h.varCompRef[1]
+            let var0 = h.varCompRef[0]
+            bRef[fixIdx] = fix
+            var c = 2
+            if haveA {
+                if haveL {
+                    if aIntra[col] == 1 {
+                        if lIntra[row7] == 1 {
+                            c = 2
+                        } else {
+                            c = 1 + 2 * vp9B(lRef[row7] != var1)
+                        }
+                    } else if lIntra[row7] == 1 {
+                        c = 1 + 2 * vp9B(aRef[col] != var1)
+                    } else {
+                        let refl = lRef[row7]
+                        let refa = aRef[col]
+                        if refl == refa && refa == var1 {
+                            c = 0
+                        } else if lComp[row7] == 0 && aComp[col] == 0 {
+                            if (refa == fix && refl == var0) || (refl == fix && refa == var0) {
+                                c = 4
+                            } else {
+                                c = if refa == refl { 3 } else { 1 }
+                            }
+                        } else if lComp[row7] == 0 {
+                            if refa == var1 && refl != var1 {
+                                c = 1
+                            } else {
+                                c = if refl == var1 && refa != var1 { 2 } else { 4 }
+                            }
+                        } else if aComp[col] == 0 {
+                            if refl == var1 && refa != var1 {
+                                c = 1
+                            } else {
+                                c = if refa == var1 && refl != var1 { 2 } else { 4 }
+                            }
+                        } else {
+                            c = if refl == refa { 4 } else { 2 }
+                        }
+                    }
+                } else {
+                    if aIntra[col] == 1 {
+                        c = 2
+                    } else if aComp[col] == 1 {
+                        c = 4 * vp9B(aRef[col] != var1)
+                    } else {
+                        c = 3 * vp9B(aRef[col] != var1)
+                    }
+                }
+            } else if haveL {
+                if lIntra[row7] == 1 {
+                    c = 2
+                } else if lComp[row7] == 1 {
+                    c = 4 * vp9B(lRef[row7] != var1)
+                } else {
+                    c = 3 * vp9B(lRef[row7] != var1)
+                }
+            }
+            let bit = bd.read(p[pCompRef + c])
+            bRef[varIdx] = h.varCompRef[bit]
+            cnt[cCompRef + c * 2 + bit] += 1
+        } else {
+            var c = 2
+            if haveA && aIntra[col] == 0 {
+                if haveL && lIntra[row7] == 0 {
+                    if lComp[row7] == 1 {
+                        if aComp[col] == 1 {
+                            c = 1 + vp9B(fix == 0 || lRef[row7] == 0 || aRef[col] == 0)
+                        } else {
+                            c = 3 * vp9B(aRef[col] == 0) + vp9B(fix == 0 || lRef[row7] == 0)
+                        }
+                    } else if aComp[col] == 1 {
+                        c = 3 * vp9B(lRef[row7] == 0) + vp9B(fix == 0 || aRef[col] == 0)
+                    } else {
+                        c = 2 * vp9B(lRef[row7] == 0) + 2 * vp9B(aRef[col] == 0)
+                    }
+                } else if aIntra[col] == 1 {
+                    c = 2
+                } else if aComp[col] == 1 {
+                    c = 1 + vp9B(fix == 0 || aRef[col] == 0)
+                } else {
+                    c = 4 * vp9B(aRef[col] == 0)
+                }
+            } else if haveL && lIntra[row7] == 0 {
+                if lComp[row7] == 1 {
+                    c = 1 + vp9B(fix == 0 || lRef[row7] == 0)
+                } else {
+                    c = 4 * vp9B(lRef[row7] == 0)
+                }
+            }
+            let bit = bd.read(p[pSingleRef + c * 2])
+            cnt[cSingleRef + c * 4 + bit] += 1
+            if bit == 0 {
+                bRef[0] = 0
+            } else {
+                var c2 = 2
+                if haveA {
+                    if haveL {
+                        if lIntra[row7] == 1 {
+                            if aIntra[col] == 1 {
+                                c2 = 2
+                            } else if aComp[col] == 1 {
+                                c2 = 1 + 2 * vp9B(fix == 1 || aRef[col] == 1)
+                            } else if aRef[col] == 0 {
+                                c2 = 3
+                            } else {
+                                c2 = 4 * vp9B(aRef[col] == 1)
+                            }
+                        } else if aIntra[col] == 1 {
+                            if lIntra[row7] == 1 {
+                                c2 = 2
+                            } else if lComp[row7] == 1 {
+                                c2 = 1 + 2 * vp9B(fix == 1 || lRef[row7] == 1)
+                            } else if lRef[row7] == 0 {
+                                c2 = 3
+                            } else {
+                                c2 = 4 * vp9B(lRef[row7] == 1)
+                            }
+                        } else if aComp[col] == 1 {
+                            if lComp[row7] == 1 {
+                                if lRef[row7] == aRef[col] {
+                                    c2 = 3 * vp9B(fix == 1 || lRef[row7] == 1)
+                                } else {
+                                    c2 = 2
+                                }
+                            } else if lRef[row7] == 0 {
+                                c2 = 1 + 2 * vp9B(fix == 1 || aRef[col] == 1)
+                            } else {
+                                c2 = 3 * vp9B(lRef[row7] == 1) + vp9B(fix == 1 || aRef[col] == 1)
+                            }
+                        } else if lComp[row7] == 1 {
+                            if aRef[col] == 0 {
+                                c2 = 1 + 2 * vp9B(fix == 1 || lRef[row7] == 1)
+                            } else {
+                                c2 = 3 * vp9B(aRef[col] == 1) + vp9B(fix == 1 || lRef[row7] == 1)
+                            }
+                        } else if aRef[col] == 0 {
+                            if lRef[row7] == 0 {
+                                c2 = 3
+                            } else {
+                                c2 = 4 * vp9B(lRef[row7] == 1)
+                            }
+                        } else if lRef[row7] == 0 {
+                            c2 = 4 * vp9B(aRef[col] == 1)
+                        } else {
+                            c2 = 2 * vp9B(lRef[row7] == 1) + 2 * vp9B(aRef[col] == 1)
+                        }
+                    } else {
+                        if aIntra[col] == 1 || (aComp[col] == 0 && aRef[col] == 0) {
+                            c2 = 2
+                        } else if aComp[col] == 1 {
+                            c2 = 3 * vp9B(fix == 1 || aRef[col] == 1)
+                        } else {
+                            c2 = 4 * vp9B(aRef[col] == 1)
+                        }
+                    }
+                } else if haveL {
+                    if lIntra[row7] == 1 || (lComp[row7] == 0 && lRef[row7] == 0) {
+                        c2 = 2
+                    } else if lComp[row7] == 1 {
+                        c2 = 3 * vp9B(fix == 1 || lRef[row7] == 1)
+                    } else {
+                        c2 = 4 * vp9B(lRef[row7] == 1)
+                    }
+                }
+                let bit2 = bd.read(p[pSingleRef + c2 * 2 + 1])
+                cnt[cSingleRef + c2 * 4 + 2 + bit2] += 1
+                bRef[0] = 1 + bit2
+            }
+        }
+    }
+
+    // ---- motion vectors (6.4.19 … 6.4.21, appendix "find_mv_refs") -----------
+
+    fn clampMv(_ m: Int) -> Int {
+        let x = vp9Clip(vp9MvX(m), minMvX, maxMvX)
+        let y = vp9Clip(vp9MvY(m), minMvY, maxMvY)
+        vp9Mv(x, y)
+    }
+
+    // RETURN_DIRECT_MV: true when the search is over.
+    fn rmDirect(_ m: Int) -> Bool {
+        if rmIdx == 0 {
+            rmOut = m
+            return true
+        }
+        if rmMem == vp9NoMv {
+            rmMem = m
+        } else if m != rmMem {
+            rmOut = m
+            return true
+        }
+        false
+    }
+
+    // RETURN_MV.
+    fn rmCand(_ m: Int) -> Bool {
+        if rmSb > 0 {
+            if rmMemSub == vp9NoMv {
+                let t = clampMv(m)
+                if t != rmMem {
+                    rmOut = t
+                    return true
+                }
+                rmMemSub = m
+            } else if rmMemSub != m {
+                let t = clampMv(m)
+                rmOut = if t != rmMem { t } else { 0 }
+                return true
+            }
+            return false
+        }
+        if rmIdx == 0 {
+            rmOut = clampMv(m)
+            return true
+        }
+        if rmMem == vp9NoMv {
+            rmMem = m
+        } else if m != rmMem {
+            rmOut = clampMv(m)
+            return true
+        }
+        false
+    }
+
+    fn rmScaled(_ m: Int, _ flip: Bool) -> Bool {
+        if flip {
+            return rmCand(vp9Mv(-vp9MvX(m), -vp9MvY(m)))
+        }
+        rmCand(m)
+    }
+
+    // FFmpeg's find_ref_mvs: the nearest (idx 0) or near (idx 1) motion
+    // vector candidate for reference `ref`, for sub-block sb (-1 whole).
+    fn findRefMv(_ ref: Int, _ z: Int, _ idx: Int, _ sb: Int) -> Int {
+        let row = bRow
+        let col = bCol
+        let row7 = row & 7
+        rmMem = vp9NoMv
+        rmMemSub = vp9NoMv
+        rmIdx = idx
+        rmSb = sb
+        let stride = sbCols * 8
+        var i = 0
+        let offs = vp9MvRefOffsets(bBs)
+        if sb >= 0 {
+            if sb == 1 || sb == 2 {
+                if rmDirect(bMv[z]) {
+                    return rmOut
+                }
+            } else if sb == 3 {
+                if rmDirect(bMv[4 + z]) {
+                    return rmOut
+                }
+                if rmDirect(bMv[2 + z]) {
+                    return rmOut
+                }
+                if rmDirect(bMv[z]) {
+                    return rmOut
+                }
+            }
+            if row > 0 {
+                let o = (row - 1) * stride + col
+                if mvRef0[o] == ref {
+                    if rmCand(aMv[(2 * col + (sb & 1)) * 2]) {
+                        return rmOut
+                    }
+                } else if mvRef1[o] == ref {
+                    if rmCand(aMv[(2 * col + (sb & 1)) * 2 + 1]) {
+                        return rmOut
+                    }
+                }
+            }
+            if col > tileStart {
+                let o = row * stride + col - 1
+                if mvRef0[o] == ref {
+                    if rmCand(lMv[(2 * row7 + (sb >> 1)) * 2]) {
+                        return rmOut
+                    }
+                } else if mvRef1[o] == ref {
+                    if rmCand(lMv[(2 * row7 + (sb >> 1)) * 2 + 1]) {
+                        return rmOut
+                    }
+                }
+            }
+            i = 2
+        }
+        // Neighbours with the same reference.
+        while i < 8 {
+            let c = offs[i * 2] + col
+            let r = offs[i * 2 + 1] + row
+            if c >= tileStart && c < cols && r >= 0 && r < rows {
+                let o = r * stride + c
+                if mvRef0[o] == ref {
+                    if rmCand(mvA[o]) {
+                        return rmOut
+                    }
+                } else if mvRef1[o] == ref {
+                    if rmCand(mvB[o]) {
+                        return rmOut
+                    }
+                }
+            }
+            i += 1
+        }
+        // The previous frame at this position, same reference.
+        if useLastMvs {
+            let o = row * stride + col
+            if pmvRef0[o] == ref {
+                if rmCand(pmvA[o]) {
+                    return rmOut
+                }
+            } else if pmvRef1[o] == ref {
+                if rmCand(pmvB[o]) {
+                    return rmOut
+                }
+            }
+        }
+        // Neighbours with other references (sign-flipped by sign bias).
+        let sbias = hdr.signBias
+        i = 0
+        while i < 8 {
+            let c = offs[i * 2] + col
+            let r = offs[i * 2 + 1] + row
+            if c >= tileStart && c < cols && r >= 0 && r < rows {
+                let o = r * stride + c
+                let r0 = mvRef0[o]
+                let r1 = mvRef1[o]
+                if r0 != ref && r0 >= 0 {
+                    if rmScaled(mvA[o], sbias[r0] != sbias[ref]) {
+                        return rmOut
+                    }
+                }
+                if r1 != ref && r1 >= 0 && mvA[o] != mvB[o] {
+                    if rmScaled(mvB[o], sbias[r1] != sbias[ref]) {
+                        return rmOut
+                    }
+                }
+            }
+            i += 1
+        }
+        if useLastMvs {
+            let o = row * stride + col
+            let r0 = pmvRef0[o]
+            let r1 = pmvRef1[o]
+            if r0 != ref && r0 >= 0 {
+                if rmScaled(pmvA[o], sbias[r0] != sbias[ref]) {
+                    return rmOut
+                }
+            }
+            if r1 != ref && r1 >= 0 && pmvA[o] != pmvB[o] {
+                if rmScaled(pmvB[o], sbias[r1] != sbias[ref]) {
+                    return rmOut
+                }
+            }
+        }
+        clampMv(0)
+    }
+
+    // read_mv_component (6.4.20, 9.3).
+    fn readMvComponent(_ idx: Int, _ hp: Bool) -> Int {
+        let b = pMvComp + idx * 33
+        let k = cMvComp + idx * 51
+        let sign = bd.read(p[b + mvcSign])
+        let c = bd.tree(tTreeMvC, p, b + mvcClasses)
+        cnt[k + mvkSign + sign] += 1
+        cnt[k + mvkClasses + c] += 1
+        var n = 0
+        if c > 0 {
+            for m in 0..c {
+                let bit = bd.read(p[b + mvcBits + m])
+                n = n | (bit << m)
+                cnt[k + mvkBits + m * 2 + bit] += 1
+            }
+            n = n << 3
+            let fp = bd.tree(tTreeMvFp, p, b + mvcFp)
+            n = n | (fp << 1)
+            cnt[k + mvkFp + fp] += 1
+            if hp {
+                let bit = bd.read(p[b + mvcHp])
+                cnt[k + mvkHp + bit] += 1
+                n = n | bit
+            } else {
+                n = n | 1
+                cnt[k + mvkHp + 1] += 1
+            }
+            n += 8 << c
+        } else {
+            let c0 = bd.read(p[b + mvcClass0])
+            cnt[k + mvkClass0 + c0] += 1
+            let fp = bd.tree(tTreeMvFp, p, b + mvcClass0Fp + c0 * 3)
+            cnt[k + mvkClass0Fp + c0 * 4 + fp] += 1
+            n = (c0 << 3) | (fp << 1)
+            if hp {
+                let bit = bd.read(p[b + mvcClass0Hp])
+                cnt[k + mvkClass0Hp + bit] += 1
+                n = n | bit
+            } else {
+                n = n | 1
+                cnt[k + mvkClass0Hp + 1] += 1
+            }
+        }
+        if sign == 1 {
+            return -(n + 1)
+        }
+        n + 1
+    }
+
+    fn lowerPrecision(_ m: Int) -> Int {
+        var x = vp9MvX(m)
+        var y = vp9MvY(m)
+        if (y & 1) != 0 {
+            y = if y < 0 { y + 1 } else { y - 1 }
+        }
+        if (x & 1) != 0 {
+            x = if x < 0 { x + 1 } else { x - 1 }
+        }
+        vp9Mv(x, y)
+    }
+
+    // ff_vp9_fill_mv: the motion vector(s) of sub-block b (sb -1 = the
+    // whole block) for its mode.
+    fn fillMv(_ b: Int, _ mode: Int, _ sb: Int) {
+        if mode == modeZero {
+            bMv[b * 2] = 0
+            bMv[b * 2 + 1] = 0
+            return
+        }
+        for z in 0..(1 + bComp) {
+            var m = findRefMv(bRef[z], z, if mode == modeNear { 1 } else { 0 }, if mode == modeNew { -1 } else { sb })
+            var hp = false
+            if mode == modeNew || sb == -1 {
+                hp = hdr.highPrecisionMv && abs(vp9MvX(m)) < 64 && abs(vp9MvY(m)) < 64
+                if !hp {
+                    m = lowerPrecision(m)
+                }
+            }
+            if mode == modeNew {
+                let j = bd.tree(tTreeMvJ, p, pMvJoint)
+                cnt[cMvJoint + j] += 1
+                var x = vp9MvX(m)
+                var y = vp9MvY(m)
+                if j >= 2 {
+                    y += readMvComponent(0, hp)
+                }
+                if (j & 1) == 1 {
+                    x += readMvComponent(1, hp)
+                }
+                m = vp9Mv(x, y)
+            }
+            bMv[b * 2 + z] = m
+        }
+    }
+
+    // ---- coefficients (6.4.21 … 6.4.24) -----------------------------------
+
+    fn decodeCoefs() -> Bool {
+        let h = hdr
+        let bs = bBs
+        let row = bRow
+        let col = bCol
+        let tx = bTx
+        let ref = if bIntra == 1 { 0 } else { 1 }
+        var w4 = tBwh8[bs * 2] * 2
+        var h4 = tBwh8[bs * 2 + 1] * 2
+        var endX = min(2 * (cols - col), w4)
+        var endY = min(2 * (rows - row), h4)
+        let q = bSeg * 4
+        let ydc = h.qmul[q]
+        let yac = h.qmul[q + 1]
+        let uvdc = h.qmul[q + 2]
+        let uvac = h.qmul[q + 3]
+        let lossless = h.lossless
+        let scan = tScan
+        let nb = tNb
+        var total = false
+        let step = 1 << tx
+        let nC = 16 << (2 * tx)
+        let tx32 = tx == 3
+        // Y.
+        let ci = (tx * 2 + 0) * 2 + ref
+        let pB = ci * 36 * 11
+        let cB = ci * 36 * 3
+        let eB = ci * 36 * 2
+        let aOff = col * 2
+        let lOff = (row & 7) * 2
+        if step > 1 {
+            vp9Merge(aYnz, aOff, endX, step)
+            vp9Merge(lYnz, lOff, endY, step)
+        }
+        var n = 0
+        var y = 0
+        while y < endY {
+            var x = 0
+            while x < endX {
+                var txType = 0
+                if !lossless {
+                    let mode = if tx == 0 && bs > bs8x8 { bMode[n] } else { bMode[0] }
+                    txType = tTxType[mode]
+                }
+                let sOff = vp9ScanOff(if lossless { 0 } else { tx }, if tx == 3 || lossless { 0 } else { txType })
+                let nnz = aYnz[aOff + x] + lYnz[lOff + y]
+                let e = bd.tokens(nC, tx32, pB, cB, eB, nnz, scan, nb, sOff, ydc, yac)
+                let nzf = if e > 0 { 1 } else { 0 }
+                aYnz[aOff + x] = nzf
+                lYnz[lOff + y] = nzf
+                if e > 0 {
+                    total = true
+                }
+                x += step
+                n += step * step
+            }
+            y += step
+        }
+        if step > 1 {
+            vp9Splat(aYnz, aOff, endX, step, endX == w4)
+            vp9Splat(lYnz, lOff, endY, step, endY == h4)
+        }
+        // U and V.
+        let uvtx = bUvTx
+        let ustep = 1 << uvtx
+        let unC = 16 << (2 * uvtx)
+        let uci = (uvtx * 2 + 1) * 2 + ref
+        let upB = uci * 36 * 11
+        let ucB = uci * 36 * 3
+        let ueB = uci * 36 * 2
+        let usOff = vp9ScanOff(if lossless { 0 } else { uvtx }, 0)
+        w4 = w4 >> h.ssH
+        endX = endX >> h.ssH
+        h4 = h4 >> h.ssV
+        endY = endY >> h.ssV
+        let uaOff = col << (1 - h.ssH)
+        let ulOff = (row & 7) << (1 - h.ssV)
+        for pl in 0..2 {
+            if ustep > 1 {
+                if pl == 0 {
+                    vp9Merge(aUnz, uaOff, endX, ustep)
+                    vp9Merge(lUnz, ulOff, endY, ustep)
+                } else {
+                    vp9Merge(aVnz, uaOff, endX, ustep)
+                    vp9Merge(lVnz, ulOff, endY, ustep)
+                }
+            }
+            var yy = 0
+            while yy < endY {
+                var xx = 0
+                while xx < endX {
+                    var nnz = 0
+                    if pl == 0 {
+                        nnz = aUnz[uaOff + xx] + lUnz[ulOff + yy]
+                    } else {
+                        nnz = aVnz[uaOff + xx] + lVnz[ulOff + yy]
+                    }
+                    let e = bd.tokens(unC, uvtx == 3, upB, ucB, ueB, nnz, scan, nb, usOff, uvdc, uvac)
+                    let nzf = if e > 0 { 1 } else { 0 }
+                    if pl == 0 {
+                        aUnz[uaOff + xx] = nzf
+                        lUnz[ulOff + yy] = nzf
+                    } else {
+                        aVnz[uaOff + xx] = nzf
+                        lVnz[ulOff + yy] = nzf
+                    }
+                    if e > 0 {
+                        total = true
+                    }
+                    xx += ustep
+                }
+                yy += ustep
+            }
+            if ustep > 1 {
+                if pl == 0 {
+                    vp9Splat(aUnz, uaOff, endX, ustep, endX == w4)
+                    vp9Splat(lUnz, ulOff, endY, ustep, endY == h4)
+                } else {
+                    vp9Splat(aVnz, uaOff, endX, ustep, endX == w4)
+                    vp9Splat(lVnz, ulOff, endY, ustep, endY == h4)
+                }
+            }
+        }
+        total
+    }
+
+    // ---- 8.4.2 backward adaptation --------------------------------------
+
+    fn adaptProb(_ i: Int, _ ct0: Int, _ ct1: Int, _ maxCount: Int, _ uf0: Int, _ ctx: Int) {
+        let ct = ct0 + ct1
+        if ct == 0 {
+            return
+        }
+        let uf = uf0 * min(ct, maxCount) / maxCount
+        let p1 = ctxP[ctx + i]
+        var p2 = ((ct0 << 8) + (ct >> 1)) / ct
+        p2 = vp9Clip(p2, 1, 255)
+        ctxP[ctx + i] = p1 + (((p2 - p1) * uf + 128) >> 8)
+    }
+
+    fn adaptCoef(_ i: Int, _ ct0: Int, _ ct1: Int, _ uf0: Int) {
+        let ct = ct0 + ct1
+        if ct == 0 {
+            return
+        }
+        let uf = uf0 * min(ct, 24) / 24
+        let p1 = ctxCoef[i]
+        var p2 = ((ct0 << 8) + (ct >> 1)) / ct
+        p2 = vp9Clip(p2, 1, 255)
+        ctxCoef[i] = p1 + (((p2 - p1) * uf + 128) >> 8)
+    }
+
+    // A tree's probabilities from its symbol counts (merge_probs):
+    // node n gets (count of the left subtree, count of the right subtree).
+    fn adaptTree(_ tree: [Int], _ pBase: Int, _ cBase: Int, _ ctx: Int) {
+        let nNodes = tree.count / 2
+        for nd in 0..nNodes {
+            let l = treeCount(tree, tree[nd * 2], cBase)
+            let r = treeCount(tree, tree[nd * 2 + 1], cBase)
+            adaptProb(pBase + nd, l, r, 20, 128, ctx)
+        }
+    }
+
+    fn treeCount(_ tree: [Int], _ v: Int, _ cBase: Int) -> Int {
+        if v <= 0 {
+            return cnt[cBase - v]
+        }
+        treeCount(tree, tree[v * 2], cBase) + treeCount(tree, tree[v * 2 + 1], cBase)
+    }
+
+    fn adapt() {
+        let h = hdr
+        let id = h.ctxId
+        let ctx = id * pCount
+        let uf = if h.keyframe || h.intraOnly || !lastKeyframe { 112 } else { 128 }
+        let cc = bd.cntCoef
+        let ce = bd.cntEob
+        for g in 0..(16 * 36) {
+            let l = (g / 6) % 6
+            let m = g % 6
+            if l == 0 && m >= 3 {
+                continue
+            }
+            let pi = id * 1728 + g * 3
+            adaptCoef(pi, ce[g * 2], ce[g * 2 + 1], uf)
+            adaptCoef(pi + 1, cc[g * 3], cc[g * 3 + 1] + cc[g * 3 + 2], uf)
+            adaptCoef(pi + 2, cc[g * 3 + 1], cc[g * 3 + 2], uf)
+        }
+        if h.keyframe || h.intraOnly {
+            for i in 0..3 {
+                ctxP[ctx + pSkip + i] = p[pSkip + i]
+            }
+            for i in 0..6 {
+                ctxP[ctx + pTx32 + i] = p[pTx32 + i]
+            }
+            for i in 0..4 {
+                ctxP[ctx + pTx16 + i] = p[pTx16 + i]
+            }
+            for i in 0..2 {
+                ctxP[ctx + pTx8 + i] = p[pTx8 + i]
+            }
+            return
+        }
+        for i in 0..3 {
+            adaptProb(pSkip + i, cnt[cSkip + i * 2], cnt[cSkip + i * 2 + 1], 20, 128, ctx)
+        }
+        for i in 0..4 {
+            adaptProb(pIntra + i, cnt[cIntra + i * 2], cnt[cIntra + i * 2 + 1], 20, 128, ctx)
+        }
+        if h.compPredMode == 2 {
+            for i in 0..5 {
+                adaptProb(pComp + i, cnt[cComp + i * 2], cnt[cComp + i * 2 + 1], 20, 128, ctx)
+            }
+        }
+        if h.compPredMode != 0 {
+            for i in 0..5 {
+                adaptProb(pCompRef + i, cnt[cCompRef + i * 2], cnt[cCompRef + i * 2 + 1], 20, 128, ctx)
+            }
+        }
+        if h.compPredMode != 1 {
+            for i in 0..5 {
+                adaptProb(pSingleRef + i * 2, cnt[cSingleRef + i * 4], cnt[cSingleRef + i * 4 + 1], 20, 128, ctx)
+                adaptProb(pSingleRef + i * 2 + 1, cnt[cSingleRef + i * 4 + 2], cnt[cSingleRef + i * 4 + 3], 20, 128, ctx)
+            }
+        }
+        for i in 0..4 {
+            for j in 0..4 {
+                let pb = pPartition + i * 12 + j * 3
+                let cb = cPartition + i * 16 + j * 4
+                let c0 = cnt[cb]
+                let c1 = cnt[cb + 1]
+                let c2 = cnt[cb + 2]
+                let c3 = cnt[cb + 3]
+                adaptProb(pb, c0, c1 + c2 + c3, 20, 128, ctx)
+                adaptProb(pb + 1, c1, c2 + c3, 20, 128, ctx)
+                adaptProb(pb + 2, c2, c3, 20, 128, ctx)
+            }
+        }
+        if h.txMode == 4 {
+            for i in 0..2 {
+                let c16 = cTx16 + i * 3
+                let c32 = cTx32 + i * 4
+                adaptProb(pTx8 + i, cnt[cTx8 + i * 2], cnt[cTx8 + i * 2 + 1], 20, 128, ctx)
+                adaptProb(pTx16 + i * 2, cnt[c16], cnt[c16 + 1] + cnt[c16 + 2], 20, 128, ctx)
+                adaptProb(pTx16 + i * 2 + 1, cnt[c16 + 1], cnt[c16 + 2], 20, 128, ctx)
+                adaptProb(pTx32 + i * 3, cnt[c32], cnt[c32 + 1] + cnt[c32 + 2] + cnt[c32 + 3], 20, 128, ctx)
+                adaptProb(pTx32 + i * 3 + 1, cnt[c32 + 1], cnt[c32 + 2] + cnt[c32 + 3], 20, 128, ctx)
+                adaptProb(pTx32 + i * 3 + 2, cnt[c32 + 2], cnt[c32 + 3], 20, 128, ctx)
+            }
+        }
+        if h.interpFilter == filterSwitchable {
+            for i in 0..4 {
+                let cb = cFilter + i * 3
+                adaptProb(pFilter + i * 2, cnt[cb], cnt[cb + 1] + cnt[cb + 2], 20, 128, ctx)
+                adaptProb(pFilter + i * 2 + 1, cnt[cb + 1], cnt[cb + 2], 20, 128, ctx)
+            }
+        }
+        for i in 0..7 {
+            let cb = cMvMode + i * 4
+            let pb = pMvMode + i * 3
+            adaptProb(pb, cnt[cb + 2], cnt[cb + 1] + cnt[cb] + cnt[cb + 3], 20, 128, ctx)
+            adaptProb(pb + 1, cnt[cb], cnt[cb + 1] + cnt[cb + 3], 20, 128, ctx)
+            adaptProb(pb + 2, cnt[cb + 1], cnt[cb + 3], 20, 128, ctx)
+        }
+        let mj = cMvJoint
+        adaptProb(pMvJoint, cnt[mj], cnt[mj + 1] + cnt[mj + 2] + cnt[mj + 3], 20, 128, ctx)
+        adaptProb(pMvJoint + 1, cnt[mj + 1], cnt[mj + 2] + cnt[mj + 3], 20, 128, ctx)
+        adaptProb(pMvJoint + 2, cnt[mj + 2], cnt[mj + 3], 20, 128, ctx)
+        for i in 0..2 {
+            let b = pMvComp + i * 33
+            let k = cMvComp + i * 51
+            adaptProb(b + mvcSign, cnt[k + mvkSign], cnt[k + mvkSign + 1], 20, 128, ctx)
+            let c = k + mvkClasses
+            var sum = 0
+            for j in 1..11 {
+                sum += cnt[c + j]
+            }
+            adaptProb(b + mvcClasses, cnt[c], sum, 20, 128, ctx)
+            sum -= cnt[c + 1]
+            adaptProb(b + mvcClasses + 1, cnt[c + 1], sum, 20, 128, ctx)
+            sum -= cnt[c + 2] + cnt[c + 3]
+            adaptProb(b + mvcClasses + 2, cnt[c + 2] + cnt[c + 3], sum, 20, 128, ctx)
+            adaptProb(b + mvcClasses + 3, cnt[c + 2], cnt[c + 3], 20, 128, ctx)
+            sum -= cnt[c + 4] + cnt[c + 5]
+            adaptProb(b + mvcClasses + 4, cnt[c + 4] + cnt[c + 5], sum, 20, 128, ctx)
+            adaptProb(b + mvcClasses + 5, cnt[c + 4], cnt[c + 5], 20, 128, ctx)
+            sum -= cnt[c + 6]
+            adaptProb(b + mvcClasses + 6, cnt[c + 6], sum, 20, 128, ctx)
+            adaptProb(b + mvcClasses + 7, cnt[c + 7] + cnt[c + 8], cnt[c + 9] + cnt[c + 10], 20, 128, ctx)
+            adaptProb(b + mvcClasses + 8, cnt[c + 7], cnt[c + 8], 20, 128, ctx)
+            adaptProb(b + mvcClasses + 9, cnt[c + 9], cnt[c + 10], 20, 128, ctx)
+            adaptProb(b + mvcClass0, cnt[k + mvkClass0], cnt[k + mvkClass0 + 1], 20, 128, ctx)
+            for j in 0..10 {
+                adaptProb(b + mvcBits + j, cnt[k + mvkBits + j * 2], cnt[k + mvkBits + j * 2 + 1], 20, 128, ctx)
+            }
+            for j in 0..2 {
+                let fb = b + mvcClass0Fp + j * 3
+                let fc = k + mvkClass0Fp + j * 4
+                adaptProb(fb, cnt[fc], cnt[fc + 1] + cnt[fc + 2] + cnt[fc + 3], 20, 128, ctx)
+                adaptProb(fb + 1, cnt[fc + 1], cnt[fc + 2] + cnt[fc + 3], 20, 128, ctx)
+                adaptProb(fb + 2, cnt[fc + 2], cnt[fc + 3], 20, 128, ctx)
+            }
+            let fc = k + mvkFp
+            adaptProb(b + mvcFp, cnt[fc], cnt[fc + 1] + cnt[fc + 2] + cnt[fc + 3], 20, 128, ctx)
+            adaptProb(b + mvcFp + 1, cnt[fc + 1], cnt[fc + 2] + cnt[fc + 3], 20, 128, ctx)
+            adaptProb(b + mvcFp + 2, cnt[fc + 2], cnt[fc + 3], 20, 128, ctx)
+            if h.highPrecisionMv {
+                adaptProb(b + mvcClass0Hp, cnt[k + mvkClass0Hp], cnt[k + mvkClass0Hp + 1], 20, 128, ctx)
+                adaptProb(b + mvcHp, cnt[k + mvkHp], cnt[k + mvkHp + 1], 20, 128, ctx)
+            }
+        }
+        for i in 0..4 {
+            adaptModes(pYMode + i * 9, cYMode + i * 10, ctx)
+        }
+        for i in 0..10 {
+            adaptModes(pUvMode + i * 9, cUvMode + i * 10, ctx)
+        }
+    }
+
+    // Intra mode probabilities from counts (FFmpeg's y/uv mode adaptation
+    // in tree order DC, TM, V, (H, D135, D117), D45, D63, (D153, D207)).
+    fn adaptModes(_ pb: Int, _ cb: Int, _ ctx: Int) {
+        var sum = 0
+        for j in 0..10 {
+            if j != modeDc {
+                sum += cnt[cb + j]
+            }
+        }
+        adaptProb(pb, cnt[cb + modeDc], sum, 20, 128, ctx)
+        sum -= cnt[cb + modeTm]
+        adaptProb(pb + 1, cnt[cb + modeTm], sum, 20, 128, ctx)
+        sum -= cnt[cb + modeV]
+        adaptProb(pb + 2, cnt[cb + modeV], sum, 20, 128, ctx)
+        var s2 = cnt[cb + modeH] + cnt[cb + modeD135] + cnt[cb + modeD117]
+        sum -= s2
+        adaptProb(pb + 3, s2, sum, 20, 128, ctx)
+        s2 -= cnt[cb + modeH]
+        adaptProb(pb + 4, cnt[cb + modeH], s2, 20, 128, ctx)
+        adaptProb(pb + 5, cnt[cb + modeD135], cnt[cb + modeD117], 20, 128, ctx)
+        sum -= cnt[cb + modeD45]
+        adaptProb(pb + 6, cnt[cb + modeD45], sum, 20, 128, ctx)
+        sum -= cnt[cb + modeD63]
+        adaptProb(pb + 7, cnt[cb + modeD63], sum, 20, 128, ctx)
+        adaptProb(pb + 8, cnt[cb + modeD153], cnt[cb + modeD207], 20, 128, ctx)
+    }
+}
+
+let vp9NoMv = 1 << 40
+
+// FFmpeg's inv_map_table for update_prob.
+let vp9InvMap: [Int] = [7, 20, 33, 46, 59, 72, 85, 98, 111, 124, 137, 150, 163, 176,
+    189, 202, 215, 228, 241, 254, 1, 2, 3, 4, 5, 6, 8, 9,
+    10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 21, 22, 23, 24,
+    25, 26, 27, 28, 29, 30, 31, 32, 34, 35, 36, 37, 38, 39,
+    40, 41, 42, 43, 44, 45, 47, 48, 49, 50, 51, 52, 53, 54,
+    55, 56, 57, 58, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69,
+    70, 71, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84,
+    86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 99, 100,
+    101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 112, 113, 114, 115,
+    116, 117, 118, 119, 120, 121, 122, 123, 125, 126, 127, 128, 129, 130,
+    131, 132, 133, 134, 135, 136, 138, 139, 140, 141, 142, 143, 144, 145,
+    146, 147, 148, 149, 151, 152, 153, 154, 155, 156, 157, 158, 159, 160,
+    161, 162, 164, 165, 166, 167, 168, 169, 170, 171, 172, 173, 174, 175,
+    177, 178, 179, 180, 181, 182, 183, 184, 185, 186, 187, 188, 190, 191,
+    192, 193, 194, 195, 196, 197, 198, 199, 200, 201, 203, 204, 205, 206,
+    207, 208, 209, 210, 211, 212, 213, 214, 216, 217, 218, 219, 220, 221,
+    222, 223, 224, 225, 226, 227, 229, 230, 231, 232, 233, 234, 235, 236,
+    237, 238, 239, 240, 242, 243, 244, 245, 246, 247, 248, 249, 250, 251,
+    252, 253, 253]
+
+fn vp9InvRecenter(_ v: Int, _ m: Int) -> Int {
+    if v > 2 * m {
+        return v
+    }
+    if (v & 1) == 1 {
+        return m - ((v + 1) >> 1)
+    }
+    m + (v >> 1)
+}
+
+// A signed value whose sign bit comes after its magnitude (su(n) in 6.2).
+fn vp9InvSigned(_ r: bind core.BitReader, _ n: Int) -> Int {
+    let v = r.bits(n)
+    if r.bit() == 1 {
+        return -v
+    }
+    v
+}
+
+fn vp9Clip(_ v: Int, _ lo: Int, _ hi: Int) -> Int {
+    if v < lo {
+        return lo
+    }
+    if v > hi {
+        return hi
+    }
+    v
+}
+
+fn vp9B(_ c: Bool) -> Int {
+    if c { 1 } else { 0 }
+}
+
+// Tile boundaries in 8x8 units (get_tile_offset, 6.4).
+fn vp9TileOffset(_ idx: Int, _ log2: Int, _ n: Int) -> Int {
+    min((idx * n) >> log2, n) << 3
+}
+
+// The largest transform size of a block size.
+fn vp9MaxTx(_ bs: Int) -> Int {
+    if bs <= 3 {
+        return 3
+    }
+    if bs <= 6 {
+        return 2
+    }
+    if bs <= 9 {
+        return 1
+    }
+    0
+}
+
+fn vp9SizeGroup(_ bs: Int) -> Int {
+    if bs <= 3 {
+        return 3
+    }
+    if bs <= 6 {
+        return 2
+    }
+    1
+}
+
+// The partition contexts a block size leaves above and to the left.
+fn vp9LeftCtx(_ bs: Int) -> Int {
+    let t = [0x0, 0x8, 0x0, 0x8, 0xc, 0x8, 0xc, 0xe, 0xc, 0xe, 0xf, 0xe, 0xf]
+    t[bs]
+}
+
+fn vp9AboveCtx(_ bs: Int) -> Int {
+    let t = [0x0, 0x0, 0x8, 0x8, 0x8, 0xc, 0xc, 0xc, 0xe, 0xe, 0xe, 0xf, 0xf]
+    t[bs]
+}
+
+// Which above/left mode entry gives the inter mode context.
+fn vp9ModeCtxOff(_ bs: Int) -> Int {
+    if bs == 0 {
+        return 3
+    }
+    if bs == 3 {
+        return 1
+    }
+    0
+}
+
+// FFmpeg's inter_mode_ctx_lut.
+fn vp9InterModeCtx(_ a: Int, _ l: Int) -> Int {
+    if a < 10 && l < 10 {
+        return 6
+    }
+    if a < 10 || l < 10 {
+        return 5
+    }
+    let t = [2, 2, 1, 3, 2, 2, 1, 3, 1, 1, 0, 3, 3, 3, 3, 4]
+    t[(a - 10) * 4 + (l - 10)]
+}
+
+// The candidate neighbour offsets (column, row) of mv_ref_blocks.
+fn vp9MvRefOffsets(_ bs: Int) -> [Int] {
+    if bs == 0 {
+        return [3, -1, -1, 3, 4, -1, -1, 4, -1, -1, 0, -1, -1, 0, 6, -1]
+    }
+    if bs == 1 {
+        return [0, -1, -1, 0, 4, -1, -1, 2, -1, -1, 0, -3, -3, 0, 2, -1]
+    }
+    if bs == 2 {
+        return [-1, 0, 0, -1, -1, 4, 2, -1, -1, -1, -3, 0, 0, -3, -1, 2]
+    }
+    if bs == 3 {
+        return [1, -1, -1, 1, 2, -1, -1, 2, -1, -1, 0, -3, -3, 0, -3, -3]
+    }
+    if bs == 4 {
+        return [0, -1, -1, 0, 2, -1, -1, -1, -1, 1, 0, -3, -3, 0, -3, -3]
+    }
+    if bs == 5 {
+        return [-1, 0, 0, -1, -1, 2, -1, -1, 1, -1, -3, 0, 0, -3, -3, -3]
+    }
+    if bs == 6 {
+        return [0, -1, -1, 0, 1, -1, -1, 1, -1, -1, 0, -3, -3, 0, -3, -3]
+    }
+    if bs == 7 {
+        return [0, -1, -1, 0, 1, -1, -1, -1, 0, -2, -2, 0, -2, -1, -1, -2]
+    }
+    if bs == 8 {
+        return [-1, 0, 0, -1, -1, 1, -1, -1, -2, 0, 0, -2, -1, -2, -2, -1]
+    }
+    [0, -1, -1, 0, -1, -1, 0, -2, -2, 0, -1, -2, -2, -1, -2, -2]
+}
+
+// Offset of a scan table in the joined scan list (×2 for neighbours):
+// tx sizes 4, 8, 16 have default, column and row scans; 32 only default.
+fn vp9ScanOff(_ tx: Int, _ txType: Int) -> Int {
+    let kind = if txType == 1 { 1 } else if txType == 2 { 2 } else { 0 }
+    if tx == 0 {
+        return kind * 16
+    }
+    if tx == 1 {
+        return 48 + kind * 64
+    }
+    if tx == 2 {
+        return 240 + kind * 256
+    }
+    1008
+}
+
+fn vp9Set(_ a: bind [Int], _ at: Int, _ n: Int, _ v: Int) {
+    var i = 0
+    while i < n {
+        a[at + i] = v
+        i += 1
+    }
+}
+
+fn vp9Fill(_ a: bind [Int], _ v: Int) {
+    var i = 0
+    let n = a.count
+    while i < n {
+        a[i] = v
+        i += 1
+    }
+}
+
+fn vp9Filled(_ n: Int, _ v: Int) -> [Int] {
+    var out: [Int] = []
+    var i = 0
+    while i < n {
+        out.append(v)
+        i += 1
+    }
+    out
+}
+
+fn vp9Put(_ a: bind [Int], _ at: Int, _ src: [Int]) {
+    var i = 0
+    while i < src.count {
+        a[at + i] = src[i]
+        i += 1
+    }
+}
+
+fn vp9Slice(_ a: [Int], _ at: Int, _ n: Int) -> [Int] {
+    var out: [Int] = []
+    var i = 0
+    while i < n {
+        out.append(a[at + i])
+        i += 1
+    }
+    out
+}
+
+
+// The nnz context merge before a larger transform (any of `step` entries
+// set → 1).
+fn vp9Merge(_ a: bind [Int], _ at: Int, _ end: Int, _ step: Int) {
+    var n = 0
+    while n < end {
+        var v = 0
+        for k in 0..step {
+            v = v | a[at + n + k]
+        }
+        a[at + n] = if v != 0 { 1 } else { 0 }
+        n += step
+    }
+}
+
+// … and the spread after it (FFmpeg's SPLAT).
+fn vp9Splat(_ a: bind [Int], _ at: Int, _ end: Int, _ step: Int, _ full: Bool) {
+    var n = 0
+    if step == 2 {
+        n = 1
+        while n < end {
+            a[at + n] = a[at + n - 1]
+            n += 2
+        }
+        return
+    }
+    while n < end {
+        let v = a[at + n]
+        let cnt = if full { step - 1 } else { min(end - n - 1, step - 1) }
+        for k in 0..cnt {
+            a[at + n + 1 + k] = v
+        }
+        n += step
+    }
+}

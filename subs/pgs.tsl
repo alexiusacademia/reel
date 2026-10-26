@@ -1,0 +1,352 @@
+// PGS (Presentation Graphic Stream, Blu-ray's "HDMV PGS" subtitles), after
+// the Blu-ray BD-ROM format's graphics stream description as implemented
+// by ffmpeg's pgssubdec and documented in "Presentation Graphic Stream
+// (SUP files) BluRay Subtitle Format" (TheScorpius666):
+//
+//   segment  = type (1) + length (2) + body; in a .sup file each segment
+//              is preceded by "PG", a 32-bit PTS and DTS (90 kHz)
+//   0x16 PCS presentation composition: video size, composition state,
+//            palette id, and the objects shown (id, window, x, y, crop)
+//   0x17 WDS window definitions (read past: objects are placed by PCS)
+//   0x14 PDS palette: entries of index, Y, Cr, Cb, alpha
+//   0x15 ODS object: id, version, sequence flags, (first fragment) data
+//            length, width, height, then run-length coded pixels
+//   0x80 END end of display set: the screen is updated now
+//
+// A display set whose PCS shows no objects clears the screen: the cue
+// shown before ends there (we send that cue again with its real end and
+// the same id; see replaceCues).
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../core"
+
+struct PgsObject {
+    w: Int = 0
+    h: Int = 0
+    rle: Data = Data()
+}
+
+struct PgsPlaced {
+    id: Int
+    x: Int
+    y: Int
+    forced: Bool = false
+    crop: Bool = false
+    cx: Int = 0
+    cy: Int = 0
+    cw: Int = 0
+    ch: Int = 0
+}
+
+struct PgsState {
+    width: Int = 1920
+    height: Int = 1080
+    palettes: [Int: [Int]] = [:]
+    objects: [Int: PgsObject] = [:]
+    placed: [PgsPlaced] = []
+    paletteId: Int = 0
+    // The PCS of the display set being read.
+    havePcs: Bool = false
+    // When the display set's composition is shown (the PCS's PTS in a
+    // .sup file: the other segments carry decoding times).
+    pcsTime: Float = 0.0
+    // The cue on screen (0 or 1 of them), to end it at the next set.
+    showing: [Cue] = []
+    canvas: [Int] = []
+    nextId: Int = 1
+    warnings: [String] = []
+
+    fn reset() {
+        objects = [:]
+        palettes = [:]
+        placed = []
+        havePcs = false
+        showing = []
+    }
+
+    // YCbCr (video range) to rgba, BT.709 for HD as ffmpeg does, BT.601
+    // for SD (pgssubdec.c parse_palette_segment).
+    fn ycc(_ y: Int, _ cr: Int, _ cb: Int, _ a: Int) -> Int {
+        let yy = 1.164383 * Float(y - 16)
+        let u = Float(cb - 128)
+        let v = Float(cr - 128)
+        var r = 0.0
+        var g = 0.0
+        var b = 0.0
+        if height > 576 {
+            r = yy + 1.792741 * v
+            g = yy - 0.213249 * u - 0.532909 * v
+            b = yy + 2.112402 * u
+        } else {
+            r = yy + 1.596027 * v
+            g = yy - 0.391762 * u - 0.812968 * v
+            b = yy + 2.017232 * u
+        }
+        rgba(Int(round(r)).clamped(min: 0, max: 255), Int(round(g)).clamped(min: 0, max: 255), Int(round(b)).clamped(min: 0, max: 255), a)
+    }
+
+    // One segment; returns the cues an END segment makes.
+    fn segment(_ kind: Int, _ d: Data, _ from: Int, _ to: Int, time: Float, duration: Float) -> [Cue] {
+        let len = to - from
+        if kind == 0x16 {
+            if len < 11 {
+                warnings.append("short PGS composition segment")
+                return []
+            }
+            width = d.uint16(at: from, bigEndian: true)
+            height = d.uint16(at: from + 2, bigEndian: true)
+            let compState = d[from + 7]
+            if compState & 0x80 != 0 {
+                // Epoch start: everything from before is gone.
+                objects = [:]
+                palettes = [:]
+            }
+            paletteId = d[from + 9]
+            let n = d[from + 10]
+            placed = []
+            var p = from + 11
+            for _ in 0..n {
+                if p + 8 > to {
+                    break
+                }
+                var o = PgsPlaced(id: d.uint16(at: p, bigEndian: true), x: d.uint16(at: p + 4, bigEndian: true), y: d.uint16(at: p + 6, bigEndian: true))
+                let flags = d[p + 3]
+                o.forced = flags & 0x40 != 0
+                p += 8
+                if flags & 0x80 != 0 && p + 8 <= to {
+                    o.crop = true
+                    o.cx = d.uint16(at: p, bigEndian: true)
+                    o.cy = d.uint16(at: p + 2, bigEndian: true)
+                    o.cw = d.uint16(at: p + 4, bigEndian: true)
+                    o.ch = d.uint16(at: p + 6, bigEndian: true)
+                    p += 8
+                }
+                placed.append(o)
+            }
+            havePcs = true
+            pcsTime = time
+            return []
+        }
+        if kind == 0x14 {
+            if len < 2 {
+                return []
+            }
+            let id = d[from]
+            var pal = palettes[id] ?? core.zeros(256)
+            var p = from + 2
+            while p + 5 <= to {
+                pal[d[p]] = ycc(d[p + 1], d[p + 2], d[p + 3], d[p + 4])
+                p += 5
+            }
+            palettes[id] = pal
+            return []
+        }
+        if kind == 0x15 {
+            if len < 4 {
+                return []
+            }
+            let id = d.uint16(at: from, bigEndian: true)
+            let seq = d[from + 3]
+            if seq & 0x80 != 0 {
+                if len < 11 {
+                    return []
+                }
+                var o = PgsObject()
+                o.w = d.uint16(at: from + 7, bigEndian: true)
+                o.h = d.uint16(at: from + 9, bigEndian: true)
+                o.rle = d.slice(from: from + 11, to: to)
+                objects[id] = o
+            } else if let o0 = objects[id] {
+                var o = o0
+                o.rle = o.rle + d.slice(from: from + 4, to: to)
+                objects[id] = o
+            }
+            return []
+        }
+        if kind == 0x80 {
+            if !havePcs {
+                return []
+            }
+            havePcs = false
+            return compose(time: pcsTime, duration: duration)
+        }
+        []
+    }
+
+    // The END of a display set: the cue it shows (and the end of the one
+    // shown before it).
+    fn compose(time: Float, duration: Float) -> [Cue] {
+        var out: [Cue] = []
+        if !showing.isEmpty {
+            var old = showing[0]
+            if old.end > time {
+                old.end = time
+                out.append(old)
+            }
+            showing = []
+        }
+        if placed.isEmpty {
+            return out
+        }
+        // The rectangle around every object shown.
+        var x0 = 1 << 30
+        var y0 = 1 << 30
+        var x1 = 0
+        var y1 = 0
+        var forced = true
+        for o in placed {
+            if let obj = objects[o.id] {
+                let w = if o.crop { o.cw } else { obj.w }
+                let h = if o.crop { o.ch } else { obj.h }
+                x0 = min(x0, o.x)
+                y0 = min(y0, o.y)
+                x1 = max(x1, o.x + w)
+                y1 = max(y1, o.y + h)
+                forced = forced && o.forced
+            }
+        }
+        if x1 <= x0 || y1 <= y0 {
+            warnings.append("PGS composition shows objects that weren't sent")
+            return out
+        }
+        let bw = x1 - x0
+        let bh = y1 - y0
+        canvas = core.zeros(bw * bh)
+        let pal = palettes[paletteId] ?? core.zeros(256)
+        for o in placed {
+            if let obj = objects[o.id] {
+                paint(obj, pal, o, x0: x0, y0: y0, bw: bw, bh: bh)
+            }
+        }
+        var cue = Cue(start: time, end: if duration > 0.0 { time + duration } else { openEnd })
+        cue.bitmap = SubBitmap(x: x0, y: y0, w: bw, h: bh, pixels: canvas, frameWidth: width, frameHeight: height)
+        cue.forced = forced
+        cue.id = nextId
+        nextId += 1
+        canvas = []
+        out.append(cue)
+        if cue.end >= openEnd {
+            showing = [cue]
+        }
+        out
+    }
+
+    // Decodes an object's run-length pixels into the canvas:
+    //   CCCCCCCC                      one pixel of colour C (C ≠ 0)
+    //   00000000 00LLLLLL             L pixels of colour 0
+    //   00000000 01LLLLLL LLLLLLLL    L pixels of colour 0
+    //   00000000 10LLLLLL CCCCCCCC    L pixels of colour C
+    //   00000000 11LLLLLL LLLLLLLL CCCCCCCC
+    //   00000000 00000000             end of line
+    fn paint(_ obj: PgsObject, _ pal: [Int], _ o: PgsPlaced, x0: Int, y0: Int, bw: Int, bh: Int) {
+        let d = obj.rle
+        let n = d.count
+        var p = 0
+        var x = 0
+        var y = 0
+        let ox = o.x - x0 - (if o.crop { o.cx } else { 0 })
+        let oy = o.y - y0 - (if o.crop { o.cy } else { 0 })
+        while p < n && y < obj.h {
+            var color = d[p]
+            var run = 1
+            p += 1
+            if color == 0 {
+                if p >= n {
+                    break
+                }
+                let f = d[p]
+                p += 1
+                if f == 0 {
+                    // End of line.
+                    x = 0
+                    y += 1
+                    continue
+                }
+                run = f & 0x3F
+                if f & 0x40 != 0 {
+                    if p >= n {
+                        break
+                    }
+                    run = run << 8 | d[p]
+                    p += 1
+                }
+                if f & 0x80 != 0 {
+                    if p >= n {
+                        break
+                    }
+                    color = d[p]
+                    p += 1
+                } else {
+                    color = 0
+                }
+            }
+            let px = pal[color]
+            let ty = y + oy
+            if px & 0xFF != 0 && ty >= 0 && ty < bh {
+                let row = ty * bw
+                var k = 0
+                while k < run {
+                    let tx = x + k + ox
+                    if tx >= 0 && tx < bw && x + k < obj.w {
+                        canvas[row + tx] = px
+                    }
+                    k += 1
+                }
+            }
+            x += run
+        }
+    }
+
+    // A packet of segments without the "PG" headers (Matroska, M2TS), all
+    // at one time.
+    fn packet(_ d: Data, time: Float, duration: Float) -> [Cue] {
+        var out: [Cue] = []
+        var p = 0
+        while p + 3 <= d.count {
+            if d[p] == 0x50 && p + 13 <= d.count && d[p + 1] == 0x47 {
+                // A .sup-style header slipped in: skip it.
+                p += 10
+                continue
+            }
+            let kind = d[p]
+            let len = d.uint16(at: p + 1, bigEndian: true)
+            let end = min(d.count, p + 3 + len)
+            out = replaceCues(out, segment(kind, d, p + 3, end, time: time, duration: duration))
+            p = p + 3 + len
+        }
+        out
+    }
+}
+
+// A .sup file (PGS segments with "PG" headers and 90 kHz times).
+public fn parseSup(_ data: Data) -> Result<SubTrack> {
+    var st = PgsState()
+    var cues: [Cue] = []
+    var p = 0
+    var any = false
+    while p + 13 <= data.count {
+        if data[p] != 0x50 || data[p + 1] != 0x47 {
+            // Lost sync: look for the next "PG".
+            p += 1
+            continue
+        }
+        any = true
+        let pts = data.uint32(at: p + 2, bigEndian: true)
+        let kind = data[p + 10]
+        let len = data.uint16(at: p + 11, bigEndian: true)
+        let end = min(data.count, p + 13 + len)
+        cues = replaceCues(cues, st.segment(kind, data, p + 13, end, time: Float(pts) / 90000.0, duration: 0.0))
+        p = p + 13 + len
+    }
+    if !any {
+        return .failure(error: Error("not a PGS .sup file"))
+    }
+    var track = SubTrack(format: "pgs")
+    track.cues = cues
+    track.playResX = st.width
+    track.playResY = st.height
+    track.warnings = st.warnings
+    Result.ok(value: track)
+}

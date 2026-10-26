@@ -1,0 +1,651 @@
+// MPEG program streams (.mpg, .mpeg, .vob): MPEG-1 system streams
+// (ISO/IEC 11172-1) and MPEG-2 program streams (ISO/IEC 13818-1 §2.5).
+//
+// A program stream is a run of packs. Each pack starts with a pack header
+// (00 00 01 BA; MPEG-1 and MPEG-2 forms differ), maybe a system header
+// (00 00 01 BB) and a program stream map (PSM, 00 00 01 BC), then PES
+// packets (§2.4.3.6) named by stream_id: E0–EF video, C0–DF MPEG audio,
+// BD "private stream 1" (DVD: a first payload byte names the substream —
+// 80–87 AC-3, 88–8F DTS, A0–A7 LPCM, 20–3F sub-pictures), BE padding,
+// BF private stream 2 (DVD navigation, skipped).
+//
+// PES packets don't line up with frames here (a pack holds 2048 bytes),
+// so each stream's payload is cut into frames: video at the start codes
+// that begin a picture (MPEG-1/2 sequence, GOP or picture header; H.264
+// and HEVC access unit starts; MPEG-4 VOPs), audio by frame headers (the
+// cutter shared with ts.tsl), DVD sub-pictures by their SPU_SIZE. A PES
+// packet's PTS/DTS belong to the first frame whose picture (or audio
+// frame) starts in it (§2.4.3.7); frames without one count on from the
+// previous frame (dts + one frame; B-pictures are shown when decoded).
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../core"
+
+// Video frame cutter kinds.
+let psVidMpeg12 = 1
+let psVidH264 = 2
+let psVidHevc = 3
+let psVidMpeg4 = 4
+
+// Cuts a video elementary stream into frames at start codes.
+struct PsVideoFramer {
+    kind: Int = 1
+    // The bytes not yet cut (a TsFramer used only as a byte queue).
+    q: TsFramer = TsFramer()
+    // Stream positions of start codes (00 00 01) found and not handled.
+    ev: [Int] = []
+    evHead: Int = 0
+    // Timestamps waiting for a frame: stream position, pts, dts triples.
+    marks: [Int] = []
+    mHead: Int = 0
+    // The frame being collected.
+    frameStart: Int = -1
+    picPos: Int = -1
+    picType: Int = 0
+    sawPicture: Bool = false
+    key: Bool = false
+    // Timing of frames without their own timestamps.
+    lastDts: Int = -9223372036854775807
+    lastPts: Int = -9223372036854775807
+    frameTicks: Int = 3600
+    frames: Int = 0
+    // MPEG-1/2 temporal_reference (display order within a GOP) of the
+    // frame being collected, and of the last frame with a timestamp in
+    // this GOP: frames without one are shown that many frames later.
+    tr: Int = 0
+    refPts: Int = -9223372036854775807
+    refTr: Int = 0
+
+    // The byte at a stream position (0 when it isn't there).
+    fn at(_ file: Data, _ sp: Int) -> Int {
+        let k = sp - q.pos
+        if k < 0 || k >= q.avail {
+            return 0
+        }
+        q.byteAt(file, k)
+    }
+
+    fn push(_ file: Data, _ off: Int, _ len: Int, pts: Int, dts: Int) {
+        if len <= 0 {
+            return
+        }
+        let sp = q.pos + q.avail
+        if pts != core.noTime {
+            marks.append(sp)
+            marks.append(pts)
+            marks.append(if dts == core.noTime { pts } else { dts })
+        }
+        q.push([off, len], pts: core.noTime, dts: core.noTime)
+        // A start code across the boundary with the previous piece.
+        for back in [2, 1] {
+            let p = sp - back
+            if p >= q.pos && at(file, p) == 0 && at(file, p + 1) == 0 && at(file, p + 2) == 1 {
+                if ev.count == evHead || ev[ev.count - 1] < p {
+                    ev.append(p)
+                }
+            }
+        }
+        var f = tsNextStartCode(file, off, off + len)
+        while f >= 0 {
+            ev.append(sp + f - off)
+            f = tsNextStartCode(file, f + 3, off + len)
+        }
+    }
+
+    // Handles the start codes whose first bytes are all here, cutting the
+    // frames they end. At the end of the stream (`final`), all of them and
+    // the last frame.
+    fn drain(_ file: Data, _ track: Int, final: Bool) -> [core.PacketRef] {
+        var out: [core.PacketRef] = []
+        let have = q.pos + q.avail
+        while evHead < ev.count && (final || ev[evHead] + 6 <= have) {
+            let e = ev[evHead]
+            evHead += 1
+            let c = at(file, e + 3)
+            var begins = false
+            var picture = false
+            if kind == psVidMpeg12 {
+                // A sequence header, GOP or picture header after the
+                // current picture's slices starts the next frame.
+                if c == 0xB3 || c == 0xB8 || c == 0x00 {
+                    begins = true
+                }
+                if c == 0x00 {
+                    picture = true
+                }
+            } else if kind == psVidH264 {
+                // ITU-T H.264 §7.4.1.2.3: an access unit starts at an AUD,
+                // SPS, PPS, SEI or prefix NAL, or at a slice whose
+                // first_mb_in_slice is 0, after the previous one's slices.
+                let t = c & 31
+                if t == 1 || t == 5 {
+                    picture = (at(file, e + 4) & 0x80) != 0
+                    begins = picture
+                } else if t == 6 || t == 7 || t == 8 || t == 9 || (t >= 14 && t <= 18) {
+                    begins = true
+                }
+            } else if kind == psVidHevc {
+                // H.265 §7.4.2.4.4: the same with first_slice_segment_in_pic_flag.
+                let t = (c >> 1) & 63
+                if t < 32 {
+                    picture = (at(file, e + 5) & 0x80) != 0
+                    begins = picture
+                } else if (t >= 32 && t <= 35) || t == 39 || (t >= 41 && t <= 44) || (t >= 48 && t <= 55) {
+                    begins = true
+                }
+            } else {
+                // MPEG-4 Part 2: VOS, VO, VOL and GOV headers or a VOP.
+                if c == 0xB6 {
+                    picture = true
+                    begins = true
+                } else if c == 0xB0 || c == 0xB3 || c <= 0x2F {
+                    begins = true
+                }
+            }
+            // An H.264/HEVC zero_byte before a 00 00 01 belongs to the
+            // NAL unit after it (Annex B.1), so a frame starts there.
+            var b = e
+            if (kind == psVidH264 || kind == psVidHevc) && begins && e - 1 > frameStart && e - 1 >= q.pos && at(file, e - 1) == 0 {
+                b = e - 1
+            }
+            if begins && sawPicture {
+                out.append(cut(file, track, b))
+            }
+            if kind == psVidMpeg12 && c == 0xB8 {
+                // A GOP header: temporal references count from 0 again.
+                refPts = core.noTime
+            }
+            if begins && frameStart < 0 {
+                frameStart = b
+                if b > q.pos {
+                    q.drop(b - q.pos)
+                }
+            }
+            if picture && frameStart >= 0 && !sawPicture {
+                sawPicture = true
+                picPos = e
+                if kind == psVidMpeg12 {
+                    picType = (at(file, e + 5) >> 3) & 7
+                    tr = (at(file, e + 4) << 2) | (at(file, e + 5) >> 6)
+                    key = picType == 1
+                } else if kind == psVidH264 {
+                    key = (c & 31) == 5 || key
+                    picType = if key { 1 } else { 0 }
+                } else if kind == psVidHevc {
+                    let t = (c >> 1) & 63
+                    key = (t >= 16 && t <= 23) || key
+                    picType = if key { 1 } else { 0 }
+                } else {
+                    picType = (at(file, e + 4) >> 6) + 1
+                    key = picType == 1
+                }
+            }
+            if kind == psVidH264 && (c & 31) == 6 && at(file, e + 4) == 6 && frameStart >= 0 {
+                // Recovery point SEI: decoding can start here.
+                key = true
+            }
+        }
+        if final && frameStart >= 0 && sawPicture {
+            out.append(cut(file, track, have))
+        }
+        q.compact()
+        if evHead >= 256 {
+            ev = ev.slice(from: evHead, to: ev.count)
+            evHead = 0
+        }
+        out
+    }
+
+    // The frame from frameStart up to stream position `end`.
+    fn cut(_ file: Data, _ track: Int, _ end: Int) -> core.PacketRef {
+        let len = end - frameStart
+        let parts = q.take(len)
+        let tpos = if picPos >= 0 { picPos } else { frameStart }
+        var found = false
+        var mp = core.noTime
+        var md = core.noTime
+        while mHead + 2 < marks.count && marks[mHead] <= tpos {
+            mp = marks[mHead + 1]
+            md = marks[mHead + 2]
+            found = true
+            mHead += 3
+        }
+        if mHead >= 96 {
+            marks = marks.slice(from: mHead, to: marks.count)
+            mHead = 0
+        }
+        var pts = mp
+        var dts = md
+        if !found {
+            // No timestamp of its own: decoded one frame after the
+            // previous one, shown by its temporal reference (MPEG-1/2),
+            // else when decoded.
+            if lastDts != core.noTime {
+                dts = lastDts + frameTicks
+                // (H.264, HEVC and MPEG-4 frames may be reordered too, and
+                // only their decoder knows how: their pts stays unknown,
+                // as in ffmpeg.)
+                if kind == psVidMpeg12 && refPts != core.noTime {
+                    pts = refPts + (tr - refTr) * frameTicks
+                } else if picType == 3 && kind == psVidMpeg12 {
+                    pts = dts
+                }
+            }
+        } else if kind == psVidMpeg12 {
+            refPts = pts
+            refTr = tr
+        }
+        if dts != core.noTime {
+            lastDts = dts
+        }
+        if pts != core.noTime {
+            lastPts = pts
+        }
+        var p = core.PacketRef(track: track, pts: pts, dts: dts, duration: frameTicks, key: key, offset: parts[0], size: len)
+        if parts.count > 2 {
+            p.parts = parts
+        }
+        frames += 1
+        frameStart = end
+        picPos = -1
+        picType = 0
+        sawPicture = false
+        key = false
+        p
+    }
+}
+
+// One elementary stream.
+struct PsStream {
+    // stream_id, or 0xBD00 + substream for private stream 1.
+    id: Int
+    track: Int
+    // How its payload is cut: 0 one PES one packet, 1 by frame headers,
+    // 2 at video start codes.
+    mode: Int = 0
+    // Bytes to skip at the start of each PES payload (DVD substream
+    // headers).
+    skip: Int = 0
+    framer: TsFramer = TsFramer()
+    video: PsVideoFramer = PsVideoFramer()
+    probed: Bool = false
+    probeTries: Int = 0
+    lastTs: Int = -9223372036854775807
+    lost: Int = 0
+    // For packets cut one per PES: where the last one ended.
+    lastEnd: Int = -9223372036854775807
+}
+
+struct PsReader {
+    file: Data
+    streams: [PsStream] = []
+    // stream id (or 0xBD00 + substream) → index in streams, -1 none.
+    slotOf: [Int: Int] = [:]
+    tracks: [core.Track] = []
+    packets: [core.PacketRef] = []
+    warnings: [String] = []
+    // From the program stream map: elementary_stream_id → stream_type.
+    psm: [Int: Int] = [:]
+    resyncs: Int = 0
+    mpeg2: Bool = false
+
+    fn run() {
+        let n = file.count
+        var at = 0
+        while at + 4 <= n {
+            if file[at] != 0 || file[at + 1] != 0 || file[at + 2] != 1 || file[at + 3] < 0xB9 {
+                at = resync(at)
+                continue
+            }
+            let id = file[at + 3]
+            if id == 0xBA {
+                // Pack header: MPEG-2 ('01' after the start code) is 14
+                // bytes plus stuffing; MPEG-1 ('0010') is 12.
+                if at + 5 > n {
+                    break
+                }
+                if (file[at + 4] >> 6) == 1 {
+                    mpeg2 = true
+                    if at + 14 > n {
+                        break
+                    }
+                    at += 14 + (file[at + 13] & 7)
+                } else {
+                    at += 12
+                }
+                continue
+            }
+            if id == 0xB9 {
+                // MPEG_program_end_code.
+                at += 4
+                continue
+            }
+            if at + 6 > n {
+                break
+            }
+            let plen = (file[at + 4] << 8) | file[at + 5]
+            let end = min(at + 6 + plen, n)
+            if id == 0xBC {
+                readPsm(at + 6, end)
+            } else if id == 0xBD || (id >= 0xC0 && id <= 0xEF) || id == 0xFD {
+                readPes(id, at, end)
+            }
+            at = end
+        }
+        for s in 0..streams.count {
+            if streams[s].mode == 1 {
+                packets += streams[s].framer.drain(file, streams[s].track, final: true)
+            } else if streams[s].mode == 2 {
+                packets += streams[s].video.drain(file, streams[s].track, final: true)
+            }
+        }
+    }
+
+    // After lost sync: the next pack, system header or PES start code.
+    fn resync(_ at: Int) -> Int {
+        resyncs += 1
+        var q = at + 1
+        let n = file.count
+        while q + 4 <= n {
+            let f = tsNextStartCode(file, q, n)
+            if f < 0 {
+                return n
+            }
+            if f + 3 < n && file[f + 3] >= 0xB9 {
+                return f
+            }
+            q = f + 1
+        }
+        n
+    }
+
+    // A PES packet (§2.4.3.6; MPEG-1 form ISO/IEC 11172-1 §2.4.3.3).
+    fn readPes(_ sid: Int, _ at: Int, _ end: Int) {
+        var p = at + 6
+        var pts = core.noTime
+        var dts = core.noTime
+        if p < end && (file[p] >> 6) == 2 {
+            // MPEG-2: flags, PES_header_data_length, then PTS/DTS.
+            if p + 3 > end {
+                return
+            }
+            let flags = file[p + 1] >> 6
+            let hdl = file[p + 2]
+            if (flags & 2) != 0 && p + 8 <= end {
+                pts = tsTimestamp(file, p + 3)
+                if flags == 3 && p + 13 <= end {
+                    dts = tsTimestamp(file, p + 8)
+                }
+            }
+            p += 3 + hdl
+        } else {
+            // MPEG-1: stuffing bytes 0xFF, maybe STD_buffer, then the
+            // timestamps or 0x0F.
+            var k = 0
+            while p < end && file[p] == 0xFF && k < 16 {
+                p += 1
+                k += 1
+            }
+            if p < end && (file[p] >> 6) == 1 {
+                p += 2
+            }
+            if p < end {
+                let b = file[p] >> 4
+                if b == 2 && p + 5 <= end {
+                    pts = tsTimestamp(file, p)
+                    p += 5
+                } else if b == 3 && p + 10 <= end {
+                    pts = tsTimestamp(file, p)
+                    dts = tsTimestamp(file, p + 5)
+                    p += 10
+                } else {
+                    p += 1
+                }
+            }
+        }
+        if p >= end {
+            return
+        }
+        var key = sid
+        if sid == 0xBD {
+            key = 0xBD00 + file[p]
+        }
+        var slot = slotOf[key] ?? -1
+        if slot < 0 {
+            slot = addStream(key, p, end)
+            if slot < 0 {
+                return
+            }
+        }
+        // Timestamps, unwrapped past 2^33.
+        let ref = streams[slot].lastTs
+        if pts != core.noTime {
+            pts = tsUnwrap(pts, ref)
+            if dts != core.noTime {
+                dts = tsUnwrap(dts, ref)
+            }
+            streams[slot].lastTs = if dts != core.noTime { dts } else { pts }
+        }
+        let from = p + streams[slot].skip
+        if from >= end {
+            return
+        }
+        let ti = streams[slot].track
+        if !streams[slot].probed && streams[slot].probeTries < 64 {
+            streams[slot].probeTries += 1
+            let pr = tsProbe(tracks[ti], file.slice(from: from, to: min(end, from + 65536)))
+            if pr.0 {
+                tracks[ti] = pr.1
+                streams[slot].probed = true
+                let fr = pr.1
+                if fr.fpsNum > 0 && fr.fpsDen > 0 {
+                    streams[slot].video.frameTicks = core.rescale(fr.fpsDen, from: fr.fpsNum, to: 90000)
+                }
+            }
+        }
+        let mode = streams[slot].mode
+        if mode == 1 {
+            streams[slot].framer.push([from, end - from], pts: pts, dts: dts)
+            packets += streams[slot].framer.drain(file, ti, final: false)
+        } else if mode == 2 {
+            streams[slot].video.push(file, from, end - from, pts: pts, dts: dts)
+            packets += streams[slot].video.drain(file, ti, final: false)
+        } else {
+            if pts == core.noTime && streams[slot].lastEnd != core.noTime {
+                // No timestamp: right after the previous packet.
+                pts = streams[slot].lastEnd
+            }
+            let d = if dts == core.noTime { pts } else { dts }
+            var dur = 0
+            let tr = tracks[ti]
+            if tr.codec == "pcm" && tr.channels > 0 && tr.sampleRate > 0 {
+                dur = (end - from) / (2 * tr.channels) * 90000 / tr.sampleRate
+            }
+            packets.append(core.PacketRef(track: ti, pts: pts, dts: d, duration: dur, key: true, offset: from, size: end - from))
+            if pts != core.noTime && dur > 0 {
+                streams[slot].lastEnd = pts + dur
+            }
+        }
+    }
+
+    // A new stream: its track, and how its payload is cut.
+    fn addStream(_ key: Int, _ p: Int, _ end: Int) -> Int {
+        let index = tracks.count
+        var t = core.Track(index: index, id: key, kind: core.TrackKind.other, codec: "unknown:0x{tsHex2(key >> 8)}{tsHex2(key & 255)}")
+        t.timescale = 90000
+        var mode = 0
+        var skip = 0
+        var cut = tsCutNone
+        var vkind = psVidMpeg12
+        if key >= 0xE0 && key <= 0xEF {
+            t.kind = core.TrackKind.video
+            t.codec = "mpeg1"
+            var st = psm[key] ?? 0
+            if st == 0 {
+                st = psSniffVideo(file, p, end)
+            }
+            if st == 0x1B {
+                t.codec = "h264"
+                vkind = psVidH264
+            } else if st == 0x24 {
+                t.codec = "hevc"
+                vkind = psVidHevc
+            } else if st == 0x10 {
+                t.codec = "mpeg4"
+                vkind = psVidMpeg4
+            } else if st == 0x02 {
+                t.codec = "mpeg2"
+            }
+            mode = 2
+        } else if key >= 0xC0 && key <= 0xDF {
+            t.kind = core.TrackKind.audio
+            let st = psm[key] ?? 0
+            if st == 0x0F {
+                t.codec = "aac"
+                t.adts = true
+                cut = tsCutAdts
+            } else if st == 0x11 {
+                t.codec = "unknown:latm"
+            } else {
+                t.codec = "mp2"
+                cut = tsCutMpa
+            }
+        } else if key >= 0xBD80 && key <= 0xBD87 {
+            t.kind = core.TrackKind.audio
+            t.codec = "ac3"
+            cut = tsCutAc3
+            skip = 4
+        } else if key >= 0xBDC0 && key <= 0xBDCF {
+            t.kind = core.TrackKind.audio
+            t.codec = "eac3"
+            cut = tsCutAc3
+            skip = 4
+        } else if (key >= 0xBD88 && key <= 0xBD8F) || (key >= 0xBD98 && key <= 0xBD9F) {
+            t.kind = core.TrackKind.audio
+            t.codec = "dts"
+            skip = 4
+        } else if key >= 0xBDA0 && key <= 0xBDA7 {
+            // DVD LPCM: substream, frame count, first access unit (2),
+            // then emphasis/mute/frame number, quantization (2 bits) /
+            // sampling frequency (2) / channels − 1 (3), dynamic range.
+            t.kind = core.TrackKind.audio
+            skip = 7
+            if p + 6 < end {
+                let b = file[p + 5]
+                let quant = b >> 6
+                let freq = (b >> 4) & 3
+                t.channels = (b & 7) + 1
+                t.sampleRate = [48000, 96000, 44100, 32000][freq]
+                t.bitsPerSample = [16, 20, 24, 0][quant]
+                if quant == 0 {
+                    t.codec = "pcm"
+                    t.pcm = core.PcmFormat(bits: 16, float: false, bigEndian: true, signed: true)
+                } else {
+                    // 20- and 24-bit DVD LPCM interleave the low bits in
+                    // groups; not plain PCM.
+                    t.codec = "unknown:pcm_dvd"
+                }
+            }
+        } else if key >= 0xBD20 && key <= 0xBD3F {
+            t.kind = core.TrackKind.subtitle
+            t.codec = "dvdsub"
+            cut = tsCutSpu
+            skip = 1
+        } else if key >= 0xBDB0 && key <= 0xBDBF {
+            t.kind = core.TrackKind.audio
+            t.codec = "truehd"
+            skip = 4
+        }
+        if cut != tsCutNone {
+            mode = 1
+        }
+        tracks.append(t)
+        var s = PsStream(id: key, track: index)
+        s.mode = mode
+        s.skip = skip
+        s.framer = TsFramer(kind: cut)
+        s.video = PsVideoFramer(kind: vkind)
+        if mode == 0 && t.kind != core.TrackKind.subtitle {
+            s.probed = true
+        }
+        if t.codec == "pcm" || t.codec == "dvdsub" || t.codec.hasPrefix("unknown") {
+            s.probed = true
+        }
+        streams.append(s)
+        slotOf[key] = streams.count - 1
+        streams.count - 1
+    }
+
+    // Program stream map (§2.5.4): which stream type each stream_id is.
+    fn readPsm(_ from: Int, _ end: Int) {
+        if from + 4 > end {
+            return
+        }
+        let infoLen = (file[from + 2] << 8) | file[from + 3]
+        var p = from + 4 + infoLen
+        if p + 2 > end {
+            return
+        }
+        let mapLen = (file[p] << 8) | file[p + 1]
+        p += 2
+        let mapEnd = min(p + mapLen, end)
+        while p + 4 <= mapEnd {
+            let type = file[p]
+            let esid = file[p + 1]
+            let len = (file[p + 2] << 8) | file[p + 3]
+            psm[esid] = type
+            p += 4 + len
+        }
+    }
+}
+
+// Without a program stream map, what the first start code of a video
+// stream's payload says it is, as a PMT stream type: MPEG-1/2 (sequence,
+// GOP or picture header), MPEG-4 Part 2 (VOS, VO, VOL), H.264 (an AUD,
+// SPS, PPS, SEI or slice NAL), HEVC (VPS, SPS, PPS, AUD).
+fn psSniffVideo(_ file: Data, _ from: Int, _ to: Int) -> Int {
+    let at = tsNextStartCode(file, from, to)
+    if at < 0 || at + 5 > to {
+        return 0
+    }
+    let c = file[at + 3]
+    if c == 0xB3 || c == 0xB8 || c == 0x00 {
+        return 0x02
+    }
+    if (c == 0x40 || c == 0x42 || c == 0x44 || c == 0x46) && file[at + 4] == 0x01 {
+        return 0x24
+    }
+    let t = c & 31
+    if c == 0xB0 || c == 0xB5 || (c >= 0x20 && c <= 0x2F && t != 1 && t != 5) {
+        return 0x10
+    }
+    if (c & 0x80) == 0 && (t == 9 || t == 7 || t == 8 || t == 6 || t == 5 || t == 1) {
+        return 0x1B
+    }
+    0
+}
+
+// Opens an MPEG program stream.
+public fn psOpen(_ file: Data) -> Result<core.Media> {
+    var r = PsReader(file: file)
+    r.run()
+    if r.tracks.isEmpty {
+        return Result.failure(error: Error("this MPEG program stream has no streams Reel can find"))
+    }
+    var media = core.Media(format: "ps")
+    media.packets = r.packets.sorted(by: { a, b in a.offset < b.offset })
+    media.tracks = r.tracks
+    tsFinishTiming(media)
+    if r.resyncs > 0 {
+        r.warnings.append("PS: lost sync {r.resyncs} times")
+    }
+    for s in r.streams {
+        if s.framer.lost > 0 {
+            r.warnings.append("PS: stream 0x{tsHex2(s.id >> 8)}{tsHex2(s.id & 255)}: skipped {s.framer.lost} bytes that weren't whole frames")
+        }
+    }
+    media.warnings = r.warnings
+    Result.ok(value: media)
+}

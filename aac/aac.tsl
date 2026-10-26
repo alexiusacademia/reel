@@ -1,0 +1,1177 @@
+// AAC decoder (ISO/IEC 14496-3 subpart 4, General Audio): AAC-LC with
+// mono, stereo and multichannel streams (channel configurations 1-7, 11,
+// 12, 14 and program config elements, coupling channel elements),
+// HE-AAC v1 (SBR, 4.6.18, also in its downsampled mode) and HE-AAC v2
+// (parametric stereo, subpart 8.6.4). AAC Main streams decode when they
+// don't use prediction; LTP, SSR, 960-sample frames and the ER/LD/ELD
+// and USAC object types are not supported.
+//
+// The setup comes from the AudioSpecificConfig in `track.extra` (MP4,
+// MKV) or from each packet's ADTS header (.aac files, MPEG-TS). Packets
+// hold one raw_data_block (or one ADTS frame) each.
+//
+// Output is 1024 samples per packet at the core rate (2048 at twice the
+// rate with SBR), in WAV channel order: the AAC element order C, L R,
+// Ls Rs, LFE becomes FL FR FC LFE BL BR, the way FFmpeg orders them.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../core"
+
+// Sampling frequencies by index (Table 1.18).
+let aacRates = [96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350]
+
+// Syntactic elements of raw_data_block (Table 4.85).
+let aacSce = 0
+let aacCpe = 1
+let aacCce = 2
+let aacLfe = 3
+let aacDse = 4
+let aacPce = 5
+let aacFil = 6
+let aacEnd = 7
+
+// Speaker position classes of a program config element.
+let aacPosFront = 1
+let aacPosSide = 2
+let aacPosBack = 3
+let aacPosLfe = 4
+let aacPosCc = 5
+
+// One element of the channel layout: its type (SCE, CPE, LFE, CCE), its
+// element_instance_tag and position class, and after mapping, the first
+// output channel it fills.
+struct AacElem {
+    type: Int
+    tag: Int
+    pos: Int
+    first: Int = -1
+}
+
+// A coupling channel element of the frame (4.4.2.5, 4.6.8.3): where it
+// is applied, the elements it is added to, and the gains.
+struct AacCoupling {
+    elem: Int = -1
+    slot: Int = 0
+    // 0 before TNS, 1 between TNS and IMDCT (dependent), 3 after the
+    // IMDCT (independent).
+    point: Int = 0
+    // Target element types (0 SCE, 1 CPE), tags and channel selections.
+    targetType: [Int] = []
+    targetTag: [Int] = []
+    chSelect: [Int] = []
+    numGain: Int = 0
+    // gain[c * 128 + band] (band 0 for independent coupling).
+    gain: [Float] = []
+}
+
+// cce_scale: 2^(1/8), 2^(1/4), 2^(1/2), 2.
+let aacCceScale = [1.09050773266525765921, 1.18920711500272106672, 1.41421356237309504880, 2.0]
+
+// What the AudioSpecificConfig (1.6.2.1) or an ADTS header says.
+struct AacConfig {
+    objectType: Int = 2
+    sfIndex: Int = 4
+    rate: Int = 44100
+    chanConfig: Int = 0
+    // SBR / PS: 1 present, 0 absent, -1 not signalled (may be implicit).
+    sbr: Int = -1
+    ps: Int = -1
+    extRate: Int = 0
+    frameLengthShort: Bool = false
+    elems: [AacElem] = []
+    error: String = ""
+}
+
+// The elements of a default channel configuration (Table 1.19), with
+// FFmpeg's reading of configuration 7 as 7.1 (its second front pair as
+// side channels, as encoders write it).
+fn aacDefaultLayout(_ config: Int) -> [AacElem] {
+    let f = aacPosFront
+    let b = aacPosBack
+    let l = aacPosLfe
+    match config {
+        1 -> [AacElem(type: aacSce, tag: 0, pos: f)]
+        2 -> [AacElem(type: aacCpe, tag: 0, pos: f)]
+        3 -> [AacElem(type: aacSce, tag: 0, pos: f), AacElem(type: aacCpe, tag: 0, pos: f)]
+        4 -> [AacElem(type: aacSce, tag: 0, pos: f), AacElem(type: aacCpe, tag: 0, pos: f), AacElem(type: aacSce, tag: 1, pos: b)]
+        5 -> [AacElem(type: aacSce, tag: 0, pos: f), AacElem(type: aacCpe, tag: 0, pos: f), AacElem(type: aacCpe, tag: 1, pos: b)]
+        6 -> [AacElem(type: aacSce, tag: 0, pos: f), AacElem(type: aacCpe, tag: 0, pos: f), AacElem(type: aacCpe, tag: 1, pos: b), AacElem(type: aacLfe, tag: 0, pos: l)]
+        7 -> [AacElem(type: aacSce, tag: 0, pos: f), AacElem(type: aacCpe, tag: 0, pos: f), AacElem(type: aacCpe, tag: 1, pos: b), AacElem(type: aacCpe, tag: 2, pos: b), AacElem(type: aacLfe, tag: 0, pos: l)]
+        11 -> [AacElem(type: aacSce, tag: 0, pos: f), AacElem(type: aacCpe, tag: 0, pos: f), AacElem(type: aacCpe, tag: 1, pos: b), AacElem(type: aacSce, tag: 1, pos: b), AacElem(type: aacLfe, tag: 0, pos: l)]
+        12 -> [AacElem(type: aacSce, tag: 0, pos: f), AacElem(type: aacCpe, tag: 0, pos: f), AacElem(type: aacCpe, tag: 1, pos: b), AacElem(type: aacCpe, tag: 2, pos: b), AacElem(type: aacLfe, tag: 0, pos: l)]
+        14 -> [AacElem(type: aacSce, tag: 0, pos: f), AacElem(type: aacCpe, tag: 0, pos: f), AacElem(type: aacCpe, tag: 1, pos: b), AacElem(type: aacLfe, tag: 0, pos: l), AacElem(type: aacCpe, tag: 2, pos: f)]
+        _ -> []
+    }
+}
+
+// program_config_element (Table 4.2), after its element_instance_tag.
+// `alignFrom` is the bit position byte alignment is counted from.
+fn aacReadPce(_ r: core.BitReader, alignFrom: Int) -> ([AacElem], core.BitReader) {
+    var br = r
+    var elems: [AacElem] = []
+    br.bits(2)
+    br.bits(4)
+    let numFront = br.bits(4)
+    let numSide = br.bits(4)
+    let numBack = br.bits(4)
+    let numLfe = br.bits(2)
+    let numAssoc = br.bits(3)
+    let numCc = br.bits(4)
+    if br.bit() == 1 {
+        br.bits(4)
+    }
+    if br.bit() == 1 {
+        br.bits(4)
+    }
+    if br.bit() == 1 {
+        br.bits(3)
+    }
+    for (count, pos) in [(numFront, aacPosFront), (numSide, aacPosSide), (numBack, aacPosBack)] {
+        for _ in 0..count {
+            let isCpe = br.bit() == 1
+            let tag = br.bits(4)
+            elems.append(AacElem(type: if isCpe { aacCpe } else { aacSce }, tag: tag, pos: pos))
+        }
+    }
+    for _ in 0..numLfe {
+        elems.append(AacElem(type: aacLfe, tag: br.bits(4), pos: aacPosLfe))
+    }
+    br.skip(4 * numAssoc)
+    for _ in 0..numCc {
+        br.bit()
+        elems.append(AacElem(type: aacCce, tag: br.bits(4), pos: aacPosCc))
+    }
+    let n = (alignFrom - br.position) & 7
+    if n > 0 {
+        br.bits(n)
+    }
+    let comment = br.bits(8)
+    br.skip(8 * comment)
+    (elems, br)
+}
+
+// AudioSpecificConfig (1.6.2.1) with GASpecificConfig (4.4.1), including
+// the explicit SBR/PS signalling (hierarchical object types 5 and 29, and
+// the backward compatible sync extensions 0x2b7 and 0x548).
+fn aacParseAsc(_ data: Data) -> AacConfig {
+    var c = AacConfig()
+    var br = core.bitReader(data)
+    c.objectType = aacReadObjectType(br)
+    br.bits(if c.objectType >= 32 { 11 } else { 5 })
+    c.sfIndex = br.bits(4)
+    if c.sfIndex == 15 {
+        c.rate = br.bits(24)
+        c.sfIndex = aacRateIndex(c.rate)
+    } else if c.sfIndex < 13 {
+        c.rate = aacRates[c.sfIndex]
+    } else {
+        c.error = "reserved sampling frequency index {c.sfIndex}"
+        return c
+    }
+    c.chanConfig = br.bits(4)
+    if c.objectType == 5 || c.objectType == 29 {
+        c.sbr = 1
+        if c.objectType == 29 {
+            c.ps = 1
+        }
+        var ext = br.bits(4)
+        if ext == 15 {
+            c.extRate = br.bits(24)
+        } else {
+            c.extRate = if ext < 13 { aacRates[ext] } else { 0 }
+        }
+        c.objectType = aacReadObjectType(br)
+        br.bits(if c.objectType >= 32 { 11 } else { 5 })
+    }
+    if c.objectType != 1 && c.objectType != 2 && c.objectType != 4 {
+        c.error = "audio object type {c.objectType} is not supported (AAC Main/LC/LTP with SBR/PS only)"
+        return c
+    }
+    // GASpecificConfig.
+    c.frameLengthShort = br.bit() == 1
+    if br.bit() == 1 {
+        br.bits(14)
+    }
+    let extensionFlag = br.bit()
+    if c.chanConfig == 0 {
+        br.bits(4)
+        let (elems, after) = aacReadPce(br, alignFrom: 0)
+        c.elems = elems
+        br = after
+    } else {
+        c.elems = aacDefaultLayout(c.chanConfig)
+        if c.elems.isEmpty {
+            c.error = "reserved channel configuration {c.chanConfig}"
+            return c
+        }
+    }
+    if extensionFlag == 1 {
+        br.bit()
+    }
+    // Backward compatible signalling: look for the sync extension.
+    if c.sbr != 1 {
+        while br.left > 15 {
+            if br.peek(11) == 0x2b7 {
+                br.bits(11)
+                let ext = aacReadObjectType(br)
+                br.bits(if ext >= 32 { 11 } else { 5 })
+                if ext == 5 {
+                    c.sbr = br.bit()
+                    if c.sbr == 1 {
+                        let idx = br.bits(4)
+                        c.extRate = if idx == 15 { br.bits(24) } else if idx < 13 { aacRates[idx] } else { 0 }
+                        if c.extRate == c.rate {
+                            c.sbr = -1
+                        }
+                    }
+                    if br.left > 11 && br.bits(11) == 0x548 {
+                        c.ps = br.bit()
+                    }
+                }
+                break
+            }
+            br.bit()
+        }
+    }
+    aacSettlePs(c)
+}
+
+// The object type, peeked (it may be escaped: 31 + 6 bits).
+fn aacReadObjectType(_ r: core.BitReader) -> Int {
+    var br = r
+    let t = br.bits(5)
+    if t == 31 {
+        return 32 + br.bits(6)
+    }
+    t
+}
+
+fn aacRateIndex(_ rate: Int) -> Int {
+    // Nearest standard rate (4.6.2.1 note): thresholds between them.
+    let limits = [92017, 75132, 55426, 46009, 37566, 27713, 23004, 18783, 13856, 11502, 9391]
+    for i in 0..limits.count {
+        if rate >= limits[i] {
+            return i
+        }
+    }
+    11
+}
+
+// PS needs SBR and a mono core; implicit PS is assumed only for AAC-LC
+// mono (as FFmpeg does, so a mono HE-AAC stream decodes as stereo).
+fn aacSettlePs(_ cfg: AacConfig) -> AacConfig {
+    var c = cfg
+    if c.sbr == 0 {
+        c.ps = 0
+    }
+    if aacCountChannels(c.elems) > 1 {
+        c.ps = 0
+    } else if c.sbr == 1 && c.ps == -1 {
+        c.ps = 1
+    }
+    if c.ps == -1 && c.objectType != 2 {
+        c.ps = 0
+    }
+    c
+}
+
+fn aacCountChannels(_ elems: [AacElem]) -> Int {
+    var n = 0
+    for e in elems {
+        if e.type == aacCpe {
+            n += 2
+        } else if e.type != aacCce {
+            n += 1
+        }
+    }
+    n
+}
+
+// WAV channel positions, in output order (core/samples.tsl).
+let aacWavNames = ["FL", "FR", "FC", "LFE", "BL", "BR", "FLC", "FRC", "BC", "SL", "SR", "LFE2"]
+let aacChFL = 0
+let aacChFR = 1
+let aacChFC = 2
+let aacChLFE = 3
+let aacChBL = 4
+let aacChBR = 5
+let aacChFLC = 6
+let aacChFRC = 7
+let aacChBC = 8
+let aacChSL = 9
+let aacChSR = 10
+let aacChLFE2 = 11
+let aacChNone = -1
+let aacChUnused = -2
+
+// Gives each element its output channels, as FFmpeg's sniff_channel_order
+// does: front centre, then pairs as FL FR (or FLC FRC and FL FR when there
+// are two), back pairs BL BR (or SL SR then BL BR), a lone back channel
+// BC, LFE; then everything sorted into WAV order. Returns the elements
+// with `first` set and the channel names.
+fn aacMapChannels(_ elems: [AacElem]) -> ([AacElem], [String]) {
+    // (element index, sub-channel, position) for every channel.
+    var assigned: [(Int, Int, Int)] = []
+    var i = 0
+    var failed = false
+    while i < elems.count && !failed {
+        let pos = elems[i].pos
+        var j = i
+        var nb = 0
+        while j < elems.count && elems[j].pos == pos {
+            nb += if elems[j].type == aacCpe { 2 } else if elems[j].type == aacCce { 0 } else { 1 }
+            j += 1
+        }
+        if pos == aacPosCc {
+            i = j
+            continue
+        }
+        let map: [Int] = match pos {
+            1 -> [aacChFC, aacChFLC, aacChFRC, aacChFL, aacChFR, aacChNone]
+            2 -> [aacChUnused, aacChSL, aacChSR, aacChNone, aacChNone, aacChNone]
+            3 -> [aacChUnused, aacChSL, aacChSR, aacChBL, aacChBR, aacChBC]
+            _ -> [aacChLFE, aacChLFE2, aacChNone, aacChNone, aacChNone, aacChNone]
+        }
+        var k = i
+        if pos == aacPosLfe {
+            var m = 0
+            while k < j {
+                if m > 1 {
+                    failed = true
+                    break
+                }
+                assigned.append((k, 0, map[m]))
+                k += 1
+                m += 1
+            }
+            i = j
+            continue
+        }
+        while nb % 2 == 1 && k < j {
+            if map[0] == aacChUnused {
+                break
+            }
+            if map[0] == aacChNone {
+                failed = true
+                break
+            }
+            assigned.append((k, 0, map[0]))
+            k += 1
+            nb -= 1
+        }
+        var m = if pos != aacPosSide && nb <= 3 { 3 } else { 1 }
+        while nb >= 2 && k < j && !failed {
+            if m + 1 > 5 || map[m] < 0 || map[m + 1] < 0 {
+                failed = true
+                break
+            }
+            if elems[k].type == aacCpe {
+                assigned.append((k, 0, map[m]))
+                assigned.append((k, 1, map[m + 1]))
+                k += 1
+            } else {
+                assigned.append((k, 0, map[m]))
+                if k + 1 < j {
+                    assigned.append((k + 1, 0, map[m + 1]))
+                }
+                k += 2
+            }
+            m += 2
+            nb -= 2
+        }
+        while nb % 2 == 1 && k < j && !failed {
+            if map[5] < 0 {
+                failed = true
+                break
+            }
+            assigned.append((k, 0, map[5]))
+            k += 1
+            nb -= 1
+        }
+        i = j
+    }
+    var out = elems
+    var names: [String] = []
+    if failed {
+        // Unusual layouts: channels in the order the elements come.
+        var ch = 0
+        for e in 0..out.count {
+            if out[e].type == aacCce {
+                continue
+            }
+            out[e].first = ch
+            ch += if out[e].type == aacCpe { 2 } else { 1 }
+        }
+        for c in 0..ch {
+            names.append("C{c + 1}")
+        }
+        return (out, names)
+    }
+    // Sort channels into WAV order; a pair sorts by its left channel.
+    let sorted = assigned.sorted(by: { a, b in a.2 < b.2 })
+    for (n, entry) in sorted.enumerated() {
+        let (e, sub, p) = entry
+        if sub == 0 {
+            out[e].first = n
+        }
+        names.append(aacWavNames[p])
+    }
+    (out, names)
+}
+
+public struct Decoder {
+    rate: Int = 0
+    channels: Int = 0
+    layout: [String] = []
+    delay: Int = 0
+    warnings: [String] = []
+
+    cfg: AacConfig = AacConfig()
+    configured: Bool = false
+    elems: [AacElem] = []
+    // Channels of the AAC core (PS turns one into two at the output).
+    coreChannels: Int = 0
+    aac: AacCore
+    // Which elements a frame had, by index in `elems`.
+    present: [Bool] = []
+    // For default configurations: the n-th element of each type in a
+    // frame is the n-th of that type in the layout.
+    typeCount: [Int] = [0, 0, 0, 0]
+    samples: [Float] = []
+    frame: [Float] = []
+    // SBR state per layout element (HE-AAC), and whether a frame has been
+    // decoded (implicit SBR must show up in the first one).
+    sbrs: [AacSbr] = []
+    locked: Bool = false
+    // Coupling elements of the current frame.
+    couplings: [AacCoupling] = []
+    // Time samples of each channel before conversion (1024 or 2048 per
+    // channel, in 16-bit units).
+    pcm: [Float] = []
+
+    // Decodes one packet (a raw_data_block, or ADTS frames).
+    fn decode(_ packet: Data, pts: Int) -> core.Samples {
+        var out = core.Samples(rate: rate, channels: channels, pts: pts)
+        if packet.count == 0 {
+            return out
+        }
+        samples = []
+        var at = 0
+        if packet.count >= 7 && packet[0] == 0xff && (packet[1] & 0xf0) == 0xf0 {
+            // ADTS frames (1.A.2.2): one or more in the packet.
+            while at + 7 <= packet.count && packet[at] == 0xff && (packet[at + 1] & 0xf0) == 0xf0 {
+                let len = readAdts(packet, at)
+                if len <= 0 {
+                    break
+                }
+                at += len
+            }
+        } else {
+            if !configured {
+                addWarning("no AudioSpecificConfig and no ADTS header: packet skipped")
+                return out
+            }
+            aac.br = core.bitReader(packet)
+            decodeRawBlock(0)
+        }
+        out.rate = rate
+        out.channels = channels
+        out.layout = layout
+        out.data = samples
+        out
+    }
+
+    // Reads the ADTS header at `at`, decodes its raw_data_block(s);
+    // returns the frame length (0 when the header is bad).
+    fn readAdts(_ packet: Data, _ at: Int) -> Int {
+        var br = core.bitReaderRange(packet, from: at, to: packet.count)
+        br.bits(12)
+        br.bit()
+        br.bits(2)
+        let protectionAbsent = br.bit()
+        let profile = br.bits(2)
+        let sfIndex = br.bits(4)
+        br.bit()
+        let chanConfig = br.bits(3)
+        br.bits(4)
+        let frameLength = br.bits(13)
+        br.bits(11)
+        let blocks = br.bits(2) + 1
+        if frameLength < 7 || sfIndex >= 13 {
+            addWarning("bad ADTS header")
+            return 0
+        }
+        let end = min(at + frameLength, packet.count)
+        if !configured || cfg.sfIndex != sfIndex || (chanConfig != 0 && cfg.chanConfig != chanConfig) || cfg.objectType != profile + 1 {
+            var c = AacConfig()
+            c.objectType = profile + 1
+            c.sfIndex = sfIndex
+            c.rate = aacRates[sfIndex]
+            c.chanConfig = chanConfig
+            if chanConfig != 0 {
+                c.elems = aacDefaultLayout(chanConfig)
+            } else if configured {
+                c.elems = cfg.elems
+            }
+            if c.objectType != 2 && c.objectType != 1 {
+                addWarning("ADTS profile {profile} is not supported")
+                return frameLength
+            }
+            setup(aacSettlePs(c))
+        }
+        var pos = at + 7
+        if protectionAbsent == 0 {
+            pos += 2
+            if blocks > 1 {
+                pos += 2 * (blocks - 1)
+            }
+        }
+        aac.br = core.bitReaderRange(packet, from: pos, to: end)
+        for _ in 0..blocks {
+            decodeRawBlock(pos * 8)
+            if protectionAbsent == 0 && blocks > 1 {
+                // crc_check after each raw_data_block.
+                aac.br.bits(16)
+            }
+        }
+        frameLength
+    }
+
+    // Sets the decoder up for a configuration.
+    fn setup(_ c: AacConfig) {
+        cfg = c
+        let (mapped, names) = aacMapChannels(c.elems)
+        elems = mapped
+        coreChannels = names.count
+        channels = coreChannels
+        layout = names
+        if cfg.ps == 1 && coreChannels == 1 {
+            channels = 2
+            layout = ["FL", "FR"]
+        }
+        rate = cfg.rate
+        if cfg.sbr == 1 {
+            settleSbrRate()
+        }
+        delay = if rate > cfg.rate { 2048 } else { 1024 }
+        // Coupling channels get slots after the output channels.
+        var extra = 0
+        for e in 0..elems.count {
+            if elems[e].type == aacCce {
+                elems[e].first = coreChannels + extra
+                extra += 1
+            }
+        }
+        aac.configure(sfIndex: cfg.sfIndex, channels: max(coreChannels, 1) + extra)
+        makeSbrs()
+        present = []
+        for _ in 0..elems.count {
+            present.append(false)
+        }
+        configured = true
+    }
+
+    // SBR decoders for every element, when SBR is or may be on.
+    fn makeSbrs() {
+        sbrs = []
+        if cfg.sbr == 0 {
+            return
+        }
+        for e in 0..elems.count {
+            let psOn = cfg.ps == 1 && coreChannels == 1 && elems[e].type == aacSce
+            var s = sbrNew(2 * cfg.rate, psOn: psOn)
+            s.idAac = elems[e].type
+            s.downsampled = cfg.extRate > 0 && cfg.extRate < 2 * cfg.rate
+            sbrs.append(s)
+        }
+    }
+
+    // Implicit SBR found in the first frame: the output rate doubles (and
+    // a mono stream becomes stereo, as PS may follow), the core goes on.
+    fn enableSbr() {
+        cfg.sbr = 1
+        if coreChannels == 1 && cfg.ps == -1 {
+            cfg.ps = 1
+        }
+        if cfg.ps == 1 && coreChannels == 1 {
+            channels = 2
+            layout = ["FL", "FR"]
+        }
+        settleSbrRate()
+        delay = if rate > cfg.rate { 2048 } else { 1024 }
+        makeSbrs()
+    }
+
+    // With SBR the output has twice the core rate, unless the
+    // configuration says the SBR rate is the core's: then SBR runs in
+    // downsampled mode (4.6.18.4.3) and the rate stays.
+    fn settleSbrRate() {
+        if cfg.extRate == 0 {
+            cfg.extRate = 2 * cfg.rate
+        }
+        rate = if cfg.extRate > cfg.rate { 2 * cfg.rate } else { cfg.rate }
+    }
+
+    // The layout element a syntactic element of the frame belongs to.
+    fn findElem(_ type: Int, _ tag: Int) -> Int {
+        let t = if type == aacLfe && cfg.chanConfig != 0 { aacLfe } else { type }
+        if cfg.chanConfig == 0 {
+            for i in 0..elems.count {
+                if elems[i].type == t && elems[i].tag == tag {
+                    return i
+                }
+            }
+            return -1
+        }
+        // By order within the frame.
+        let n = typeCount[t]
+        typeCount[t] = n + 1
+        var seen = 0
+        for i in 0..elems.count {
+            if elems[i].type == t {
+                if seen == n {
+                    return i
+                }
+                seen += 1
+            }
+        }
+        -1
+    }
+
+    // raw_data_block (Table 4.3).
+    fn decodeRawBlock(_ alignFrom: Int) {
+        for i in 0..present.count {
+            present[i] = false
+        }
+        typeCount = [0, 0, 0, 0]
+        couplings = []
+        var prevElem = -1
+        var ok = true
+        while ok {
+            if aac.br.left < 3 {
+                addWarning("raw_data_block ends without ID_END")
+                break
+            }
+            let type = aac.br.bits(3)
+            if type == aacEnd {
+                break
+            }
+            let tag = aac.br.bits(4)
+            if type == aacSce || type == aacLfe || type == aacCpe {
+                var e = findElem(type, tag)
+                if e < 0 && type == aacCpe && cfg.chanConfig == 1 {
+                    // A stereo pair in a stream that says mono.
+                    var c = cfg
+                    c.chanConfig = 2
+                    c.elems = aacDefaultLayout(2)
+                    setup(aacSettlePs(c))
+                    typeCount = [0, 0, 0, 0]
+                    e = findElem(type, tag)
+                }
+                if e < 0 {
+                    addWarning("element {type}.{tag} is not in the channel layout")
+                    ok = false
+                    break
+                }
+                let slot = elems[e].first
+                if type == aacCpe {
+                    ok = decodeCpe(e, slot)
+                } else {
+                    ok = aac.readIcs(slot, commonWindow: false)
+                }
+                present[e] = true
+                prevElem = e
+            } else if type == aacCce {
+                ok = decodeCce(tag)
+            } else if type == aacDse {
+                let align = aac.br.bit()
+                var count = aac.br.bits(8)
+                if count == 255 {
+                    count += aac.br.bits(8)
+                }
+                if align == 1 {
+                    aac.br.alignToByte()
+                }
+                aac.br.skip(8 * count)
+            } else if type == aacPce {
+                let (pceElems, after) = aacReadPce(aac.br, alignFrom: alignFrom)
+                aac.br = after
+                if cfg.chanConfig == 0 && pceElems.count > 0 && !sameLayout(pceElems) {
+                    var c = cfg
+                    c.elems = pceElems
+                    setup(aacSettlePs(c))
+                }
+            } else if type == aacFil {
+                var count = tag
+                if count == 15 {
+                    count += aac.br.bits(8) - 1
+                }
+                decodeFill(count, prevElem)
+            }
+            if !aac.error.isEmpty {
+                ok = false
+            }
+        }
+        if !ok {
+            if !aac.error.isEmpty {
+                addWarning(aac.error)
+                aac.error = ""
+            }
+            // Conceal: silence for this frame's channels that failed.
+        }
+        // Spectral processing and filterbank for every channel, then SBR,
+        // in FFmpeg's order: coupling channels first, then the others.
+        let sbrOn = cfg.sbr == 1 && sbrs.count == elems.count
+        let n = if sbrOn && rate > cfg.rate { 2048 } else { 1024 }
+        let slotCount = aac.slots
+        if pcm.count != slotCount * n {
+            pcm = []
+            for _ in 0..(slotCount * n) {
+                pcm.append(0.0)
+            }
+        }
+        for pass in 0..2 {
+            for e in 0..elems.count {
+                let isCce = elems[e].type == aacCce
+                if (pass == 0) != isCce {
+                    continue
+                }
+                let slot = elems[e].first
+                let count = if elems[e].type == aacCpe { 2 } else { 1 }
+                if isCce {
+                    var point = -1
+                    for cc in couplings {
+                        if cc.elem == e {
+                            point = cc.point
+                        }
+                    }
+                    if point < 0 || !ok {
+                        continue
+                    }
+                    if aac.tnsPresent[slot] {
+                        aac.applyTns(slot)
+                    }
+                    if point != 3 {
+                        continue
+                    }
+                } else {
+                    for c in 0..count {
+                        let s = slot + c
+                        if !present[e] || !ok {
+                            // A missing element is silence (its overlap still plays).
+                            for k in 0..1024 {
+                                aac.coef[s * 1024 + k] = 0.0
+                            }
+                            aac.tnsPresent[s] = false
+                        }
+                    }
+                    if ok && !couplings.isEmpty {
+                        applyCoupling(e, 0, n)
+                    }
+                    for c in 0..count {
+                        if aac.tnsPresent[slot + c] {
+                            aac.applyTns(slot + c)
+                        }
+                    }
+                    if ok && !couplings.isEmpty {
+                        applyCoupling(e, 1, n)
+                    }
+                }
+                for c in 0..count {
+                    aac.filterbank(slot + c)
+                }
+                if sbrOn {
+                    sbrs[e].apply(aac.output, slot, count, elems[e].type)
+                    if !sbrs[e].error.isEmpty {
+                        addWarning(sbrs[e].error)
+                        sbrs[e].error = ""
+                    }
+                    let outs = if sbrs[e].psOn { 2 } else { count }
+                    for c in 0..outs {
+                        let s = slot + c
+                        for k in 0..n {
+                            pcm[s * n + k] = sbrs[e].out[c * n + k]
+                        }
+                    }
+                } else {
+                    for c in 0..count {
+                        let s = slot + c
+                        for k in 0..n {
+                            pcm[s * n + k] = aac.output[s * 1024 + k]
+                        }
+                    }
+                }
+                if !isCce && ok && !couplings.isEmpty {
+                    applyCoupling(e, 3, n)
+                }
+            }
+        }
+        let outCount = n * channels
+        if frame.count != outCount {
+            frame = []
+            for _ in 0..outCount {
+                frame.append(0.0)
+            }
+        }
+        for c in 0..channels {
+            for k in 0..n {
+                frame[k * channels + c] = pcm[c * n + k] / 32768.0
+            }
+        }
+        samples += frame
+        locked = true
+    }
+
+    // Adds a warning once (repeats are counted, not listed).
+    fn addWarning(_ w: String) {
+        if warnings.count < 50 && !warnings.contains(w) {
+            warnings.append(w)
+        }
+    }
+
+    fn sameLayout(_ a: [AacElem]) -> Bool {
+        if a.count != elems.count {
+            return false
+        }
+        for i in 0..a.count {
+            if a[i].type != elems[i].type || a[i].tag != elems[i].tag || a[i].pos != elems[i].pos {
+                return false
+            }
+        }
+        true
+    }
+
+    // channel_pair_element (Table 4.5).
+    fn decodeCpe(_ e: Int, _ slot: Int) -> Bool {
+        let common = aac.br.bit() == 1
+        var ms = 0
+        if common {
+            if !aac.readIcsInfo(slot) {
+                return false
+            }
+            let keepKbd = aac.ics[slot + 1].kbd
+            aac.ics[slot + 1] = aac.ics[slot]
+            aac.ics[slot + 1].prevKbd = keepKbd
+            ms = aac.br.bits(2)
+            if ms == 3 {
+                aac.error = "reserved ms_mask_present 3"
+                return false
+            }
+            if ms != 0 {
+                aac.readMsMask(slot, present: ms)
+            }
+        }
+        if !aac.readIcs(slot, commonWindow: common) {
+            return false
+        }
+        if !aac.readIcs(slot + 1, commonWindow: common) {
+            return false
+        }
+        if common && ms != 0 {
+            aac.applyMs(slot, slot + 1)
+        }
+        aac.applyIntensity(slot, slot + 1, msPresent: if common { ms } else { 0 })
+        true
+    }
+
+    // coupling_channel_element (Table 4.8). Its channel is decoded into
+    // its own slot (the scratch slot when the layout doesn't list it, and
+    // then dropped) and its gains kept for the coupling (4.6.8.3).
+    fn decodeCce(_ tag: Int) -> Bool {
+        var cc = AacCoupling()
+        cc.elem = findElem(aacCce, tag)
+        cc.slot = if cc.elem >= 0 { elems[cc.elem].first } else { aac.slots - 1 }
+        var point = 2 * aac.br.bit()
+        let coupled = aac.br.bits(3)
+        for _ in 0..(coupled + 1) {
+            cc.numGain += 1
+            let isCpe = aac.br.bit() == 1
+            cc.targetType.append(if isCpe { aacCpe } else { aacSce })
+            cc.targetTag.append(aac.br.bits(4))
+            var sel = 2
+            if isCpe {
+                sel = aac.br.bits(2)
+                if sel == 3 {
+                    cc.numGain += 1
+                }
+            }
+            cc.chSelect.append(sel)
+        }
+        if aac.br.bit() == 1 || (point >> 1) == 1 {
+            point += 1
+        }
+        cc.point = point
+        let sign = aac.br.bit() == 1
+        let scale = aacCceScale[aac.br.bits(2)]
+        if !aac.readIcs(cc.slot, commonWindow: false) {
+            return false
+        }
+        let slot = cc.slot
+        let maxSfb = aac.ics[slot].maxSfb
+        for _ in 0..(cc.numGain * 128) {
+            cc.gain.append(0.0)
+        }
+        for c in 0..cc.numGain {
+            var cge = true
+            var gain = 0
+            var cache = 1.0
+            if c > 0 {
+                cge = if point == 3 { true } else { aac.br.bit() == 1 }
+                gain = if cge { aac.scalefactorCode() - 60 } else { 0 }
+                cache = pow(scale, Float(-gain))
+            }
+            if point == 3 {
+                cc.gain[c * 128] = cache
+                continue
+            }
+            var idx = 0
+            for g in 0..aac.ics[slot].numGroups {
+                for sfb in 0..maxSfb {
+                    if aac.bandType[slot * 128 + g * maxSfb + sfb] != aacZeroHcb {
+                        if !cge {
+                            var t = aac.scalefactorCode() - 60
+                            if t != 0 {
+                                var sg = 1.0
+                                gain += t
+                                t = gain
+                                if sign {
+                                    if t & 1 == 1 {
+                                        sg = -1.0
+                                    }
+                                    t = t >> 1
+                                }
+                                cache = pow(scale, Float(-t)) * sg
+                            }
+                        }
+                        cc.gain[c * 128 + idx] = cache
+                    }
+                    idx += 1
+                }
+            }
+        }
+        aac.stats[9] += 1
+        if cc.elem < 0 {
+            addWarning("a coupling channel element not in the channel layout is ignored")
+        } else {
+            couplings.append(cc)
+            present[cc.elem] = true
+        }
+        true
+    }
+
+    // Applies the frame's coupling elements at one point to an element's
+    // channels (FFmpeg's apply_channel_coupling): dependent coupling adds
+    // gain-scaled coefficients band by band, independent coupling adds
+    // the coupling channel's output samples.
+    fn applyCoupling(_ e: Int, _ point: Int, _ samples: Int) {
+        let type = elems[e].type
+        let tag = elems[e].tag
+        let slot = elems[e].first
+        for cc in couplings {
+            if cc.point != point {
+                continue
+            }
+            var index = 0
+            for c in 0..cc.targetType.count {
+                if cc.targetType[c] == type && cc.targetTag[c] == tag {
+                    if cc.chSelect[c] != 1 {
+                        coupleInto(cc, slot, index, samples)
+                        if cc.chSelect[c] != 0 {
+                            index += 1
+                        }
+                    }
+                    if cc.chSelect[c] != 2 {
+                        coupleInto(cc, slot + 1, index, samples)
+                        index += 1
+                    }
+                } else {
+                    index += if cc.chSelect[c] == 3 { 2 } else { 1 }
+                }
+            }
+        }
+    }
+
+    fn coupleInto(_ cc: AacCoupling, _ target: Int, _ index: Int, _ samples: Int) {
+        let src = cc.slot
+        if cc.point == 3 {
+            let g = cc.gain[index * 128]
+            for k in 0..samples {
+                pcm[target * samples + k] += g * pcm[src * samples + k]
+            }
+            return
+        }
+        let short = aac.ics[src].seq == aacEightShort
+        let off = if short { aac.swbShort } else { aac.swbLong }
+        let maxSfb = aac.ics[src].maxSfb
+        var win = 0
+        var idx = 0
+        for g in 0..aac.ics[src].numGroups {
+            let glen = aac.ics[src].groupLen[g]
+            for sfb in 0..maxSfb {
+                if aac.bandType[src * 128 + idx] != aacZeroHcb {
+                    let gain = cc.gain[index * 128 + idx]
+                    for w in 0..glen {
+                        let b = (win + w) * 128
+                        for k in off[sfb]..off[sfb + 1] {
+                            aac.coef[target * 1024 + b + k] += gain * aac.coef[src * 1024 + b + k]
+                        }
+                    }
+                }
+                idx += 1
+            }
+            win += glen
+        }
+    }
+
+    // fill_element (Table 4.11) with extension_payload (Table 4.57).
+    fn decodeFill(_ count: Int, _ prevElem: Int) -> Bool {
+        var left = count
+        while left > 0 {
+            let start = aac.br.position
+            let type = aac.br.bits(4)
+            if type == 13 || type == 14 {
+                // SBR extension data (with a CRC for type 14).
+                handleSbr(type == 14, left, prevElem)
+                aac.br.seek(toBit: start + 8 * left)
+                left = 0
+            } else if type == 11 {
+                // dynamic_range_info (4.5.2.7): read to find its length.
+                var n = 1
+                var bands = 1
+                if aac.br.bit() == 1 {
+                    aac.br.bits(8)
+                    n += 1
+                }
+                if aac.br.bit() == 1 {
+                    var excl = 0
+                    while true {
+                        aac.br.bits(7)
+                        excl += 7
+                        if excl >= 64 - 7 || aac.br.bit() == 0 {
+                            break
+                        }
+                    }
+                    n += excl / 7
+                }
+                if aac.br.bit() == 1 {
+                    let incr = aac.br.bits(4)
+                    aac.br.bits(4)
+                    n += 1
+                    bands += incr
+                    for _ in 0..bands {
+                        aac.br.bits(8)
+                        n += 1
+                    }
+                }
+                if aac.br.bit() == 1 {
+                    aac.br.bits(8)
+                    n += 1
+                }
+                for _ in 0..bands {
+                    aac.br.bits(8)
+                    n += 1
+                }
+                if n > left {
+                    n = left
+                }
+                aac.br.seek(toBit: start + 8 * n)
+                left -= n
+            } else {
+                aac.br.seek(toBit: start + 8 * left)
+                left = 0
+            }
+        }
+        true
+    }
+
+    // An SBR extension payload (4.4.2.8) for the element before it.
+    fn handleSbr(_ crc: Bool, _ bytes: Int, _ prevElem: Int) {
+        if cfg.sbr == 0 || prevElem < 0 {
+            return
+        }
+        if cfg.frameLengthShort {
+            addWarning("SBR with 960-sample frames is not supported")
+            return
+        }
+        if cfg.sbr == -1 {
+            if locked {
+                addWarning("implicit SBR first found after the first frame: ignored")
+                return
+            }
+            enableSbr()
+        }
+        if prevElem >= sbrs.count {
+            return
+        }
+        sbrs[prevElem].br = aac.br
+        sbrs[prevElem].readExtension(crc: crc, bytes: bytes, type: elems[prevElem].type)
+        aac.stats[10] += 1
+        if sbrs[prevElem].ps.started {
+            aac.stats[11] += 1
+            if sbrs[prevElem].ps.is34 {
+                aac.stats[12] += 1
+            }
+            if sbrs[prevElem].ps.enableIpdopd {
+                aac.stats[13] += 1
+            }
+        }
+        if sbrs[prevElem].downsampled {
+            aac.stats[14] += 1
+        }
+        if !sbrs[prevElem].error.isEmpty {
+            addWarning(sbrs[prevElem].error)
+            sbrs[prevElem].error = ""
+        }
+    }
+
+    // How often each coding tool was seen so far (for tests and the
+    // media info window): "short windows", "TNS", "SBR frames", ...
+    fn tools() -> [String: Int] {
+        var out: [String: Int] = [:]
+        for i in 0..aacToolNames.count {
+            out[aacToolNames[i]] = aac.stats[i]
+        }
+        out
+    }
+
+    // End of stream: nothing is held back (the last overlap is the
+    // encoder's padding).
+    fn flush() -> core.Samples {
+        core.Samples(rate: rate, channels: channels, layout: layout)
+    }
+
+    // After a seek: forget the overlap and SBR/PS history.
+    fn reset() {
+        aac.resetState()
+        for e in 0..sbrs.count {
+            sbrs[e].resetSignal()
+        }
+    }
+}
+
+public fn newDecoder(_ track: core.Track) -> Result<Decoder> {
+    if track.codec != "aac" {
+        return .failure(error: Error("not an AAC track: {track.codec}"))
+    }
+    var d = Decoder(aac: aacNewCore())
+    if !track.extra.isEmpty && !track.adts {
+        let c = aacParseAsc(track.extra)
+        if !c.error.isEmpty {
+            return .failure(error: Error(c.error))
+        }
+        if c.frameLengthShort {
+            return .failure(error: Error("960-sample AAC frames are not supported"))
+        }
+        d.setup(c)
+    } else {
+        // ADTS: the first packet's header sets things up; until then use
+        // what the container says.
+        d.rate = track.sampleRate
+        d.channels = track.channels
+        d.layout = core.defaultLayout(track.channels)
+        d.delay = 1024
+    }
+    Result.ok(value: d)
+}

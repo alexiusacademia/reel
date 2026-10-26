@@ -1,0 +1,147 @@
+// Equalizer tests: the Cookbook peaking design, measured responses
+// against the designed curves, presets, and smooth gain changes.
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+import "../../fx"
+import "../../core"
+
+fn eqTests(_ t: bind Tally) {
+    let fs = 48000.0
+    // The peaking filter has its gain at f0 and half its gain (in dB) at
+    // the band edges f0·2^(±BW/2) (the Cookbook's definition of BW).
+    var centreOk = true
+    var edgeWorst = 0.0
+    for f0 in fx.eqFrequencies {
+        for g in [12.0, -12.0, 6.0, -3.0] {
+            let q = fx.peaking(f0: f0, gain: g, bw: 1.0, rate: fs)
+            if abs(q.db(f0, fs) - g) > 1e-6 {
+                centreOk = false
+            }
+            if f0 <= 4000.0 {
+                let lo = q.db(f0 / sqrt(2.0), fs)
+                let hi = q.db(f0 * sqrt(2.0), fs)
+                edgeWorst = max(edgeWorst, max(abs(lo - g / 2.0), abs(hi - g / 2.0)))
+            }
+        }
+    }
+    t.check(centreOk, "peaking filters have their gain at f0")
+    t.check(edgeWorst < 0.15, "peaking filters have half the gain at the band edges (worst {edgeWorst} dB)")
+    // Far from every band the filters do nothing.
+    let q1 = fx.peaking(f0: 1000.0, gain: 12.0, bw: 1.0, rate: fs)
+    t.check(abs(q1.db(10.0, fs)) < 0.01 && abs(q1.db(23000.0, fs)) < 0.5, "a peaking filter is flat far from its band")
+
+    // Measured response of the equalizer (sines through it) against the
+    // designed curve, for two presets and a hand-made curve.
+    for name in ["Rock", "Bass and treble", "Vocal"] {
+        var e = fx.Equalizer()
+        e.setup(48000, 2)
+        let p = fx.preset(named: name) ?? fx.Preset(name: "", preamp: 0.0, gains: [])
+        e.setTargets(p.gains, on: true)
+        e.snap()
+        var worst = 0.0
+        for f in [25.0, 31.25, 45.0, 62.5, 90.0, 125.0, 180.0, 250.0, 350.0, 500.0, 700.0, 1000.0, 1400.0, 2000.0, 2800.0, 4000.0, 5600.0, 8000.0, 11000.0, 16000.0, 19000.0] {
+            var x = sine(f, amp: 0.1, frames: 24000)
+            e.clear()
+            e.process(x)
+            let l = channel(x, 0, 2)
+            let r = channel(x, 1, 2)
+            let got = db(amplitudeAt(l, f, rate: 48000, from: 12000, to: 24000) / 0.1)
+            let gotR = db(amplitudeAt(r, f, rate: 48000, from: 12000, to: 24000) / 0.1)
+            let want = e.responseDb(f)
+            worst = max(worst, max(abs(got - want), abs(gotR - want)))
+        }
+        t.check(worst < 0.02, "{name}: measured response matches the designed curve (worst {worst} dB)")
+    }
+
+    // The designed curve of a single band equals that band's filter.
+    var e1 = fx.Equalizer()
+    e1.setup(48000, 1)
+    e1.setTargets([0.0, 0.0, 0.0, 0.0, 0.0, 9.0, 0.0, 0.0, 0.0, 0.0], on: true)
+    e1.snap()
+    t.near(e1.responseDb(1000.0), 9.0, 1e-6, "one band at +9 dB: +9 dB at 1 kHz")
+
+    // Flat (all 0 dB) is exactly the input.
+    var e2 = fx.Equalizer()
+    e2.setup(48000, 2)
+    e2.setTargets([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], on: true)
+    let x0 = lcgProgramme(channels: 2, levels: [-12.0], seed: 3)
+    var x1 = x0
+    e2.process(x1)
+    t.check(x1 == x0, "a flat equalizer leaves the sound untouched")
+    // Gains are clamped to ±12 dB.
+    var e3 = fx.Equalizer()
+    e3.setup(48000, 2)
+    e3.setTargets([30.0, -30.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], on: true)
+    e3.snap()
+    t.check(e3.curDb[0] == 12.0 && e3.curDb[1] == -12.0, "band gains are clamped to ±12 dB")
+    // At 22.05 kHz the 16 kHz band can't exist: it stays flat.
+    var e4 = fx.Equalizer()
+    e4.setup(22050, 2)
+    e4.setTargets([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 12.0], on: true)
+    e4.snap()
+    t.check(e4.idle(), "bands above 0.45 × rate stay flat")
+
+    // Presets: every usual name, gains in range, found by any case.
+    let names = ["Flat", "Classical", "Club", "Dance", "Bass boost", "Treble boost", "Bass and treble", "Headphones", "Large hall", "Live", "Party", "Pop", "Reggae", "Rock", "Ska", "Soft", "Soft rock", "Techno", "Vocal"]
+    var allThere = true
+    var inRange = true
+    for n in names {
+        if let p = fx.preset(named: n.uppercase()) {
+            if p.gains.count != 10 {
+                inRange = false
+            }
+            for g in p.gains {
+                if abs(g) > 12.0 {
+                    inRange = false
+                }
+            }
+            if p.preamp > 0.0 || p.preamp < -12.0 {
+                inRange = false
+            }
+        } else {
+            allThere = false
+        }
+    }
+    t.check(allThere && fx.presets().count == names.count, "all {names.count} presets exist")
+    t.check(inRange, "preset gains are 10 bands within ±12 dB with a preamp ≤ 0")
+    let ws = fx.withPreset(fx.Settings(), "rock")
+    t.check(ws.eqOn && ws.eqPreset == "Rock" && ws.eqGains[0] == 5.0 && ws.eqPreamp == -3.25, "withPreset turns the equalizer on with the preset")
+    t.check(fx.preset(named: "Nope") == nil, "an unknown preset is nil")
+
+    // Smooth changes: a 1 kHz sine while its band jumps 0 → +12 dB. With
+    // the ramp the waveform stays a sine; switched at once, it clicks.
+    let f = 1000.0
+    let amp = 0.2
+    var smooth = fx.Equalizer()
+    smooth.setup(48000, 1)
+    smooth.setTargets([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], on: true)
+    var abrupt = smooth
+    var outS: [Float] = []
+    var outA: [Float] = []
+    let all = sine(f, amp: amp, frames: 9600, channels: 1)
+    var pos = 0
+    var block = 0
+    while pos < all.count {
+        let end = min(all.count, pos + 512)
+        var a = all.slice(from: pos, to: end)
+        var b = a
+        if block == 6 {
+            let g = [0.0, 0.0, 0.0, 0.0, 0.0, 12.0, 0.0, 0.0, 0.0, 0.0]
+            smooth.setTargets(g, on: true)
+            abrupt.setTargets(g, on: true)
+            abrupt.snap()
+        }
+        smooth.process(a)
+        abrupt.process(b)
+        outS.appendAll(a)
+        outA.appendAll(b)
+        pos = end
+        block += 1
+    }
+    let cs = clickiness(outS, f, rate: 48000, amp: amp)
+    let ca = clickiness(outA, f, rate: 48000, amp: amp)
+    t.check(cs < 0.01 && ca > 3.0 * cs, "an EQ gain change is smooth (residual {cs.formatted(decimals: 5)} vs {ca.formatted(decimals: 5)} switched at once)")
+    t.near(db(amplitudeAt(outS, f, rate: 48000, from: 7200, to: 9600) / amp), 12.0, 0.02, "after the ramp the band is at +12 dB")
+}

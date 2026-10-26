@@ -1,0 +1,532 @@
+// Export dialogs: a lossless clip (export/plan.tsl + the MKV and MP4
+// writers) and an animated GIF (export/gif.tsl). The views only collect
+// the choices; the app plans and writes (or encodes) when `onExport`
+// runs, using the helpers here to turn the form into arguments, and
+// passes progress and the outcome back in.
+//
+// MP4 holds fewer codecs than Matroska; the clip view greys out tracks MP4
+// can't carry (the list follows the sample entries export/mp4.tsl writes)
+// and says which ones are rewritten on the way (export.payloadMode).
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+import "../core"
+import "../export"
+
+// ---- clip: helpers ----
+
+// What the clip dialog holds. Times are kept as typed ("1:23.4"); an
+// empty end means "to the end".
+public struct ExportClipForm {
+    fromText: String = "0:00.0"
+    toText: String = ""
+    // One per track of the media: whether it goes into the clip.
+    include: [Bool] = []
+    // "mkv" or "mp4".
+    container: String = "mkv"
+    exactStart: Bool = false
+    // The output file (its extension follows the container).
+    output: String = ""
+}
+
+// A form for a media file: from `from` to `to` seconds (to < 0: the end),
+// every video, audio and subtitle track, Matroska, saved beside the file.
+public fn exportClipForm(_ media: core.Media, path: String, from: Float = 0.0, to: Float = -1.0) -> ExportClipForm {
+    var f = ExportClipForm(fromText: formatClock(max(0.0, from), tenths: true), toText: if to < 0.0 { "" } else { formatClock(to, tenths: true) })
+    for t in media.tracks {
+        f.include.append(t.kind != .other)
+    }
+    f.output = exportClipName(videoPath: path, from: max(0.0, from), to: to, container: "mkv")
+    f
+}
+
+// "1h02m03s", "1m23s", "45s" (for file names; no colons).
+fn toolsCompactTime(_ seconds: Float) -> String {
+    let total = Int(max(0.0, seconds))
+    let h = total / 3600
+    let m = total / 60 % 60
+    let s = total % 60
+    if h > 0 {
+        return "{h}h" + "{m}".padStart(2, with: "0") + "m" + "{s}".padStart(2, with: "0") + "s"
+    }
+    if m > 0 {
+        return "{m}m" + "{s}".padStart(2, with: "0") + "s"
+    }
+    "{s}s"
+}
+
+// The clip's default file: beside the video, "<name> 1m23s-1m45s.mkv".
+public fn exportClipName(videoPath: String, from: Float, to: Float, container: String) -> String {
+    let name = videoPath.fileName
+    let base = if let dot = name.findLast(".") { name.substring(from: 0, to: dot) } else { name }
+    let range = if to < 0.0 { "{toolsCompactTime(from)}-end" } else { "{toolsCompactTime(from)}-{toolsCompactTime(to)}" }
+    joinPath(videoPath.folder, "{base} {range}.{container}")
+}
+
+// The output path with the container's extension.
+public fn exportOutputPath(_ path: String, container: String) -> String {
+    if path.isEmpty {
+        return ""
+    }
+    let name = path.fileName
+    let base = if let dot = name.findLast(".") { name.substring(from: 0, to: dot) } else { name }
+    joinPath(path.folder, "{base}.{container}")
+}
+
+// Whether the MP4 writer has a sample entry for the track (the codecs
+// export/mp4.tsl lists; AV1, FLAC and ALAC need their setup bytes).
+public fn mp4Carries(_ t: core.Track) -> Bool {
+    let c = t.codec
+    match t.kind {
+        .video -> {
+            if c == "av1" {
+                return t.extra.count >= 4
+            }
+            ["h264", "hevc", "vp9", "mpeg4", "mpeg2", "mpeg1", "mjpeg"].contains(c)
+        }
+        .audio -> {
+            if c == "flac" {
+                return t.extra.count >= 42
+            }
+            if c == "alac" {
+                return t.extra.count >= 24
+            }
+            ["aac", "mp3", "mp2", "mp1", "ac3", "eac3", "opus"].contains(c)
+        }
+        .subtitle -> ["tx3g", "srt", "text", "webvtt"].contains(c)
+        .other -> false
+    }
+}
+
+// A note on what happens to a track in a container: "" or why it's left
+// out / how it's rewritten.
+public fn exportTrackNote(_ t: core.Track, container: String) -> String {
+    let mp4 = container == "mp4"
+    if t.kind == .other {
+        return "not exported"
+    }
+    if mp4 && !mp4Carries(t) {
+        return if t.kind == .subtitle { "MP4 holds only text subtitles" } else { "MP4 can't hold {codecTitle(t.codec)}" }
+    }
+    let mode = export.payloadMode(t, mp4: mp4)
+    if mode == export.exToTx3g {
+        return "becomes MP4 timed text"
+    }
+    if mode == export.exFromTx3g {
+        return "becomes plain text"
+    }
+    ""
+}
+
+// The source tracks to export: chosen, and ones the container holds.
+public fn exportClipTracks(_ form: ExportClipForm, _ media: core.Media) -> [Int] {
+    var out: [Int] = []
+    for t in media.tracks {
+        let on = t.index < form.include.count && form.include[t.index]
+        if on && t.kind != .other && (form.container != "mp4" || mp4Carries(t)) {
+            out.append(t.index)
+        }
+    }
+    out
+}
+
+// The start in seconds (0 when it can't be read).
+public fn exportClipStart(_ form: ExportClipForm) -> Float {
+    parseTimeAmount(form.fromText) ?? 0.0
+}
+
+// The end in seconds, or -1 for "to the end".
+public fn exportClipEnd(_ form: ExportClipForm) -> Float {
+    if form.toText.trim().isEmpty {
+        return -1.0
+    }
+    parseTimeAmount(form.toText) ?? -1.0
+}
+
+// Why the clip can't be exported yet, or "".
+public fn exportClipProblem(_ form: ExportClipForm, _ media: core.Media) -> String {
+    let from = parseTimeAmount(form.fromText)
+    if from == nil {
+        return "The start time can't be read (try 1:23.5)."
+    }
+    let start = from ?? 0.0
+    if !form.toText.trim().isEmpty {
+        if let end = parseTimeAmount(form.toText) {
+            if end <= start {
+                return "The end must come after the start."
+            }
+        } else {
+            return "The end time can't be read (try 1:45, or leave it empty for the end)."
+        }
+    }
+    if media.duration > 0.0 && start >= media.duration {
+        return "The start is past the end of the file."
+    }
+    if exportClipTracks(form, media).isEmpty {
+        return "Choose at least one track."
+    }
+    if form.output.isEmpty {
+        return "Choose where to save the clip."
+    }
+    ""
+}
+
+// The clip's length in seconds for the label (-1 if unknown).
+public fn exportClipLength(_ form: ExportClipForm, duration: Float) -> Float {
+    let a = parseTimeAmount(form.fromText) ?? -1.0
+    var b = exportClipEnd(form)
+    if b < 0.0 {
+        b = duration
+    }
+    if a < 0.0 || b < 0.0 || b <= a { -1.0 } else { b - a }
+}
+
+// "Video 1 · H.264 · 1920×1080", "Audio 2 · AAC · stereo · English".
+public fn exportTrackLabel(_ t: core.Track) -> String {
+    let kind = match t.kind {
+        .video -> "Video"
+        .audio -> "Audio"
+        .subtitle -> "Subtitles"
+        .other -> "Other"
+    }
+    var parts = ["{kind} {t.index + 1}", codecTitle(t.codec)]
+    if t.kind == .video && t.width > 0 {
+        parts.append("{t.width}×{t.height}")
+    }
+    if t.kind == .audio && t.channels > 0 {
+        parts.append(channelsText(t.channels))
+    }
+    if !t.language.isEmpty {
+        parts.append(languageText(t.language))
+    }
+    if !t.title.isEmpty {
+        parts.append("“{t.title}”")
+    }
+    parts.joined(separator: " · ")
+}
+
+// ---- clip: the view ----
+
+// `media`: the open file; `form`: the choices (make one with
+// exportClipForm); `position`: the playback time, for the "Current"
+// buttons; `busy`/`progress` (0…1, or -1 for none)/`result`: the export
+// under way and how it went. Callbacks: `onChooseOutput()` ask for the
+// output file (saveFile) and put it in form.output; `onExport()` plan
+// and write (export.planClip(media, tracks: ui.exportClipTracks(form,
+// media), from: ui.exportClipStart(form), to: ui.exportClipEnd(form),
+// exactStart: form.exactStart), then writeMkv/writeMp4 to
+// ui.exportOutputPath(form.output, container: form.container));
+// `onClose()` the dialog's Close button.
+public view ExportClipView(media: core.Media, form: bind ExportClipForm, position: Float, busy: Bool = false, progress: Float = -1.0, result: String = "", onChooseOutput: fn(), onExport: fn(), onClose: fn()) {
+    let problem = exportClipProblem(form, media)
+    let length = exportClipLength(form, duration: media.duration)
+
+    VStack(spacing: 10, alignment: .leading) {
+        Text("Export Clip").font(size: 15, weight: .semibold)
+        Text("Copies part of the file without re-encoding: quick, and nothing is lost.").font(size: 12).color(.secondary)
+        Grid(spacing: 8) {
+            GridRow {
+                Text("Start").gridColumnAlignment(.trailing)
+                TextField("0:00", text: form.fromText).frame(width: 110).accessibilityLabel("Start time")
+                Button("Set to Current") { form.fromText = formatClock(position, tenths: true) }
+                    .tooltip("Use the playback position ({formatClock(position, tenths: true)})")
+            }
+            GridRow {
+                Text("End")
+                TextField("end", text: form.toText).frame(width: 110).accessibilityLabel("End time")
+                HStack {
+                    Button("Set to Current") { form.toText = formatClock(position, tenths: true) }
+                        .tooltip("Use the playback position ({formatClock(position, tenths: true)})")
+                    Button("To the End") { form.toText = "" }
+                }
+            }
+            GridRow {
+                Text("Length")
+                Text(if length < 0.0 { "–" } else { formatClock(length, tenths: true) }).color(.secondary)
+            }
+        }
+        Toggle("Start exactly at the start time", isOn: form.exactStart)
+        Text(if form.exactStart { "The video is cut at the keyframe before the start and the pictures before it are hidden, so players start at the exact time." } else { "The clip starts at the keyframe at or before the start time, which can be a few seconds earlier." })
+            .font(size: 11)
+            .color(.secondary)
+        Divider()
+        HStack {
+            Text("Format")
+            Picker(selection: form.container) {
+                Text("Matroska (.mkv)").tag("mkv")
+                Text("MP4 (.mp4)").tag("mp4")
+            }
+            Spacer()
+        }
+        Text("Tracks").font(size: 12, weight: .semibold).color(.secondary)
+        Scroll {
+            VStack(spacing: 4, alignment: .leading) {
+                for i in 0..media.tracks.count {
+                    if i < form.include.count {
+                        ToolsTrackRow(track: media.tracks[i], on: form.include[i], note: exportTrackNote(media.tracks[i], container: form.container), carried: media.tracks[i].kind != .other && (form.container != "mp4" || mp4Carries(media.tracks[i])))
+                    }
+                }
+            }
+        }
+        .frame(minHeight: 60, maxHeight: 180)
+        Divider()
+        HStack {
+            Text("Save as")
+            Text(if form.output.isEmpty { "—" } else { exportOutputPath(form.output, container: form.container) })
+                .lineLimit(1)
+                .color(.secondary)
+                .tooltip(exportOutputPath(form.output, container: form.container))
+            Spacer()
+            Button("Choose…") { onChooseOutput() }.disabled(busy)
+        }
+        if progress >= 0.0 {
+            ProgressBar(value: progress)
+        }
+        if !result.isEmpty {
+            Text(result).font(size: 12).selectable()
+        } else if !problem.isEmpty {
+            Text(problem).font(size: 12).color(.secondary)
+        }
+        HStack {
+            Spacer()
+            Button("Close") { onClose() }
+            Button("Export") { onExport() }.disabled(!problem.isEmpty || busy)
+        }
+    }
+    .padding(16)
+    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+}
+
+view ToolsTrackRow(track: core.Track, on: bind Bool, note: String, carried: Bool) {
+    // A track the container can't hold shows as off (its choice is kept
+    // for the other container).
+    state never = false
+
+    HStack(spacing: 6) {
+        if carried {
+            Toggle(isOn: on).accessibilityLabel(exportTrackLabel(track))
+        } else {
+            Toggle(isOn: never).disabled(true).accessibilityLabel(exportTrackLabel(track))
+        }
+        Text(exportTrackLabel(track)).lineLimit(1).color(if carried { .primary } else { .secondary })
+        if !note.isEmpty {
+            Text(note).font(size: 11).color(if carried { .secondary } else { .orange })
+        }
+        Spacer()
+    }
+}
+
+// ---- GIF: helpers ----
+
+public struct ExportGifForm {
+    fromText: String = "0:00.0"
+    toText: String = "0:03.0"
+    // Output width in pixels (the height follows the picture's shape).
+    width: Int = 480
+    fps: Int = 12
+    colors: Int = 256
+    dither: Bool = true
+    // Loop forever, or play once.
+    loop: Bool = true
+    output: String = ""
+}
+
+// A form starting at `position`, three seconds long (inside the file),
+// saved beside it as "<name> 1m23s.gif".
+public fn exportGifForm(position: Float, duration: Float, path: String, sourceWidth: Int = 0) -> ExportGifForm {
+    let from = max(0.0, position)
+    var to = from + 3.0
+    if duration > 0.0 && to > duration {
+        to = duration
+    }
+    let name = path.fileName
+    let base = if let dot = name.findLast(".") { name.substring(from: 0, to: dot) } else { name }
+    let width = if sourceWidth > 0 && sourceWidth < 480 { sourceWidth } else { 480 }
+    ExportGifForm(fromText: formatClock(from, tenths: true), toText: formatClock(to, tenths: true), width: width, output: joinPath(path.folder, "{base} {toolsCompactTime(from)}.gif"))
+}
+
+// The GIF's height for a width, keeping the picture's shape (pixel
+// shape sarNum:sarDen included).
+public fn gifHeight(width: Int, sourceWidth: Int, sourceHeight: Int, sarNum: Int = 1, sarDen: Int = 1) -> Int {
+    if sourceWidth <= 0 || sourceHeight <= 0 {
+        return max(1, width * 9 / 16)
+    }
+    let shown = Float(sourceWidth) * Float(max(1, sarNum)) / Float(max(1, sarDen))
+    max(1, Int(Float(width) * Float(sourceHeight) / shown + 0.5))
+}
+
+// Frames for a length at a frame rate (at least 1).
+public fn gifFrameCount(seconds: Float, fps: Int) -> Int {
+    max(1, Int(max(0.0, seconds) * Float(max(1, fps)) + 0.5))
+}
+
+// A rough size for the GIF in bytes. Our own rule of thumb, measured
+// loosely on video: LZW stores about 60% of the palette index bits of
+// a frame (90% with dithering, whose noise compresses badly); frames
+// after the first store only the part that changed, about 80% of video.
+public fn gifEstimateBytes(width: Int, height: Int, frames: Int, colors: Int, dither: Bool) -> Int {
+    var bits = 1
+    while (1 << bits) < max(2, colors) && bits < 8 {
+        bits += 1
+    }
+    let pixels = Float(max(1, width) * max(1, height))
+    let perPixel = Float(bits) / 8.0 * (if dither { 0.9 } else { 0.6 })
+    let first = pixels * perPixel
+    let rest = Float(max(0, frames - 1)) * pixels * perPixel * 0.8
+    let tables = max(1, frames) * (3 * (1 << bits) + 30)
+    800 + tables + Int(first + rest)
+}
+
+// The encoder options for a form.
+public fn gifOptions(_ form: ExportGifForm) -> export.GifOptions {
+    export.GifOptions(colors: max(2, min(256, form.colors)), dither: form.dither, loop: if form.loop { 0 } else { -1 })
+}
+
+// Start and end in seconds (end -1 when it can't be read).
+public fn exportGifRange(_ form: ExportGifForm) -> (Float, Float) {
+    (parseTimeAmount(form.fromText) ?? 0.0, parseTimeAmount(form.toText) ?? -1.0)
+}
+
+// Why the GIF can't be made yet, or "".
+public fn exportGifProblem(_ form: ExportGifForm, duration: Float) -> String {
+    if parseTimeAmount(form.fromText) == nil {
+        return "The start time can't be read (try 1:23.5)."
+    }
+    if parseTimeAmount(form.toText) == nil {
+        return "The end time can't be read (try 1:26)."
+    }
+    let (a, b) = exportGifRange(form)
+    if b <= a {
+        return "The end must come after the start."
+    }
+    if duration > 0.0 && a >= duration {
+        return "The start is past the end of the file."
+    }
+    if b - a > 60.0 {
+        return "A GIF this long would be huge; keep it under a minute."
+    }
+    if form.width < 16 || form.width > 1920 {
+        return "The width should be 16 to 1920 pixels."
+    }
+    if form.output.isEmpty {
+        return "Choose where to save the GIF."
+    }
+    ""
+}
+
+// ---- GIF: the view ----
+
+// `form`: the choices (make one with exportGifForm); `duration`,
+// `position`: the file's length and the playback time; `sourceWidth`,
+// `sourceHeight`, `sarNum`/`sarDen`: the picture's size and pixel shape;
+// `preview`: the first frame as RGBA pixels (r<<24|g<<16|b<<8|a, as
+// render gives them) of `previewWidth` × `previewHeight`, or empty;
+// `busy`/`progress`/`result`: the export under way. Callbacks:
+// `onChooseOutput()` ask for the file; `onExport()` decode the range at
+// form.fps, scale to form.width × gifHeight(…), encode with
+// ui.gifOptions(form); `onClose()`.
+public view ExportGifView(form: bind ExportGifForm, duration: Float, position: Float, sourceWidth: Int, sourceHeight: Int, sarNum: Int = 1, sarDen: Int = 1, preview: [Int] = [], previewWidth: Int = 0, previewHeight: Int = 0, busy: Bool = false, progress: Float = -1.0, result: String = "", onChooseOutput: fn(), onExport: fn(), onClose: fn()) {
+    let (a, b) = exportGifRange(form)
+    let length = if b > a { b - a } else { 0.0 }
+    let height = gifHeight(width: form.width, sourceWidth: sourceWidth, sourceHeight: sourceHeight, sarNum: sarNum, sarDen: sarDen)
+    let frames = gifFrameCount(seconds: length, fps: form.fps)
+    let problem = exportGifProblem(form, duration: duration)
+    let estimate = gifEstimateBytes(width: form.width, height: height, frames: frames, colors: form.colors, dither: form.dither)
+
+    VStack(spacing: 10, alignment: .leading) {
+        Text("Export GIF").font(size: 15, weight: .semibold)
+        HStack(spacing: 14, alignment: .top) {
+            Grid(spacing: 8) {
+                GridRow {
+                    Text("Start").gridColumnAlignment(.trailing)
+                    TextField("0:00", text: form.fromText).frame(width: 90).accessibilityLabel("Start time")
+                    Button("Current") { form.fromText = formatClock(position, tenths: true) }
+                        .tooltip("Use the playback position")
+                }
+                GridRow {
+                    Text("End")
+                    TextField("0:03", text: form.toText).frame(width: 90).accessibilityLabel("End time")
+                    Button("Current") { form.toText = formatClock(position, tenths: true) }
+                        .tooltip("Use the playback position")
+                }
+                GridRow {
+                    Text("Width")
+                    Stepper(value: form.width, step: 40, from: 80, to: 1920).accessibilityLabel("Width in pixels")
+                    Text("× {height} px").color(.secondary)
+                }
+                GridRow {
+                    Text("Frame rate")
+                    Picker(selection: form.fps, style: .menu) {
+                        for f in [5, 8, 10, 12, 15, 20, 25, 30] {
+                            Text("{f} fps").tag(f)
+                        }
+                    }
+                    .accessibilityLabel("Frame rate")
+                }
+                GridRow {
+                    Text("Colours")
+                    Picker(selection: form.colors, style: .menu) {
+                        for c in [256, 128, 64, 32, 16] {
+                            Text("{c}").tag(c)
+                        }
+                    }
+                    .accessibilityLabel("Colours")
+                }
+                GridRow {
+                    Text("Loop")
+                    Picker(selection: form.loop) {
+                        Text("Forever").tag(true)
+                        Text("Once").tag(false)
+                    }
+                    .gridCellColumns(2)
+                }
+                GridRow {
+                    Text("")
+                    Toggle("Dither", isOn: form.dither).gridCellColumns(2).tooltip("Smoother gradients, larger file")
+                }
+            }
+            VStack(spacing: 4) {
+                if preview.isEmpty || previewWidth <= 0 || previewHeight <= 0 {
+                    Text("No preview").font(size: 12).color(.secondary).frame(width: 200, height: 120).background(.sidebar, radius: 4)
+                } else {
+                    Canvas { g in
+                        let scale = min(g.width / Float(previewWidth), g.height / Float(previewHeight))
+                        let w = Float(previewWidth) * scale
+                        let h = Float(previewHeight) * scale
+                        g.fillRect(x: 0, y: 0, width: g.width, height: g.height, color: .black)
+                        let drew = g.image(pixels: preview, pixelWidth: previewWidth, pixelHeight: previewHeight, x: (g.width - w) / 2.0, y: (g.height - h) / 2.0, width: w, height: h)
+                    }
+                    .frame(width: 200, height: Float(max(60, min(200, 200 * height / max(1, form.width)))))
+                    .accessibilityLabel("First frame")
+                }
+                Text("First frame").font(size: 11).color(.secondary)
+            }
+        }
+        Text("{formatClock(length, tenths: true)} · {frames} frames · about {formatBytes(estimate)}")
+            .font(size: 12)
+            .color(.secondary)
+        Divider()
+        HStack {
+            Text("Save as")
+            Text(if form.output.isEmpty { "—" } else { form.output }).lineLimit(1).color(.secondary).tooltip(form.output)
+            Spacer()
+            Button("Choose…") { onChooseOutput() }.disabled(busy)
+        }
+        if progress >= 0.0 {
+            ProgressBar(value: progress)
+        }
+        if !result.isEmpty {
+            Text(result).font(size: 12).selectable()
+        } else if !problem.isEmpty {
+            Text(problem).font(size: 12).color(.secondary)
+        }
+        HStack {
+            Spacer()
+            Button("Close") { onClose() }
+            Button("Export") { onExport() }.disabled(!problem.isEmpty || busy)
+        }
+    }
+    .padding(16)
+    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+}

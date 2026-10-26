@@ -1,0 +1,547 @@
+// Blu-ray (BDMV) navigation files, parsed into plain structs:
+//   index.bdmv        "INDX": first play, top menu and the titles, each an
+//                     HDMV movie object or a BD-J object
+//   MovieObject.bdmv  "MOBJ": movie objects and their navigation commands
+//                     (the PlayPL commands say which playlist a title plays)
+//   PLAYLIST/*.mpls   "MPLS": play items (clip, in/out time, angles, the
+//                     STN table of streams), sub-paths, playlist marks
+//                     (chapters)
+//   CLIPINF/*.clpi    "HDMV": clip info, sequence info, program info
+//                     (streams), CPI with the EP map (PTS → source packet)
+//
+// Followed: the published Blu-ray format notes (BD-ROM Audio Visual
+// Application Format overview, public descriptions of the INDX / MOBJ /
+// MPLS / CLPI layouts, e.g. the BDMV structure notes on Wikipedia and in
+// open documentation). Own code; no player library source was read.
+//
+// Times in playlists count in 45 kHz ticks; EP map PTS in 90 kHz; a source
+// packet is 192 bytes (4-byte arrival time stamp + a 188-byte TS packet).
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+import "../core"
+
+public struct BdIndexTitle {
+    // 1 HDMV movie object, 2 BD-J.
+    objectType: Int = 1
+    // 0 movie title, 1 interactive.
+    playbackType: Int = 0
+    // HDMV: the movie object number; BD-J: -1.
+    movieObject: Int = -1
+    bdjo: String = ""
+}
+
+public struct BdIndex {
+    version: String = ""
+    firstPlay: BdIndexTitle = BdIndexTitle()
+    topMenu: BdIndexTitle = BdIndexTitle()
+    titles: [BdIndexTitle] = []
+}
+
+public struct BdMovieObject {
+    // The playlists its PlayPL commands name, in command order.
+    playlists: [Int] = []
+    commands: Int = 0
+}
+
+public struct BdStream {
+    kind: core.TrackKind
+    // MPLS/CLPI stream_coding_type.
+    coding: Int = 0
+    codec: String = ""
+    pid: Int = 0
+    language: String = ""
+    // Video: video_format (1 480i … 6 1080p, 8 2160p) and frame_rate code.
+    format: Int = 0
+    rate: Int = 0
+    // Audio: presentation type (1 mono, 3 stereo, 6 multichannel, 12
+    // stereo + multichannel) and sampling frequency code.
+    presentation: Int = 0
+    // "primary", "secondary", "pip"; IG streams are kind .other.
+    role: String = "primary"
+}
+
+public struct BdPlayItem {
+    clip: String
+    codecId: String = "M2TS"
+    // 45 kHz.
+    inTime: Int = 0
+    outTime: Int = 0
+    connection: Int = 1
+    stcId: Int = 0
+    angles: Int = 1
+    // Clips of angles 2…n.
+    angleClips: [String] = []
+    streams: [BdStream] = []
+}
+
+public struct BdMark {
+    // 1 entry mark (chapter), 2 link point.
+    type: Int = 1
+    item: Int = 0
+    // 45 kHz, on the play item's clip time line.
+    time: Int = 0
+    pid: Int = 0xFFFF
+    duration: Int = 0
+}
+
+public struct BdPlaylist {
+    number: Int = -1
+    version: String = ""
+    playbackType: Int = 1
+    items: [BdPlayItem] = []
+    subPaths: Int = 0
+    marks: [BdMark] = []
+    warnings: [String] = []
+}
+
+// One stream's EP map: entry points, each a PTS (90 kHz) and a source
+// packet number.
+public struct BdEpMap {
+    pid: Int = 0
+    streamType: Int = 0
+    pts: [Int] = []
+    spn: [Int] = []
+}
+
+public struct BdClip {
+    name: String = ""
+    version: String = ""
+    // ClipInfo: application type (1 main movie), TS recording rate (bytes/s)
+    // and the number of source packets.
+    applicationType: Int = 0
+    rate: Int = 0
+    packets: Int = 0
+    // Presentation start/end of each STC sequence (45 kHz), flat pairs.
+    presentation: [Int] = []
+    streams: [BdStream] = []
+    epMaps: [BdEpMap] = []
+    warnings: [String] = []
+}
+
+// Codec of a stream_coding_type, in Reel's names (as demux/ts.tsl names
+// m2ts stream types).
+public fn bdCodec(_ coding: Int) -> (String, core.TrackKind) {
+    let v = core.TrackKind.video
+    let a = core.TrackKind.audio
+    let s = core.TrackKind.subtitle
+    match coding {
+        0x01 -> ("mpeg1", v)
+        0x02 -> ("mpeg2", v)
+        0x1B -> ("h264", v)
+        0x20 -> ("unknown:mvc", v)
+        0x24 -> ("hevc", v)
+        0xEA -> ("vc1", v)
+        0x03 -> ("mp2", a)
+        0x04 -> ("mp2", a)
+        0x80 -> ("unknown:bdlpcm", a)
+        0x81 -> ("ac3", a)
+        0x82 -> ("dts", a)
+        0x83 -> ("truehd", a)
+        0x84 -> ("eac3", a)
+        0x85 -> ("dts", a)
+        0x86 -> ("dts", a)
+        0xA1 -> ("eac3", a)
+        0xA2 -> ("dts", a)
+        0x90 -> ("pgs", s)
+        0x91 -> ("unknown:igs", core.TrackKind.other)
+        0x92 -> ("unknown:bdtext", s)
+        _ -> ("unknown:bd{coding}", core.TrackKind.other)
+    }
+}
+
+fn bdTitleEntry(_ d: Data, _ at: Int) -> BdIndexTitle {
+    var t = BdIndexTitle()
+    let b0 = dU8(d, at)
+    t.objectType = b0 >> 6
+    t.playbackType = dU8(d, at + 4) >> 6
+    if t.objectType == 1 {
+        t.movieObject = dU16(d, at + 6)
+    } else if t.objectType == 2 {
+        t.bdjo = dAscii(d, at + 6, 5)
+    }
+    t
+}
+
+// index.bdmv.
+public fn parseIndex(_ d: Data) -> Result<BdIndex> {
+    if d.count < 40 || dAscii(d, 0, 4) != "INDX" {
+        return Result.failure(error: Error("not a Blu-ray index (no INDX)"))
+    }
+    var x = BdIndex(version: dAscii(d, 4, 4))
+    let at = dU32(d, 8)
+    if at < 40 || at + 4 + 24 + 2 > d.count {
+        return Result.failure(error: Error("index.bdmv: the index table is outside the file"))
+    }
+    x.firstPlay = bdTitleEntry(d, at + 4)
+    x.topMenu = bdTitleEntry(d, at + 16)
+    let n = min(999, dU16(d, at + 28))
+    var i = 0
+    while i < n && at + 30 + 12 * i + 12 <= d.count {
+        x.titles.append(bdTitleEntry(d, at + 30 + 12 * i))
+        i += 1
+    }
+    Result.ok(value: x)
+}
+
+// MovieObject.bdmv: the playlists each object plays. A navigation
+// command is 12 bytes: a 4-byte opcode (operand count 3 bits, group 2,
+// sub-group 3; immediate flags for both operands; branch option 4 bits;
+// …), then two 4-byte operands. Group 0 (branch) sub-group 2 (play) with
+// branch option 0–2 (PlayPL, PlayPL at play item, PlayPL at mark) and an
+// immediate first operand names a playlist.
+public fn parseMovieObjects(_ d: Data) -> Result<[BdMovieObject]> {
+    if d.count < 40 || dAscii(d, 0, 4) != "MOBJ" {
+        return Result.failure(error: Error("not a Blu-ray movie object file (no MOBJ)"))
+    }
+    var out: [BdMovieObject] = []
+    let n = dU16(d, 40 + 8)
+    var p = 40 + 10
+    var i = 0
+    while i < n && i < 9999 && p + 4 <= d.count {
+        let nc = dU16(d, p + 2)
+        p += 4
+        var m = BdMovieObject(commands: nc)
+        var c = 0
+        while c < nc && p + 12 <= d.count {
+            let op0 = dU8(d, p)
+            let op1 = dU8(d, p + 1)
+            let group = (op0 >> 3) & 3
+            let sub = op0 & 7
+            let branch = op1 & 15
+            let immediate = (op1 >> 7) & 1 == 1
+            if group == 0 && sub == 2 && branch <= 2 && immediate {
+                let pl = dU32(d, p + 4)
+                if pl < 100000 && !m.playlists.contains(pl) {
+                    m.playlists.append(pl)
+                }
+            }
+            p += 12
+            c += 1
+        }
+        out.append(m)
+        i += 1
+    }
+    Result.ok(value: out)
+}
+
+// The stream entry + attributes of one STN table stream at `at`; returns
+// the stream and the position after it.
+fn bdStnStream(_ d: Data, _ at: Int, _ kind: core.TrackKind, _ role: String) -> (BdStream, Int) {
+    var s = BdStream(kind: kind, role: role)
+    let elen = dU8(d, at)
+    let etype = dU8(d, at + 1)
+    // Stream entry: type 1 = in the play item's clip (PID), 2 = in a
+    // sub-path's clip (sub-path id, clip id, PID), 3/4 = in a sub-path
+    // (sub-path id, PID).
+    if etype == 1 {
+        s.pid = dU16(d, at + 2)
+    } else if etype == 2 {
+        s.pid = dU16(d, at + 4)
+    } else if etype == 3 || etype == 4 {
+        s.pid = dU16(d, at + 3)
+    }
+    let a = at + 1 + elen
+    let alen = dU8(d, a)
+    s.coding = dU8(d, a + 1)
+    let (codec, k) = bdCodec(s.coding)
+    s.codec = codec
+    // The codec's kind (IG streams stay .other); an unknown coding keeps
+    // the kind of the STN group it is listed in.
+    s.kind = if codec.hasPrefix("unknown:bd") { kind } else { k }
+    if s.kind == core.TrackKind.video {
+        let b = dU8(d, a + 2)
+        s.format = b >> 4
+        s.rate = b & 15
+    } else if s.kind == core.TrackKind.audio {
+        let b = dU8(d, a + 2)
+        s.presentation = b >> 4
+        s.rate = b & 15
+        if alen >= 5 {
+            s.language = dAscii(d, a + 3, 3).lowercase()
+        }
+    } else if s.coding == 0x92 && alen >= 5 {
+        s.language = dAscii(d, a + 3, 3).lowercase()
+    } else if (s.coding == 0x90 || s.coding == 0x91) && alen >= 4 {
+        s.language = dAscii(d, a + 2, 3).lowercase()
+    }
+    (s, a + 1 + alen)
+}
+
+// The STN table at `at` (its 2-byte length first).
+fn bdStn(_ d: Data, _ at: Int) -> [BdStream] {
+    var out: [BdStream] = []
+    let len = dU16(d, at)
+    let end = min(d.count, at + 2 + len)
+    if len < 14 {
+        return out
+    }
+    let nv = dU8(d, at + 4)
+    let na = dU8(d, at + 5)
+    let npg = dU8(d, at + 6)
+    let nig = dU8(d, at + 7)
+    var p = at + 16
+    let v = core.TrackKind.video
+    let au = core.TrackKind.audio
+    let su = core.TrackKind.subtitle
+    for (count, kind) in [(nv, v), (na, au), (npg, su), (nig, core.TrackKind.other)] {
+        var i = 0
+        while i < count && p + 2 <= end {
+            let (s, next) = bdStnStream(d, p, kind, "primary")
+            if next <= p {
+                return out
+            }
+            out.append(s)
+            p = next
+            i += 1
+        }
+    }
+    out
+}
+
+// A playlist (PLAYLIST/nnnnn.mpls).
+public fn parseMpls(_ d: Data, number: Int = -1) -> Result<BdPlaylist> {
+    if d.count < 40 || dAscii(d, 0, 4) != "MPLS" {
+        return Result.failure(error: Error("not a Blu-ray playlist (no MPLS)"))
+    }
+    var pl = BdPlaylist(number: number, version: dAscii(d, 4, 4))
+    let listAt = dU32(d, 8)
+    let markAt = dU32(d, 12)
+    pl.playbackType = dU8(d, 40 + 5)
+    if listAt < 40 || listAt + 10 > d.count {
+        return Result.failure(error: Error("playlist {number}: the play item list is outside the file"))
+    }
+    let ni = dU16(d, listAt + 6)
+    pl.subPaths = dU16(d, listAt + 8)
+    var p = listAt + 10
+    var i = 0
+    while i < ni && i < 9999 {
+        let len = dU16(d, p)
+        if p + 2 + len > d.count || len < 20 {
+            pl.warnings.append("playlist {number}: play item {i} is cut short")
+            break
+        }
+        var item = BdPlayItem(clip: dAscii(d, p + 2, 5))
+        item.codecId = dAscii(d, p + 7, 4)
+        let flags = dU16(d, p + 11)
+        let multiAngle = (flags >> 4) & 1 == 1
+        item.connection = flags & 15
+        item.stcId = dU8(d, p + 13)
+        item.inTime = dU32(d, p + 14)
+        item.outTime = dU32(d, p + 18)
+        // UO mask (8), random access flag (1), still mode (1), still time (2).
+        var q = p + 34
+        if multiAngle {
+            item.angles = max(1, dU8(d, q))
+            q += 2
+            var k = 1
+            while k < item.angles && q + 10 <= p + 2 + len {
+                item.angleClips.append(dAscii(d, q, 5))
+                q += 10
+                k += 1
+            }
+        }
+        item.streams = bdStn(d, q)
+        pl.items.append(item)
+        p += 2 + len
+        i += 1
+    }
+    if markAt >= 40 && markAt + 6 <= d.count {
+        let nm = dU16(d, markAt + 4)
+        var k = 0
+        while k < nm && markAt + 6 + 14 * k + 14 <= d.count {
+            let m = markAt + 6 + 14 * k
+            var mark = BdMark()
+            mark.type = dU8(d, m + 1)
+            mark.item = dU16(d, m + 2)
+            mark.time = dU32(d, m + 4)
+            mark.pid = dU16(d, m + 8)
+            mark.duration = dU32(d, m + 10)
+            pl.marks.append(mark)
+            k += 1
+        }
+    }
+    Result.ok(value: pl)
+}
+
+// The EP map at `at` (CPI's EP_map()).
+fn bdEpMaps(_ d: Data, _ at: Int, _ warn: [String]) -> ([BdEpMap], [String]) {
+    var w = warn
+    var out: [BdEpMap] = []
+    let n = dU8(d, at + 1)
+    var i = 0
+    while i < n {
+        let e = at + 2 + 12 * i
+        if e + 12 > d.count {
+            w.append("EP map cut short")
+            break
+        }
+        var m = BdEpMap(pid: dU16(d, e))
+        // 10 reserved bits, EP_stream_type (4), coarse count (16), fine
+        // count (18): 48 bits from e + 2.
+        let hi = dU16(d, e + 2)
+        let lo = dU32(d, e + 4)
+        m.streamType = (hi >> 2) & 15
+        let nc = ((hi & 3) << 14) | (lo >> 18)
+        let nf = lo & 0x3FFFF
+        let base = at + dU32(d, e + 8)
+        let fineAt = base + dU32(d, base)
+        // Coarse entries: ref_to_EP_fine_id (18), PTS_EP_coarse (14),
+        // SPN_EP_coarse (32).
+        var ci = 0
+        while ci < nc {
+            let c = base + 4 + 8 * ci
+            if c + 8 > d.count {
+                w.append("EP map: coarse entries cut short")
+                break
+            }
+            let word = dU32(d, c)
+            let ref = word >> 14
+            let ptsC = word & 0x3FFF
+            let spnC = dU32(d, c + 4)
+            let nextRef = if ci + 1 < nc { dU32(d, c + 8) >> 14 } else { nf }
+            var f = ref
+            while f < nextRef && f < nf {
+                let fe = fineAt + 4 * f
+                if fe + 4 > d.count {
+                    break
+                }
+                // Fine: angle change (1), I end offset (3), PTS_EP_fine
+                // (11), SPN_EP_fine (17).
+                let fw = dU32(d, fe)
+                let ptsF = (fw >> 17) & 0x7FF
+                let spnF = fw & 0x1FFFF
+                // The coarse PTS is PTS >> 19 and the fine PTS bits 19…9:
+                // they share bit 19, which the fine part gives.
+                m.pts.append(((ptsC & 0x3FFE) << 19) | (ptsF << 9))
+                m.spn.append((spnC & 0xFFFE0000) | spnF)
+                f += 1
+            }
+            ci += 1
+        }
+        out.append(m)
+        i += 1
+    }
+    (out, w)
+}
+
+// Clip information (CLIPINF/nnnnn.clpi).
+public fn parseClpi(_ d: Data, name: String = "") -> Result<BdClip> {
+    if d.count < 40 || dAscii(d, 0, 4) != "HDMV" {
+        return Result.failure(error: Error("not a Blu-ray clip info file (no HDMV)"))
+    }
+    var c = BdClip(name: name, version: dAscii(d, 4, 4))
+    let seqAt = dU32(d, 8)
+    let progAt = dU32(d, 12)
+    let cpiAt = dU32(d, 16)
+    c.applicationType = dU8(d, 40 + 7)
+    c.rate = dU32(d, 40 + 12)
+    c.packets = dU32(d, 40 + 16)
+    // SequenceInfo: ATC sequences, each with STC sequences (PCR PID,
+    // SPN start, presentation start and end).
+    if seqAt >= 40 && seqAt + 6 <= d.count {
+        let na = dU8(d, seqAt + 5)
+        var p = seqAt + 6
+        var a = 0
+        while a < na && p + 6 <= d.count {
+            let ns = dU8(d, p + 4)
+            p += 6
+            var s = 0
+            while s < ns && p + 14 <= d.count {
+                c.presentation.append(dU32(d, p + 6))
+                c.presentation.append(dU32(d, p + 10))
+                p += 14
+                s += 1
+            }
+            a += 1
+        }
+    }
+    // ProgramInfo: programs, each with its streams' PID and coding info.
+    if progAt >= 40 && progAt + 6 <= d.count {
+        let np = dU8(d, progAt + 5)
+        var p = progAt + 6
+        var k = 0
+        while k < np && p + 8 <= d.count {
+            let ns = dU8(d, p + 6)
+            p += 8
+            var s = 0
+            while s < ns && p + 3 <= d.count {
+                let pid = dU16(d, p)
+                let len = dU8(d, p + 2)
+                let coding = dU8(d, p + 3)
+                let (codec, kind) = bdCodec(coding)
+                var st = BdStream(kind: kind, coding: coding, codec: codec, pid: pid)
+                if kind == core.TrackKind.video {
+                    st.format = dU8(d, p + 4) >> 4
+                    st.rate = dU8(d, p + 4) & 15
+                } else if kind == core.TrackKind.audio {
+                    st.presentation = dU8(d, p + 4) >> 4
+                    st.rate = dU8(d, p + 4) & 15
+                    st.language = dAscii(d, p + 5, 3).lowercase()
+                } else if coding == 0x90 || coding == 0x91 {
+                    st.language = dAscii(d, p + 4, 3).lowercase()
+                } else if coding == 0x92 {
+                    st.language = dAscii(d, p + 5, 3).lowercase()
+                }
+                c.streams.append(st)
+                p += 3 + len
+                s += 1
+            }
+            k += 1
+        }
+    }
+    // CPI: length (4), CPI_type in the low 4 bits of the next 2 bytes
+    // (1 = EP map), then the EP map.
+    if cpiAt >= 40 && cpiAt + 8 <= d.count && dU32(d, cpiAt) > 0 {
+        if dU16(d, cpiAt + 4) & 15 == 1 {
+            let (maps, w) = bdEpMaps(d, cpiAt + 6, c.warnings)
+            c.epMaps = maps
+            c.warnings = w
+        }
+    }
+    Result.ok(value: c)
+}
+
+// Video size of a video_format code.
+fn bdVideoSize(_ format: Int) -> (Int, Int) {
+    match format {
+        1, 3 -> (720, 480)
+        2, 7 -> (720, 576)
+        4, 6 -> (1920, 1080)
+        5 -> (1280, 720)
+        8 -> (3840, 2160)
+        _ -> (0, 0)
+    }
+}
+
+// Frames per second of a frame_rate code, as a fraction.
+fn bdFps(_ rate: Int) -> (Int, Int) {
+    match rate {
+        1 -> (24000, 1001)
+        2 -> (24, 1)
+        3 -> (25, 1)
+        4 -> (30000, 1001)
+        6 -> (50, 1)
+        7 -> (60000, 1001)
+        _ -> (0, 1)
+    }
+}
+
+fn bdSampleRate(_ code: Int) -> Int {
+    match code {
+        1 -> 48000
+        4, 14 -> 96000
+        5, 12 -> 192000
+        _ -> 0
+    }
+}
+
+fn bdChannels(_ presentation: Int) -> Int {
+    match presentation {
+        1 -> 1
+        3 -> 2
+        6, 12 -> 6
+        _ -> 0
+    }
+}

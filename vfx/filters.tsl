@@ -1,0 +1,221 @@
+// Picture filters for playback: sharpening (unsharp mask) and noise
+// reduction (Reel's own spatio-temporal filter), on core.Picture of any
+// depth (8–12 bit) and chroma form. Both return a picture with the same
+// plane layout (strides, offsets) as the input, so they chain freely, and
+// both are sized for 1080p in under 10 ms.
+//
+// Unsharp mask (the classic darkroom technique, as any image-processing
+// text describes it): the picture minus a blurred copy is the detail;
+// adding `amount` times the detail back sharpens. The blur is the 3×3
+// binomial kernel (1 2 1)ᵀ(1 2 1)/16, done separably with a ring of three
+// rows of horizontal sums. Detail no larger than `threshold` (8-bit steps)
+// is left alone, so flat noise isn't amplified. Luma only: chroma
+// sharpening mostly makes colour fringes.
+//
+// Noise reduction (Reel's design): two steps in one pass per sample.
+//   1. Spatial: the mean n of the four neighbours (left, right, above,
+//      below) pulls the sample towards it by a table S[n − s]: fully for
+//      tiny differences (noise), falling to nothing at about three noise
+//      sigmas (an edge), a soft "sigma filter".
+//   2. Temporal: recursive averaging with the previous output o:
+//      out = o + T[s' − o], where T passes most of a small difference
+//      through only partly (so noise averages out over pictures) and a
+//      large one fully (motion: no ghost trails). The weight ramps between
+//      `strength`-dependent bounds, a motion-adaptive recursive filter.
+//   Chroma gets the temporal step only (and a light spatial one on 4:4:4
+//   pixel counts would cost the budget). After a seek, call reset.
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+import "../core"
+
+// Unsharp-mask settings: amount 0…4 (0.5 is mild, 1.0 strong), threshold
+// in 8-bit steps.
+public struct Sharpener {
+    amount: Float = 0.6
+    threshold: Int = 2
+
+    // The picture sharpened (luma only).
+    fn apply(_ p: core.Picture) -> core.Picture {
+        if amount <= 0.0 || p.width < 3 || p.height < 3 || p.y.isEmpty {
+            return p
+        }
+        var out = p
+        let depth = max(8, min(p.depth, 16))
+        let amt = Int(floor(min(amount, 8.0) * 256.0 + 0.5))
+        out.y = sharpenPlane(p.y, p.yOffset, p.yStride, p.width, p.height, amt, threshold << (depth - 8), (1 << depth) - 1)
+        out
+    }
+}
+
+public fn newSharpener(amount: Float = 0.6) -> Sharpener {
+    Sharpener(amount: amount)
+}
+
+// Unsharp mask on one plane: rows 1…h−2, columns 1…w−2 (the border stays).
+fn sharpenPlane(_ plane: [Int], _ off: Int, _ stride: Int, _ w: Int, _ h: Int, _ amt: Int, _ thr: Int, _ top: Int) -> [Int] {
+    var out = plane
+    // Horizontal sums (p[x−1] + 2p[x] + p[x+1]) of three rows, in a ring.
+    var hs = core.zeros(3 * w)
+    for r in 0..2 {
+        let b = off + r * stride
+        let o = r * w
+        var x = 1
+        while x < w - 1 {
+            hs[o + x] = plane[b + x - 1] + 2 * plane[b + x] + plane[b + x + 1]
+            x += 1
+        }
+    }
+    var row = 1
+    while row < h - 1 {
+        // Row row + 1's sums into the ring slot of row − 2 (now unused).
+        let nb = off + (row + 1) * stride
+        let ns = ((row + 1) % 3) * w
+        var x = 1
+        while x < w - 1 {
+            hs[ns + x] = plane[nb + x - 1] + 2 * plane[nb + x] + plane[nb + x + 1]
+            x += 1
+        }
+        let s0 = ((row + 2) % 3) * w
+        let s1 = (row % 3) * w
+        let b = off + row * stride
+        x = 1
+        while x < w - 1 {
+            let c = plane[b + x]
+            // 16·c − (sum of the 3×3 binomial): the detail ×16.
+            let d16 = (c << 4) - (hs[s0 + x] + 2 * hs[s1 + x] + hs[ns + x])
+            if abs(d16) > (thr << 4) {
+                out[b + x] = max(0, min(c + ((d16 * amt + 2048) >> 12), top))
+            }
+            x += 1
+        }
+        row += 1
+    }
+    out
+}
+
+// Noise reduction: strength 0…1 (0.5 is moderate). Keeps the previous
+// output for the temporal part.
+public struct Denoiser {
+    strength: Float = 0.5
+    // The previous output, and the settings/depth the tables are for.
+    last: [core.Picture] = []
+    tableKey: String = ""
+    // S (spatial) and T (temporal) correction tables, indexed by a
+    // difference + `tableMid`.
+    spatial: [Int] = []
+    temporal: [Int] = []
+    tableMid: Int = 0
+
+    // Forget the previous picture (after a seek or a jump).
+    fn reset() {
+        last = []
+    }
+
+    // The picture with its noise reduced.
+    fn apply(_ p: core.Picture) -> core.Picture {
+        if strength <= 0.0 || p.width < 3 || p.height < 3 || p.y.isEmpty {
+            return p
+        }
+        let depth = max(8, min(p.depth, 12))
+        prepareTables(depth)
+        let has = !last.isEmpty && sameShape(last[0], p)
+        let prev = if has { last[0] } else { p }
+        var out = p
+        out.y = denoiseLuma(p.y, prev.y, p.yOffset, p.yStride, p.width, p.height, spatial, temporal, tableMid, has)
+        if has && p.chroma != .gray && !p.u.isEmpty && !p.v.isEmpty {
+            let cw = p.chromaWidth
+            let ch = p.chromaHeight
+            out.u = denoiseTemporal(p.u, prev.u, p.cOffset, p.cStride, cw, ch, temporal, tableMid)
+            out.v = denoiseTemporal(p.v, prev.v, p.cOffset, p.cStride, cw, ch, temporal, tableMid)
+        }
+        last = [out]
+        out
+    }
+
+    // The two correction tables for this strength and depth. Sigma is the
+    // noise level treated as noise: 2…8 8-bit steps by strength.
+    fn prepareTables(_ depth: Int) {
+        let key = "{strength} {depth}"
+        if key == tableKey {
+            return
+        }
+        tableKey = key
+        let st = max(0.0, min(strength, 1.0))
+        let scale = Float(1 << (depth - 8))
+        let sigma = (2.0 + 6.0 * st) * scale
+        let n = 1 << depth
+        tableMid = n
+        spatial = []
+        temporal = []
+        // Spatial: move by d·(1 − (|d|/3σ)²)² · k, a smooth bump that is 0
+        // past 3σ (edges kept); k up to 0.75 of the way.
+        let ks = 0.25 + 0.5 * st
+        // Temporal: keep a fraction kt of the old picture for |d| ≤ σ,
+        // falling to 0 at 3σ (motion).
+        let kt = 0.3 + 0.45 * st
+        for i in 0..(2 * n + 1) {
+            let d = Float(i - n)
+            let a = abs(d)
+            var ws = 0.0
+            if a < 3.0 * sigma {
+                let q = a / (3.0 * sigma)
+                ws = ks * (1.0 - q * q) * (1.0 - q * q)
+            }
+            spatial.append(Int(floor(d * ws + 0.5)))
+            var keep = 0.0
+            if a <= sigma {
+                keep = kt
+            } else if a < 3.0 * sigma {
+                keep = kt * (3.0 * sigma - a) / (2.0 * sigma)
+            }
+            // out = o + d·(1 − keep), d = new − old.
+            temporal.append(Int(floor(d * (1.0 - keep) + 0.5)))
+        }
+    }
+}
+
+public fn newDenoiser(strength: Float = 0.5) -> Denoiser {
+    Denoiser(strength: strength)
+}
+
+// Spatial + temporal on luma (see the top of the file). The border keeps
+// the temporal step only.
+fn denoiseLuma(_ plane: [Int], _ prev: [Int], _ off: Int, _ stride: Int, _ w: Int, _ h: Int, _ sp: [Int], _ tp: [Int], _ mid: Int, _ temporal: Bool) -> [Int] {
+    var out = plane
+    for row in 0..h {
+        let b = off + row * stride
+        let inner = row > 0 && row + 1 < h
+        var x = 0
+        while x < w {
+            var s = plane[b + x]
+            if inner && x > 0 && x + 1 < w {
+                let n = (plane[b + x - 1] + plane[b + x + 1] + plane[b + x - stride] + plane[b + x + stride] + 2) >> 2
+                s += sp[n - s + mid]
+            }
+            if temporal {
+                let o = prev[b + x]
+                s = o + tp[s - o + mid]
+            }
+            out[b + x] = s
+            x += 1
+        }
+    }
+    out
+}
+
+// The temporal step alone (chroma).
+fn denoiseTemporal(_ plane: [Int], _ prev: [Int], _ off: Int, _ stride: Int, _ w: Int, _ h: Int, _ tp: [Int], _ mid: Int) -> [Int] {
+    var out = plane
+    for row in 0..h {
+        let b = off + row * stride
+        var x = 0
+        while x < w {
+            let o = prev[b + x]
+            out[b + x] = o + tp[plane[b + x] - o + mid]
+            x += 1
+        }
+    }
+    out
+}

@@ -1,0 +1,592 @@
+// Episodes: what a file name says about the show it belongs to ("Show
+// S02E05", "Show 2x05", "Show - Episode 5", "Show 2026-10-26", anime
+// "[Group] Show - 07 [1080p]", "Season 2/05 Title"), series names
+// normalised so files of one show match, and "next episode" in a folder or
+// in the library. Movie names give their title and year ("Movie (2019)",
+// "Movie.2019.1080p").
+//
+// These are the naming conventions media centres document for their users
+// (season/episode markers, date-based shows, absolute anime numbering); the
+// scanner below is written from those descriptions.
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+public struct EpisodeInfo {
+    // Whether the name looks like an episode of a show.
+    isEpisode: Bool = false
+    // The show's name as written (cleaned of dots, tags, years), and its
+    // key for matching (folded words, "&" read as "and").
+    series: String = ""
+    key: String = ""
+    // −1 when the name doesn't say.
+    season: Int = -1
+    episode: Int = -1
+    // The last episode of a double episode (S01E01E02, S01E01-E02), or −1.
+    episodeEnd: Int = -1
+    // Date-based shows: "yyyy-mm-dd", else "".
+    date: String = ""
+    // The year in the name ("Movie (2019)", "Show (2005) S01E01"), or −1.
+    year: Int = -1
+    // The episode's title after its number, or the movie's title.
+    title: String = ""
+    // How it was found: "sxe" (S01E02), "x" (1x02), "season" (Season 1
+    // Episode 2), "date", "episode" (Episode 2, Ep 2, E02), "anime"
+    // (- 07, or a bare number after [Group] tags), "folder" (a number in a
+    // "Season N" folder), "" when it isn't an episode.
+    kind: String = ""
+}
+
+// Words that start the technical part of a release name; an episode
+// title stops there.
+let releaseWords: [String] = ["1080p", "720p", "2160p", "480p", "576p", "4k", "uhd", "hdr", "hdr10", "dv", "x264", "x265", "h264", "h265", "hevc", "avc", "xvid", "divx", "web", "webrip", "webdl", "web-dl", "bluray", "blu-ray", "bdrip", "brrip", "dvdrip", "hdtv", "hdrip", "remux", "proper", "repack", "internal", "aac", "ac3", "dts", "ddp", "dd5", "flac", "10bit", "8bit", "multi", "subbed", "dubbed", "nf", "amzn", "dsnp", "hmax", "atvp"]
+
+// The name of a file without its extension (when it has a short one).
+fn episodeStem(_ path: String) -> String {
+    let name = path.fileName
+    if let dot = name.findLast(".") {
+        let ext = name.substring(from: dot + 1, to: name.count)
+        if ext.count >= 2 && ext.count <= 5 && !ext.contains(" ") {
+            return name.substring(from: 0, to: dot)
+        }
+    }
+    name
+}
+
+// Removes [tags] and {tags}, and (tags) other than a year; dots and
+// underscores become spaces. Gives the text, the year found in brackets
+// (or −1), and whether the name had bracketed tags (an anime hint).
+fn episodeClean(_ s: String) -> (String, Int, Bool) {
+    var out = ""
+    var depth = 0
+    var inside = ""
+    var close = ""
+    var year = -1
+    var hadTags = false
+    for ch in s.characters {
+        if depth == 0 && (ch == "[" || ch == "\{" || ch == "(") {
+            depth = 1
+            inside = ""
+            close = if ch == "[" { "]" } else if ch == "\{" { "\}" } else { ")" }
+            continue
+        }
+        if depth > 0 {
+            if ch == close {
+                depth = 0
+                let t = inside.trim()
+                let y = parseInt(t).valueOr(-1)
+                if close == ")" && t.count == 4 && y >= 1900 && y <= 2099 {
+                    year = y
+                } else {
+                    hadTags = true
+                }
+                out += " "
+            } else {
+                inside += ch
+            }
+            continue
+        }
+        if ch == "." || ch == "_" {
+            out += " "
+        } else {
+            out += ch
+        }
+    }
+    (out, year, hadTags)
+}
+
+fn epIsDigit(_ c: String) -> Bool {
+    c >= "0" && c <= "9" && c.count == 1
+}
+
+fn epIsAlnum(_ c: String) -> Bool {
+    if c.count != 1 {
+        return false
+    }
+    (c >= "0" && c <= "9") || (c >= "a" && c <= "z") || (c >= "A" && c <= "Z") || Data(text: c).count > 1
+}
+
+// The number of digits starting at i (0 when none).
+fn epDigits(_ low: [String], _ i: Int) -> Int {
+    var n = 0
+    while i + n < low.count && epIsDigit(low[i + n]) {
+        n += 1
+    }
+    n
+}
+
+fn epNumber(_ low: [String], _ i: Int, _ n: Int) -> Int {
+    parseInt(low.slice(from: i, to: i + n).joined()).valueOr(-1)
+}
+
+// Whether the word `w` is at i, with a non-letter (or the start) before it.
+fn epWordAt(_ low: [String], _ i: Int, _ w: String) -> Bool {
+    if i > 0 && epIsAlnum(low[i - 1]) {
+        return false
+    }
+    let n = w.count
+    if i + n > low.count {
+        return false
+    }
+    low.slice(from: i, to: i + n).joined() == w
+}
+
+// Skips spaces and dashes from i.
+fn epSkipSep(_ low: [String], _ i0: Int) -> Int {
+    var i = i0
+    while i < low.count && (low[i] == " " || low[i] == "-") {
+        i += 1
+    }
+    i
+}
+
+// Text trimmed of spaces and separators at both ends, with runs of spaces
+// made one.
+fn epTidy(_ s: String) -> String {
+    var t = s.trim()
+    var changed = true
+    while changed {
+        changed = false
+        for sep in ["-", "–", "—", ",", ":", "#", "~"] {
+            if t.hasSuffix(sep) {
+                t = t.substring(from: 0, to: t.count - sep.count).trim()
+                changed = true
+            }
+            if t.hasPrefix(sep) {
+                t = t.substring(from: sep.count, to: t.count).trim()
+                changed = true
+            }
+        }
+    }
+    t.words().joined(separator: " ")
+}
+
+// An episode title: the text after the number, up to the release tags.
+fn epTitle(_ s: String) -> String {
+    var kept: [String] = []
+    for w in epTidy(s).words() {
+        let lw = w.lowercase()
+        if releaseWords.contains(lw) || (lw.hasSuffix("p") && epIsDigit(lw.substring(from: 0, to: 1)) && parseInt(lw.substring(from: 0, to: lw.count - 1)).isOk()) {
+            break
+        }
+        kept.append(w)
+    }
+    epTidy(kept.joined(separator: " "))
+}
+
+// A show name for matching: folded words, "&" as "and", without a
+// trailing year.
+public fn seriesKey(_ name: String) -> String {
+    var words = searchWords(name.replace("&", with: " and ").replace("+", with: " and "))
+    if words.count > 1 {
+        let y = parseInt(words[words.count - 1]).valueOr(-1)
+        if words[words.count - 1].count == 4 && y >= 1900 && y <= 2099 {
+            words.removeLast()
+        }
+    }
+    words.joined(separator: " ")
+}
+
+// What a file's name (and its folder's) says: see EpisodeInfo.
+public fn parseEpisode(_ path: String) -> EpisodeInfo {
+    let (clean, bracketYear, hadTags) = episodeClean(episodeStem(path))
+    let chars = clean.characters
+    let low: [String] = chars.map { c in c.lowercase() }
+    let n = low.count
+    var info = EpisodeInfo(year: bracketYear)
+    var at = -1
+    var endAt = -1
+
+    // 1. S01E02 (also S01 E02, S01E01E02, S01E01-E02, S01E01-02).
+    var i = 0
+    while i < n && at < 0 {
+        if low[i] == "s" && (i == 0 || !epIsAlnum(low[i - 1])) {
+            let sd = epDigits(low, i + 1)
+            if sd >= 1 && sd <= 4 {
+                var j = i + 1 + sd
+                if j < n && low[j] == " " {
+                    j += 1
+                }
+                if j < n && low[j] == "e" {
+                    let ed = epDigits(low, j + 1)
+                    if ed >= 1 && ed <= 4 {
+                        info.season = epNumber(low, i + 1, sd)
+                        info.episode = epNumber(low, j + 1, ed)
+                        var k = j + 1 + ed
+                        // A second episode number.
+                        var k2 = k
+                        if k2 < n && low[k2] == "-" {
+                            k2 += 1
+                        }
+                        if k2 < n && low[k2] == "e" {
+                            k2 += 1
+                        }
+                        let ed2 = epDigits(low, k2)
+                        if ed2 >= 1 && ed2 <= 4 && k2 > k {
+                            let e2 = epNumber(low, k2, ed2)
+                            if e2 > info.episode {
+                                info.episodeEnd = e2
+                                k = k2 + ed2
+                            }
+                        }
+                        if k >= n || !epIsDigit(low[k]) {
+                            at = i
+                            endAt = k
+                            info.kind = "sxe"
+                        }
+                    }
+                }
+            }
+        }
+        i += 1
+    }
+
+    // 2. 1x02.
+    i = 0
+    while i < n && at < 0 {
+        let sd = epDigits(low, i)
+        if sd >= 1 && sd <= 2 && (i == 0 || !epIsAlnum(low[i - 1])) && i + sd < n && low[i + sd] == "x" {
+            let ed = epDigits(low, i + sd + 1)
+            let k = i + sd + 1 + ed
+            if ed >= 2 && ed <= 3 && (k >= n || !epIsAlnum(low[k])) {
+                info.season = epNumber(low, i, sd)
+                info.episode = epNumber(low, i + sd + 1, ed)
+                at = i
+                endAt = k
+                info.kind = "x"
+            }
+        }
+        i += max(sd, 1)
+    }
+
+    // 3. Season 1 Episode 2.
+    i = 0
+    while i < n && at < 0 {
+        if epWordAt(low, i, "season") {
+            let j = epSkipSep(low, i + 6)
+            let sd = epDigits(low, j)
+            if sd >= 1 && sd <= 3 {
+                var k = epSkipSep(low, j + sd)
+                var word = 0
+                if epWordAt(low, k, "episode") {
+                    word = 7
+                } else if epWordAt(low, k, "ep") {
+                    word = 2
+                }
+                if word > 0 {
+                    k += word
+                    if k < n && low[k] == "." {
+                        k += 1
+                    }
+                    k = epSkipSep(low, k)
+                    let ed = epDigits(low, k)
+                    if ed >= 1 && ed <= 4 {
+                        info.season = epNumber(low, j, sd)
+                        info.episode = epNumber(low, k, ed)
+                        at = i
+                        endAt = k + ed
+                        info.kind = "season"
+                    }
+                }
+            }
+        }
+        i += 1
+    }
+
+    // 4. A date: 2026-10-26, 2026 10 26.
+    i = 0
+    while i < n && at < 0 {
+        if epDigits(low, i) == 4 && (i == 0 || !epIsAlnum(low[i - 1])) {
+            let y = epNumber(low, i, 4)
+            let j = i + 4
+            if y >= 1900 && y <= 2099 && j + 6 <= n && (low[j] == "-" || low[j] == " ") && epDigits(low, j + 1) == 2 && (low[j + 3] == "-" || low[j + 3] == " ") && epDigits(low, j + 4) == 2 && (j + 6 >= n || !epIsAlnum(low[j + 6])) {
+                let m = epNumber(low, j + 1, 2)
+                let d = epNumber(low, j + 4, 2)
+                if m >= 1 && m <= 12 && d >= 1 && d <= 31 {
+                    info.date = "{y}-{"{m}".padStart(2, with: "0")}-{"{d}".padStart(2, with: "0")}"
+                    info.year = y
+                    at = i
+                    endAt = j + 6
+                    info.kind = "date"
+                }
+            }
+        }
+        i += 1
+    }
+
+    // 5. Episode 2, Ep 2, Ep.2, E02.
+    i = 0
+    while i < n && at < 0 {
+        var word = 0
+        if epWordAt(low, i, "episode") {
+            word = 7
+        } else if epWordAt(low, i, "ep") {
+            word = 2
+        } else if low[i] == "e" && (i == 0 || !epIsAlnum(low[i - 1])) && i + 1 < n && epIsDigit(low[i + 1]) {
+            word = 1
+        }
+        if word > 0 {
+            var k = i + word
+            if word > 1 {
+                if k < n && low[k] == "." {
+                    k += 1
+                }
+                k = epSkipSep(low, k)
+            }
+            let ed = epDigits(low, k)
+            if ed >= 1 && ed <= 4 && (k + ed >= n || !epIsAlnum(low[k + ed])) && (word > 1 || ed >= 2) {
+                info.episode = epNumber(low, k, ed)
+                at = i
+                endAt = k + ed
+                info.kind = "episode"
+            }
+        }
+        i += 1
+    }
+
+    // 6. Anime: "Show - 07", "Show - 07v2", or a bare last number after
+    //    [Group] tags.
+    i = 0
+    while i + 3 < n && at < 0 {
+        if low[i] == " " && low[i + 1] == "-" && low[i + 2] == " " {
+            let ed = epDigits(low, i + 3)
+            var k = i + 3 + ed
+            if k + 1 < n && low[k] == "v" && epIsDigit(low[k + 1]) {
+                k += 2
+            }
+            if ed >= 1 && ed <= 4 && (k >= n || !epIsAlnum(low[k])) {
+                let num = epNumber(low, i + 3, ed)
+                if !(ed == 4 && num >= 1900 && num <= 2099) {
+                    info.episode = num
+                    at = i
+                    endAt = k
+                    info.kind = "anime"
+                }
+            }
+        }
+        i += 1
+    }
+    if at < 0 && hadTags {
+        let words = clean.words()
+        if words.count >= 2 {
+            let last = words[words.count - 1]
+            let num = parseInt(last).valueOr(-1)
+            if last.count <= 4 && num >= 0 && epDigits(last.characters, 0) == last.count && !(last.count == 4 && num >= 1900) {
+                info.episode = num
+                info.kind = "anime"
+                at = (clean.findLast(last) ?? n)
+                endAt = at + last.count
+            }
+        }
+    }
+
+    // The folder: "Season 2" or "S02" gives the season (and the show is the
+    // folder above it); a number at the start of the name in such a folder
+    // is the episode.
+    let folder = path.folder.fileName
+    let folderSeason = seasonOfFolder(folder)
+    if at < 0 && folderSeason >= 0 {
+        let lead = epDigits(low, 0)
+        if lead >= 1 && lead <= 3 {
+            info.episode = epNumber(low, 0, lead)
+            info.kind = "folder"
+            at = 0
+            endAt = lead
+        }
+    }
+
+    if at >= 0 {
+        info.isEpisode = true
+        info.series = epTidy(chars.slice(from: 0, to: at).joined())
+        info.title = epTitle(chars.slice(from: endAt, to: n).joined())
+        if info.season < 0 && folderSeason >= 0 {
+            info.season = folderSeason
+        }
+        // A year at the end of the show's name: "Show 2005 S01E01".
+        let sw = info.series.words()
+        if sw.count >= 2 {
+            let y = parseInt(sw[sw.count - 1]).valueOr(-1)
+            if sw[sw.count - 1].count == 4 && y >= 1900 && y <= 2099 {
+                info.year = y
+                info.series = sw.dropLast().joined(separator: " ")
+            }
+        }
+        if info.series.isEmpty {
+            // "Season 2/05 - Title.mkv", "Show/S01E05.mkv": the folders say.
+            if folderSeason >= 0 {
+                info.series = epTidy(episodeClean(path.folder.folder.fileName).0)
+            } else {
+                info.series = epTidy(episodeClean(folder).0)
+            }
+        }
+        info.key = seriesKey(info.series)
+        return info
+    }
+
+    // Not an episode: a title and maybe a year ("Movie 2019 1080p"; in
+    // "Blade Runner 2049 2017" the last year-like word is the year).
+    let words = clean.words()
+    var stop = words.count
+    var yearAt = -1
+    for (k, w) in words.enumerated() {
+        if releaseWords.contains(w.lowercase()) {
+            stop = k
+            break
+        }
+        let y = parseInt(w).valueOr(-1)
+        if k > 0 && w.count == 4 && y >= 1900 && y <= 2099 {
+            yearAt = k
+        }
+    }
+    if yearAt > 0 {
+        info.year = parseInt(words[yearAt]).valueOr(-1)
+        stop = yearAt
+    }
+    info.title = epTitle(words.prefix(stop).joined(separator: " "))
+    info
+}
+
+// "Season 2", "Season 02", "S2", "S02", "Series 3" → the number, else −1.
+public fn seasonOfFolder(_ name: String) -> Int {
+    let w = searchWords(name)
+    if w.count == 2 && (w[0] == "season" || w[0] == "series" || w[0] == "staffel" || w[0] == "saison" || w[0] == "temporada") {
+        return parseInt(w[1]).valueOr(-1)
+    }
+    if w.count == 1 && w[0].hasPrefix("s") && w[0].count <= 4 {
+        return parseInt(w[0].substring(from: 1, to: w[0].count)).valueOr(-1)
+    }
+    -1
+}
+
+// Whether episode `a` comes before episode `b` (same show assumed):
+// by season, episode and date, then by natural name order.
+fn episodeBefore(_ a: EpisodeInfo, _ b: EpisodeInfo, _ pa: String, _ pb: String) -> Bool {
+    let sa = max(a.season, 0)
+    let sb = max(b.season, 0)
+    if sa != sb {
+        return sa < sb
+    }
+    if !a.date.isEmpty || !b.date.isEmpty {
+        if a.date != b.date {
+            return a.date < b.date
+        }
+    }
+    if a.episode != b.episode {
+        return a.episode < b.episode
+    }
+    naturalCompare(pa.fileName, pb.fileName) < 0
+}
+
+// Whether two names are episodes of the same show: the same key, or (when
+// a name gives no show, as "- 07" or "S01E02.mkv") the same folder.
+fn sameShow(_ a: EpisodeInfo, _ b: EpisodeInfo, _ pa: String, _ pb: String) -> Bool {
+    if !a.key.isEmpty && !b.key.isEmpty {
+        return a.key == b.key
+    }
+    pa.folder == pb.folder
+}
+
+// The episode after `path` among `candidates` (paths: a folder's files or
+// the library's), or "" when there's none. For a file that isn't an
+// episode, the next file of the same folder in natural order.
+public fn nextEpisode(_ path: String, candidates: [String]) -> String {
+    stepEpisode(path, candidates: candidates, forward: true)
+}
+
+// The episode before `path`, or "".
+public fn previousEpisode(_ path: String, candidates: [String]) -> String {
+    stepEpisode(path, candidates: candidates, forward: false)
+}
+
+fn stepEpisode(_ path: String, candidates: [String], forward: Bool) -> String {
+    let cur = parseEpisode(path)
+    var best = ""
+    var bestInfo = EpisodeInfo()
+    if cur.isEpisode {
+        for c in candidates {
+            if c == path {
+                continue
+            }
+            let e = parseEpisode(c)
+            if !e.isEpisode || !sameShow(cur, e, path, c) {
+                continue
+            }
+            let after = if forward { episodeBefore(cur, e, path, c) } else { episodeBefore(e, cur, c, path) }
+            if !after {
+                continue
+            }
+            let better = if forward { episodeBefore(e, bestInfo, c, best) } else { episodeBefore(bestInfo, e, best, c) }
+            if best.isEmpty || better {
+                best = c
+                bestInfo = e
+            }
+        }
+        return best
+    }
+    let folderFiles = candidates.filter { c in c.folder == path.folder && c != path }
+    for c in folderFiles {
+        let cmp = naturalCompare(c.fileName, path.fileName)
+        let after = if forward { cmp > 0 } else { cmp < 0 }
+        if !after {
+            continue
+        }
+        if best.isEmpty || (forward && naturalCompare(c.fileName, best.fileName) < 0) || (!forward && naturalCompare(c.fileName, best.fileName) > 0) {
+            best = c
+        }
+    }
+    best
+}
+
+// The next episode among the media files beside `path` (from listFolder),
+// or "".
+public fn nextInFolder(_ path: String) -> String {
+    var cands: [String] = []
+    for name in listFolder(path.folder) ?? [] {
+        let p = joinPath(path.folder, name)
+        if isMediaFile(p) {
+            cands.append(p)
+        }
+    }
+    nextEpisode(path, candidates: cands)
+}
+
+// Paths in show order: by show, season, episode (or date), then natural
+// name order; files that aren't episodes in natural order after them.
+public fn sortEpisodes(_ paths: [String]) -> [String] {
+    var infos: [(String, EpisodeInfo)] = []
+    for p in paths {
+        infos.append((p, parseEpisode(p)))
+    }
+    let sorted = infos.sorted(by: { a, b in
+        if a.1.isEpisode != b.1.isEpisode {
+            return a.1.isEpisode
+        }
+        if a.1.key != b.1.key {
+            return naturalCompare(a.1.key, b.1.key) < 0
+        }
+        if !a.1.isEpisode {
+            return naturalCompare(a.0.fileName, b.0.fileName) < 0
+        }
+        episodeBefore(a.1, b.1, a.0, b.0)
+    })
+    sorted.map { x in x.0 }
+}
+
+// "S02E05", "S02E05–E06", "2026-10-26", "Episode 7", or "" (for lists).
+public fn episodeLabel(_ e: EpisodeInfo) -> String {
+    if !e.isEpisode {
+        return ""
+    }
+    if !e.date.isEmpty {
+        return e.date
+    }
+    let ep = "{e.episode}".padStart(2, with: "0")
+    if e.season >= 0 {
+        let s = "{e.season}".padStart(2, with: "0")
+        if e.episodeEnd > 0 {
+            return "S{s}E{ep}–E{"{e.episodeEnd}".padStart(2, with: "0")}"
+        }
+        return "S{s}E{ep}"
+    }
+    "Episode {e.episode}"
+}

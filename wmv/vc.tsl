@@ -1,0 +1,128 @@
+// The VC-1 decoder for "wmv3" (WMV9: VC-1 Simple and Main profiles, and
+// the "Complex" profile as ffmpeg decodes it) and "vc1" (VC-1 Advanced
+// profile, WVC1/WMVA) tracks: the parser (vcparse.tsl) and the
+// reconstructor (vcrecon.tsl) one after the other. vcapi.tsl offers the two
+// stages separately for running them on two cores.
+//
+// Track.extra: for wmv3 the 4 (or more) bytes of STRUCT_C, the Simple/Main
+// sequence header (SMPTE 421M Annex J.2), from the BITMAPINFOHEADER tail;
+// for vc1 the Advanced sequence header and entry point with their start
+// codes (00 00 01 0F …, 00 00 01 0E …), possibly after a size byte, or
+// empty when they come in the stream (MPEG-TS, raw Annex E).
+//
+// Pictures come out in display order: B pictures at once, I and P
+// pictures when the next one arrives (or right away when a WMV9 stream says
+// it has no B pictures), as ffmpeg outputs them.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../core"
+
+struct VcDecoder {
+    skipNonReference: Bool = false
+    warnings: [String] = []
+    parser: VcParser = VcParser()
+    recon: VcRecon = VcRecon()
+
+    fn decode(_ packet: Data, pts: Int, dts: Int, key: Bool) -> [core.Picture] {
+        parser.skipNonReference = skipNonReference
+        let p = parser.parse(packet, pts: pts, key: key)
+        recon.resFasttxHint = parser.resFasttx || parser.profile == 3
+        var out = recon.reconstruct(p)
+        if parser.pendingField {
+            // A field pair: the second field finishes the frame.
+            let p2 = parser.parseSecondField()
+            out += recon.reconstruct(p2)
+        }
+        takeWarnings()
+        out
+    }
+
+    fn flush() -> [core.Picture] {
+        recon.flush()
+    }
+
+    fn reset() {
+        parser.reset()
+        recon.reset()
+    }
+
+    fn takeWarnings() {
+        for list in [parser.warnings, recon.warnings] {
+            for w in list {
+                if warnings.count < 200 {
+                    warnings.append(w)
+                }
+            }
+        }
+        parser.warnings = []
+        recon.warnings = []
+    }
+}
+
+// A decoder for a "wmv3" or "vc1" track.
+fn vcNewDecoder(_ track: core.Track) -> Result<VcDecoder> {
+    var d = VcDecoder()
+    var p = VcParser()
+    p.setupTables()
+    let x = track.extra
+    if track.codec == "wmv3" {
+        if x.count < 4 {
+            return .failure(error: Error("wmv3: the sequence header (STRUCT_C) is missing"))
+        }
+        p.br = core.bitReader(x)
+        if !p.seqHeaderSimple() {
+            let why = if p.warnings.isEmpty { "unsupported sequence header" } else { p.warnings[0] }
+            return .failure(error: Error(why))
+        }
+        if track.width <= 0 || track.height <= 0 {
+            return .failure(error: Error("wmv3: the picture size is unknown"))
+        }
+        p.setupGeometry(track.width, track.height)
+        d.recon.lowDelay = p.maxBFrames == 0
+    } else {
+        // Sequence header and entry point from the extra (find_next_marker,
+        // as vc1_decode_init does).
+        var start = vcNextMarker(x, 0)
+        while start < x.count {
+            let next = vcNextMarker(x, start + 4)
+            if next - start - 4 > 0 {
+                let body = vcUnescape(x, start + 4, next)
+                let code = x[start + 3]
+                p.br = core.bitReader(body)
+                if code == 0x0F {
+                    p.profile = p.br.bits(2)
+                    if p.profile == 3 {
+                        p.seqHeaderAdv()
+                    } else {
+                        p.br = core.bitReader(body)
+                        p.seqHeaderSimple()
+                    }
+                } else if code == 0x0E && p.seqOk {
+                    p.entryPoint()
+                }
+            }
+            start = next
+        }
+        p.profile = if p.seqOk { p.profile } else { 3 }
+        d.recon.lowDelay = false
+    }
+    if track.sarNum > 0 && track.sarDen > 0 {
+        d.recon.sarNum = track.sarNum
+        d.recon.sarDen = track.sarDen
+    }
+    if p.sarNum > 0 && p.sarDen > 0 {
+        d.recon.sarNum = p.sarNum
+        d.recon.sarDen = p.sarDen
+    }
+    if p.matrixCoef == 1 {
+        d.recon.matrix = .bt709
+    } else if p.matrixCoef == 6 || p.matrixCoef == 7 {
+        d.recon.matrix = .bt601
+    } else {
+        d.recon.matrix = track.matrix
+    }
+    d.parser = p
+    Result.ok(value: d)
+}

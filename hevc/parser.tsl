@@ -1,0 +1,2717 @@
+// The first stage of the HEVC decoder: Parser takes packets and produces
+// ParsedPictures. It does everything that needs the bitstream: NAL units,
+// parameter sets, slice headers, picture order counts and the reference
+// picture sets (ITU-T H.265 8.3.1, 8.3.2), reference picture lists (8.3.4),
+// the decoded picture buffer's output and removal decisions (C.5.2), the
+// CABAC parsing of slice data (7.3.8: coding quadtree, coding units,
+// prediction units, transform trees, SAO syntax, PCM), the intra mode and
+// QP derivations (8.4.2, 8.6.1), motion vector derivation (merge, AMVP and
+// temporal prediction, 8.5.3.2) and deblocking boundary strengths (8.7.2.4).
+// What reconstruction needs goes into the ParsedPicture's operation stream
+// and filter tables (see parsed.tsl).
+//
+// Grids of the current picture are kept per 4x4 luma unit, index
+// (y >> 2) * w4 + (x >> 2). Motion: mf (bits 0-1 prediction flags, 2-5
+// refIdxL0, 6-9 refIdxL1, 10 / 11 long-term flags), mv0 / mv1 packed as
+// (x & 0xFFFF) | ((y & 0xFFFF) << 16), and the POCs of the references.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../core"
+
+// A picture in the parser's model of the decoded picture buffer, with the
+// motion it keeps for temporal motion vector prediction.
+struct HevcDpbEntry {
+    slot: Int = 0
+    poc: Int = 0
+    // 0 unused for reference, 1 short-term, 2 long-term.
+    ref: Int = 0
+    needOutput: Bool = false
+    latency: Int = 0
+    missing: Bool = false
+    mf: [Int] = []
+    mv0: [Int] = []
+    mv1: [Int] = []
+    poc0: [Int] = []
+    poc1: [Int] = []
+}
+
+public struct Parser {
+    skipNonReference: Bool = false
+    warnings: [String] = []
+    lengthSize: Int = 0
+    // Development: print each prediction unit's motion.
+    debugMv: Bool = false
+    spsList: [HevcSps] = []
+    ppsList: [HevcPps] = []
+    sps: HevcSps = HevcSps()
+    pps: HevcPps = HevcPps()
+    activePps: Int = -1
+    ppsGen: Int = 0
+    builtGen: Int = -1
+    cabac: HevcCabac = HevcCabac()
+    tr: HevcTransform = HevcTransform()
+    flt: HevcFilter = HevcFilter()
+    // Residual planes of the current picture, and a ring of picture-sized
+    // sets handed out with ParsedPictures (reused when the reconstructor
+    // is done with them, so writes stay in place).
+    resY: [Int] = []
+    resU: [Int] = []
+    resV: [Int] = []
+    ringY: [[Int]] = []
+    ringU: [[Int]] = []
+    ringV: [[Int]] = []
+    ringPos: Int = 0
+    out: [ParsedPicture] = []
+    ops: [Int] = []
+
+    // Geometry of the active SPS.
+    width: Int = 0
+    height: Int = 0
+    log2Ctb: Int = 4
+    ctbSize: Int = 16
+    ctbW: Int = 0
+    ctbH: Int = 0
+    log2MinCb: Int = 3
+    log2MinTb: Int = 2
+    w4: Int = 0
+    h4: Int = 0
+    chromaIdc: Int = 1
+    bitDepth: Int = 8
+    qpBdOffset: Int = 0
+    geomKey: [Int] = []
+
+    // Tiles (6.5.1): CTB address conversions, tile of each CTB (by TS),
+    // the CTB column where each CTB's tile starts (by RS), and whether a
+    // CTB (by TS) starts a tile / a CTB row within its tile.
+    rsToTs: [Int] = []
+    tsToRs: [Int] = []
+    tileIdTs: [Int] = []
+    tileColStart: [Int] = []
+    tileStart: [Int] = []
+    rowStart: [Int] = []
+    // z-scan order of the minimum transform blocks in a CTB.
+    zs: [Int] = []
+
+    // Grids of the current picture (4x4 units).
+    intra4: [Int] = []
+    skip4: [Int] = []
+    depth4: [Int] = []
+    ipm4: [Int] = []
+    cbf4: [Int] = []
+    mf4: [Int] = []
+    mv04: [Int] = []
+    mv14: [Int] = []
+    poc04: [Int] = []
+    poc14: [Int] = []
+    ctbSliceAddr: [Int] = []
+    mvPool: [HevcDpbEntry] = []
+
+    // Picture state.
+    inPicture: Bool = false
+    picSlot: Int = 0
+    poc: Int = 0
+    picPts: Int = -9223372036854775807
+    picKey: Bool = false
+    picOutput: Bool = true
+    picIrap: Bool = false
+    picWarnings: [String] = []
+    before: [Int] = []
+    decodedCtbs: Int = 0
+    // Where bump / removeUnused put their actions.
+    toAfter: Bool = false
+
+    // POC and random access state.
+    prevPocTid0: Int = 0
+    firstPicture: Bool = true
+    noRaslOutput: Bool = true
+    pendingEos: Bool = false
+    dpb: [HevcDpbEntry] = []
+    nextSlot: Int = 1
+    maxDpb: Int = 6
+    numReorder: Int = 0
+    maxLatency: Int = 0
+
+    // Slice state.
+    sh: HevcSlice = HevcSlice()
+    prevSh: HevcSlice = HevcSlice()
+    refPoc0: [Int] = []
+    refPoc1: [Int] = []
+    refSlot0: [Int] = []
+    refSlot1: [Int] = []
+    refLt0: [Int] = []
+    refLt1: [Int] = []
+    colDpb: Int = -1
+    noBackwardPred: Bool = true
+    sliceAddrRs: Int = 0
+    sliceOk: Bool = true
+
+    // CTU / CU state.
+    ctbAddrTs: Int = 0
+    ctbAddrRs: Int = 0
+    ctbX: Int = 0
+    ctbY: Int = 0
+    qpY: Int = 26
+    lastQpY: Int = 26
+    qgPrevQp: Int = 26
+    cuQpDeltaCoded: Bool = false
+    cuQpDeltaVal: Int = 0
+    log2MinQg: Int = 4
+    cuBypass: Bool = false
+    cuIntra: Bool = false
+    partMode: Int = 0
+    intraSplit: Bool = false
+    mergeFlag: Bool = false
+    ctDepth: Int = 0
+    maxTrafoDepth: Int = 0
+    ipmPart: [Int] = []
+    chromaModeC: Int = 0
+    cbX: Int = 0
+    cbY: Int = 0
+    cbSize: Int = 0
+    // Merge candidates (mf, mv0, mv1, poc0, poc1).
+    cMf: [Int] = []
+    cMv0: [Int] = []
+    cMv1: [Int] = []
+    cPoc0: [Int] = []
+    cPoc1: [Int] = []
+    // PU result.
+    puMf: Int = 0
+    puMv0: Int = 0
+    puMv1: Int = 0
+
+    // ------------------------------------------------------------------
+    // Entry points.
+
+    fn setup() {
+        if spsList.count > 0 {
+            return
+        }
+        for _ in 0..16 {
+            spsList.append(HevcSps())
+        }
+        for _ in 0..64 {
+            ppsList.append(HevcPps())
+        }
+        cabac.setup()
+        tr.setup()
+        ipmPart = hevcFilled(4, 1)
+        cMf = hevcFilled(6, 0)
+        cMv0 = hevcFilled(6, 0)
+        cMv1 = hevcFilled(6, 0)
+        cPoc0 = hevcFilled(6, 0)
+        cPoc1 = hevcFilled(6, 0)
+    }
+
+    // Parses one packet (an access unit, or parameter sets); returns the
+    // pictures completed by it.
+    public fn parse(_ packet: Data, pts: Int, dts: Int, key: Bool) -> [ParsedPicture] {
+        setup()
+        let nals = hevcSplitNals(packet, lengthSize)
+        var i = 0
+        var first = true
+        while i + 1 < nals.count {
+            handleNal(packet, nals[i], nals[i + 1], pts, key, first)
+            first = false
+            i += 2
+        }
+        // A packet holds one access unit: its picture is complete.
+        if inPicture {
+            finishPicture()
+        }
+        take()
+    }
+
+    // End of stream: finishes the current picture and outputs everything.
+    public fn flush() -> [ParsedPicture] {
+        setup()
+        if inPicture {
+            finishPicture()
+        }
+        var p = ParsedPicture()
+        toAfter = true
+        while bump(p) {
+        }
+        for k in 0..dpb.count {
+            dpb[k].ref = 0
+        }
+        removeUnused(p)
+        p.warnings = picWarnings
+        picWarnings = []
+        if !p.after.isEmpty || !p.warnings.isEmpty {
+            out.append(p)
+        }
+        take()
+    }
+
+    // After a seek: drops every picture and waits for a random access
+    // point (the reconstructor's reset() drops its pictures likewise).
+    public fn reset() {
+        inPicture = false
+        dpb = []
+        out = []
+        firstPicture = true
+        pendingEos = false
+        prevPocTid0 = 0
+    }
+
+    fn take() -> [ParsedPicture] {
+        let o = out
+        out = []
+        o
+    }
+
+    fn warn(_ s: String) {
+        if picWarnings.count < 20 {
+            picWarnings.append(s)
+        }
+        if warnings.count < 200 {
+            warnings.append(s)
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // NAL units and parameter sets.
+
+    fn handleNal(_ d: Data, _ start: Int, _ end: Int, _ pts: Int, _ key: Bool, _ firstInPacket: Bool) {
+        if end - start < 2 {
+            return
+        }
+        let type = (d[start] >> 1) & 63
+        let layer = ((d[start] & 1) << 5) | (d[start + 1] >> 3)
+        let tid = (d[start + 1] & 7) - 1
+        if layer != 0 || tid < 0 {
+            return
+        }
+        if type == nalSps || type == nalPps {
+            let rbsp = hevcUnescape(d, from: start, to: end)
+            var ps = hevcNewPs(rbsp.data, from: 2)
+            if type == nalSps {
+                let s = ps.parseSps()
+                if s.valid {
+                    spsList[s.id] = s
+                    ppsGen += 1
+                } else {
+                    warn("hevc: a sequence parameter set can't be read")
+                }
+            } else {
+                let p = ps.parsePps()
+                if p.valid {
+                    ppsList[p.id] = p
+                    ppsGen += 1
+                } else {
+                    warn("hevc: a picture parameter set can't be read")
+                }
+            }
+            return
+        }
+        if type == nalEos || type == nalEob {
+            if inPicture {
+                finishPicture()
+            }
+            pendingEos = true
+            return
+        }
+        if type > 21 || (type >= 10 && type <= 15) {
+            return
+        }
+        handleSlice(d, start, end, type, tid, pts, key)
+    }
+
+    // ------------------------------------------------------------------
+    // Slices and pictures.
+
+    fn handleSlice(_ d: Data, _ start: Int, _ end: Int, _ type: Int, _ tid: Int, _ pts: Int, _ key: Bool) {
+        let rbsp = hevcUnescape(d, from: start, to: end)
+        let ps = hevcNewPs(rbsp.data, from: 2)
+        let h = hevcParseSliceHeader(ps, rbsp, nalType: type, temporalId: tid, spsList: spsList, ppsList: ppsList, prev: prevSh)
+        if !h.valid {
+            if h.firstSliceInPic || inPicture {
+                warn("hevc: a slice header can't be read")
+            }
+            return
+        }
+        if h.firstSliceInPic {
+            if inPicture {
+                finishPicture()
+            }
+            if !startPicture(h, pts, key) {
+                return
+            }
+        } else if !inPicture {
+            return
+        }
+        if h.ppsId != activePps {
+            // All slices of a picture use the same PPS.
+            warn("hevc: slices of one picture refer to different parameter sets")
+            return
+        }
+        sh = h
+        if !h.dependent {
+            prevSh = h
+        }
+        decodeSlice(rbsp.data, h)
+    }
+
+    // Starts a picture at its first slice: activates the parameter sets,
+    // works out the POC and reference picture set, and makes room in the
+    // DPB. False when the picture is skipped.
+    fn startPicture(_ h: HevcSlice, _ pts: Int, _ key: Bool) -> Bool {
+        let type = h.nalType
+        let irap = type >= 16 && type <= 23
+        let rasl = type == nalRaslN || type == nalRaslR
+        if firstPicture && !irap {
+            // Wait for a random access point.
+            return false
+        }
+        if irap {
+            noRaslOutput = type == nalIdrWRadl || type == nalIdrNLp || (type >= nalBlaWLp && type <= nalBlaNLp) || firstPicture || pendingEos
+        }
+        if rasl && noRaslOutput {
+            return false
+        }
+        let p = ppsList[h.ppsId]
+        let s = spsList[p.spsId]
+        if !s.valid || !p.valid {
+            return false
+        }
+        if !hevcTilesFit(p, s) {
+            warn("hevc: the tiles of a picture parameter set don't fit the picture")
+            return false
+        }
+        if s.unsupported != "" || p.unsupported != "" {
+            warn("hevc: not supported: " + (if s.unsupported != "" { s.unsupported } else { p.unsupported }))
+            return false
+        }
+        // Sub-layer non-reference pictures of the highest sub-layer.
+        if skipNonReference && type < 16 && (type & 1) == 0 && h.temporalId == s.maxSubLayers - 1 {
+            return false
+        }
+        activate(h.ppsId)
+        // POC (8.3.1).
+        let maxLsb = 1 << sps.log2MaxPocLsb
+        var msb = 0
+        if !(irap && noRaslOutput) {
+            let prevLsb = prevPocTid0 & (maxLsb - 1)
+            let prevMsb = prevPocTid0 - prevLsb
+            if h.pocLsb < prevLsb && prevLsb - h.pocLsb >= maxLsb / 2 {
+                msb = prevMsb + maxLsb
+            } else if h.pocLsb > prevLsb && h.pocLsb - prevLsb > maxLsb / 2 {
+                msb = prevMsb - maxLsb
+            } else {
+                msb = prevMsb
+            }
+        }
+        poc = msb + h.pocLsb
+        if h.temporalId == 0 && !(type >= nalRadlN && type <= nalRaslR) && !(type < 16 && (type & 1) == 0) {
+            prevPocTid0 = poc
+        }
+        var pp = ParsedPicture()
+        toAfter = false
+        // Reference picture set (8.3.2) and DPB output / removal (C.5.2.2).
+        if irap && noRaslOutput {
+            var noOutput = h.noOutputOfPriorPics
+            if type == nalCra {
+                noOutput = true
+            }
+            if firstPicture {
+                noOutput = false
+            }
+            if !noOutput {
+                while bump(pp) {
+                }
+            }
+            for e in dpb {
+                pp.before.append(actFree)
+                pp.before.append(e.slot)
+            }
+            dpb = []
+        }
+        applyRps(h, irap && noRaslOutput)
+        removeUnused(pp)
+        if !(irap && noRaslOutput) {
+            while true {
+                var waiting = 0
+                var lat = false
+                for e in dpb {
+                    if e.needOutput {
+                        waiting += 1
+                        if maxLatency > 0 && e.latency >= maxLatency {
+                            lat = true
+                        }
+                    }
+                }
+                if waiting > numReorder || lat || dpb.count >= maxDpb {
+                    if !bump(pp) {
+                        break
+                    }
+                    removeUnused(pp)
+                } else {
+                    break
+                }
+            }
+        }
+        // While the DPB is still full (references nothing outputs), drop
+        // the oldest non-reference, then the oldest picture.
+        while dpb.count >= max(maxDpb, 1) + 1 {
+            warn("hevc: decoded picture buffer overflow")
+            pp.before.append(actFree)
+            pp.before.append(dpb[0].slot)
+            dpb.remove(at: 0)
+        }
+        before = pp.before
+        firstPicture = false
+        pendingEos = false
+        inPicture = true
+        picSlot = nextSlot
+        nextSlot += 1
+        picPts = pts
+        picKey = irap
+        picIrap = irap
+        picOutput = h.picOutput && !(rasl && noRaslOutput)
+        ops = []
+        decodedCtbs = 0
+        // This picture's residual planes from the ring.
+        resY = ringY[ringPos]
+        resU = ringU[ringPos]
+        resV = ringV[ringPos]
+        ringY[ringPos] = []
+        ringU[ringPos] = []
+        ringV[ringPos] = []
+        flt.startPicture()
+        flt.cbQpOffset = pps.cbQpOffset
+        flt.crQpOffset = pps.crQpOffset
+        flt.lfAcrossTiles = pps.loopFilterAcrossTiles
+        for i in 0..ctbSliceAddr.count {
+            ctbSliceAddr[i] = -1
+        }
+        true
+    }
+
+    // Activates a PPS and its SPS, (re)building geometry tables when they
+    // change.
+    fn activate(_ ppsId: Int) {
+        let p = ppsList[ppsId]
+        let s = spsList[p.spsId]
+        let changed = activePps != ppsId || builtGen != ppsGen
+        activePps = ppsId
+        if !changed {
+            return
+        }
+        builtGen = ppsGen
+        pps = p
+        sps = s
+        let key = [s.width, s.height, s.log2Ctb, s.log2MinCb, s.log2MinTb, s.chromaFormatIdc, s.bitDepth]
+        if key != geomKey {
+            geomKey = key
+            width = s.width
+            height = s.height
+            log2Ctb = s.log2Ctb
+            ctbSize = 1 << log2Ctb
+            ctbW = s.picWidthInCtbs
+            ctbH = s.picHeightInCtbs
+            log2MinCb = s.log2MinCb
+            log2MinTb = s.log2MinTb
+            chromaIdc = s.chromaFormatIdc
+            bitDepth = s.bitDepth
+            qpBdOffset = 6 * (bitDepth - 8)
+            w4 = (width + 3) >> 2
+            h4 = (height + 3) >> 2
+            let n4 = w4 * h4
+            intra4 = hevcFilled(n4, 0)
+            skip4 = hevcFilled(n4, 0)
+            depth4 = hevcFilled(n4, 0)
+            ipm4 = hevcFilled(n4, 1)
+            cbf4 = hevcFilled(n4, 0)
+            mf4 = hevcFilled(n4, 0)
+            mv04 = hevcFilled(n4, 0)
+            mv14 = hevcFilled(n4, 0)
+            poc04 = hevcFilled(n4, 0)
+            poc14 = hevcFilled(n4, 0)
+            ctbSliceAddr = hevcFilled(ctbW * ctbH, -1)
+            flt.setup(width: width, height: height, chromaIdc: chromaIdc, bitDepth: bitDepth, log2Ctb: log2Ctb)
+            tr.bitDepth = bitDepth
+            mvPool = []
+            let cs = if chromaIdc != 0 { ((width + 1) >> 1) * ((height + 1) >> 1) } else { 0 }
+            ringY = []
+            ringU = []
+            ringV = []
+            for _ in 0..3 {
+                ringY.append(hevcFilled(width * height, 0))
+                ringU.append(hevcFilled(cs, 0))
+                ringV.append(hevcFilled(cs, 0))
+            }
+            ringPos = 0
+            // z-scan of minimum transform blocks inside a CTB (6.5.2).
+            let n = ctbSize >> log2MinTb
+            zs = hevcFilled(n * n, 0)
+            for yy in 0..n {
+                for xx in 0..n {
+                    var z = 0
+                    for b in 0..5 {
+                        z = z | (((xx >> b) & 1) << (2 * b)) | (((yy >> b) & 1) << (2 * b + 1))
+                    }
+                    zs[yy * n + xx] = z
+                }
+            }
+        }
+        maxDpb = max(1, s.maxDecPicBuffering)
+        numReorder = s.numReorderPics
+        maxLatency = s.maxLatencyPictures
+        log2MinQg = log2Ctb - p.diffCuQpDeltaDepth
+        // Tiles (6.5.1).
+        var colW: [Int] = []
+        var rowH: [Int] = []
+        let nc = if p.tiles { p.numTileCols } else { 1 }
+        let nr = if p.tiles { p.numTileRows } else { 1 }
+        if !p.tiles || p.uniformSpacing {
+            for i in 0..nc {
+                colW.append(((i + 1) * ctbW) / nc - (i * ctbW) / nc)
+            }
+            for j in 0..nr {
+                rowH.append(((j + 1) * ctbH) / nr - (j * ctbH) / nr)
+            }
+        } else {
+            var used = 0
+            for i in 0..(nc - 1) {
+                colW.append(p.colWidths[i])
+                used += p.colWidths[i]
+            }
+            colW.append(max(1, ctbW - used))
+            used = 0
+            for j in 0..(nr - 1) {
+                rowH.append(p.rowHeights[j])
+                used += p.rowHeights[j]
+            }
+            rowH.append(max(1, ctbH - used))
+        }
+        var colBd: [Int] = [0]
+        for i in 0..nc {
+            colBd.append(colBd[i] + colW[i])
+        }
+        var rowBd: [Int] = [0]
+        for j in 0..nr {
+            rowBd.append(rowBd[j] + rowH[j])
+        }
+        let total = ctbW * ctbH
+        rsToTs = hevcFilled(total, 0)
+        tsToRs = hevcFilled(total, 0)
+        tileIdTs = hevcFilled(total, 0)
+        tileColStart = hevcFilled(total, 0)
+        tileStart = hevcFilled(total, 0)
+        rowStart = hevcFilled(total, 0)
+        for rs in 0..total {
+            let tbX = rs % ctbW
+            let tbY = rs / ctbW
+            var tileX = 0
+            for i in 0..nc {
+                if tbX >= colBd[i] {
+                    tileX = i
+                }
+            }
+            var tileY = 0
+            for j in 0..nr {
+                if tbY >= rowBd[j] {
+                    tileY = j
+                }
+            }
+            var v = 0
+            for i in 0..tileX {
+                v += rowH[tileY] * colW[i]
+            }
+            for j in 0..tileY {
+                v += ctbW * rowH[j]
+            }
+            v += (tbY - rowBd[tileY]) * colW[tileX] + tbX - colBd[tileX]
+            rsToTs[rs] = v
+            tsToRs[v] = rs
+            tileIdTs[v] = tileY * nc + tileX
+            tileColStart[rs] = colBd[tileX]
+            if tbX == colBd[tileX] {
+                rowStart[v] = 1
+                if tbY == rowBd[tileY] {
+                    tileStart[v] = 1
+                }
+            }
+        }
+        // The scaling factors for this PPS / SPS.
+        cabac.scalingOn = s.scalingListEnabled
+        if s.scalingListEnabled {
+            if p.scalingListPresent {
+                cabac.scaleTab = hevcScaleTable(p.scaling, p.scalingDc)
+            } else {
+                cabac.scaleTab = hevcScaleTable(s.scaling, s.scalingDc)
+            }
+        }
+        for i in 0..ctbW * ctbH {
+            flt.ctbTile[i] = tileIdTs[rsToTs[i]]
+            flt.ctbTs[i] = rsToTs[i]
+        }
+    }
+
+    // Marks references per the slice's RPS (8.3.2); missing references
+    // are generated (8.3.3) so decoding can go on.
+    fn applyRps(_ h: HevcSlice, _ irapNoRasl: Bool) {
+        let maxLsb = 1 << sps.log2MaxPocLsb
+        var keep = hevcFilled(dpb.count, 0)
+        if !irapNoRasl {
+            // Long-term pictures first (they may be short-term now).
+            for i in 0..h.ltPoc.count {
+                var p = h.ltPoc[i]
+                let full = h.ltMsbPresent[i] == 1
+                if full {
+                    p += poc - h.ltMsbCycle[i] * maxLsb - (poc & (maxLsb - 1))
+                }
+                var found = -1
+                for k in 0..dpb.count {
+                    if dpb[k].ref != 0 {
+                        let same = if full { dpb[k].poc == p } else { (dpb[k].poc & (maxLsb - 1)) == p }
+                        if same {
+                            found = k
+                        }
+                    }
+                }
+                if found >= 0 {
+                    keep[found] = 2
+                } else if h.ltUsed[i] == 1 {
+                    warn("hevc: a long-term reference picture is missing")
+                    found = addMissing(p)
+                    keep.append(2)
+                }
+            }
+            for d in h.rps.s0 + h.rps.s1 {
+                let p = poc + d
+                var found = -1
+                for k in 0..dpb.count {
+                    if dpb[k].ref == 1 && dpb[k].poc == p && keep[k] == 0 {
+                        found = k
+                    }
+                }
+                if found >= 0 {
+                    keep[found] = 1
+                }
+            }
+        }
+        for k in 0..dpb.count {
+            dpb[k].ref = keep[k]
+        }
+        // Missing short-term references the current picture uses.
+        if !irapNoRasl {
+            var all: [Int] = []
+            for i in 0..h.rps.s0.count {
+                if h.rps.used0[i] == 1 {
+                    all.append(poc + h.rps.s0[i])
+                }
+            }
+            for i in 0..h.rps.s1.count {
+                if h.rps.used1[i] == 1 {
+                    all.append(poc + h.rps.s1[i])
+                }
+            }
+            for p in all {
+                var found = false
+                for e in dpb {
+                    if e.ref == 1 && e.poc == p {
+                        found = true
+                    }
+                }
+                if !found {
+                    warn("hevc: a reference picture is missing")
+                    let k = addMissing(p)
+                    dpb[k].ref = 1
+                }
+            }
+        }
+    }
+
+    // A generated stand-in for a missing reference (no samples: the
+    // reconstructor conceals it), returning its DPB index.
+    fn addMissing(_ p: Int) -> Int {
+        var e = HevcDpbEntry()
+        e.slot = nextSlot
+        nextSlot += 1
+        e.poc = p
+        e.ref = 2
+        e.missing = true
+        dpb.append(e)
+        dpb.count - 1
+    }
+
+    // The bumping process (C.5.2.4): outputs the picture with the smallest
+    // POC that waits for output. False when none waits.
+    fn bump(_ p: bind ParsedPicture) -> Bool {
+        var best = -1
+        for i in 0..dpb.count {
+            if dpb[i].needOutput && (best < 0 || dpb[i].poc < dpb[best].poc) {
+                best = i
+            }
+        }
+        if best < 0 {
+            return false
+        }
+        dpb[best].needOutput = false
+        if toAfter {
+            p.after.append(actOutput)
+            p.after.append(dpb[best].slot)
+        } else {
+            p.before.append(actOutput)
+            p.before.append(dpb[best].slot)
+        }
+        true
+    }
+
+    // Removes pictures neither waiting for output nor used for reference.
+    fn removeUnused(_ p: bind ParsedPicture) {
+        var i = 0
+        while i < dpb.count {
+            if !dpb[i].needOutput && dpb[i].ref == 0 {
+                if toAfter {
+                    p.after.append(actFree)
+                    p.after.append(dpb[i].slot)
+                } else {
+                    p.before.append(actFree)
+                    p.before.append(dpb[i].slot)
+                }
+                let e = dpb.remove(at: i)
+                if !e.missing && mvPool.count < 4 && e.mf.count == w4 * h4 {
+                    mvPool.append(e)
+                }
+            } else {
+                i += 1
+            }
+        }
+    }
+
+    // Ends the current picture: stores it in the DPB with its motion,
+    // applies the additional bumping (C.5.2.3) and emits the ParsedPicture.
+    fn finishPicture() {
+        inPicture = false
+        var pp = ParsedPicture()
+        pp.hasPicture = true
+        pp.slot = picSlot
+        pp.poc = poc
+        pp.pts = picPts
+        pp.key = picKey
+        pp.width = width
+        pp.height = height
+        pp.chromaIdc = chromaIdc
+        pp.bitDepth = bitDepth
+        pp.cropLeft = sps.confLeft
+        pp.cropRight = sps.confRight
+        pp.cropTop = sps.confTop
+        pp.cropBottom = sps.confBottom
+        if sps.sarNum > 0 && sps.sarDen > 0 {
+            pp.sarNum = sps.sarNum
+            pp.sarDen = sps.sarDen
+        }
+        pp.fullRange = sps.fullRange
+        let m = sps.matrixCoeffs
+        let visW = width - sps.confLeft - sps.confRight
+        let visH = height - sps.confTop - sps.confBottom
+        // matrix_coeffs (Table E.5); unspecified: BT.2020 for UHD sizes,
+        // else the usual guess (BT.709 for HD, BT.601 below).
+        pp.matrix = if m == 1 { core.ColorMatrix.bt709 } else if m == 5 || m == 6 { core.ColorMatrix.bt601 } else if m == 9 || m == 10 { core.ColorMatrix.bt2020 } else if visW >= 3840 || visH >= 2160 { core.ColorMatrix.bt2020 } else { core.guessMatrix(width: visW, height: visH) }
+        pp.strongSmoothing = sps.strongIntraSmoothing
+        let total = ctbW * ctbH
+        if decodedCtbs < total {
+            warn("hevc: {total - decodedCtbs} of {total} coding tree blocks are missing")
+            for rs in 0..total {
+                if ctbSliceAddr[rs] < 0 {
+                    ops.append(opConceal)
+                    ops.append((rs % ctbW) << log2Ctb)
+                    ops.append((rs / ctbW) << log2Ctb)
+                    ops.append(ctbSize)
+                    ops.append(ctbSize)
+                }
+            }
+        }
+        pp.ops = ops
+        ops = []
+        pp.resY = resY
+        pp.resU = resU
+        pp.resV = resV
+        ringY[ringPos] = resY
+        ringU[ringPos] = resU
+        ringV[ringPos] = resV
+        resY = []
+        resU = []
+        resV = []
+        ringPos = (ringPos + 1) % 3
+        pp.filter = flt
+        pp.before = before
+        before = []
+        // Into the DPB with its motion for later temporal prediction.
+        var e = HevcDpbEntry()
+        if !mvPool.isEmpty {
+            e = mvPool.removeLast()
+        }
+        e.slot = picSlot
+        e.poc = poc
+        e.ref = 1
+        e.missing = false
+        e.mf = mf4
+        e.mv0 = mv04
+        e.mv1 = mv14
+        e.poc0 = poc04
+        e.poc1 = poc14
+        for k in 0..dpb.count {
+            if dpb[k].needOutput {
+                dpb[k].latency += 1
+            }
+        }
+        e.needOutput = picOutput
+        e.latency = 0
+        dpb.append(e)
+        toAfter = true
+        while true {
+            var waiting = 0
+            var lat = false
+            for d in dpb {
+                if d.needOutput {
+                    waiting += 1
+                    if maxLatency > 0 && d.latency >= maxLatency {
+                        lat = true
+                    }
+                }
+            }
+            if waiting > numReorder || lat {
+                if !bump(pp) {
+                    break
+                }
+            } else {
+                break
+            }
+        }
+        // The current picture is marked short-term; pictures no longer
+        // needed go at the next picture's RPS.
+        pp.warnings = picWarnings
+        picWarnings = []
+        out.append(pp)
+    }
+
+    // ------------------------------------------------------------------
+    // Reference picture lists (8.3.4).
+
+    fn buildRefLists(_ h: HevcSlice) -> Bool {
+        refPoc0 = []
+        refPoc1 = []
+        refSlot0 = []
+        refSlot1 = []
+        refLt0 = []
+        refLt1 = []
+        colDpb = -1
+        if h.sliceType == sliceI {
+            return true
+        }
+        let maxLsb = 1 << sps.log2MaxPocLsb
+        var before: [Int] = []
+        var after: [Int] = []
+        var lt: [Int] = []
+        for i in 0..h.rps.s0.count {
+            if h.rps.used0[i] == 1 {
+                before.append(findRef(poc + h.rps.s0[i], false, true))
+            }
+        }
+        for i in 0..h.rps.s1.count {
+            if h.rps.used1[i] == 1 {
+                after.append(findRef(poc + h.rps.s1[i], false, true))
+            }
+        }
+        for i in 0..h.ltPoc.count {
+            if h.ltUsed[i] == 1 {
+                var p = h.ltPoc[i]
+                let full = h.ltMsbPresent[i] == 1
+                if full {
+                    p += poc - h.ltMsbCycle[i] * maxLsb - (poc & (maxLsb - 1))
+                }
+                lt.append(findRef(p, true, full))
+            }
+        }
+        let totalCurr = before.count + after.count + lt.count
+        if totalCurr == 0 {
+            warn("hevc: a P or B slice has no reference pictures")
+            return false
+        }
+        for list in 0..2 {
+            if list == 1 && h.sliceType != sliceB {
+                break
+            }
+            let n = if list == 0 { h.numRefIdx0 } else { h.numRefIdx1 }
+            var temp: [Int] = []
+            var tempLt: [Int] = []
+            let numTemp = max(n, totalCurr)
+            while temp.count < numTemp {
+                let first = if list == 0 { before } else { after }
+                let second = if list == 0 { after } else { before }
+                for k in first {
+                    if temp.count < numTemp {
+                        temp.append(k)
+                        tempLt.append(0)
+                    }
+                }
+                for k in second {
+                    if temp.count < numTemp {
+                        temp.append(k)
+                        tempLt.append(0)
+                    }
+                }
+                for k in lt {
+                    if temp.count < numTemp {
+                        temp.append(k)
+                        tempLt.append(1)
+                    }
+                }
+            }
+            let mod = if list == 0 { h.modList0 } else { h.modList1 }
+            let entries = if list == 0 { h.listEntry0 } else { h.listEntry1 }
+            for i in 0..n {
+                var idx = i
+                if mod && i < entries.count {
+                    idx = min(entries[i], temp.count - 1)
+                }
+                let k = temp[idx]
+                let isLt = if tempLt[idx] == 1 { 1 } else { 0 }
+                if list == 0 {
+                    refPoc0.append(dpb[k].poc)
+                    refSlot0.append(dpb[k].slot)
+                    refLt0.append(isLt)
+                } else {
+                    refPoc1.append(dpb[k].poc)
+                    refSlot1.append(dpb[k].slot)
+                    refLt1.append(isLt)
+                }
+            }
+        }
+        noBackwardPred = true
+        for p in refPoc0 + refPoc1 {
+            if p > poc {
+                noBackwardPred = false
+            }
+        }
+        if h.temporalMvp {
+            var slot = -1
+            if h.sliceType == sliceB && !h.collocatedFromL0 {
+                if h.collocatedRefIdx < refSlot1.count {
+                    slot = refSlot1[h.collocatedRefIdx]
+                }
+            } else if h.collocatedRefIdx < refSlot0.count {
+                slot = refSlot0[h.collocatedRefIdx]
+            }
+            for k in 0..dpb.count {
+                if dpb[k].slot == slot && !dpb[k].missing && dpb[k].mf.count == w4 * h4 {
+                    colDpb = k
+                }
+            }
+        }
+        true
+    }
+
+    // The DPB index of the reference with that POC (or POC LSBs).
+    fn findRef(_ p: Int, _ long: Bool, _ full: Bool) -> Int {
+        let maxLsb = 1 << sps.log2MaxPocLsb
+        for k in 0..dpb.count {
+            if dpb[k].ref == 0 {
+                continue
+            }
+            if long && (dpb[k].ref != 2 && dpb[k].ref != 1) {
+                continue
+            }
+            let same = if full { dpb[k].poc == p } else { (dpb[k].poc & (maxLsb - 1)) == p }
+            if same {
+                if long {
+                    dpb[k].ref = 2
+                }
+                return k
+            }
+        }
+        addMissing(p)
+    }
+
+    // ------------------------------------------------------------------
+    // Slice data (7.3.8.1).
+
+    fn decodeSlice(_ data: Data, _ h: HevcSlice) {
+        // Lists per independent slice; a dependent segment reuses them, but
+        // damaged data can leave them not matching its header: rebuild.
+        let listsMatch = h.sliceType == sliceI || (refPoc0.count == h.numRefIdx0 && (h.sliceType != sliceB || refPoc1.count == h.numRefIdx1))
+        if !h.dependent || h.firstSliceInPic || !listsMatch {
+            if !buildRefLists(h) {
+                return
+            }
+        }
+        if h.sliceType != sliceI && (refPoc0.isEmpty || (h.sliceType == sliceB && refPoc1.isEmpty)) {
+            warn("hevc: a slice has no reference pictures")
+            return
+        }
+        sliceAddrRs = if h.dependent { sliceAddrRs } else { h.segmentAddress }
+        if h.dependent && h.firstSliceInPic {
+            sliceAddrRs = 0
+        }
+        var ts = rsToTs[h.segmentAddress]
+        let initType = if h.sliceType == sliceI { 0 } else if h.sliceType == sliceP { (if h.cabacInit { 2 } else { 1 }) } else { (if h.cabacInit { 1 } else { 2 }) }
+        var substream = 0
+        var subEnd = if h.entryPoints.isEmpty { data.count } else { min(data.count, h.entryPoints[0]) }
+        cabac.start(data, at: h.dataOffset, end: subEnd)
+        // Contexts at the start of the slice segment (9.3.1).
+        let rs0 = tsToRs[ts]
+        if tileStart[ts] == 1 || !h.dependent {
+            cabac.initContexts(initType, h.sliceQp)
+        } else if pps.entropySync && rowStart[ts] == 1 {
+            cabac.initContexts(initType, h.sliceQp)
+            if wppAvailable(rs0) {
+                cabac.loadWpp()
+            }
+        } else {
+            cabac.loadDs()
+        }
+        if !h.dependent || tileStart[ts] == 1 || (pps.entropySync && rowStart[ts] == 1) {
+            lastQpY = h.sliceQp
+        }
+        qpY = lastQpY
+        let total = ctbW * ctbH
+        while ts < total {
+            let rs = tsToRs[ts]
+            ctbAddrTs = ts
+            ctbAddrRs = rs
+            ctbX = (rs % ctbW) << log2Ctb
+            ctbY = (rs / ctbW) << log2Ctb
+            if ctbSliceAddr[rs] >= 0 {
+                warn("hevc: a coding tree block is decoded twice")
+                return
+            }
+            ctbSliceAddr[rs] = sliceAddrRs
+            flt.ctbSlice[rs] = sliceAddrRs
+            flt.ctbBeta[rs] = h.betaOffsetDiv2 * 2
+            flt.ctbTc[rs] = h.tcOffsetDiv2 * 2
+            flt.ctbLfAcross[rs] = if h.loopFilterAcrossSlices { 1 } else { 0 }
+            if h.saoLuma || h.saoChroma {
+                parseSao(h, rs)
+            }
+            codingQuadtree(ctbX, ctbY, log2Ctb, 0)
+            decodedCtbs += 1
+            let endOfSlice = cabac.terminate() == 1
+            if pps.entropySync && (rs % ctbW) == tileColStart[rs] + 1 {
+                cabac.saveWpp()
+            }
+            ts += 1
+            if cabac.overrun {
+                warn("hevc: slice data ends early")
+                return
+            }
+            if endOfSlice {
+                if pps.dependentSliceSegments {
+                    cabac.saveDs()
+                }
+                return
+            }
+            if ts >= total {
+                warn("hevc: slice data goes past the picture")
+                return
+            }
+            let newTile = pps.tiles && tileStart[ts] == 1
+            let newRow = pps.entropySync && rowStart[ts] == 1
+            if newTile || newRow {
+                // end_of_subset_one_bit, then the next substream.
+                cabac.terminate()
+                substream += 1
+                var at = cabac.bytePosAfterTerminate
+                if substream - 1 < h.entryPoints.count {
+                    at = h.entryPoints[substream - 1]
+                }
+                subEnd = if substream < h.entryPoints.count { min(data.count, h.entryPoints[substream]) } else { data.count }
+                cabac.start(data, at: at, end: subEnd)
+                cabac.initContexts(initType, h.sliceQp)
+                if newRow && !newTile && wppAvailable(tsToRs[ts]) {
+                    cabac.loadWpp()
+                }
+                lastQpY = h.sliceQp
+            }
+        }
+    }
+
+    // Whether the CTB above-right of the CTB at raster address rs is
+    // available (same slice and tile), for WPP context synchronisation.
+    fn wppAvailable(_ rs: Int) -> Bool {
+        let cx = rs % ctbW
+        let cy = rs / ctbW
+        if cy == 0 || cx + 1 >= ctbW {
+            return false
+        }
+        let n = rs - ctbW + 1
+        ctbSliceAddr[n] == sliceAddrRs && tileIdTs[rsToTs[n]] == tileIdTs[rsToTs[rs]]
+    }
+
+    // sao() (7.3.8.3).
+    fn parseSao(_ h: HevcSlice, _ rs: Int) {
+        let rx = rs % ctbW
+        let ry = rs / ctbW
+        var mergeLeft = false
+        var mergeUp = false
+        let tile = tileIdTs[rsToTs[rs]]
+        if rx > 0 && rs - 1 >= 0 && ctbSliceAddr[rs - 1] == sliceAddrRs && tileIdTs[rsToTs[rs - 1]] == tile {
+            mergeLeft = cabac.decision(ctxSaoMerge) == 1
+        }
+        if ry > 0 && !mergeLeft && ctbSliceAddr[rs - ctbW] == sliceAddrRs && tileIdTs[rsToTs[rs - ctbW]] == tile {
+            mergeUp = cabac.decision(ctxSaoMerge) == 1
+        }
+        let base = rs * 3
+        if mergeLeft || mergeUp {
+            let src = if mergeLeft { rs - 1 } else { rs - ctbW }
+            for c in 0..3 {
+                flt.saoType[base + c] = flt.saoType[src * 3 + c]
+                flt.saoClass[base + c] = flt.saoClass[src * 3 + c]
+                for k in 0..4 {
+                    flt.saoOff[(base + c) * 4 + k] = flt.saoOff[(src * 3 + c) * 4 + k]
+                }
+            }
+        } else {
+            let nc = if chromaIdc != 0 { 3 } else { 1 }
+            let maxAbs = (1 << (min(bitDepth, 10) - 5)) - 1
+            for c in 0..nc {
+                flt.saoType[base + c] = 0
+                if (c == 0 && !h.saoLuma) || (c > 0 && !h.saoChroma) {
+                    continue
+                }
+                var t = 0
+                if c == 2 {
+                    t = flt.saoType[base + 1]
+                } else if cabac.decision(ctxSaoType) == 1 {
+                    t = if cabac.bypass() == 1 { 2 } else { 1 }
+                }
+                flt.saoType[base + c] = t
+                if t == 0 {
+                    continue
+                }
+                var offs = [0, 0, 0, 0]
+                for k in 0..4 {
+                    var a = 0
+                    while a < maxAbs && cabac.bypass() == 1 {
+                        a += 1
+                    }
+                    offs[k] = a
+                }
+                if t == 1 {
+                    for k in 0..4 {
+                        if offs[k] != 0 && cabac.bypass() == 1 {
+                            offs[k] = -offs[k]
+                        }
+                    }
+                    flt.saoClass[base + c] = cabac.bypassBits(5)
+                } else {
+                    offs[2] = -offs[2]
+                    offs[3] = -offs[3]
+                    if c == 0 || c == 1 {
+                        flt.saoClass[base + c] = cabac.bypassBits(2)
+                    } else {
+                        flt.saoClass[base + c] = flt.saoClass[base + 1]
+                    }
+                }
+                for k in 0..4 {
+                    flt.saoOff[(base + c) * 4 + k] = offs[k] << (bitDepth - min(bitDepth, 10))
+                }
+            }
+        }
+        // Components the slice doesn't filter stay off even when merged.
+        if !h.saoLuma {
+            flt.saoType[base] = 0
+        }
+        if !h.saoChroma {
+            flt.saoType[base + 1] = 0
+            flt.saoType[base + 2] = 0
+        }
+        if chromaIdc == 0 {
+            flt.saoType[base + 1] = 0
+            flt.saoType[base + 2] = 0
+        }
+        if flt.saoType[base] != 0 || flt.saoType[base + 1] != 0 || flt.saoType[base + 2] != 0 {
+            flt.anySao = true
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Availability (6.4.1 z-scan order, 6.4.2 prediction blocks).
+
+    // Whether the luma location (xN, yN) is available to the block at
+    // (xC, yC) of the current CTB.
+    fn avail(_ xC: Int, _ yC: Int, _ xN: Int, _ yN: Int) -> Bool {
+        if xN < 0 || yN < 0 || xN >= width || yN >= height {
+            return false
+        }
+        let nRs = (yN >> log2Ctb) * ctbW + (xN >> log2Ctb)
+        if nRs != ctbAddrRs {
+            if ctbSliceAddr[nRs] != sliceAddrRs {
+                return false
+            }
+            let nTs = rsToTs[nRs]
+            if nTs > ctbAddrTs || tileIdTs[nTs] != tileIdTs[ctbAddrTs] {
+                return false
+            }
+            return true
+        }
+        let mask = ctbSize - 1
+        let sh = log2MinTb
+        let n = ctbSize >> sh
+        let zN = zs[((yN & mask) >> sh) * n + ((xN & mask) >> sh)]
+        let zC = zs[((yC & mask) >> sh) * n + ((xC & mask) >> sh)]
+        zN <= zC
+    }
+
+    fn at4(_ x: Int, _ y: Int) -> Int {
+        (y >> 2) * w4 + (x >> 2)
+    }
+
+    // 6.4.2: availability of a neighbouring prediction block's motion.
+    fn availPb(_ xPb: Int, _ yPb: Int, _ nPbW: Int, _ nPbH: Int, _ partIdx: Int, _ xN: Int, _ yN: Int) -> Bool {
+        var a = false
+        let sameCb = cbX <= xN && cbY <= yN && cbX + cbSize > xN && cbY + cbSize > yN
+        if !sameCb {
+            a = avail(xPb, yPb, xN, yN)
+        } else if (nPbW << 1) == cbSize && (nPbH << 1) == cbSize && partIdx == 1 && cbY + nPbH <= yN && cbX + nPbW > xN {
+            a = false
+        } else {
+            a = true
+        }
+        if a && intra4[at4(xN, yN)] == 1 {
+            return false
+        }
+        a
+    }
+
+    // ------------------------------------------------------------------
+    // Coding quadtree and coding units (7.3.8.4, 7.3.8.5).
+
+    fn codingQuadtree(_ x0: Int, _ y0: Int, _ log2Cb: Int, _ depth: Int) {
+        let size = 1 << log2Cb
+        var split = false
+        if x0 + size <= width && y0 + size <= height && log2Cb > log2MinCb {
+            var inc = 0
+            if avail(x0, y0, x0 - 1, y0) && depth4[at4(x0 - 1, y0)] > depth {
+                inc += 1
+            }
+            if avail(x0, y0, x0, y0 - 1) && depth4[at4(x0, y0 - 1)] > depth {
+                inc += 1
+            }
+            split = cabac.decision(ctxSplitCu + inc) == 1
+        } else {
+            split = log2Cb > log2MinCb
+        }
+        if log2Cb >= log2MinQg {
+            // A quantization group starts: qPY_PREV is the QpY of the last
+            // coding unit of the previous group (8.6.1).
+            cuQpDeltaCoded = false
+            cuQpDeltaVal = 0
+            qgPrevQp = lastQpY
+        }
+        if split {
+            let x1 = x0 + (size >> 1)
+            let y1 = y0 + (size >> 1)
+            codingQuadtree(x0, y0, log2Cb - 1, depth + 1)
+            if x1 < width {
+                codingQuadtree(x1, y0, log2Cb - 1, depth + 1)
+            }
+            if y1 < height {
+                codingQuadtree(x0, y1, log2Cb - 1, depth + 1)
+            }
+            if x1 < width && y1 < height {
+                codingQuadtree(x1, y1, log2Cb - 1, depth + 1)
+            }
+        } else {
+            ctDepth = depth
+            codingUnit(x0, y0, log2Cb)
+        }
+    }
+
+    // QpY of a coding unit (8.6.1) from the quantization group's
+    // prediction and CuQpDeltaVal.
+    fn setQp(_ xCb: Int, _ yCb: Int) {
+        let qgMask = (1 << log2MinQg) - 1
+        let xQg = xCb - (xCb & qgMask)
+        let yQg = yCb - (yCb & qgMask)
+        let prev = qgPrevQp
+        let ctbMask = ctbSize - 1
+        var qa = prev
+        var qb = prev
+        if (xQg & ctbMask) != 0 {
+            qa = flt.qp4[at4(xQg - 1, yQg)]
+        }
+        if (yQg & ctbMask) != 0 {
+            qb = flt.qp4[at4(xQg, yQg - 1)]
+        }
+        let pred = (qa + qb + 1) >> 1
+        let m = 52 + qpBdOffset
+        qpY = (((pred + cuQpDeltaVal + 52 + 2 * qpBdOffset) % m + m) % m) - qpBdOffset
+    }
+
+    fn codingUnit(_ x0: Int, _ y0: Int, _ log2Cb: Int) {
+        let n = 1 << log2Cb
+        cbX = x0
+        cbY = y0
+        cbSize = n
+        cuBypass = false
+        if pps.transquantBypass {
+            cuBypass = cabac.decision(ctxTqBypass) == 1
+        }
+        setQp(x0, y0)
+        var skip = false
+        if sh.sliceType != sliceI {
+            var inc = 0
+            if avail(x0, y0, x0 - 1, y0) && skip4[at4(x0 - 1, y0)] == 1 {
+                inc += 1
+            }
+            if avail(x0, y0, x0, y0 - 1) && skip4[at4(x0, y0 - 1)] == 1 {
+                inc += 1
+            }
+            skip = cabac.decision(ctxSkip + inc) == 1
+        }
+        cuIntra = false
+        partMode = 0
+        intraSplit = false
+        var pcm = false
+        let x1 = min(width, x0 + n)
+        let y1 = min(height, y0 + n)
+        if skip {
+            fillGrid(x0, y0, x1, y1, 0, 1)
+            mergeFlag = true
+            predictionUnit(x0, y0, n, n, log2Cb, 0, true)
+            setIpmDefault(x0, y0, x1, y1)
+            setQpGrid(x0, y0, x1, y1)
+            clearCbf(x0, y0, x1, y1)
+            if !sh.deblockingDisabled {
+                edgeBs(x0, y0, n, n, true)
+            }
+        } else {
+            if sh.sliceType != sliceI {
+                cuIntra = cabac.decision(ctxPredMode) == 1
+            } else {
+                cuIntra = true
+            }
+            if !cuIntra || log2Cb == log2MinCb {
+                partMode = cabac.partMode(intra: cuIntra, log2Cb: log2Cb, log2MinCb: log2MinCb, amp: sps.ampEnabled)
+                intraSplit = cuIntra && partMode == 3
+            }
+            fillGrid(x0, y0, x1, y1, if cuIntra { 1 } else { 0 }, 0)
+            if cuIntra {
+                if partMode == 0 && sps.pcmEnabled && log2Cb >= sps.log2MinPcm && log2Cb <= sps.log2MaxPcm {
+                    pcm = cabac.terminate() == 1
+                }
+                if pcm {
+                    setIpmDefault(x0, y0, x1, y1)
+                    pcmSample(x0, y0, log2Cb)
+                    if sps.pcmLoopFilterDisabled {
+                        setNoFilter(x0, y0, x1, y1)
+                    }
+                } else {
+                    intraModes(x0, y0, log2Cb)
+                }
+                // Intra CUs have no motion.
+                for yy in (y0 >> 2)..((y1 + 3) >> 2) {
+                    for xx in (x0 >> 2)..((x1 + 3) >> 2) {
+                        let i = yy * w4 + xx
+                        mf4[i] = 0
+                        mv04[i] = 0
+                        mv14[i] = 0
+                    }
+                }
+            } else {
+                setIpmDefault(x0, y0, x1, y1)
+                let h2 = n >> 1
+                let q = n >> 2
+                if partMode == 0 {
+                    predictionUnit(x0, y0, n, n, log2Cb, 0, false)
+                } else if partMode == 1 {
+                    predictionUnit(x0, y0, n, h2, log2Cb, 0, false)
+                    predictionUnit(x0, y0 + h2, n, h2, log2Cb, 1, false)
+                } else if partMode == 2 {
+                    predictionUnit(x0, y0, h2, n, log2Cb, 0, false)
+                    predictionUnit(x0 + h2, y0, h2, n, log2Cb, 1, false)
+                } else if partMode == 4 {
+                    predictionUnit(x0, y0, n, q, log2Cb, 0, false)
+                    predictionUnit(x0, y0 + q, n, n * 3 / 4, log2Cb, 1, false)
+                } else if partMode == 5 {
+                    predictionUnit(x0, y0, n, n * 3 / 4, log2Cb, 0, false)
+                    predictionUnit(x0, y0 + n * 3 / 4, n, q, log2Cb, 1, false)
+                } else if partMode == 6 {
+                    predictionUnit(x0, y0, q, n, log2Cb, 0, false)
+                    predictionUnit(x0 + q, y0, n * 3 / 4, n, log2Cb, 1, false)
+                } else if partMode == 7 {
+                    predictionUnit(x0, y0, n * 3 / 4, n, log2Cb, 0, false)
+                    predictionUnit(x0 + n * 3 / 4, y0, q, n, log2Cb, 1, false)
+                } else {
+                    predictionUnit(x0, y0, h2, h2, log2Cb, 0, false)
+                    predictionUnit(x0 + h2, y0, h2, h2, log2Cb, 1, false)
+                    predictionUnit(x0, y0 + h2, h2, h2, log2Cb, 2, false)
+                    predictionUnit(x0 + h2, y0 + h2, h2, h2, log2Cb, 3, false)
+                }
+            }
+            if cuBypass {
+                setNoFilter(x0, y0, x1, y1)
+            }
+            if !pcm {
+                var rootCbf = true
+                if !cuIntra && !(partMode == 0 && mergeFlag) {
+                    rootCbf = cabac.decision(ctxRootCbf) == 1
+                }
+                if rootCbf {
+                    maxTrafoDepth = if cuIntra { sps.maxTrDepthIntra + (if intraSplit { 1 } else { 0 }) } else { sps.maxTrDepthInter }
+                    transformTree(x0, y0, x0, y0, log2Cb, 0, 0, 0, 0)
+                } else {
+                    clearCbf(x0, y0, x1, y1)
+                    if !sh.deblockingDisabled {
+                        edgeBs(x0, y0, n, n, true)
+                    }
+                }
+            } else {
+                clearCbf(x0, y0, x1, y1)
+                if !sh.deblockingDisabled {
+                    edgeBs(x0, y0, n, n, true)
+                }
+            }
+            setQpGrid(x0, y0, x1, y1)
+        }
+        lastQpY = qpY
+        // CtDepth and skip flags for later context derivations.
+        for yy in (y0 >> 2)..((y1 + 3) >> 2) {
+            for xx in (x0 >> 2)..((x1 + 3) >> 2) {
+                depth4[yy * w4 + xx] = ctDepth
+            }
+        }
+    }
+
+    fn fillGrid(_ x0: Int, _ y0: Int, _ x1: Int, _ y1: Int, _ intra: Int, _ skip: Int) {
+        for yy in (y0 >> 2)..((y1 + 3) >> 2) {
+            for xx in (x0 >> 2)..((x1 + 3) >> 2) {
+                let i = yy * w4 + xx
+                intra4[i] = intra
+                skip4[i] = skip
+            }
+        }
+    }
+
+    fn setIpmDefault(_ x0: Int, _ y0: Int, _ x1: Int, _ y1: Int) {
+        for yy in (y0 >> 2)..((y1 + 3) >> 2) {
+            for xx in (x0 >> 2)..((x1 + 3) >> 2) {
+                ipm4[yy * w4 + xx] = 1
+            }
+        }
+    }
+
+    fn setQpGrid(_ x0: Int, _ y0: Int, _ x1: Int, _ y1: Int) {
+        for yy in (y0 >> 2)..((y1 + 3) >> 2) {
+            for xx in (x0 >> 2)..((x1 + 3) >> 2) {
+                flt.qp4[yy * w4 + xx] = qpY
+            }
+        }
+    }
+
+    fn setNoFilter(_ x0: Int, _ y0: Int, _ x1: Int, _ y1: Int) {
+        flt.anyNoFilt = true
+        for yy in (y0 >> 2)..((y1 + 3) >> 2) {
+            for xx in (x0 >> 2)..((x1 + 3) >> 2) {
+                flt.noFilt[yy * w4 + xx] = 1
+            }
+        }
+    }
+
+    fn clearCbf(_ x0: Int, _ y0: Int, _ x1: Int, _ y1: Int) {
+        for yy in (y0 >> 2)..((y1 + 3) >> 2) {
+            for xx in (x0 >> 2)..((x1 + 3) >> 2) {
+                cbf4[yy * w4 + xx] = 0
+            }
+        }
+    }
+
+    // pcm_sample() (7.3.8.7): raw samples after the terminate bin.
+    fn pcmSample(_ x0: Int, _ y0: Int, _ log2Cb: Int) {
+        let n = 1 << log2Cb
+        let at = cabac.bytePosAfterTerminate
+        var r = core.bitReaderRange(cabac.data, from: at, to: cabac.end)
+        ops.append(opPcm)
+        ops.append(x0)
+        ops.append(y0)
+        ops.append(log2Cb)
+        let shY = bitDepth - sps.pcmBitDepth
+        for _ in 0..(n * n) {
+            ops.append(r.bits(sps.pcmBitDepth) << shY)
+        }
+        if chromaIdc != 0 {
+            let shC = bitDepth - sps.pcmBitDepthC
+            for _ in 0..(2 * (n >> 1) * (n >> 1)) {
+                ops.append(r.bits(sps.pcmBitDepthC) << shC)
+            }
+        }
+        r.alignToByte()
+        cabac.start(cabac.data, at: r.bytePosition, end: cabac.end)
+        // The CU edges for deblocking (intra: bS 2).
+        clearCbf(x0, y0, min(width, x0 + n), min(height, y0 + n))
+        if !sh.deblockingDisabled {
+            edgeBs(x0, y0, n, n, true)
+        }
+    }
+
+    // Luma intra modes of the prediction blocks and the chroma mode
+    // (7.3.8.5, 8.4.2, 8.4.3).
+    fn intraModes(_ x0: Int, _ y0: Int, _ log2Cb: Int) {
+        let n = 1 << log2Cb
+        let nb = if intraSplit { 4 } else { 1 }
+        let pb = if intraSplit { n >> 1 } else { n }
+        var prevFlag = [0, 0, 0, 0]
+        for k in 0..nb {
+            prevFlag[k] = cabac.decision(ctxPrevIntra)
+        }
+        for k in 0..nb {
+            let xP = x0 + (k & 1) * pb
+            let yP = y0 + (k >> 1) * pb
+            var mpmIdx = 0
+            var rem = 0
+            if prevFlag[k] == 1 {
+                if cabac.bypass() == 1 {
+                    mpmIdx = 1
+                    if cabac.bypass() == 1 {
+                        mpmIdx = 2
+                    }
+                }
+            } else {
+                rem = cabac.bypassBits(5)
+            }
+            // Candidates A (left) and B (above, not across the CTB row).
+            var a = 1
+            if avail(xP, yP, xP - 1, yP) {
+                let i = at4(xP - 1, yP)
+                if intra4[i] == 1 {
+                    a = ipm4[i]
+                }
+            }
+            var b = 1
+            if yP - 1 >= ((yP >> log2Ctb) << log2Ctb) && avail(xP, yP, xP, yP - 1) {
+                let i = at4(xP, yP - 1)
+                if intra4[i] == 1 {
+                    b = ipm4[i]
+                }
+            }
+            var c0 = 0
+            var c1 = 0
+            var c2 = 0
+            if a == b {
+                if a < 2 {
+                    c0 = 0
+                    c1 = 1
+                    c2 = 26
+                } else {
+                    c0 = a
+                    c1 = 2 + ((a + 29) % 32)
+                    c2 = 2 + ((a - 2 + 1) % 32)
+                }
+            } else {
+                c0 = a
+                c1 = b
+                if a != 0 && b != 0 {
+                    c2 = 0
+                } else if a != 1 && b != 1 {
+                    c2 = 1
+                } else {
+                    c2 = 26
+                }
+            }
+            var mode = 0
+            if prevFlag[k] == 1 {
+                mode = if mpmIdx == 0 { c0 } else if mpmIdx == 1 { c1 } else { c2 }
+            } else {
+                // Sort the candidates ascending, then step over them.
+                if c0 > c1 {
+                    let t = c0
+                    c0 = c1
+                    c1 = t
+                }
+                if c0 > c2 {
+                    let t = c0
+                    c0 = c2
+                    c2 = t
+                }
+                if c1 > c2 {
+                    let t = c1
+                    c1 = c2
+                    c2 = t
+                }
+                mode = rem
+                if mode >= c0 {
+                    mode += 1
+                }
+                if mode >= c1 {
+                    mode += 1
+                }
+                if mode >= c2 {
+                    mode += 1
+                }
+            }
+            ipmPart[k] = mode
+            let xe = min(width, xP + pb)
+            let ye = min(height, yP + pb)
+            for yy in (yP >> 2)..((ye + 3) >> 2) {
+                for xx in (xP >> 2)..((xe + 3) >> 2) {
+                    ipm4[yy * w4 + xx] = mode
+                }
+            }
+        }
+        if chromaIdc != 0 {
+            var cm = 4
+            if cabac.decision(ctxChromaMode) == 1 {
+                cm = cabac.bypassBits(2)
+            }
+            let lm = ipmPart[0]
+            if cm == 4 {
+                chromaModeC = lm
+            } else {
+                let cand = if cm == 0 { 0 } else if cm == 1 { 26 } else if cm == 2 { 10 } else { 1 }
+                chromaModeC = if cand == lm { 34 } else { cand }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Transform tree and units (7.3.8.8, 7.3.8.10).
+
+    fn transformTree(_ x0: Int, _ y0: Int, _ xBase: Int, _ yBase: Int, _ log2: Int, _ depth: Int, _ blkIdx: Int, _ parentCb: Int, _ parentCr: Int) {
+        var split = false
+        if log2 <= sps.log2MaxTb && log2 > log2MinTb && depth < maxTrafoDepth && !(intraSplit && depth == 0) {
+            split = cabac.decision(ctxSplitTu + 5 - log2) == 1
+        } else {
+            let interSplit = sps.maxTrDepthInter == 0 && !cuIntra && partMode != 0 && depth == 0
+            split = log2 > sps.log2MaxTb || (intraSplit && depth == 0) || interSplit
+        }
+        var cbfCb = 0
+        var cbfCr = 0
+        if chromaIdc != 0 && log2 > 2 {
+            if depth == 0 || parentCb == 1 {
+                cbfCb = cabac.decision(ctxCbfChroma + depth)
+            }
+            if depth == 0 || parentCr == 1 {
+                cbfCr = cabac.decision(ctxCbfChroma + depth)
+            }
+        } else if chromaIdc != 0 {
+            // 4x4 luma: chroma flags come from the parent (cbfDepthC).
+            cbfCb = parentCb
+            cbfCr = parentCr
+        }
+        if split {
+            let h = 1 << (log2 - 1)
+            transformTree(x0, y0, x0, y0, log2 - 1, depth + 1, 0, cbfCb, cbfCr)
+            transformTree(x0 + h, y0, x0, y0, log2 - 1, depth + 1, 1, cbfCb, cbfCr)
+            transformTree(x0, y0 + h, x0, y0, log2 - 1, depth + 1, 2, cbfCb, cbfCr)
+            transformTree(x0 + h, y0 + h, x0, y0, log2 - 1, depth + 1, 3, cbfCb, cbfCr)
+            return
+        }
+        var cbfLuma = 1
+        if cuIntra || depth != 0 || cbfCb == 1 || cbfCr == 1 {
+            cbfLuma = cabac.decision(ctxCbfLuma + (if depth == 0 { 1 } else { 0 }))
+        }
+        transformUnit(x0, y0, xBase, yBase, log2, blkIdx, cbfLuma, cbfCb, cbfCr)
+        let n = 1 << log2
+        let xe = min(width, x0 + n)
+        let ye = min(height, y0 + n)
+        for yy in (y0 >> 2)..((ye + 3) >> 2) {
+            for xx in (x0 >> 2)..((xe + 3) >> 2) {
+                cbf4[yy * w4 + xx] = cbfLuma
+            }
+        }
+        if !sh.deblockingDisabled {
+            edgeBs(x0, y0, n, n, true)
+        }
+    }
+
+    fn transformUnit(_ x0: Int, _ y0: Int, _ xBase: Int, _ yBase: Int, _ log2: Int, _ blkIdx: Int, _ cbfLuma: Int, _ cbfCb: Int, _ cbfCr: Int) {
+        let chromaHere = chromaIdc != 0 && (log2 > 2 || blkIdx == 3)
+        let cbfChroma = chromaIdc != 0 && (cbfCb == 1 || cbfCr == 1)
+        if (cbfLuma == 1 || cbfChroma) && pps.cuQpDeltaEnabled && !cuQpDeltaCoded {
+            var d = cabac.cuQpDeltaAbs()
+            if d != 0 && cabac.bypass() == 1 {
+                d = -d
+            }
+            let lim = 26 + qpBdOffset / 2
+            if d < -lim || d > lim - 1 {
+                warn("hevc: cu_qp_delta out of range")
+                d = max(-lim, min(lim - 1, d))
+            }
+            cuQpDeltaCoded = true
+            cuQpDeltaVal = d
+            setQp(cbX, cbY)
+        }
+        // With NxN intra the mode is that of the prediction block holding
+        // this transform block (the tree may split further than the PUs).
+        var lumaMode = 0
+        if cuIntra {
+            lumaMode = ipmPart[0]
+            if intraSplit {
+                let half = cbSize >> 1
+                let k = (if y0 - cbY >= half { 2 } else { 0 }) + (if x0 - cbX >= half { 1 } else { 0 })
+                lumaMode = ipmPart[k]
+            }
+        }
+        if cuIntra {
+            emitIntra(0, x0, y0, log2, lumaMode)
+        }
+        if cbfLuma == 1 {
+            var scan = 0
+            if cuIntra && (log2 == 2 || log2 == 3) {
+                scan = scanFor(lumaMode)
+            }
+            residual(0, x0, y0, log2, scan, lumaMode)
+        }
+        if !chromaHere {
+            return
+        }
+        // Chroma blocks: at (x0, y0) half size, or for 4x4 luma blocks one
+        // 4x4 chroma block after the fourth (at xBase, yBase).
+        let xc = if log2 > 2 { x0 } else { xBase }
+        let yc = if log2 > 2 { y0 } else { yBase }
+        let log2C = if log2 > 2 { log2 - 1 } else { 2 }
+        let cm = chromaModeC
+        for c in 1..3 {
+            if cuIntra {
+                emitIntra(c, xc >> 1, yc >> 1, log2C, cm)
+            }
+            let f = if c == 1 { cbfCb } else { cbfCr }
+            if f == 1 {
+                var scan = 0
+                if cuIntra && log2C == 2 {
+                    scan = scanFor(cm)
+                }
+                residual(c, xc >> 1, yc >> 1, log2C, scan, cm)
+            }
+        }
+    }
+
+    fn scanFor(_ mode: Int) -> Int {
+        if mode >= 6 && mode <= 14 {
+            return 2
+        }
+        if mode >= 22 && mode <= 30 {
+            return 1
+        }
+        0
+    }
+
+    // An intra prediction op with the availability of its reference
+    // samples (8.4.4.2.2, with constrained intra prediction).
+    fn emitIntra(_ cIdx: Int, _ x0: Int, _ y0: Int, _ log2: Int, _ mode: Int) {
+        let n = 1 << log2
+        let s = if cIdx == 0 { 0 } else { 1 }
+        let unit = if cIdx == 0 { 4 } else { 2 }
+        let units = 2 * n / unit
+        let xL = x0 << s
+        let yL = y0 << s
+        let cip = pps.constrainedIntraPred
+        var mask = 0
+        // Left column, bottom to top.
+        for k in 0..units {
+            let yy = ((y0 + 2 * n - 1 - k * unit) << s)
+            let xx = xL - 1
+            if avail(xL, yL, xx, yy) && (!cip || intra4[at4(xx, yy)] == 1) {
+                mask = mask | (1 << k)
+            }
+        }
+        if avail(xL, yL, xL - 1, yL - 1) && (!cip || intra4[at4(xL - 1, yL - 1)] == 1) {
+            mask = mask | (1 << units)
+        }
+        for k in 0..units {
+            let xx = (x0 + k * unit) << s
+            let yy = yL - 1
+            if avail(xL, yL, xx, yy) && (!cip || intra4[at4(xx, yy)] == 1) {
+                mask = mask | (1 << (units + 1 + k))
+            }
+        }
+        ops.append(opIntra)
+        ops.append(cIdx)
+        ops.append(x0)
+        ops.append(y0)
+        ops.append(log2)
+        ops.append(mode)
+        ops.append(mask)
+    }
+
+    // residual_coding of one block, appended to the op stream.
+    fn residual(_ cIdx: Int, _ x0: Int, _ y0: Int, _ log2: Int, _ scan: Int, _ predMode: Int) {
+        let tsAllowed = pps.transformSkip && !cuBypass && log2 <= pps.log2MaxTransformSkipSize
+        var qp = 0
+        if cIdx == 0 {
+            qp = qpY + qpBdOffset
+        } else {
+            let off = if cIdx == 1 { pps.cbQpOffset + sh.cbQpOffset } else { pps.crQpOffset + sh.crQpOffset }
+            let qpi = max(-qpBdOffset, min(57, qpY + off))
+            var qpc = qpi
+            if qpi >= 30 {
+                qpc = if qpi > 43 { qpi - 6 } else { hevcQpcTable[qpi - 30] }
+            }
+            qp = qpc + qpBdOffset
+        }
+        let matrixId = (if cuIntra { 0 } else { 3 }) + cIdx
+        cabac.residual(log2, cIdx, scan, tsAllowed: tsAllowed, bypass: cuBypass, sdh: pps.signDataHiding, qp: qp, matrixId: matrixId, bitDepth: bitDepth)
+        var kind = 0
+        if cuBypass {
+            kind = 3
+        } else if cabac.tsFlag {
+            kind = 2
+        } else if cuIntra && cIdx == 0 && log2 == 2 {
+            kind = 1
+        }
+        // The inverse transform (8.6.4) here, the samples into the
+        // residual plane; constant residuals as one value.
+        if tr.compute(cabac.coeffs, log2, kind, cabac.maxX, cabac.maxY) {
+            let dc = tr.dcValue
+            if dc != 0 {
+                ops.append(opResDc)
+                ops.append(cIdx)
+                ops.append(x0)
+                ops.append(y0)
+                ops.append(log2)
+                ops.append(dc)
+            }
+            return
+        }
+        let n = 1 << log2
+        let stride = if cIdx == 0 { width } else { (width + 1) >> 1 }
+        var at = y0 * stride + x0
+        var k = 2048
+        if cIdx == 0 {
+            for _ in 0..n {
+                for xx in 0..n {
+                    resY[at + xx] = tr.work[k]
+                    k += 1
+                }
+                at += stride
+            }
+        } else if cIdx == 1 {
+            for _ in 0..n {
+                for xx in 0..n {
+                    resU[at + xx] = tr.work[k]
+                    k += 1
+                }
+                at += stride
+            }
+        } else {
+            for _ in 0..n {
+                for xx in 0..n {
+                    resV[at + xx] = tr.work[k]
+                    k += 1
+                }
+                at += stride
+            }
+        }
+        ops.append(opResidual)
+        ops.append(cIdx)
+        ops.append(x0)
+        ops.append(y0)
+        ops.append(log2)
+    }
+
+    // ------------------------------------------------------------------
+    // Prediction units and motion (7.3.8.6, 8.5.3.2).
+
+    fn predictionUnit(_ x0: Int, _ y0: Int, _ w: Int, _ h: Int, _ log2Cb: Int, _ partIdx: Int, _ skip: Bool) {
+        var merge = skip
+        if !skip {
+            merge = cabac.decision(ctxMergeFlag) == 1
+        }
+        if partIdx == 0 {
+            mergeFlag = merge
+        }
+        if merge {
+            let idx = cabac.mergeIdx(sh.maxNumMergeCand)
+            deriveMerge(x0, y0, w, h, partIdx, idx)
+        } else {
+            var ipi = 0
+            if sh.sliceType == sliceB {
+                ipi = cabac.interPredIdc(w, h, ctDepth)
+            }
+            var mf = 0
+            var mv0 = 0
+            var mv1 = 0
+            var p0 = 0
+            var p1 = 0
+            var r0 = 0
+            var r1 = 0
+            var mvd0x = 0
+            var mvd0y = 0
+            var mvd1x = 0
+            var mvd1y = 0
+            var mvp0 = 0
+            var mvp1 = 0
+            if ipi != 1 {
+                r0 = cabac.refIdx(sh.numRefIdx0)
+                let (dx, dy) = mvdCoding()
+                mvd0x = dx
+                mvd0y = dy
+                mvp0 = cabac.decision(ctxMvpFlag)
+            }
+            if ipi != 0 {
+                r1 = cabac.refIdx(sh.numRefIdx1)
+                if sh.mvdL1Zero && ipi == 2 {
+                    mvd1x = 0
+                    mvd1y = 0
+                } else {
+                    let (dx, dy) = mvdCoding()
+                    mvd1x = dx
+                    mvd1y = dy
+                }
+                mvp1 = cabac.decision(ctxMvpFlag)
+            }
+            if ipi != 1 {
+                r0 = min(r0, refPoc0.count - 1)
+                let pred = amvp(x0, y0, w, h, partIdx, 0, r0, mvp0)
+                mv0 = hevcPackMv(hevcWrap16(hevcMvX(pred) + mvd0x), hevcWrap16(hevcMvY(pred) + mvd0y))
+                p0 = refPoc0[r0]
+                mf = mf | 1 | (r0 << 2) | (refLt0[r0] << 10)
+            }
+            if ipi != 0 {
+                r1 = min(r1, refPoc1.count - 1)
+                let pred = amvp(x0, y0, w, h, partIdx, 1, r1, mvp1)
+                mv1 = hevcPackMv(hevcWrap16(hevcMvX(pred) + mvd1x), hevcWrap16(hevcMvY(pred) + mvd1y))
+                p1 = refPoc1[r1]
+                mf = mf | 2 | (r1 << 6) | (refLt1[r1] << 11)
+            }
+            puMf = mf
+            puMv0 = mv0
+            puMv1 = mv1
+        }
+        // Store the motion and emit the prediction.
+        let xe = min(width, x0 + w)
+        let ye = min(height, y0 + h)
+        let pc0 = if (puMf & 1) != 0 { refPocOf(0, puMf) } else { 0 }
+        let pc1 = if (puMf & 2) != 0 { refPocOf(1, puMf) } else { 0 }
+        for yy in (y0 >> 2)..((ye + 3) >> 2) {
+            for xx in (x0 >> 2)..((xe + 3) >> 2) {
+                let i = yy * w4 + xx
+                mf4[i] = puMf
+                mv04[i] = puMv0
+                mv14[i] = puMv1
+                poc04[i] = pc0
+                poc14[i] = pc1
+            }
+        }
+        if debugMv {
+            var line = "poc {poc} pu {x0} {y0} {w} {h}"
+            line += if (puMf & 1) != 0 { " L0 r{(puMf >> 2) & 15} {hevcMvX(puMv0)} {hevcMvY(puMv0)}" } else { " L0 -" }
+            line += if (puMf & 2) != 0 { " L1 r{(puMf >> 6) & 15} {hevcMvX(puMv1)} {hevcMvY(puMv1)}" } else { " L1 -" }
+            print(line)
+        }
+        emitInter(x0, y0, w, h)
+    }
+
+    fn refPocOf(_ list: Int, _ mf: Int) -> Int {
+        if list == 0 {
+            let r = (mf >> 2) & 15
+            return if r < refPoc0.count { refPoc0[r] } else { 0 }
+        }
+        let r = (mf >> 6) & 15
+        if r < refPoc1.count { refPoc1[r] } else { 0 }
+    }
+
+    // mvd_coding() (7.3.8.9).
+    fn mvdCoding() -> (Int, Int) {
+        var gx = cabac.decision(ctxMvdGt0)
+        var gy = cabac.decision(ctxMvdGt0)
+        if gx == 1 {
+            gx += cabac.decision(ctxMvdGt1 + 1)
+        }
+        if gy == 1 {
+            gy += cabac.decision(ctxMvdGt1 + 1)
+        }
+        let x = cabac.mvdValue(gx)
+        let y = cabac.mvdValue(gy)
+        (x, y)
+    }
+
+    fn emitInter(_ x0: Int, _ y0: Int, _ w: Int, _ h: Int) {
+        let f = puMf & 3
+        if f == 0 {
+            return
+        }
+        let r0 = (puMf >> 2) & 15
+        let r1 = (puMf >> 6) & 15
+        let weighted = sh.weighted
+        ops.append(opInter)
+        ops.append(x0)
+        ops.append(y0)
+        ops.append(w)
+        ops.append(h)
+        ops.append(f | (if weighted { 4 } else { 0 }))
+        ops.append(if (f & 1) != 0 && r0 < refSlot0.count { refSlot0[r0] } else { 0 })
+        ops.append(puMv0)
+        ops.append(if (f & 2) != 0 && r1 < refSlot1.count { refSlot1[r1] } else { 0 })
+        ops.append(puMv1)
+        if weighted {
+            let shl = bitDepth - 8
+            ops.append(sh.lumaDenom)
+            ops.append(sh.chromaDenom)
+            for list in 0..2 {
+                let r = if list == 0 { r0 } else { r1 }
+                let wt = if list == 0 { sh.wt0 } else { sh.wt1 }
+                let use = (f & (1 << list)) != 0 && r * 6 + 5 < wt.count
+                for k in 0..3 {
+                    if use {
+                        ops.append(wt[r * 6 + k * 2])
+                        ops.append(wt[r * 6 + k * 2 + 1] << shl)
+                    } else {
+                        ops.append(1)
+                        ops.append(0)
+                    }
+                }
+            }
+        }
+    }
+
+    // Merge mode (8.5.3.2.2 to 8.5.3.2.5): candidate merge_idx into puMf /
+    // puMv0 / puMv1.
+    fn deriveMerge(_ xPb0: Int, _ yPb0: Int, _ nPbW0: Int, _ nPbH0: Int, _ partIdx0: Int, _ mergeIdx: Int) {
+        var xPb = xPb0
+        var yPb = yPb0
+        var nPbW = nPbW0
+        var nPbH = nPbH0
+        var partIdx = partIdx0
+        let par = pps.log2ParMrgLevel
+        if par > 2 && cbSize == 8 {
+            // singleMCLFlag: one list for all PUs of an 8x8 CU.
+            xPb = cbX
+            yPb = cbY
+            nPbW = 8
+            nPbH = 8
+            partIdx = 0
+        }
+        var count = 0
+        // A1
+        let xA1 = xPb - 1
+        let yA1 = yPb + nPbH - 1
+        var availA1 = false
+        if !(partIdx == 1 && (partMode == 2 || partMode == 6 || partMode == 7)) && !((xPb >> par) == (xA1 >> par) && (yPb >> par) == (yA1 >> par)) {
+            availA1 = availPb(xPb, yPb, nPbW, nPbH, partIdx, xA1, yA1)
+        }
+        let iA1 = if availA1 { at4(xA1, yA1) } else { 0 }
+        if availA1 {
+            addCand(count, iA1)
+            count += 1
+        }
+        if count > mergeIdx {
+            finishMerge(mergeIdx, nPbW0, nPbH0)
+            return
+        }
+        // B1
+        let xB1 = xPb + nPbW - 1
+        let yB1 = yPb - 1
+        var availB1 = false
+        if !(partIdx == 1 && (partMode == 1 || partMode == 4 || partMode == 5)) && !((xPb >> par) == (xB1 >> par) && (yPb >> par) == (yB1 >> par)) {
+            availB1 = availPb(xPb, yPb, nPbW, nPbH, partIdx, xB1, yB1)
+        }
+        let iB1 = if availB1 { at4(xB1, yB1) } else { 0 }
+        if availB1 && !(availA1 && sameMotion(iA1, iB1)) {
+            addCand(count, iB1)
+            count += 1
+        }
+        if count > mergeIdx {
+            finishMerge(mergeIdx, nPbW0, nPbH0)
+            return
+        }
+        // B0
+        let xB0 = xPb + nPbW
+        let yB0 = yPb - 1
+        var availB0 = false
+        if !((xPb >> par) == (xB0 >> par) && (yPb >> par) == (yB0 >> par)) {
+            availB0 = availPb(xPb, yPb, nPbW, nPbH, partIdx, xB0, yB0)
+        }
+        if availB0 && !(availB1 && sameMotion(iB1, at4(xB0, yB0))) {
+            addCand(count, at4(xB0, yB0))
+            count += 1
+        }
+        if count > mergeIdx {
+            finishMerge(mergeIdx, nPbW0, nPbH0)
+            return
+        }
+        // A0
+        let xA0 = xPb - 1
+        let yA0 = yPb + nPbH
+        var availA0 = false
+        if !((xPb >> par) == (xA0 >> par) && (yPb >> par) == (yA0 >> par)) {
+            availA0 = availPb(xPb, yPb, nPbW, nPbH, partIdx, xA0, yA0)
+        }
+        if availA0 && !(availA1 && sameMotion(iA1, at4(xA0, yA0))) {
+            addCand(count, at4(xA0, yA0))
+            count += 1
+        }
+        if count > mergeIdx {
+            finishMerge(mergeIdx, nPbW0, nPbH0)
+            return
+        }
+        // B2
+        let xB2 = xPb - 1
+        let yB2 = yPb - 1
+        var availB2 = false
+        if count != 4 && !((xPb >> par) == (xB2 >> par) && (yPb >> par) == (yB2 >> par)) {
+            availB2 = availPb(xPb, yPb, nPbW, nPbH, partIdx, xB2, yB2)
+        }
+        let iB2 = if availB2 { at4(xB2, yB2) } else { 0 }
+        if availB2 && !(availA1 && sameMotion(iA1, iB2)) && !(availB1 && sameMotion(iB1, iB2)) {
+            addCand(count, iB2)
+            count += 1
+        }
+        if count > mergeIdx {
+            finishMerge(mergeIdx, nPbW0, nPbH0)
+            return
+        }
+        let maxCand = sh.maxNumMergeCand
+        // Temporal candidate (refIdx 0).
+        if sh.temporalMvp && count < maxCand {
+            var mf = 0
+            var mv0 = 0
+            var mv1 = 0
+            if refPoc0.count > 0 {
+                let m = temporalMv(xPb, yPb, nPbW, nPbH, 0, 0)
+                if m >= 0 {
+                    mf = mf | 1 | (refLt0[0] << 10)
+                    mv0 = m
+                }
+            }
+            if sh.sliceType == sliceB && refPoc1.count > 0 {
+                let m = temporalMv(xPb, yPb, nPbW, nPbH, 1, 0)
+                if m >= 0 {
+                    mf = mf | 2 | (refLt1[0] << 11)
+                    mv1 = m
+                }
+            }
+            if (mf & 3) != 0 {
+                cMf[count] = mf
+                cMv0[count] = mv0
+                cMv1[count] = mv1
+                count += 1
+            }
+        }
+        if count > mergeIdx {
+            finishMerge(mergeIdx, nPbW0, nPbH0)
+            return
+        }
+        // Combined bi-predictive candidates (B slices).
+        let numOrig = count
+        if sh.sliceType == sliceB && numOrig > 1 && numOrig < maxCand {
+            let l0Idx = [0, 1, 0, 2, 1, 2, 0, 3, 1, 3, 2, 3]
+            let l1Idx = [1, 0, 2, 0, 2, 1, 3, 0, 3, 1, 3, 2]
+            var combIdx = 0
+            while combIdx < numOrig * (numOrig - 1) && count < maxCand {
+                let a = l0Idx[combIdx]
+                let b = l1Idx[combIdx]
+                let ma = cMf[a]
+                let mb = cMf[b]
+                if (ma & 1) != 0 && (mb & 2) != 0 {
+                    let ra = (ma >> 2) & 15
+                    let rb = (mb >> 6) & 15
+                    let pa = refPoc0[min(ra, refPoc0.count - 1)]
+                    let pb = refPoc1[min(rb, refPoc1.count - 1)]
+                    if pa != pb || cMv0[a] != cMv1[b] {
+                        cMf[count] = 3 | (ma & (15 << 2)) | (ma & (1 << 10)) | (mb & (15 << 6)) | (mb & (1 << 11))
+                        cMv0[count] = cMv0[a]
+                        cMv1[count] = cMv1[b]
+                        count += 1
+                    }
+                }
+                combIdx += 1
+            }
+        }
+        // Zero candidates.
+        let numRef = if sh.sliceType == sliceP { refPoc0.count } else { min(refPoc0.count, refPoc1.count) }
+        var zeroIdx = 0
+        while count < maxCand && count <= mergeIdx {
+            let r = if zeroIdx < numRef { zeroIdx } else { 0 }
+            if sh.sliceType == sliceP {
+                cMf[count] = 1 | (r << 2) | (refLt0[r] << 10)
+            } else {
+                cMf[count] = 3 | (r << 2) | (r << 6) | (refLt0[r] << 10) | (refLt1[r] << 11)
+            }
+            cMv0[count] = 0
+            cMv1[count] = 0
+            count += 1
+            zeroIdx += 1
+        }
+        finishMerge(mergeIdx, nPbW0, nPbH0)
+    }
+
+    fn addCand(_ k: Int, _ i: Int) {
+        cMf[k] = mf4[i]
+        cMv0[k] = mv04[i]
+        cMv1[k] = mv14[i]
+    }
+
+    fn sameMotion(_ a: Int, _ b: Int) -> Bool {
+        mf4[a] == mf4[b] && mv04[a] == mv04[b] && mv14[a] == mv14[b]
+    }
+
+    fn finishMerge(_ idx: Int, _ nPbW: Int, _ nPbH: Int) {
+        var mf = cMf[idx]
+        var mv1 = cMv1[idx]
+        // 8x4 and 4x8 blocks are never bi-predicted (8.5.3.2.2).
+        if (mf & 3) == 3 && nPbW + nPbH == 12 {
+            mf = (mf & ((15 << 2) | (1 << 10))) | 1
+            mv1 = 0
+        }
+        if (mf & 1) == 0 {
+            puMv0 = 0
+        } else {
+            puMv0 = cMv0[idx]
+        }
+        puMf = mf
+        puMv1 = if (mf & 2) != 0 { mv1 } else { 0 }
+    }
+
+    // Scales a packed motion vector by POC distances (8-180 to 8-183).
+    fn scaleMv(_ mv: Int, _ td0: Int, _ tb0: Int) -> Int {
+        let td = max(-128, min(127, td0))
+        let tb = max(-128, min(127, tb0))
+        if td == 0 {
+            return mv
+        }
+        let tx = (16384 + (abs(td) >> 1)) / td
+        let dsf = max(-4096, min(4095, (tb * tx + 32) >> 6))
+        let x = hevcMvX(mv)
+        let y = hevcMvY(mv)
+        let sx = dsf * x
+        let sy = dsf * y
+        let nx = if sx >= 0 { (sx + 127) >> 8 } else { -((-sx + 127) >> 8) }
+        let ny = if sy >= 0 { (sy + 127) >> 8 } else { -((-sy + 127) >> 8) }
+        hevcPackMv(max(-32768, min(32767, nx)), max(-32768, min(32767, ny)))
+    }
+
+    // Temporal luma motion vector prediction (8.5.3.2.8): the packed MV
+    // for list X and reference index refIdx, or -1 when unavailable.
+    fn temporalMv(_ xPb: Int, _ yPb: Int, _ nPbW: Int, _ nPbH: Int, _ list: Int, _ refIdx: Int) -> Int {
+        if colDpb < 0 {
+            return -1
+        }
+        let xBr = xPb + nPbW
+        let yBr = yPb + nPbH
+        if (yPb >> log2Ctb) == (yBr >> log2Ctb) && yBr < height && xBr < width {
+            let m = colMv(((xBr >> 4) << 4), ((yBr >> 4) << 4), list, refIdx)
+            if m >= 0 {
+                return m
+            }
+        }
+        let xC = xPb + (nPbW >> 1)
+        let yC = yPb + (nPbH >> 1)
+        colMv(((xC >> 4) << 4), ((yC >> 4) << 4), list, refIdx)
+    }
+
+    // Collocated motion vectors (8.5.3.2.9).
+    fn colMv(_ x: Int, _ y: Int, _ list: Int, _ refIdx: Int) -> Int {
+        let i = at4(x, y)
+        let mf = dpb[colDpb].mf[i]
+        if (mf & 3) == 0 {
+            return -1
+        }
+        var useList = 0
+        if (mf & 1) == 0 {
+            useList = 1
+        } else if (mf & 2) == 0 {
+            useList = 0
+        } else if noBackwardPred {
+            useList = list
+        } else {
+            useList = if sh.collocatedFromL0 { 1 } else { 0 }
+        }
+        let mvCol = if useList == 0 { dpb[colDpb].mv0[i] } else { dpb[colDpb].mv1[i] }
+        let refPocCol = if useList == 0 { dpb[colDpb].poc0[i] } else { dpb[colDpb].poc1[i] }
+        let colLt = if useList == 0 { (mf >> 10) & 1 } else { (mf >> 11) & 1 }
+        let curLt = if list == 0 { refLt0[refIdx] } else { refLt1[refIdx] }
+        if colLt != curLt {
+            return -1
+        }
+        let colPocDiff = dpb[colDpb].poc - refPocCol
+        let curRefPoc = if list == 0 { refPoc0[refIdx] } else { refPoc1[refIdx] }
+        let curPocDiff = poc - curRefPoc
+        if curLt == 1 || colPocDiff == curPocDiff || colPocDiff == 0 {
+            return mvCol
+        }
+        scaleMv(mvCol, colPocDiff, curPocDiff)
+    }
+
+    // AMVP (8.5.3.2.6, 8.5.3.2.7): the predictor mvpIdx for list X and
+    // refIdx, packed.
+    fn amvp(_ xPb: Int, _ yPb: Int, _ nPbW: Int, _ nPbH: Int, _ partIdx: Int, _ list: Int, _ refIdx: Int, _ mvpIdx: Int) -> Int {
+        let targetPoc = if list == 0 { refPoc0[refIdx] } else { refPoc1[refIdx] }
+        let targetLt = if list == 0 { refLt0[refIdx] } else { refLt1[refIdx] }
+        let xA0 = xPb - 1
+        let yA0 = yPb + nPbH
+        let xA1 = xPb - 1
+        let yA1 = yPb + nPbH - 1
+        let availA0 = availPb(xPb, yPb, nPbW, nPbH, partIdx, xA0, yA0)
+        let availA1 = availPb(xPb, yPb, nPbW, nPbH, partIdx, xA1, yA1)
+        let isScaled = availA0 || availA1
+        var haveA = false
+        var mvA = 0
+        // Without scaling: a neighbour referring to the same picture.
+        for k in 0..2 {
+            if haveA {
+                break
+            }
+            let ok = if k == 0 { availA0 } else { availA1 }
+            if !ok {
+                continue
+            }
+            let i = if k == 0 { at4(xA0, yA0) } else { at4(xA1, yA1) }
+            let m = sameRefMv(i, list, targetPoc)
+            if m >= 0 {
+                haveA = true
+                mvA = m
+            }
+        }
+        if !haveA {
+            for k in 0..2 {
+                if haveA {
+                    break
+                }
+                let ok = if k == 0 { availA0 } else { availA1 }
+                if !ok {
+                    continue
+                }
+                let i = if k == 0 { at4(xA0, yA0) } else { at4(xA1, yA1) }
+                let m = scaledRefMv(i, list, targetPoc, targetLt)
+                if m >= 0 {
+                    haveA = true
+                    mvA = m
+                }
+            }
+        }
+        // B candidates.
+        let xB0 = xPb + nPbW
+        let yB0 = yPb - 1
+        let xB1 = xPb + nPbW - 1
+        let yB1 = yPb - 1
+        let xB2 = xPb - 1
+        let yB2 = yPb - 1
+        let availB0 = availPb(xPb, yPb, nPbW, nPbH, partIdx, xB0, yB0)
+        let availB1 = availPb(xPb, yPb, nPbW, nPbH, partIdx, xB1, yB1)
+        let availB2 = availPb(xPb, yPb, nPbW, nPbH, partIdx, xB2, yB2)
+        var haveB = false
+        var mvB = 0
+        for k in 0..3 {
+            if haveB {
+                break
+            }
+            let ok = if k == 0 { availB0 } else if k == 1 { availB1 } else { availB2 }
+            if !ok {
+                continue
+            }
+            let i = if k == 0 { at4(xB0, yB0) } else if k == 1 { at4(xB1, yB1) } else { at4(xB2, yB2) }
+            let m = sameRefMv(i, list, targetPoc)
+            if m >= 0 {
+                haveB = true
+                mvB = m
+            }
+        }
+        if !isScaled && haveB {
+            haveA = true
+            mvA = mvB
+        }
+        if !isScaled {
+            haveB = false
+            for k in 0..3 {
+                if haveB {
+                    break
+                }
+                let ok = if k == 0 { availB0 } else if k == 1 { availB1 } else { availB2 }
+                if !ok {
+                    continue
+                }
+                let i = if k == 0 { at4(xB0, yB0) } else if k == 1 { at4(xB1, yB1) } else { at4(xB2, yB2) }
+                let m = scaledRefMv(i, list, targetPoc, targetLt)
+                if m >= 0 {
+                    haveB = true
+                    mvB = m
+                }
+            }
+        }
+        var n = 0
+        var c0 = 0
+        var c1 = 0
+        if haveA {
+            c0 = mvA
+            n = 1
+        }
+        if haveB && !(haveA && mvA == mvB) {
+            if n == 0 {
+                c0 = mvB
+            } else {
+                c1 = mvB
+            }
+            n += 1
+        }
+        if n < 2 && sh.temporalMvp && mvpIdx >= n {
+            let m = temporalMv(xPb, yPb, nPbW, nPbH, list, refIdx)
+            if m >= 0 {
+                if n == 0 {
+                    c0 = m
+                } else {
+                    c1 = m
+                }
+                n += 1
+            }
+        }
+        if mvpIdx == 0 {
+            return if n >= 1 { c0 } else { 0 }
+        }
+        if n >= 2 { c1 } else { 0 }
+    }
+
+    // A neighbour's MV in list X or Y that refers to the picture with POC
+    // targetPoc, or -1.
+    fn sameRefMv(_ i: Int, _ list: Int, _ targetPoc: Int) -> Int {
+        let mf = mf4[i]
+        let other = 1 - list
+        if (mf & (1 << list)) != 0 {
+            let p = if list == 0 { poc04[i] } else { poc14[i] }
+            if p == targetPoc {
+                return if list == 0 { mv04[i] } else { mv14[i] }
+            }
+        }
+        if (mf & (1 << other)) != 0 {
+            let p = if other == 0 { poc04[i] } else { poc14[i] }
+            if p == targetPoc {
+                return if other == 0 { mv04[i] } else { mv14[i] }
+            }
+        }
+        -1
+    }
+
+    // A neighbour's MV in list X or Y whose reference has the same
+    // long-term status, scaled when both are short-term; or -1.
+    fn scaledRefMv(_ i: Int, _ list: Int, _ targetPoc: Int, _ targetLt: Int) -> Int {
+        let mf = mf4[i]
+        for k in 0..2 {
+            let l = if k == 0 { list } else { 1 - list }
+            if (mf & (1 << l)) == 0 {
+                continue
+            }
+            let lt = (mf >> (10 + l)) & 1
+            if lt != targetLt {
+                continue
+            }
+            let mv = if l == 0 { mv04[i] } else { mv14[i] }
+            if lt == 1 {
+                return mv
+            }
+            let p = if l == 0 { poc04[i] } else { poc14[i] }
+            let td = poc - p
+            let tb = poc - targetPoc
+            if p == targetPoc {
+                return mv
+            }
+            return scaleMv(mv, td, tb)
+        }
+        -1
+    }
+
+    // ------------------------------------------------------------------
+    // Deblocking boundary strengths (8.7.2.3, 8.7.2.4) for a transform
+    // block (or a CU without residual) at (x0, y0): its left and top edges
+    // and the prediction block edges inside it, on the 8x8 grid.
+    fn edgeBs(_ x0: Int, _ y0: Int, _ w: Int, _ h: Int, _ tu: Bool) {
+        flt.anyDeblock = true
+        let ctbMask = ctbSize - 1
+        // Left edge.
+        if x0 > 0 && (x0 & 7) == 0 {
+            var filter = true
+            if (x0 & ctbMask) == 0 {
+                let nRs = ctbAddrRs - 1
+                if !sh.loopFilterAcrossSlices && ctbSliceAddr[nRs] != sliceAddrRs {
+                    filter = false
+                }
+                if !pps.loopFilterAcrossTiles && tileIdTs[rsToTs[nRs]] != tileIdTs[ctbAddrTs] {
+                    filter = false
+                }
+            }
+            if filter {
+                var yy = y0
+                let ye = min(height, y0 + h)
+                while yy < ye {
+                    let q = at4(x0, yy)
+                    flt.bsV[q] = bsOf(q, q - 1, true)
+                    yy += 4
+                }
+            }
+        }
+        // Top edge.
+        if y0 > 0 && (y0 & 7) == 0 {
+            var filter = true
+            if (y0 & ctbMask) == 0 {
+                let nRs = ctbAddrRs - ctbW
+                if !sh.loopFilterAcrossSlices && ctbSliceAddr[nRs] != sliceAddrRs {
+                    filter = false
+                }
+                if !pps.loopFilterAcrossTiles && tileIdTs[rsToTs[nRs]] != tileIdTs[ctbAddrTs] {
+                    filter = false
+                }
+            }
+            if filter {
+                var xx = x0
+                let xe = min(width, x0 + w)
+                while xx < xe {
+                    let q = at4(xx, y0)
+                    flt.bsH[q] = bsOf(q, q - w4, true)
+                    xx += 4
+                }
+            }
+        }
+        // Prediction block edges inside (inter CUs only).
+        if intra4[at4(x0, y0)] == 1 {
+            return
+        }
+        let xe = min(width, x0 + w)
+        let ye = min(height, y0 + h)
+        var xx = ((x0 + 8) >> 3) << 3
+        while xx < xe {
+            var yy = y0
+            while yy < ye {
+                let q = at4(xx, yy)
+                if !sameMotion(q, q - 1) {
+                    flt.bsV[q] = motionBs(q, q - 1)
+                }
+                yy += 4
+            }
+            xx += 8
+        }
+        var yy = ((y0 + 8) >> 3) << 3
+        while yy < ye {
+            var xx2 = x0
+            while xx2 < xe {
+                let q = at4(xx2, yy)
+                if !sameMotion(q, q - w4) {
+                    flt.bsH[q] = motionBs(q, q - w4)
+                }
+                xx2 += 4
+            }
+            yy += 8
+        }
+    }
+
+    // bS of a transform block edge between units q and p.
+    fn bsOf(_ q: Int, _ p: Int, _ transformEdge: Bool) -> Int {
+        if intra4[q] == 1 || intra4[p] == 1 {
+            return 2
+        }
+        if transformEdge && (cbf4[q] == 1 || cbf4[p] == 1) {
+            return 1
+        }
+        motionBs(q, p)
+    }
+
+    // bS from the motion of two inter units (8.7.2.4).
+    fn motionBs(_ q: Int, _ p: Int) -> Int {
+        let fq = mf4[q] & 3
+        let fp = mf4[p] & 3
+        let nq = if fq == 3 { 2 } else { 1 }
+        let np = if fp == 3 { 2 } else { 1 }
+        if nq != np {
+            return 1
+        }
+        if nq == 1 {
+            let pq = if fq == 1 { poc04[q] } else { poc14[q] }
+            let pp = if fp == 1 { poc04[p] } else { poc14[p] }
+            let mq = if fq == 1 { mv04[q] } else { mv14[q] }
+            let mp = if fp == 1 { mv04[p] } else { mv14[p] }
+            if pq != pp {
+                return 1
+            }
+            return if hevcMvFar(mq, mp) { 1 } else { 0 }
+        }
+        let q0 = poc04[q]
+        let q1 = poc14[q]
+        let p0 = poc04[p]
+        let p1 = poc14[p]
+        if !((q0 == p0 && q1 == p1) || (q0 == p1 && q1 == p0)) {
+            return 1
+        }
+        let qm0 = mv04[q]
+        let qm1 = mv14[q]
+        let pm0 = mv04[p]
+        let pm1 = mv14[p]
+        if q0 != q1 {
+            // Two different references: compare the MVs for each.
+            if q0 == p0 {
+                return if hevcMvFar(qm0, pm0) || hevcMvFar(qm1, pm1) { 1 } else { 0 }
+            }
+            return if hevcMvFar(qm0, pm1) || hevcMvFar(qm1, pm0) { 1 } else { 0 }
+        }
+        // Both MVs refer to the same picture.
+        let straight = hevcMvFar(qm0, pm0) || hevcMvFar(qm1, pm1)
+        let crossed = hevcMvFar(qm0, pm1) || hevcMvFar(qm1, pm0)
+        if straight && crossed { 1 } else { 0 }
+    }
+}
+
+fn hevcPackMv(_ x: Int, _ y: Int) -> Int {
+    (x & 0xFFFF) | ((y & 0xFFFF) << 16)
+}
+
+fn hevcMvX(_ m: Int) -> Int {
+    ((m & 0xFFFF) ^ 0x8000) - 0x8000
+}
+
+fn hevcMvY(_ m: Int) -> Int {
+    (((m >> 16) & 0xFFFF) ^ 0x8000) - 0x8000
+}
+
+// A motion vector component wrapped to 16 bits (8-198 to 8-201).
+fn hevcWrap16(_ v: Int) -> Int {
+    let u = (v + 65536 * 4) % 65536
+    if u >= 32768 { u - 65536 } else { u }
+}
+
+// Whether two packed MVs differ by one integer sample or more.
+fn hevcMvFar(_ a: Int, _ b: Int) -> Bool {
+    abs(hevcMvX(a) - hevcMvX(b)) >= 4 || abs(hevcMvY(a) - hevcMvY(b)) >= 4
+}
+
+public fn newParser(_ track: core.Track) -> Result<Parser> {
+    var p = Parser()
+    p.setup()
+    let x = track.extra
+    if x.isEmpty {
+        p.lengthSize = 0
+        return Result.ok(value: p)
+    }
+    if hevcLooksAnnexB(x) {
+        p.lengthSize = 0
+        p.parse(x, pts: core.noTime, dts: core.noTime, key: false)
+        return Result.ok(value: p)
+    }
+    let c = parseHvcC(x)
+    if !c.valid {
+        return .failure(error: Error("hevc: the hvcC configuration can't be read"))
+    }
+    p.lengthSize = c.lengthSize
+    for n in c.nals {
+        p.handleNal(n, 0, n.count, core.noTime, false, true)
+    }
+    Result.ok(value: p)
+}
+
+// Whether a PPS's tile columns and rows fit the SPS's picture (6.5.1).
+fn hevcTilesFit(_ p: HevcPps, _ s: HevcSps) -> Bool {
+    if !p.tiles {
+        return true
+    }
+    let w = s.picWidthInCtbs
+    let h = s.picHeightInCtbs
+    if p.numTileCols > w || p.numTileRows > h {
+        return false
+    }
+    if p.uniformSpacing {
+        return true
+    }
+    var sum = 0
+    for c in p.colWidths {
+        sum += c
+    }
+    if sum >= w || p.colWidths.count != p.numTileCols - 1 {
+        return false
+    }
+    sum = 0
+    for r in p.rowHeights {
+        sum += r
+    }
+    sum < h && p.rowHeights.count == p.numTileRows - 1
+}

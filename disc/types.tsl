@@ -1,0 +1,261 @@
+// The disc model: what Reel needs to play a title of a DVD-Video or
+// Blu-ray folder (or of an ISO image of one) without knowing the disc
+// format. A title is a list of byte segments of files (VOB or m2ts), played
+// one after the other, with its chapters, its streams, its length and
+// points to seek to.
+//
+//   Disc     the disc: kind, volume name, titles, which one is the main one
+//   Title    one playable title (DVD title / Blu-ray playlist)
+//   Segment  a byte range of a file, with the title time it starts at
+//   Stream   an audio / subtitle / video stream the title offers, with the
+//            container id the demuxer gives it (DVD: the PS key Reel's PS
+//            demuxer uses as Track.id; Blu-ray: the TS PID)
+//   SeekPoint a time and the byte position in the title it starts at
+//
+// Positions: `pos` counts bytes through the title's segments as if they
+// were one file (segment 0's bytes first); `locate` turns a position into
+// a file and offset.
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+import "../core"
+
+public struct Segment {
+    // The file the bytes are in (a VOB, an m2ts, or the .iso image itself).
+    path: String
+    // Byte range in that file: from ..< to.
+    from: Int
+    to: Int
+    // Seconds into the title where this segment starts, and how long it
+    // plays.
+    start: Float = 0.0
+    duration: Float = 0.0
+    // Where the segment starts in the title's byte stream.
+    pos: Int = 0
+    // DVD: the cell (1-based within its program chain) and its PGC number;
+    // Blu-ray: the play item (0-based) and -1.
+    cell: Int = 0
+    pgc: Int = 0
+    // The timestamps in this segment don't continue from the previous one
+    // (DVD cell with an STC discontinuity, a new Blu-ray clip, or a new
+    // program chain): the player rebases them to `start`.
+    discontinuity: Bool = false
+    // A DVD cell is one of several VOB files' ranges: its sector range.
+    firstSector: Int = 0
+    lastSector: Int = 0
+    // DVD: part of an interleaved cell (angle block or seamless branching)
+    // not yet cut down to its own ILVUs (see resolveInterleaved).
+    interleaved: Bool = false
+    // Blu-ray: the clip's in and out time (90 kHz PTS) inside this segment.
+    inPts: Int = 0
+    outPts: Int = 0
+}
+
+public struct Stream {
+    kind: core.TrackKind
+    // Reel codec names (core/media.tsl): "ac3" "dts" "pcm" "mp2" "truehd"
+    // "eac3" "dvdsub" "pgs" "mpeg2" "h264" "vc1" "hevc" …
+    codec: String
+    // The id the demuxer gives the track (core.Track.id): DVD private
+    // stream 1 substream key 0xBDxx or MPEG audio 0xC0+n (as demux/ps.tsl
+    // does), Blu-ray TS PID.
+    id: Int = 0
+    // ISO 639-2 ("eng"), or "".
+    language: String = ""
+    // The disc's own code (DVD: ISO 639-1 "en").
+    languageCode: String = ""
+    // What it is for: "Director's comments", "Forced", "Captions", … or "".
+    note: String = ""
+    channels: Int = 0
+    sampleRate: Int = 0
+    bitsPerSample: Int = 0
+    forced: Bool = false
+    // Video.
+    width: Int = 0
+    height: Int = 0
+    fpsNum: Int = 0
+    fpsDen: Int = 1
+    aspect: String = ""
+    // The stream's position in the disc's list (DVD: audio 0–7, subpicture
+    // 0–31; Blu-ray: STN table order), what the disc's menus call it.
+    number: Int = 0
+}
+
+public struct SeekPoint {
+    // Seconds into the title.
+    time: Float
+    // Byte position in the title (see `locate`).
+    pos: Int
+}
+
+public struct Title {
+    // 1-based title number as the disc numbers them (DVD title, Blu-ray
+    // index.bdmv title or the playlist number when not in a title).
+    number: Int
+    // "dvd" or "bluray".
+    kind: String = "dvd"
+    name: String = ""
+    // Seconds.
+    duration: Float = 0.0
+    chapters: [core.Chapter] = []
+    segments: [Segment] = []
+    // Video first, then audio, then subtitles.
+    streams: [Stream] = []
+    // Seek points in time order (DVD time map and cell starts, Blu-ray EP
+    // map entries of the video stream).
+    points: [SeekPoint] = []
+    angles: Int = 1
+    angle: Int = 1
+    // DVD subpicture palette: 16 colours, rgba packed (opaque), from the
+    // PGC's YCrCb table; empty for Blu-ray.
+    palette: [Int] = []
+    // Video picture size and shape as the disc says.
+    width: Int = 0
+    height: Int = 0
+    aspect: String = ""
+    // DVD: title set and title within it; Blu-ray: playlist number.
+    titleSet: Int = 0
+    vtsTitle: Int = 0
+    playlist: Int = -1
+    // DVD: the program chains played, in order.
+    pgcs: [Int] = []
+    // Blu-ray: the clip names ("00001") of the play items.
+    clips: [String] = []
+    // The disc's guess that this is the film itself.
+    mainFeature: Bool = false
+    // Total bytes of all segments.
+    size: Int = 0
+    // Problems found building it (sectors past the files, missing clips).
+    warnings: [String] = []
+}
+
+public struct Disc {
+    // "dvd" or "bluray".
+    kind: String
+    // The folder (VIDEO_TS's or BDMV's parent) or the .iso file.
+    path: String
+    volumeName: String = ""
+    titles: [Title] = []
+    // Index in `titles` of the main feature, -1 when there are no titles.
+    main: Int = -1
+    warnings: [String] = []
+    // Set when the disc is an image: segments point into it.
+    iso: Bool = false
+}
+
+// The file and offset of a byte position in a title: (segment index,
+// path, offset in that file), or (-1, "", 0) past the end.
+public fn locate(_ t: Title, _ pos: Int) -> (Int, String, Int) {
+    var i = 0
+    while i < t.segments.count {
+        let s = t.segments[i]
+        let n = s.to - s.from
+        if pos >= s.pos && pos < s.pos + n {
+            return (i, s.path, s.from + pos - s.pos)
+        }
+        i += 1
+    }
+    (-1, "", 0)
+}
+
+// The segment a title time is in (the last one starting at or before it).
+public fn segmentAt(_ t: Title, _ seconds: Float) -> Int {
+    var best = -1
+    var i = 0
+    while i < t.segments.count {
+        // The latest start at or before the time; of pieces starting
+        // together (one item split over image extents) the first.
+        if t.segments[i].start <= seconds + 0.0000001 && (best < 0 || t.segments[i].start > t.segments[best].start) {
+            best = i
+        }
+        i += 1
+    }
+    if best < 0 && !t.segments.isEmpty {
+        best = 0
+    }
+    best
+}
+
+// Where to start reading to show `seconds`: the last seek point at or
+// before it; without points, the start of the segment it is in.
+public fn seek(_ t: Title, _ seconds: Float) -> SeekPoint {
+    var lo = 0
+    var hi = t.points.count
+    // Binary search: the first point after `seconds`.
+    while lo < hi {
+        let mid = (lo + hi) / 2
+        if t.points[mid].time <= seconds + 0.0000001 {
+            lo = mid + 1
+        } else {
+            hi = mid
+        }
+    }
+    if lo > 0 {
+        return t.points[lo - 1]
+    }
+    let i = segmentAt(t, seconds)
+    if i < 0 {
+        return SeekPoint(time: 0.0, pos: 0)
+    }
+    SeekPoint(time: t.segments[i].start, pos: t.segments[i].pos)
+}
+
+// The chapter (0-based) a time is in, or -1 without chapters.
+public fn chapterAt(_ t: Title, _ seconds: Float) -> Int {
+    var best = -1
+    var i = 0
+    while i < t.chapters.count {
+        if t.chapters[i].start <= seconds + 0.0000001 {
+            best = i
+        }
+        i += 1
+    }
+    if best < 0 && !t.chapters.isEmpty {
+        best = 0
+    }
+    best
+}
+
+// The streams of one kind.
+public fn streamsOf(_ t: Title, _ kind: core.TrackKind) -> [Stream] {
+    t.streams.filter { s in s.kind == kind }
+}
+
+// "1:23:45" for a title list.
+public fn formatTime(_ seconds: Float) -> String {
+    let total = Int(seconds + 0.5)
+    let h = total / 3600
+    let m = total / 60 % 60
+    let s = total % 60
+    let ss = "{s}".padStart(2, with: "0")
+    if h > 0 {
+        let mm = "{m}".padStart(2, with: "0")
+        return "{h}:{mm}:{ss}"
+    }
+    "{m}:{ss}"
+}
+
+// The bytes of one segment (reads the whole file: Tessel has no ranged
+// local reads yet), or nil when the file can't be read.
+public fn readSegment(_ s: Segment) -> Data? {
+    if let d = readData(s.path) {
+        return d.slice(from: s.from, to: s.to)
+    }
+    nil
+}
+
+// Puts bookkeeping right after segments are listed: positions, size.
+fn discFinishTitle(_ t: Title) -> Title {
+    var out = t
+    var pos = 0
+    var i = 0
+    while i < out.segments.count {
+        out.segments[i].pos = pos
+        pos += max(0, out.segments[i].to - out.segments[i].from)
+        i += 1
+    }
+    out.size = pos
+    out.points = out.points.sorted(by: { a, b in a.time < b.time || (a.time == b.time && a.pos < b.pos) })
+    out
+}

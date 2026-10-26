@@ -1,0 +1,307 @@
+// The General, Playback, Audio and Video pages of the Preferences window.
+// Each edits library.Preferences (and PrefsExtra for what it lacks)
+// through bindings and can be shown alone; PreferencesView puts them
+// together and calls onChange after every edit.
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+import "../library"
+import "../fx"
+import "../render"
+
+// General: continuing where you left off, per-file memory, episodes,
+// history, appearance.
+public view GeneralPrefs(prefs: bind library.Preferences, historyCount: Int = -1, onClearHistory: fn()) {
+    state confirming = false
+
+    PrefsPage {
+        Grid(spacing: 10) {
+            PrefsHeader("Continuing")
+            PrefsRow("Continue where I left off") {
+                Picker(selection: prefs.resume, style: .radio) {
+                    Text("Ask each time").tag("ask")
+                    Text("Always").tag("always")
+                    Text("Never").tag("never")
+                }
+                .accessibilityLabel("Continue where I left off")
+            }
+            PrefsRow("Only after") {
+                Stepper(value: prefs.resumeMinSeconds, step: 5, from: 0, to: 600)
+                    .accessibilityLabel("Only continue after this many seconds")
+                Text("seconds watched").color(.secondary)
+            }
+            PrefsRow("Per file") {
+                Toggle("Remember tracks, volume and delays for each file", isOn: prefs.rememberPerFile)
+            }
+            PrefsRow("Episodes") {
+                Toggle("Play the next episode when one ends", isOn: prefs.autoNextEpisode)
+            }
+
+            PrefsHeader("History")
+            PrefsRow("Watch history") {
+                Toggle("Keep a history of what I play", isOn: prefs.historyEnabled)
+            }
+            PrefsRow("Recent items") {
+                Stepper(value: prefs.recentCount, from: 0, to: 100)
+                    .accessibilityLabel("Number of recent items")
+                Text("in File ▸ Open Recent").color(.secondary)
+            }
+            PrefsRow("") {
+                if confirming {
+                    VStack(spacing: 6, alignment: .leading) {
+                        Text(prefsClearHistoryQuestion(historyCount))
+                            .frame(maxWidth: 380)
+                        HStack(spacing: 8) {
+                            Button("Clear History") {
+                                confirming = false
+                                onClearHistory()
+                            }
+                            .color(.red)
+                            Button("Cancel") { confirming = false }
+                        }
+                    }
+                    .padding(10)
+                    .background(.lightGray, radius: 6)
+                    Spacer()
+                } else {
+                    Button("Clear History…") { confirming = true }
+                        .disabled(historyCount == 0)
+                    if historyCount >= 0 {
+                        Text(if historyCount == 1 { "1 item" } else { "{historyCount} items" }).color(.secondary)
+                    }
+                }
+            }
+
+            PrefsHeader("Window")
+            PrefsRow("Appearance") {
+                Picker(selection: prefs.theme) {
+                    Text("System").tag("system")
+                    Text("Dark").tag("dark")
+                    Text("Light").tag("light")
+                }
+                .accessibilityLabel("Appearance")
+            }
+            PrefsRow("Playlist") {
+                Toggle("Show the playlist when Reel starts", isOn: prefs.showPlaylistOnStart)
+            }
+            PrefsNote("Reel's menus and windows are in English.")
+        }
+    }
+}
+
+// Playback: jumps, speed, the end of the playlist, sleep timer, mini
+// player, the controls over the video.
+public view PlaybackPrefs(prefs: bind library.Preferences, extra: bind PrefsExtra) {
+    PrefsPage {
+        Grid(spacing: 10) {
+            PrefsHeader("Jumps")
+            PrefsRow("Short jump") {
+                Stepper(value: prefs.jumpShort, step: 0.5, from: 0.5, to: 600)
+                    .accessibilityLabel("Short jump in seconds")
+                Text("seconds (Shift + arrow)").color(.secondary)
+            }
+            PrefsRow("Normal jump") {
+                Stepper(value: prefs.jumpNormal, step: 1, from: 1, to: 600)
+                    .accessibilityLabel("Normal jump in seconds")
+                Text("seconds (arrow)").color(.secondary)
+            }
+            PrefsRow("Long jump") {
+                Stepper(value: prefs.jumpLong, step: 5, from: 5, to: 3600)
+                    .accessibilityLabel("Long jump in seconds")
+                Text("seconds (Option + arrow)").color(.secondary)
+            }
+            PrefsRow("Speed step") {
+                Stepper(value: extra.speedStep, step: 0.05, from: 0.05, to: 0.5)
+                    .accessibilityLabel("Speed step")
+                Text("× per Faster or Slower").color(.secondary)
+            }
+
+            PrefsHeader("Playlist")
+            PrefsRow("At the end") {
+                Picker(selection: prefs.loopMode, style: .radio) {
+                    Text("Stop").tag(0)
+                    Text("Start the playlist again").tag(1)
+                    Text("Repeat the current item").tag(2)
+                }
+                .accessibilityLabel("At the end of the playlist")
+            }
+            PrefsRow("Order") {
+                Toggle("Shuffle", isOn: prefs.shuffle)
+            }
+            PrefsRow("Sleep timer") {
+                Picker(selection: extra.sleepTimerMinutes, style: .menu) {
+                    for m in prefsSleepChoices {
+                        Text(prefsSleepTitle(m)).tag(m)
+                    }
+                }
+                .frame(width: 240)
+                .accessibilityLabel("Sleep timer default")
+            }
+
+            PrefsHeader("Window")
+            PrefsRow("Mini player") {
+                Picker(selection: extra.miniPlayer, style: .menu) {
+                    Text("Off").tag("off")
+                    Text("From the View menu").tag("menu")
+                    Text("Also when the window is made small").tag("small")
+                }
+                .frame(width: 260)
+                .accessibilityLabel("Mini player")
+            }
+            PrefsRow("Controls") {
+                Toggle("Always show the controls over the video", isOn: extra.alwaysShowControls)
+            }
+            PrefsRow("Hide them after", off: extra.alwaysShowControls) {
+                Stepper(value: prefs.controlsHideSeconds, step: 0.5, from: 0.5, to: 60)
+                    .accessibilityLabel("Hide the controls after this many seconds")
+                Text("seconds without the mouse moving").color(.secondary)
+            }
+            PrefsRow("Time") {
+                Toggle("Show the time left instead of the length", isOn: prefs.showRemaining)
+            }
+            PrefsRow("Minimised") {
+                Toggle("Pause when the window is minimised", isOn: prefs.pauseWhenHidden)
+            }
+        }
+    }
+}
+
+// The names of fx's equalizer presets.
+fn prefsPresetNames() -> [String] {
+    fx.presets().map { p in p.name }
+}
+
+// Audio: languages, normalisation, the equalizer preset, the volume.
+public view AudioPrefs(prefs: bind library.Preferences, extra: bind PrefsExtra) {
+    let presets = prefsPresetNames()
+
+    PrefsPage {
+        Grid(spacing: 10) {
+            PrefsHeader("Languages")
+            PrefsRow("Audio languages") {
+                PrefsLanguageList(languages: prefs.audioLanguages, what: "audio languages", empty: "None: the file's default track plays.")
+            }
+            PrefsNote("The first language a file has is chosen.")
+
+            PrefsHeader("Loudness")
+            PrefsRow("Normalise") {
+                Toggle("Even out loudness between files", isOn: prefs.normalize)
+            }
+            PrefsRow("Target", off: !prefs.normalize) {
+                Slider(value: prefs.normalizeTarget, from: -40, to: -5, step: 1)
+                    .frame(width: 200)
+                    .accessibilityLabel("Loudness target in LUFS")
+                Text("{Int(prefs.normalizeTarget)} LUFS").frame(width: 70, alignment: .leading)
+            }
+            PrefsRow("ReplayGain") {
+                Picker(selection: prefs.replayGain) {
+                    Text("Off").tag("off")
+                    Text("Track").tag("track")
+                    Text("Album").tag("album")
+                }
+                .accessibilityLabel("ReplayGain")
+            }
+            PrefsNote("Uses the files' ReplayGain tags when they have them, instead of measuring.")
+
+            PrefsHeader("Equalizer")
+            PrefsRow("Equalizer") {
+                Toggle("On for new files", isOn: prefs.equalizerEnabled)
+            }
+            PrefsRow("Preset") {
+                Picker(selection: prefs.equalizerPreset, style: .menu) {
+                    for name in presets {
+                        Text(name).tag(name)
+                    }
+                    if !presets.contains(prefs.equalizerPreset) {
+                        Text(prefs.equalizerPreset).tag(prefs.equalizerPreset)
+                    }
+                }
+                .frame(width: 200)
+                .accessibilityLabel("Default equalizer preset")
+            }
+
+            PrefsHeader("Output")
+            PrefsRow("Highest volume") {
+                Slider(value: extra.volumeLimit, from: 0.25, to: 2.0, step: 0.05)
+                    .frame(width: 200)
+                    .accessibilityLabel("Highest volume")
+                Text(prefsPercent(extra.volumeLimit)).frame(width: 60, alignment: .leading)
+            }
+            PrefsNote("Above 100 % quiet files are made louder (and may clip).")
+            PrefsRow("Volume step") {
+                Stepper(value: prefs.volumeStep, step: 0.01, from: 0.01, to: 0.5)
+                    .accessibilityLabel("Volume step")
+                Text(prefsPercent(prefs.volumeStep) + " per key press").color(.secondary)
+            }
+            PrefsRow("Channels") {
+                Picker(selection: prefs.stereoMode, style: .menu) {
+                    Text("Stereo").tag("stereo")
+                    Text("Mono").tag("mono")
+                    Text("Swap left and right").tag("swap")
+                    Text("Left only").tag("left")
+                    Text("Right only").tag("right")
+                }
+                .frame(width: 200)
+                .accessibilityLabel("Channels")
+            }
+            PrefsRow("Headphones") {
+                Toggle("Crossfeed (softer stereo)", isOn: prefs.crossfeed)
+            }
+        }
+    }
+}
+
+// Video: deinterlacing, aspect ratio, scaling, snapshots.
+public view VideoPrefs(prefs: bind library.Preferences, extra: bind PrefsExtra, onChooseSnapshotFolder: fn()) {
+    PrefsPage {
+        Grid(spacing: 10) {
+            PrefsHeader("Picture")
+            PrefsRow("Deinterlace") {
+                Picker(selection: prefs.deinterlace, style: .menu) {
+                    Text("Off").tag("off")
+                    Text("Automatic").tag("auto")
+                    Text("Bob").tag("bob")
+                    Text("Blend").tag("blend")
+                    Text("Adaptive").tag("adaptive")
+                }
+                .frame(width: 160)
+                .accessibilityLabel("Deinterlace")
+            }
+            PrefsRow("", off: prefs.deinterlace == "off") {
+                Toggle("One picture per field (double frame rate)", isOn: prefs.deinterlaceDoubleRate)
+            }
+            PrefsRow("Aspect ratio") {
+                Picker(selection: extra.defaultAspect, style: .menu) {
+                    for (name, _) in render.aspectPresets {
+                        Text(name).tag(name)
+                    }
+                }
+                .frame(width: 160)
+                .accessibilityLabel("Default aspect ratio")
+            }
+            PrefsRow("Scaling") {
+                Toggle("Smooth scaling", isOn: prefs.smoothScaling)
+            }
+
+            PrefsHeader("Snapshots")
+            PrefsRow("Save to") {
+                Text(if prefs.snapshotFolder.isEmpty { "Pictures" } else { prefs.snapshotFolder })
+                    .lineLimit(1)
+                Button("Choose…") { onChooseSnapshotFolder() }
+                    .accessibilityLabel("Choose the snapshot folder")
+                if !prefs.snapshotFolder.isEmpty {
+                    Button("Use Pictures") { prefs.snapshotFolder = "" }
+                }
+                Spacer()
+            }
+            PrefsRow("Format") {
+                Picker(selection: prefs.snapshotFormat) {
+                    Text("PNG").tag("png")
+                    Text("JPEG").tag("jpg")
+                }
+                .accessibilityLabel("Snapshot format")
+            }
+        }
+    }
+}

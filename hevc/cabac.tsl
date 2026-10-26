@@ -1,0 +1,734 @@
+// The HEVC CABAC decoder (ITU-T H.265 9.3): arithmetic decoding engine
+// (9.3.4.3), context initialisation (9.3.2.2), WPP / dependent slice
+// context storage (9.3.2.3, 9.3.2.4), the multi-bin syntax elements, and
+// residual_coding() (7.3.8.11) with the context derivations of 9.3.4.2.4
+// to 9.3.4.2.7, coeff_abs_level_remaining binarisation (9.3.3.11) and
+// scaling / dequantisation of the levels (8.6.2, 8.6.3).
+//
+// Engine state: the spec's 9-bit ivlOffset is kept in `value` together
+// with `held` bits read ahead (value = ivlOffset * 2^held + next bits), so
+// renormalising by n bits is just held -= n, and a run of n bypass bins is
+// one division. Context states are pStateIdx * 2 + valMps.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+struct HevcCabac {
+    data: Data = Data()
+    pos: Int = 0
+    end: Int = 0
+    range: Int = 510
+    value: Int = 0
+    held: Int = 0
+    overrun: Bool = false
+    states: [Int] = []
+    // Saved states for WPP (after the 2nd CTB of a row) and for dependent
+    // slice segments (end of the previous slice segment).
+    wppStates: [Int] = []
+    dsStates: [Int] = []
+    lpsTab: [Int] = []
+    mpsNext: [Int] = []
+    lpsNext: [Int] = []
+    normShift: [Int] = []
+    initValues: [Int] = []
+
+    // Residual coding: dequantised coefficients in raster order of the
+    // block (x + y * size), the positions written (to clear them next
+    // time), and facts the inverse transform uses.
+    coeffs: [Int] = []
+    written: [Int] = []
+    numWritten: Int = 0
+    // Largest x and y with a non-zero coefficient.
+    maxX: Int = 0
+    maxY: Int = 0
+    tsFlag: Bool = false
+    // Scan tables: for each scan kind (0 diagonal, 1 horizontal, 2
+    // vertical) and block size 4..32, the coefficient positions in scan
+    // order (x + (y << 5)), sub-block by sub-block.
+    scanPos: [Int] = []
+    // The inverse: scan index by position x + (y << 5).
+    scanInv: [Int] = []
+    // Sub-block scans (positions of the 4x4 sub-blocks, xS + (yS << 3)).
+    sbScan: [Int] = []
+    // sig_coeff_flag ctxInc (with +27 for chroma) by block size, colour,
+    // scan, prevCsbf, first sub-block or not, and position in the
+    // sub-block's scan; see hevcMakeSigCtx.
+    sigCtx: [Int] = []
+    // Scaling factors m by size id and matrix id ((s * 6 + m) * 1024 +
+    // x + y * size); flat when scaling lists are off.
+    scaleTab: [Int] = []
+    scalingOn: Bool = false
+    levelScale: [Int] = []
+    // Scratch for one sub-block.
+    sbPos: [Int] = []
+    sbAbs: [Int] = []
+    sbSig: [Int] = []
+    csbf: [Int] = []
+
+    fn setup() {
+        if states.count == ctxCount {
+            return
+        }
+        states = hevcFilled(ctxCount, 0)
+        wppStates = hevcFilled(ctxCount, 0)
+        dsStates = hevcFilled(ctxCount, 0)
+        initValues = hevcInitValues
+        lpsTab = []
+        mpsNext = []
+        lpsNext = []
+        for st in 0..128 {
+            let p = st >> 1
+            let m = st & 1
+            for q in 0..4 {
+                lpsTab.append(hevcRangeLps[p * 4 + q])
+            }
+            mpsNext.append(min(p + 1, 62) * 2 + m)
+            let nm = if p == 0 { 1 - m } else { m }
+            lpsNext.append(hevcTransLps[p] * 2 + nm)
+        }
+        normShift = []
+        for r in 0..512 {
+            var v = max(r, 1)
+            var n = 0
+            while v < 256 {
+                v = v << 1
+                n += 1
+            }
+            normShift.append(n)
+        }
+        coeffs = hevcFilled(1024, 0)
+        written = hevcFilled(1024, 0)
+        sbPos = hevcFilled(16, 0)
+        sbAbs = hevcFilled(16, 0)
+        sbSig = hevcFilled(16, 0)
+        csbf = hevcFilled(64, 0)
+        levelScale = hevcLevelScale
+        // Scans: index ((kind * 4 + log2 - 2) * 1024 + n).
+        scanPos = hevcFilled(3 * 4 * 1024, 0)
+        scanInv = hevcFilled(3 * 4 * 1024, 0)
+        sbScan = hevcFilled(3 * 4 * 64, 0)
+        for kind in 0..3 {
+            let in4 = if kind == 0 { hevcDiagScan(4) } else if kind == 1 { hevcHorScan(4) } else { hevcVerScan(4) }
+            for l in 2..6 {
+                let sbn = 1 << (l - 2)
+                let sb = if kind == 0 { hevcDiagScan(sbn) } else if kind == 1 { hevcHorScan(sbn) } else { hevcVerScan(sbn) }
+                for i in 0..(sbn * sbn) {
+                    let xs = sb[i] % sbn
+                    let ys = sb[i] / sbn
+                    sbScan[(kind * 4 + l - 2) * 64 + i] = xs + (ys << 3)
+                    for k in 0..16 {
+                        let x = xs * 4 + in4[k] % 4
+                        let y = ys * 4 + in4[k] / 4
+                        scanPos[(kind * 4 + l - 2) * 1024 + i * 16 + k] = x + (y << 5)
+                        scanInv[(kind * 4 + l - 2) * 1024 + x + (y << 5)] = i * 16 + k
+                    }
+                }
+            }
+        }
+        sigCtx = hevcMakeSigCtx()
+        scaleTab = hevcFilled(24 * 1024, 16)
+    }
+
+    // Context variables for a slice (9.3.2.2).
+    fn initContexts(_ initType: Int, _ sliceQp: Int) {
+        let qp = max(0, min(51, sliceQp))
+        let base = initType * ctxCount
+        for i in 0..ctxCount {
+            let v = initValues[base + i]
+            let m = (v >> 4) * 5 - 45
+            let n = ((v & 15) << 3) - 16
+            let pre = max(1, min(126, ((m * qp) >> 4) + n))
+            if pre <= 63 {
+                states[i] = (63 - pre) * 2
+            } else {
+                states[i] = (pre - 64) * 2 + 1
+            }
+        }
+    }
+
+    fn saveWpp() {
+        for i in 0..ctxCount {
+            wppStates[i] = states[i]
+        }
+    }
+
+    fn loadWpp() {
+        for i in 0..ctxCount {
+            states[i] = wppStates[i]
+        }
+    }
+
+    fn saveDs() {
+        for i in 0..ctxCount {
+            dsStates[i] = states[i]
+        }
+    }
+
+    fn loadDs() {
+        for i in 0..ctxCount {
+            states[i] = dsStates[i]
+        }
+    }
+
+    // Initialises the arithmetic decoder at byte `at` (9.3.2.5).
+    fn start(_ d: Data, at: Int, end: Int) {
+        data = d
+        pos = at
+        self.end = end
+        overrun = false
+        range = 510
+        value = 0
+        held = -9
+        refill()
+    }
+
+    fn refill() {
+        var b0 = 0
+        var b1 = 0
+        if pos < end {
+            b0 = data[pos]
+        } else if pos > end + 4 {
+            overrun = true
+        }
+        if pos + 1 < end {
+            b1 = data[pos + 1]
+        }
+        pos += 2
+        value = (value << 16) | (b0 << 8) | b1
+        held += 16
+    }
+
+    // DecodeDecision (9.3.4.3.2).
+    fn decision(_ ctx: Int) -> Int {
+        let s = states[ctx]
+        let lps = lpsTab[s * 4 + ((range >> 6) & 3)]
+        range -= lps
+        let scaled = range << held
+        if value < scaled {
+            states[ctx] = mpsNext[s]
+            if range < 256 {
+                range = range << 1
+                held -= 1
+                if held < 0 {
+                    refill()
+                }
+            }
+            return s & 1
+        }
+        value -= scaled
+        states[ctx] = lpsNext[s]
+        let shift = normShift[lps]
+        range = lps << shift
+        held -= shift
+        if held < 0 {
+            refill()
+        }
+        1 - (s & 1)
+    }
+
+    // DecodeBypass (9.3.4.3.4).
+    fn bypass() -> Int {
+        held -= 1
+        if held < 0 {
+            refill()
+        }
+        let scaled = range << held
+        if value >= scaled {
+            value -= scaled
+            return 1
+        }
+        0
+    }
+
+    // n bypass bins (n up to 16) as a number, first bin highest: the bins
+    // are the quotient of a division of the offset by the range.
+    fn bypassBits(_ n: Int) -> Int {
+        if n <= 0 {
+            return 0
+        }
+        while held < n {
+            refill()
+        }
+        held -= n
+        let scaled = range << held
+        var q = value / scaled
+        value -= q * scaled
+        if q >= (1 << n) {
+            // Only damaged data breaks offset < range: keep values in range.
+            q = (1 << n) - 1
+            overrun = true
+        }
+        q
+    }
+
+    // DecodeTerminate (9.3.4.3.5).
+    fn terminate() -> Int {
+        range -= 2
+        let scaled = range << held
+        if value >= scaled {
+            return 1
+        }
+        if range < 256 {
+            range = range << 1
+            held -= 1
+            if held < 0 {
+                refill()
+            }
+        }
+        0
+    }
+
+    // The byte where data continues after a terminate bin of 1 (PCM
+    // samples, the next substream): the spec's decoder has read the
+    // rbsp stop bit as the last of its 9 offset bits.
+    bytePosAfterTerminate: Int {
+        (pos * 8 - held + 7) >> 3
+    }
+
+    // cu_qp_delta_abs (9.3.3.10): prefix TR cMax 5 with contexts, then
+    // EG0 suffix.
+    fn cuQpDeltaAbs() -> Int {
+        var v = 0
+        var ctx = ctxQpDelta
+        while v < 5 && decision(ctx) == 1 {
+            v += 1
+            ctx = ctxQpDelta + 1
+        }
+        if v == 5 {
+            var k = 0
+            while k < 32 && bypass() == 1 {
+                v += 1 << k
+                k += 1
+            }
+            if k > 0 {
+                v += bypassBits(k)
+            }
+        }
+        v
+    }
+
+    // part_mode (9.3.3.7, Table 9-43): returns 0 2Nx2N, 1 2NxN, 2 Nx2N,
+    // 3 NxN, 4 2NxnU, 5 2NxnD, 6 nLx2N, 7 nRx2N.
+    fn partMode(intra: Bool, log2Cb: Int, log2MinCb: Int, amp: Bool) -> Int {
+        if decision(ctxPartMode) == 1 {
+            return 0
+        }
+        if intra {
+            return 3
+        }
+        if log2Cb == log2MinCb {
+            if decision(ctxPartMode + 1) == 1 {
+                return 1
+            }
+            if log2Cb == 3 {
+                return 2
+            }
+            if decision(ctxPartMode + 2) == 1 {
+                return 2
+            }
+            return 3
+        }
+        if !amp {
+            if decision(ctxPartMode + 1) == 1 {
+                return 1
+            }
+            return 2
+        }
+        if decision(ctxPartMode + 1) == 1 {
+            if decision(ctxPartMode + 3) == 1 {
+                return 1
+            }
+            return if bypass() == 1 { 5 } else { 4 }
+        }
+        if decision(ctxPartMode + 3) == 1 {
+            return 2
+        }
+        if bypass() == 1 { 7 } else { 6 }
+    }
+
+    // merge_idx: TR with cMax MaxNumMergeCand - 1, first bin coded.
+    fn mergeIdx(_ maxCand: Int) -> Int {
+        if maxCand <= 1 {
+            return 0
+        }
+        if decision(ctxMergeIdx) == 0 {
+            return 0
+        }
+        var i = 1
+        while i < maxCand - 1 && bypass() == 1 {
+            i += 1
+        }
+        i
+    }
+
+    // inter_pred_idc (9.3.4.2.2): 0 PRED_L0, 1 PRED_L1, 2 PRED_BI.
+    fn interPredIdc(_ nPbW: Int, _ nPbH: Int, _ ctDepth: Int) -> Int {
+        if nPbW + nPbH != 12 {
+            if decision(ctxInterPred + ctDepth) == 1 {
+                return 2
+            }
+        }
+        decision(ctxInterPred + 4)
+    }
+
+    // ref_idx_lX: TR cMax numRefIdx - 1, two coded bins then bypass.
+    fn refIdx(_ numRefIdx: Int) -> Int {
+        let maxV = numRefIdx - 1
+        if maxV <= 0 {
+            return 0
+        }
+        var i = 0
+        while i < min(maxV, 2) && decision(ctxRefIdx + i) == 1 {
+            i += 1
+        }
+        if i == 2 {
+            while i < maxV && bypass() == 1 {
+                i += 1
+            }
+        }
+        i
+    }
+
+    // abs_mvd_minus2 (EG1) and the sign of one mvd component whose
+    // greater0/greater1 flags were g (0, 1 or 2 meaning greater than 1).
+    fn mvdValue(_ g: Int) -> Int {
+        if g == 0 {
+            return 0
+        }
+        var a = 1
+        if g == 2 {
+            // EG1 (9.3.3.3): unary prefix of 1s, then k bits.
+            var k = 1
+            var v = 0
+            while k < 32 && bypass() == 1 {
+                v += 1 << k
+                k += 1
+            }
+            v += bypassBits(k)
+            a = v + 2
+        }
+        if bypass() == 1 { -a } else { a }
+    }
+
+    // coeff_abs_level_remaining (9.3.3.11) with Rice parameter rice.
+    fn levelRemaining(_ rice: Int) -> Int {
+        var prefix = 0
+        while prefix < 32 && bypass() == 1 {
+            prefix += 1
+        }
+        if prefix <= 3 {
+            return (prefix << rice) + bypassBits(rice)
+        }
+        let k = prefix - 3 + rice
+        var suffix = 0
+        if k > 16 {
+            suffix = bypassBits(16) << (k - 16)
+            suffix += bypassBits(k - 16)
+        } else {
+            suffix = bypassBits(k)
+        }
+        (((1 << (prefix - 3)) + 2) << rice) + suffix
+    }
+
+    // residual_coding() for a log2 x log2 transform block of colour cIdx
+    // with scan kind scanIdx (0 diagonal, 1 horizontal, 2 vertical).
+    // tsAllowed: transform_skip_flag is present; bypass: cu_transquant_
+    // bypass; sdh: sign data hiding enabled; qp: the qP for scaling (with
+    // QpBdOffset); matrixId 0..5 for scaling lists; bitDepth of the colour.
+    // Leaves the scaled coefficients (or the levels, for bypass) in coeffs.
+    fn residual(_ log2: Int, _ cIdx: Int, _ scanIdx: Int, tsAllowed: Bool, bypass: Bool, sdh: Bool, qp: Int, matrixId: Int, bitDepth: Int) {
+        // Clear what the last block wrote.
+        for i in 0..numWritten {
+            coeffs[written[i]] = 0
+        }
+        numWritten = 0
+        maxX = 0
+        maxY = 0
+        tsFlag = false
+        if tsAllowed {
+            tsFlag = decision(ctxTSkip + (if cIdx == 0 { 0 } else { 1 })) == 1
+        }
+        // last_sig_coeff_x/y_prefix and suffix (9.3.4.2.3).
+        var ctxOff = 15
+        var ctxShift = log2 - 2
+        if cIdx == 0 {
+            ctxOff = 3 * (log2 - 2) + ((log2 - 1) >> 2)
+            ctxShift = (log2 + 1) >> 2
+        }
+        let maxPrefix = (log2 << 1) - 1
+        var lastX = 0
+        while lastX < maxPrefix && decision(ctxLastX + ctxOff + (lastX >> ctxShift)) == 1 {
+            lastX += 1
+        }
+        var lastY = 0
+        while lastY < maxPrefix && decision(ctxLastY + ctxOff + (lastY >> ctxShift)) == 1 {
+            lastY += 1
+        }
+        if lastX > 3 {
+            let len = (lastX >> 1) - 1
+            lastX = (1 << len) * (2 + (lastX & 1)) + bypassBits(len)
+        }
+        if lastY > 3 {
+            let len = (lastY >> 1) - 1
+            lastY = (1 << len) * (2 + (lastY & 1)) + bypassBits(len)
+        }
+        if scanIdx == 2 {
+            let t = lastX
+            lastX = lastY
+            lastY = t
+        }
+        let size = 1 << log2
+        let sbWidth = 1 << (log2 - 2)
+        let scanBase = (scanIdx * 4 + log2 - 2) * 1024
+        let sbBase = (scanIdx * 4 + log2 - 2) * 64
+        // The scan position of the last coefficient.
+        let lastPos = lastX + (lastY << 5)
+        let lastK = scanInv[scanBase + (lastPos & 1023)]
+        let lastSb = lastK >> 4
+        let lastN = lastK & 15
+        for i in 0..(sbWidth * sbWidth) {
+            csbf[sbScan[sbBase + i]] = 0
+        }
+        // Dequantisation (8.6.3): coeff = (level * m * levelScale << (qP /
+        // 6) + (1 << (bdShift - 1))) >> bdShift, clipped to 16 bits.
+        let bdShift = bitDepth + log2 - 5
+        let add = 1 << (bdShift - 1)
+        let qpc = max(0, qp)
+        let ls = levelScale[qpc % 6] << (qpc / 6)
+        let flatScale = ls * 16
+        let useMatrix = scalingOn && !(tsFlag && log2 > 2)
+        let mBase = ((log2 - 2) * 6 + matrixId) * 1024
+        let chroma = if cIdx == 0 { 0 } else { 1 }
+        // sigCtx table base for this block (without prevCsbf / first).
+        let sigBase = (((log2 - 2) * 2 + chroma) * 3 + scanIdx) * 128
+        let sigOff = ctxSig
+        let gt1Base = ctxGt1 + (if chroma == 1 { 16 } else { 0 })
+        let gt2Base = ctxGt2 + (if chroma == 1 { 4 } else { 0 })
+        let sigCgCtx = ctxSigCg + (if chroma == 1 { 2 } else { 0 })
+        var greater1Ctx = 1
+        var i = lastSb
+        while i >= 0 {
+            let sbp = sbScan[sbBase + i]
+            let xS = sbp & 7
+            let yS = sbp >> 3
+            // coded_sub_block_flag (9.3.4.2.4).
+            var csbfRight = 0
+            var csbfBelow = 0
+            if xS < sbWidth - 1 {
+                csbfRight = csbf[sbp + 1]
+            }
+            if yS < sbWidth - 1 {
+                csbfBelow = csbf[sbp + 8]
+            }
+            var coded = 1
+            var inferDc = false
+            if i < lastSb && i > 0 {
+                coded = decision(sigCgCtx + (if csbfRight + csbfBelow > 0 { 1 } else { 0 }))
+                inferDc = true
+            }
+            csbf[sbp] = coded
+            // sig_coeff_flag, highest scan position first.
+            var nSig = 0
+            let posBase = scanBase + i * 16
+            var nStart = 15
+            if i == lastSb {
+                nStart = lastN - 1
+                sbSig[0] = lastN
+                nSig = 1
+            }
+            if coded == 1 {
+                let prevCsbf = csbfRight + csbfBelow * 2
+                let first = if i == 0 { 0 } else { 1 }
+                let tab = sigBase + (prevCsbf * 2 + first) * 16
+                var n = nStart
+                while n > 0 {
+                    if decision(sigOff + sigCtx[tab + n]) == 1 {
+                        sbSig[nSig] = n
+                        nSig += 1
+                        inferDc = false
+                    }
+                    n -= 1
+                }
+                if nStart >= 0 {
+                    if inferDc {
+                        sbSig[nSig] = 0
+                        nSig += 1
+                    } else if decision(sigOff + sigCtx[tab]) == 1 {
+                        sbSig[nSig] = 0
+                        nSig += 1
+                    }
+                }
+            }
+            if nSig > 0 {
+                // coeff_abs_level_greater1_flag (9.3.4.2.6).
+                var ctxSet = if i == 0 || chroma == 1 { 0 } else { 2 }
+                if i != lastSb && greater1Ctx == 0 {
+                    ctxSet += 1
+                }
+                greater1Ctx = 1
+                var firstG1 = -1
+                let nG1 = min(nSig, 8)
+                for m in 0..nG1 {
+                    let f = decision(gt1Base + ctxSet * 4 + greater1Ctx)
+                    sbAbs[m] = 1 + f
+                    if f == 1 {
+                        greater1Ctx = 0
+                        if firstG1 < 0 {
+                            firstG1 = m
+                        }
+                    } else if greater1Ctx > 0 && greater1Ctx < 3 {
+                        greater1Ctx += 1
+                    }
+                }
+                for m in nG1..nSig {
+                    sbAbs[m] = 1
+                }
+                if firstG1 >= 0 {
+                    sbAbs[firstG1] += decision(gt2Base + ctxSet)
+                }
+                // Signs (bypass), the last one hidden with sign data hiding.
+                let hidden = sdh && !bypass && (sbSig[0] - sbSig[nSig - 1] > 3)
+                let nSigns = if hidden { nSig - 1 } else { nSig }
+                var signs = 0
+                if nSigns > 16 {
+                    signs = bypassBits(16)
+                } else {
+                    signs = bypassBits(nSigns) << (16 - nSigns)
+                }
+                // Remaining levels.
+                var rice = 0
+                var sumAbs = 0
+                for m in 0..nSig {
+                    var level = sbAbs[m]
+                    let need = if m < 8 { (if m == firstG1 { 3 } else { 2 }) } else { 1 }
+                    if level == need {
+                        level += levelRemaining(rice)
+                        if level > 3 * (1 << rice) {
+                            rice = min(rice + 1, 4)
+                        }
+                    }
+                    sumAbs += level
+                    var neg = (signs >> (15 - m)) & 1
+                    if hidden && m == nSig - 1 {
+                        neg = sumAbs & 1
+                    }
+                    let p = scanPos[posBase + sbSig[m]]
+                    let x = p & 31
+                    let y = p >> 5
+                    let at = x + y * size
+                    var c = if neg == 1 { -level } else { level }
+                    if !bypass {
+                        var sc = flatScale
+                        if useMatrix {
+                            sc = ls * scaleTab[mBase + at]
+                        }
+                        c = (c * sc + add) >> bdShift
+                        if c > 32767 {
+                            c = 32767
+                        } else if c < -32768 {
+                            c = -32768
+                        }
+                    }
+                    coeffs[at] = c
+                    written[numWritten] = at
+                    numWritten += 1
+                    if x > maxX {
+                        maxX = x
+                    }
+                    if y > maxY {
+                        maxY = y
+                    }
+                }
+            }
+            i -= 1
+        }
+    }
+}
+
+// sig_coeff_flag ctxInc table (9.3.4.2.5), index
+// ((((log2 - 2) * 2 + chroma) * 3 + scanIdx) * 4 + prevCsbf) * 2 + notFirst)
+// * 16 + n, n the position in the sub-block's scan; chroma adds 27.
+fn hevcMakeSigCtx() -> [Int] {
+    var out: [Int] = []
+    for l in 2..6 {
+        for chroma in 0..2 {
+            for scanIdx in 0..3 {
+                let in4 = if scanIdx == 0 { hevcDiagScan(4) } else if scanIdx == 1 { hevcHorScan(4) } else { hevcVerScan(4) }
+                for prevCsbf in 0..4 {
+                    for notFirst in 0..2 {
+                        for n in 0..16 {
+                            let xP = in4[n] % 4
+                            let yP = in4[n] / 4
+                            var sig = 0
+                            if l == 2 {
+                                sig = hevcSigCtx4x4[(yP << 2) + xP]
+                            } else if notFirst == 0 && xP + yP == 0 {
+                                sig = 0
+                            } else {
+                                if prevCsbf == 0 {
+                                    sig = if xP + yP == 0 { 2 } else if xP + yP < 3 { 1 } else { 0 }
+                                } else if prevCsbf == 1 {
+                                    sig = if yP == 0 { 2 } else if yP == 1 { 1 } else { 0 }
+                                } else if prevCsbf == 2 {
+                                    sig = if xP == 0 { 2 } else if xP == 1 { 1 } else { 0 }
+                                } else {
+                                    sig = 2
+                                }
+                                if chroma == 0 {
+                                    if notFirst == 1 {
+                                        sig += 3
+                                    }
+                                    if l == 3 {
+                                        sig += if scanIdx == 0 { 9 } else { 15 }
+                                    } else {
+                                        sig += 21
+                                    }
+                                } else {
+                                    if l == 3 {
+                                        sig += 9
+                                    } else {
+                                        sig += 12
+                                    }
+                                }
+                            }
+                            out.append(if chroma == 1 { sig + 27 } else { sig })
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+// The scaling factor tables of an SPS / PPS's scaling lists, laid out as
+// HevcCabac.scaleTab.
+fn hevcScaleTable(_ sl: [Int], _ dc: [Int]) -> [Int] {
+    var out = hevcFilled(24 * 1024, 16)
+    for sizeId in 0..4 {
+        let size = 4 << sizeId
+        for m in 0..6 {
+            let src = (sizeId * 6 + m) * 64
+            let dst = (sizeId * 6 + m) * 1024
+            for y in 0..size {
+                for x in 0..size {
+                    var v = 16
+                    if sizeId == 0 {
+                        v = sl[src + y * 4 + x]
+                    } else if sizeId == 1 {
+                        v = sl[src + y * 8 + x]
+                    } else if sizeId == 2 {
+                        v = sl[src + (y >> 1) * 8 + (x >> 1)]
+                    } else {
+                        v = sl[src + (y >> 2) * 8 + (x >> 2)]
+                    }
+                    if sizeId >= 2 && x == 0 && y == 0 {
+                        v = dc[sizeId * 6 + m]
+                    }
+                    out[dst + x + y * size] = v
+                }
+            }
+        }
+    }
+    out
+}

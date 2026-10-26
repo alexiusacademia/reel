@@ -1,0 +1,415 @@
+// Find in dialogue and the transcript: an index over the text cues of
+// every subtitle track of a file (and subtitle files loaded for it),
+// searched without regard to case or accents ("cafe" finds "Café",
+// "ETRE" finds "être"), with "quoted phrases"; results carry their times
+// and the lines around them. The transcript gives the lines around a
+// time for a scrolling panel that follows playback.
+//
+// Matching: the text is folded (lower case, accents and other combining
+// marks removed, ß → ss, final sigma, ё → е, full-width forms to ASCII,
+// punctuation and apostrophes to spaces, so "j'étais" has the word
+// "etais" and "don't" is "don t"); every word of the
+// query must start a word of the line ("walk" finds "walking", not
+// "sidewalk"), a quoted phrase must appear as a whole starting at a word;
+// words in scripts written without spaces (Chinese, Japanese, Thai) may
+// appear anywhere.
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+// One line of dialogue in the index.
+public struct DialogueLine {
+    // Which source (an index of DialogueIndex.sources).
+    source: Int
+    start: Float
+    end: Float
+    // The cue's text with its line breaks as spaces.
+    text: String
+    // The folded text, with a space before and after (for matching).
+    norm: String = ""
+}
+
+// A search result.
+public struct DialogueHit {
+    // The line (an index of DialogueIndex.lines) and its source.
+    line: Int
+    source: Int
+    start: Float
+    end: Float
+    text: String
+    // Where the first match is in `text`, in characters (from, to).
+    matchFrom: Int = 0
+    matchTo: Int = 0
+    // The lines before and after it in the same source ("" if none).
+    before: String = ""
+    after: String = ""
+}
+
+public struct TranscriptLine {
+    // An index of DialogueIndex.lines.
+    index: Int
+    start: Float
+    end: Float
+    text: String
+    // Whether it's showing at the transcript's time.
+    showing: Bool = false
+}
+
+// The lines around a time.
+public struct Transcript {
+    lines: [TranscriptLine] = []
+    // Which of `lines` is the current one (showing, or the last before
+    // the time); −1 if the time is before the first line.
+    current: Int = -1
+}
+
+public struct DialogueIndex {
+    // Names of the sources, e.g. "English (track 3)", "movie.fr.srt".
+    sources: [String] = []
+    // All lines, sorted by source, then start.
+    lines: [DialogueLine] = []
+    // The lines of source s are lines[from[s] ..< to[s]].
+    from: [Int] = []
+    to: [Int] = []
+
+    // Adds the text cues of a track (bitmap subtitles have none); returns
+    // the source's index. ASS layers that repeat a line, and cues that
+    // repeat the previous one back to back, are merged into one line.
+    fn add(_ track: SubTrack, name: String) -> Int {
+        let s = sources.count
+        sources.append(name)
+        let folds = searchFoldTable()
+        var mine: [DialogueLine] = []
+        for c in track.cues.sorted(by: { a, b in a.start < b.start }) {
+            if !c.bitmap.pixels.isEmpty {
+                continue
+            }
+            let text = searchCueText(c)
+            if text.isEmpty {
+                continue
+            }
+            var merged = false
+            var k = mine.count - 1
+            // Same text overlapping or touching an earlier line: one line.
+            while k >= 0 && k >= mine.count - 4 {
+                if mine[k].text == text && c.start <= mine[k].end + 0.05 {
+                    if c.end > mine[k].end && c.end < openEnd {
+                        mine[k].end = c.end
+                    }
+                    merged = true
+                    break
+                }
+                k -= 1
+            }
+            if !merged {
+                mine.append(DialogueLine(source: s, start: c.start, end: c.end, text: text, norm: " " + searchFold(text, folds) + " "))
+            }
+        }
+        from.append(lines.count)
+        lines.appendAll(mine)
+        to.append(lines.count)
+        s
+    }
+
+    // Lines matching a query, in time order (all sources, or one), at most
+    // `limit`.
+    fn search(_ query: String, source: Int = -1, limit: Int = 500) -> [DialogueHit] {
+        let folds = searchFoldTable()
+        let terms = searchTerms(query, folds)
+        var out: [DialogueHit] = []
+        if terms.isEmpty {
+            return out
+        }
+        for (i, l) in lines.enumerated() {
+            if source >= 0 && l.source != source {
+                continue
+            }
+            var all = true
+            var firstAt = -1
+            var firstLen = 0
+            for t in terms {
+                let at = searchFind(l.norm, t)
+                if at < 0 {
+                    all = false
+                    break
+                }
+                if firstAt < 0 || at < firstAt {
+                    firstAt = at
+                    firstLen = searchLength(t)
+                }
+            }
+            if !all {
+                continue
+            }
+            var hit = DialogueHit(line: i, source: l.source, start: l.start, end: l.end, text: l.text)
+            let (mf, mt) = searchSpan(l.text, folds, firstAt, firstLen)
+            hit.matchFrom = mf
+            hit.matchTo = mt
+            if i > from[l.source] {
+                hit.before = lines[i - 1].text
+            }
+            if i + 1 < to[l.source] {
+                hit.after = lines[i + 1].text
+            }
+            out.append(hit)
+        }
+        out = out.sorted(by: { a, b in a.start < b.start })
+        if out.count > limit {
+            out = out.prefix(limit)
+        }
+        out
+    }
+
+    // The index (in `lines`) of the line of a source showing at a time, or
+    // else the last one that started before it; −1 if none has.
+    fn lineAt(source: Int, at: Float) -> Int {
+        if source < 0 || source >= sources.count {
+            return -1
+        }
+        var lo = from[source]
+        var hi = to[source]
+        // The first line starting after `at`.
+        while lo < hi {
+            let mid = (lo + hi) / 2
+            if lines[mid].start <= at {
+                lo = mid + 1
+            } else {
+                hi = mid
+            }
+        }
+        let last = lo - 1
+        if last < from[source] {
+            return -1
+        }
+        // A longer earlier line may still be showing (overlaps).
+        var k = last
+        while k >= from[source] && k >= last - 3 {
+            if lines[k].start <= at && at < lines[k].end {
+                return k
+            }
+            k -= 1
+        }
+        last
+    }
+
+    // The lines of a source around a time: `before` lines before the
+    // current one and `after` after it.
+    fn transcript(source: Int, at: Float, before: Int = 3, after: Int = 8) -> Transcript {
+        var t = Transcript()
+        if source < 0 || source >= sources.count || from[source] == to[source] {
+            return t
+        }
+        let cur = lineAt(source: source, at: at)
+        let center = if cur < 0 { from[source] } else { cur }
+        let a = max(from[source], center - before)
+        let b = min(to[source], center + after + 1)
+        for i in a..b {
+            let l = lines[i]
+            t.lines.append(TranscriptLine(index: i, start: l.start, end: l.end, text: l.text, showing: l.start <= at && at < l.end))
+            if i == cur {
+                t.current = t.lines.count - 1
+            }
+        }
+        t
+    }
+
+    // All lines of a source (for a transcript panel that shows them all and
+    // scrolls to lineAt).
+    fn sourceLines(_ source: Int) -> [DialogueLine] {
+        if source < 0 || source >= sources.count {
+            return []
+        }
+        lines.slice(from: from[source], to: to[source])
+    }
+}
+
+// An index of tracks with their names.
+public fn dialogueIndex(_ tracks: [SubTrack], names: [String]) -> DialogueIndex {
+    var ix = DialogueIndex()
+    for (i, t) in tracks.enumerated() {
+        let added = ix.add(t, name: if i < names.count { names[i] } else { "Subtitles {i + 1}" })
+    }
+    ix
+}
+
+// A cue's text on one line: breaks as spaces, spaces collapsed.
+fn searchCueText(_ c: Cue) -> String {
+    var s = ""
+    for sp in c.spans {
+        s += if sp.text == "\n" { " " } else { sp.text.replace("\n", with: " ") }
+    }
+    s.words().joined(separator: " ")
+}
+
+// Accented letters and their plain forms, as pairs of strings.
+let searchFoldPairs = [
+    "àáâãäåāăąǎ", "a", "çćĉċč", "c", "ďđ", "d", "èéêëēĕėęěẽ", "e", "ĝğġģ", "g", "ĥħ", "h",
+    "ìíîïĩīĭįıǐ", "i", "ĵ", "j", "ķ", "k", "ĺļľŀł", "l", "ñńņňŉ", "n", "òóôõöøōŏőǒơ", "o",
+    "ŕŗř", "r", "śŝşšș", "s", "ţťŧț", "t", "ùúûüũūŭůűųǔư", "u", "ŵ", "w", "ýÿŷỳ", "y",
+    "źżž", "z", "æ", "ae", "œ", "oe", "ß", "ss", "þ", "th", "ð", "d",
+    "ά", "α", "έ", "ε", "ή", "η", "ίϊΐ", "ι", "ό", "ο", "ύϋΰ", "υ", "ώ", "ω", "ς", "σ",
+    "ё", "е", "й", "и", "ї", "і",
+    "’‘`´ʼ", " ",
+]
+
+// The fold table: character → folded text (lower-case input).
+fn searchFoldTable() -> [String: String] {
+    var t: [String: String] = [:]
+    var i = 0
+    while i + 1 < searchFoldPairs.count {
+        let to = searchFoldPairs[i + 1]
+        for c in searchFoldPairs[i].characters {
+            t[c] = to
+        }
+        i += 2
+    }
+    t
+}
+
+// One character folded: "" (dropped), " " (a separator) or text.
+fn searchFoldChar(_ c: String, _ folds: [String: String]) -> String {
+    let b = Data(text: c)
+    if b.count == 1 {
+        let x = b[0]
+        if (x >= 0x61 && x <= 0x7A) || (x >= 0x30 && x <= 0x39) {
+            return c
+        }
+        if x >= 0x41 && x <= 0x5A {
+            return charOf(x + 32)
+        }
+        return " "
+    }
+    let low = c.lowercase()
+    if let f = folds[low] {
+        return f
+    }
+    let cps = encCodePointsOf(low)
+    if cps.isEmpty {
+        return " "
+    }
+    let cp = cps[0]
+    // Combining marks (U+0300–036F, and Vietnamese/other above-marks).
+    if (cp >= 0x300 && cp <= 0x36F) || (cp >= 0x1AB0 && cp <= 0x1AFF) || (cp >= 0x20D0 && cp <= 0x20FF) {
+        return ""
+    }
+    // Full-width ASCII forms.
+    if cp >= 0xFF01 && cp <= 0xFF5E {
+        return searchFoldChar(charOf(cp - 0xFEE0), folds)
+    }
+    // Latin letters with marks not in the table: the Latin Extended
+    // Additional block (Vietnamese ạ ả ấ …) by its pattern of bases.
+    if cp >= 0x1EA0 && cp <= 0x1EF9 {
+        let bases = "aaaaaaaaaaaaaaaaaaaaaaaaeeeeeeeeeeeeeeeeiiiioooooooooooooooooooooooouuuuuuuuuuuuuuyyyyyyyy"
+        let k = cp - 0x1EA0
+        if k < bases.count {
+            return bases.substring(from: k, to: k + 1)
+        }
+    }
+    // Punctuation and symbols that separate words.
+    if (cp >= 0x80 && cp <= 0xBF) || (cp >= 0x2000 && cp <= 0x206F) || (cp >= 0x3000 && cp <= 0x3003) || (cp >= 0x3008 && cp <= 0x3011) || cp == 0xD7 || cp == 0xF7 || cp == 0x30FB {
+        return " "
+    }
+    low
+}
+
+// Text folded for matching, spaces collapsed.
+fn searchFold(_ text: String, _ folds: [String: String]) -> String {
+    var out = ""
+    var space = true
+    for c in text.characters {
+        let f = searchFoldChar(c, folds)
+        if f == " " {
+            if !space {
+                out += " "
+                space = true
+            }
+        } else if !f.isEmpty {
+            out += f
+            space = false
+        }
+    }
+    out.trim()
+}
+
+// Whether text is in a script written without spaces between words.
+fn searchNoSpaces(_ t: String) -> Bool {
+    for cp in encCodePointsOf(t) {
+        if (cp >= 0x3040 && cp <= 0x30FF) || encIsIdeograph(cp) || (cp >= 0x0E00 && cp <= 0x0EFF) || (cp >= 0x1000 && cp <= 0x109F) || (cp >= 0x1780 && cp <= 0x17FF) {
+            return true
+        }
+    }
+    false
+}
+
+// The query's terms, folded: quoted phrases whole, other words one by
+// one. A term that must start a word starts with a space.
+fn searchTerms(_ query: String, _ folds: [String: String]) -> [String] {
+    var out: [String] = []
+    let parts = query.replace("“", with: "\"").replace("”", with: "\"").split("\"")
+    for (i, p) in parts.enumerated() {
+        if i % 2 == 1 {
+            let f = searchFold(p, folds)
+            if !f.isEmpty {
+                out.append(if searchNoSpaces(f) { f } else { " " + f })
+            }
+        } else {
+            for w in searchFold(p, folds).words() {
+                out.append(if searchNoSpaces(w) { w } else { " " + w })
+            }
+        }
+    }
+    out
+}
+
+// Where a term is in a line's folded text (with its leading space); the
+// index of its first character in the folded text without the leading
+// space, or −1.
+fn searchFind(_ norm: String, _ term: String) -> Int {
+    if let at = norm.find(term) {
+        let k = if term.hasPrefix(" ") { at } else { at - 1 }
+        return max(0, k)
+    }
+    -1
+}
+
+fn searchLength(_ term: String) -> Int {
+    if term.hasPrefix(" ") { term.count - 1 } else { term.count }
+}
+
+// The range of `text` (in characters) that folded characters
+// [from, from + len) of searchFold(text) came from.
+fn searchSpan(_ text: String, _ folds: [String: String], _ from: Int, _ len: Int) -> (Int, Int) {
+    var pos = 0
+    var space = true
+    var start = -1
+    var end = 0
+    let chars = text.characters
+    // Leading separators are trimmed by searchFold.
+    for (i, c) in chars.enumerated() {
+        let f = searchFoldChar(c, folds)
+        var n = 0
+        if f == " " {
+            if !space {
+                n = 1
+                space = true
+            }
+        } else if !f.isEmpty {
+            n = f.count
+            space = false
+        }
+        if n > 0 {
+            if start < 0 && pos + n > from {
+                start = i
+            }
+            pos += n
+            if start >= 0 && pos >= from + len {
+                end = i + 1
+                return (start, end)
+            }
+        }
+    }
+    if start < 0 {
+        return (0, 0)
+    }
+    (start, chars.count)
+}

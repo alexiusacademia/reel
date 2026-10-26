@@ -1,0 +1,238 @@
+// The inverse MDCT of the CELT layer (RFC 6716 section 4.3.7), done the way
+// the reference decoder does it (libopus mdct.c clt_mdct_backward): a
+// pre-rotation, an N/4-point complex FFT, a post-rotation, and the TDAC
+// mirroring of the overlap with the power-complementary window. The FFT is
+// a Stockham (self-sorting) mixed-radix FFT with radices 4, 2, 3 and 5,
+// for the four sizes CELT uses: 480, 240, 120 and 60 points.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+// One FFT size: its radices and, per stage, the twiddle factors
+// exp(-2 pi i r k / (Ns R)) for k < Ns, r < R (Ns = product of the radices
+// before the stage).
+struct CeltFftPlan {
+    n: Int
+    radices: [Int] = []
+    twOff: [Int] = []
+    twCos: [Float] = []
+    twSin: [Float] = []
+}
+
+fn celtMakeFftPlan(_ n: Int) -> CeltFftPlan {
+    var p = CeltFftPlan(n: n)
+    var left = n
+    while left % 4 == 0 {
+        p.radices.append(4)
+        left = left / 4
+    }
+    for r in [2, 3, 5] {
+        while left % r == 0 {
+            p.radices.append(r)
+            left = left / r
+        }
+    }
+    var ns = 1
+    for r in p.radices {
+        p.twOff.append(p.twCos.count)
+        for k in 0..ns {
+            for q in 0..r {
+                let a = -2.0 * pi * Float(q * k) / Float(ns * r)
+                p.twCos.append(cos(a))
+                p.twSin.append(sin(a))
+            }
+        }
+        ns *= r
+    }
+    p
+}
+
+let celtFftPlans = [celtMakeFftPlan(480), celtMakeFftPlan(240), celtMakeFftPlan(120), celtMakeFftPlan(60)]
+
+// The MDCT twiddles cos(2 pi (i + 1/8) / N) for N = 1920 >> shift, i < N/2,
+// one block after another (mdct.c clt_mdct_init).
+fn celtMakeTrig() -> [Float] {
+    var out: [Float] = []
+    for shift in 0..4 {
+        let n = 1920 >> shift
+        for i in 0..(n / 2) {
+            out.append(cos(2.0 * pi * (Float(i) + 0.125) / Float(n)))
+        }
+    }
+    out
+}
+
+let celtTrig = celtMakeTrig()
+let celtTrigOff = [0, 960, 1440, 1680]
+
+// cos and sin of -2 pi q / 3 and -2 pi q / 5 for the small DFTs.
+let celtC3 = -0.5
+let celtS3 = -0.86602540378443864676
+let celtC51 = 0.30901699437494742410
+let celtS51 = -0.95105651629515357212
+let celtC52 = -0.80901699437494742410
+let celtS52 = -0.58778525229247312917
+
+// Work buffers for the inverse MDCT (plain data, reused every frame).
+struct CeltSynth {
+    // Two halves for the Stockham FFT's ping-pong: [0, n) and [n, 2n).
+    re: [Float] = celtZerosF(960)
+    im: [Float] = celtZerosF(960)
+    // The values of one small DFT.
+    vr: [Float] = celtZerosF(5)
+    vi: [Float] = celtZerosF(5)
+
+    // Forward complex FFT of re/im[0..<n] (no scaling). The result ends up
+    // in re/im starting at the returned offset (0 or n).
+    fn fft(_ plan: CeltFftPlan) -> Int {
+        let n = plan.n
+        let radices = plan.radices
+        let twc = plan.twCos
+        let tws = plan.twSin
+        var src = 0
+        var dst = n
+        var ns = 1
+        for (stage, r) in radices.enumerated() {
+            let tw = plan.twOff[stage]
+            let m = n / r
+            for j in 0..m {
+                let k = j % ns
+                let base = (j / ns) * ns * r + k
+                // Load and twiddle.
+                for q in 0..r {
+                    let xr = re[src + j + q * m]
+                    let xi = im[src + j + q * m]
+                    if q == 0 {
+                        vr[0] = xr
+                        vi[0] = xi
+                    } else {
+                        let c = twc[tw + k * r + q]
+                        let s = tws[tw + k * r + q]
+                        vr[q] = xr * c - xi * s
+                        vi[q] = xr * s + xi * c
+                    }
+                }
+                if r == 4 {
+                    let ar = vr[0] + vr[2]
+                    let ai = vi[0] + vi[2]
+                    let br = vr[0] - vr[2]
+                    let bi = vi[0] - vi[2]
+                    let cr = vr[1] + vr[3]
+                    let ci = vi[1] + vi[3]
+                    let dr = vr[1] - vr[3]
+                    let di = vi[1] - vi[3]
+                    re[dst + base] = ar + cr
+                    im[dst + base] = ai + ci
+                    // X1 = b - i d, X3 = b + i d (forward transform).
+                    re[dst + base + ns] = br + di
+                    im[dst + base + ns] = bi - dr
+                    re[dst + base + 2 * ns] = ar - cr
+                    im[dst + base + 2 * ns] = ai - ci
+                    re[dst + base + 3 * ns] = br - di
+                    im[dst + base + 3 * ns] = bi + dr
+                } else if r == 2 {
+                    re[dst + base] = vr[0] + vr[1]
+                    im[dst + base] = vi[0] + vi[1]
+                    re[dst + base + ns] = vr[0] - vr[1]
+                    im[dst + base + ns] = vi[0] - vi[1]
+                } else if r == 3 {
+                    let sr = vr[1] + vr[2]
+                    let si = vi[1] + vi[2]
+                    let dr = vr[1] - vr[2]
+                    let di = vi[1] - vi[2]
+                    re[dst + base] = vr[0] + sr
+                    im[dst + base] = vi[0] + si
+                    let mr = vr[0] + celtC3 * sr
+                    let mi = vi[0] + celtC3 * si
+                    // +- i * S3 * d
+                    re[dst + base + ns] = mr - celtS3 * di
+                    im[dst + base + ns] = mi + celtS3 * dr
+                    re[dst + base + 2 * ns] = mr + celtS3 * di
+                    im[dst + base + 2 * ns] = mi - celtS3 * dr
+                } else {
+                    // Radix 5.
+                    let s1r = vr[1] + vr[4]
+                    let s1i = vi[1] + vi[4]
+                    let d1r = vr[1] - vr[4]
+                    let d1i = vi[1] - vi[4]
+                    let s2r = vr[2] + vr[3]
+                    let s2i = vi[2] + vi[3]
+                    let d2r = vr[2] - vr[3]
+                    let d2i = vi[2] - vi[3]
+                    re[dst + base] = vr[0] + s1r + s2r
+                    im[dst + base] = vi[0] + s1i + s2i
+                    let a1r = vr[0] + celtC51 * s1r + celtC52 * s2r
+                    let a1i = vi[0] + celtC51 * s1i + celtC52 * s2i
+                    let a2r = vr[0] + celtC52 * s1r + celtC51 * s2r
+                    let a2i = vi[0] + celtC52 * s1i + celtC51 * s2i
+                    // b = S51 * d1 + S52 * d2 (for X1), c = S52 * d1 - S51 * d2 (X2)
+                    let b1r = celtS51 * d1r + celtS52 * d2r
+                    let b1i = celtS51 * d1i + celtS52 * d2i
+                    let b2r = celtS52 * d1r - celtS51 * d2r
+                    let b2i = celtS52 * d1i - celtS51 * d2i
+                    // X_q = a_q + i * b_q, X_{5-q} = a_q - i * b_q
+                    re[dst + base + ns] = a1r - b1i
+                    im[dst + base + ns] = a1i + b1r
+                    re[dst + base + 4 * ns] = a1r + b1i
+                    im[dst + base + 4 * ns] = a1i - b1r
+                    re[dst + base + 2 * ns] = a2r - b2i
+                    im[dst + base + 2 * ns] = a2i + b2r
+                    re[dst + base + 3 * ns] = a2r + b2i
+                    im[dst + base + 3 * ns] = a2i - b2r
+                }
+            }
+            ns *= r
+            let t = src
+            src = dst
+            dst = t
+        }
+        src
+    }
+
+    // clt_mdct_backward: the inverse MDCT of the N/2 coefficients
+    // input[inOff + stride * i], written to out[outOff ..< outOff + N/2 +
+    // overlap/2] with the first `overlap` samples TDAC-mixed with what is
+    // already there. N = 1920 >> shift.
+    fn imdct(_ input: [Float], inOff: Int, stride: Int, out: bind [Float], outOff: Int, shift: Int) {
+        let n = 1920 >> shift
+        let n2 = n >> 1
+        let n4 = n >> 2
+        let t = celtTrigOff[shift]
+        let trig = celtTrig
+        // Pre-rotation (into natural order; the reference stores it
+        // bit-reversed because its FFT expects that).
+        for i in 0..n4 {
+            let x1 = input[inOff + 2 * stride * i]
+            let x2 = input[inOff + stride * (n2 - 1) - 2 * stride * i]
+            let yr = x2 * trig[t + i] + x1 * trig[t + n4 + i]
+            let yi = x1 * trig[t + i] - x2 * trig[t + n4 + i]
+            // Real and imaginary swapped: an FFT used as an IFFT.
+            re[i] = yi
+            im[i] = yr
+        }
+        let at = fft(celtFftPlans[shift])
+        // Post-rotation.
+        let o = outOff + 60
+        for k in 0..n4 {
+            let zr = re[at + k]
+            let zi = im[at + k]
+            out[o + 2 * k] = zi * trig[t + k] + zr * trig[t + n4 + k]
+            out[o + n2 - 1 - 2 * k] = zi * trig[t + n4 + k] - zr * trig[t + k]
+        }
+        // Mirror on both sides for TDAC.
+        for i in 0..60 {
+            let x1 = out[outOff + 119 - i]
+            let x2 = out[outOff + i]
+            out[outOff + i] = celtWindow[119 - i] * x2 - celtWindow[i] * x1
+            out[outOff + 119 - i] = celtWindow[i] * x2 + celtWindow[119 - i] * x1
+        }
+    }
+}
+
+fn celtZerosF(_ n: Int) -> [Float] {
+    var out: [Float] = []
+    for _ in 0..n {
+        out.append(0.0)
+    }
+    out
+}

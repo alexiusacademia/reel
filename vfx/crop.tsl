@@ -1,0 +1,181 @@
+// Black bar detection: how many rows and columns at each edge of a
+// picture are (near) black, for automatic cropping of letterboxed and
+// pillarboxed video. The result goes into render.View's crop fields.
+//
+// A row (or column) counts as picture when more than 1/64 of its sampled
+// luma values (every 4th sample) lie above black + `limit` (8-bit steps,
+// scaled for depth; black is 16 for video range, 0 for full range). Rows
+// are scanned in from the top and bottom, then columns from the left and
+// right within the rows found. Edges are rounded down to even sample
+// counts (chroma siting). A black picture, or bars of more than 45 % of a
+// side, give no crop for that direction.
+//
+// One dark picture can look all bars; CropDetector keeps, over all the
+// pictures it is shown, the smallest bars at each edge, so a crop only
+// grows smaller as brighter pictures come by.
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+import "../core"
+
+// Samples taken off each edge.
+public struct Crop {
+    left: Int = 0
+    top: Int = 0
+    right: Int = 0
+    bottom: Int = 0
+
+    isEmpty: Bool {
+        left == 0 && top == 0 && right == 0 && bottom == 0
+    }
+}
+
+// The black bars of one picture.
+public fn detectCrop(_ p: core.Picture, limit: Int = 24) -> Crop {
+    var c = Crop()
+    let w = p.width
+    let h = p.height
+    if w < 8 || h < 8 || p.y.count < p.yOffset + (h - 1) * p.yStride + w {
+        return c
+    }
+    let depth = max(8, min(p.depth, 16))
+    let black = if p.fullRange { 0 } else { 16 << (depth - 8) }
+    let level = black + (limit << (depth - 8))
+    let ys = p.y
+    // Top and bottom: rows sampled every 4th column.
+    let need = max(1, (w / 4) / 64)
+    var top = 0
+    while top < h && !cropRowHasPicture(ys, p.yOffset + top * p.yStride, w, level, need) {
+        top += 1
+    }
+    if top >= h {
+        // All black.
+        return c
+    }
+    var bottom = 0
+    while bottom < h - top && !cropRowHasPicture(ys, p.yOffset + (h - 1 - bottom) * p.yStride, w, level, need) {
+        bottom += 1
+    }
+    if top + bottom > h * 9 / 10 {
+        top = 0
+        bottom = 0
+    }
+    // Left and right: columns sampled every 4th row between the bars.
+    let r0 = top
+    let r1 = h - bottom
+    let needC = max(1, ((r1 - r0) / 4) / 64)
+    var left = 0
+    while left < w && !cropColumnHasPicture(ys, p.yOffset + left, p.yStride, r0, r1, level, needC) {
+        left += 1
+    }
+    var right = 0
+    while right < w - left && !cropColumnHasPicture(ys, p.yOffset + w - 1 - right, p.yStride, r0, r1, level, needC) {
+        right += 1
+    }
+    if left + right > w * 9 / 10 {
+        left = 0
+        right = 0
+    }
+    c.top = top - top % 2
+    c.bottom = bottom - bottom % 2
+    c.left = left - left % 2
+    c.right = right - right % 2
+    c
+}
+
+fn cropRowHasPicture(_ ys: [Int], _ base: Int, _ w: Int, _ level: Int, _ need: Int) -> Bool {
+    var count = 0
+    var x = 0
+    while x < w {
+        if ys[base + x] > level {
+            count += 1
+            if count >= need {
+                return true
+            }
+        }
+        x += 4
+    }
+    false
+}
+
+fn cropColumnHasPicture(_ ys: [Int], _ base: Int, _ stride: Int, _ r0: Int, _ r1: Int, _ level: Int, _ need: Int) -> Bool {
+    var count = 0
+    var r = r0
+    while r < r1 {
+        if ys[base + r * stride] > level {
+            count += 1
+            if count >= need {
+                return true
+            }
+        }
+        r += 4
+    }
+    false
+}
+
+// Black bar detection over many pictures (see the top of the file).
+public struct CropDetector {
+    limit: Int = 24
+    // Look at every n-th picture pushed (detection costs ~0.1 ms).
+    every: Int = 5
+    crop: Crop = Crop()
+    seen: Int = 0
+    pushed: Int = 0
+    width: Int = 0
+    height: Int = 0
+
+    fn reset() {
+        crop = Crop()
+        seen = 0
+        pushed = 0
+    }
+
+    // Looks at a picture (every `every`-th one) and returns the crop so far.
+    fn push(_ p: core.Picture) -> Crop {
+        pushed += 1
+        if (pushed - 1) % max(every, 1) != 0 {
+            return crop
+        }
+        if p.width != width || p.height != height {
+            reset()
+            pushed = 1
+            width = p.width
+            height = p.height
+        }
+        let c = detectCrop(p, limit: limit)
+        // An all-black picture says nothing.
+        if c.isEmpty && cropAllDark(p, limit) {
+            return crop
+        }
+        if seen == 0 {
+            crop = c
+        } else {
+            crop.left = min(crop.left, c.left)
+            crop.top = min(crop.top, c.top)
+            crop.right = min(crop.right, c.right)
+            crop.bottom = min(crop.bottom, c.bottom)
+        }
+        seen += 1
+        crop
+    }
+}
+
+public fn newCropDetector() -> CropDetector {
+    CropDetector()
+}
+
+// Whether a picture is dark all over (sampled).
+fn cropAllDark(_ p: core.Picture, _ limit: Int) -> Bool {
+    let depth = max(8, min(p.depth, 16))
+    let black = if p.fullRange { 0 } else { 16 << (depth - 8) }
+    let level = black + (limit << (depth - 8))
+    var r = 0
+    while r < p.height {
+        if cropRowHasPicture(p.y, p.yOffset + r * p.yStride, p.width, level, 1) {
+            return false
+        }
+        r += 4
+    }
+    true
+}

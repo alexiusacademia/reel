@@ -1,0 +1,429 @@
+// Tests for the ui-tools views' helpers (ui/tools_*.tsl): reading and
+// writing times (jump to time, export ranges), find-in-dialogue stepping
+// and highlighting, the transcript's current row, the OpenSubtitles form
+// → query, flags and quota text, encoding groups, the export clip and
+// GIF helpers (MP4 track support, names, sizes, problems), disc title
+// lists, the sleep timer, and the media information rows and text.
+// The views themselves are checked headless with the demo app in
+// build/scratch/ui-tools/demo (build/scratch/ui-tools/run_demo.sh).
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+import "../../ui"
+import "../../subs"
+import "../../core"
+import "../../disc"
+import "../../export"
+
+struct Checks {
+    passed: Int = 0
+    total: Int = 0
+
+    fn check(_ ok: Bool, _ what: String) {
+        total += 1
+        if ok {
+            passed += 1
+        } else {
+            print("FAIL {what}")
+        }
+    }
+
+    fn same(_ got: String, _ want: String, _ what: String) {
+        check(got == want, "{what}: got \"{got}\", want \"{want}\"")
+    }
+
+    fn near(_ got: Float?, _ want: Float, _ what: String) {
+        if let g = got {
+            check(abs(g - want) < 0.0001, "{what}: got {g}, want {want}")
+        } else {
+            check(false, "{what}: got nil, want {want}")
+        }
+    }
+
+    fn none(_ got: Float?, _ what: String) {
+        check(got == nil, "{what}: got {got ?? -1.0}, want nil")
+    }
+}
+
+fn main() {
+    var c = Checks()
+    times(c)
+    find(c)
+    opensubs(c)
+    encodings(c)
+    clips(c)
+    gifs(c)
+    discs(c)
+    sleep(c)
+    info(c)
+    print("ui_tools: {c.passed} of {c.total} passed")
+}
+
+fn times(_ c: bind Checks) {
+    c.same(ui.formatClock(0.0), "0:00", "clock 0")
+    c.same(ui.formatClock(65.4), "1:05", "clock 65.4")
+    c.same(ui.formatClock(5025.0), "1:23:45", "clock h")
+    c.same(ui.formatClock(83.45, tenths: true), "1:23.5", "clock tenths")
+    c.same(ui.formatClock(3599.96, tenths: true), "1:00:00.0", "clock tenths carry")
+    c.same(ui.formatClock(-1.0), "--:--", "clock negative")
+    c.same(ui.formatSpan(3900.0), "1 h 5 min", "span h")
+    c.same(ui.formatSpan(45.0), "45 s", "span s")
+    c.same(ui.formatSpan(150.0), "2 min 30 s", "span m s")
+
+    // The forms the brief lists.
+    c.near(ui.parseJumpTime("1:23:45"), 5025.0, "h:m:s")
+    c.near(ui.parseJumpTime("83:45"), 5025.0, "m:s past 59")
+    c.near(ui.parseJumpTime("45s"), 45.0, "45s")
+    c.near(ui.parseJumpTime("+30", position: 100.0), 130.0, "+30")
+    c.near(ui.parseJumpTime("-1:00", position: 100.0), 40.0, "-1:00")
+    // More.
+    c.near(ui.parseJumpTime("90"), 90.0, "bare seconds")
+    c.near(ui.parseJumpTime(" 1h30m "), 5400.0, "1h30m")
+    c.near(ui.parseJumpTime("2.5m"), 150.0, "2.5m")
+    c.near(ui.parseJumpTime("1 min 30 s"), 90.0, "1 min 30 s")
+    c.near(ui.parseJumpTime("500ms"), 0.5, "500ms")
+    c.near(ui.parseJumpTime("1:02.5"), 62.5, "m:s.f")
+    c.near(ui.parseJumpTime("1:02,5"), 62.5, "decimal comma")
+    c.near(ui.parseJumpTime("50%", duration: 600.0), 300.0, "50%")
+    c.near(ui.parseJumpTime("+10%", position: 100.0, duration: 600.0), 160.0, "+10%")
+    c.near(ui.parseJumpTime("−20", position: 100.0), 80.0, "unicode minus")
+    c.near(ui.parseJumpTime("-5:00", position: 100.0), 0.0, "clamped at 0")
+    c.near(ui.parseJumpTime("3:00:00", duration: 5400.0), 5400.0, "clamped at the end")
+    c.near(ui.parseJumpTime("0:00"), 0.0, "zero")
+    c.none(ui.parseJumpTime(""), "empty")
+    c.none(ui.parseJumpTime("abc"), "letters")
+    c.none(ui.parseJumpTime("1:2x"), "junk")
+    c.none(ui.parseJumpTime("1:60"), "60 seconds")
+    c.none(ui.parseJumpTime("1:60:00"), "60 minutes under hours")
+    c.none(ui.parseJumpTime("1:2:3:4"), "four parts")
+    c.none(ui.parseJumpTime("1.5:30"), "fraction before the last part")
+    c.none(ui.parseJumpTime("50%"), "percent without a length")
+    c.none(ui.parseJumpTime("5x"), "unknown unit")
+    c.none(ui.parseJumpTime("m5"), "unit first")
+    c.none(ui.parseJumpTime("1..2"), "two dots")
+    c.none(ui.parseJumpTime("+"), "sign alone")
+    c.same(ui.jumpPreview("1:00", position: 0.0, duration: 600.0), "Goes to 1:00 of 10:00", "preview")
+    c.same(ui.jumpPreview("", position: 61.0, duration: -1.0), "Now at 1:01", "preview empty")
+    c.same(ui.jumpPreview("zz", position: 0.0, duration: 600.0), "Can't read that time", "preview bad")
+    c.same(ui.formatBytes(1536), "1 KB", "bytes KB")
+    c.same(ui.formatBytes(3460300), "3.3 MB", "bytes MB")
+    c.same(ui.formatCount(1234567), "1,234,567", "count")
+    c.same(ui.formatCount(999), "999", "count small")
+}
+
+fn findIndex() -> subs.DialogueIndex {
+    let en = "1\n00:00:01,000 --> 00:00:02,000\nWhere were you?\n\n2\n00:00:05,000 --> 00:00:07,000\nI was at the café,\nwaiting for you.\n\n3\n00:00:10,000 --> 00:00:12,000\nYou never came.\n"
+    let fr = "1\n00:00:01,000 --> 00:00:02,000\nOù étais-tu ?\n\n2\n00:00:05,500 --> 00:00:07,000\nAu café.\n"
+    var tracks: [subs.SubTrack] = []
+    if let t = subs.parseText(en, format: "srt").value() {
+        tracks.append(t)
+    }
+    if let t = subs.parseText(fr, format: "srt").value() {
+        tracks.append(t)
+    }
+    subs.dialogueIndex(tracks, names: ["English", "French"])
+}
+
+fn find(_ c: bind Checks) {
+    c.check(ui.findStep(count: 5, selected: 4, delta: 1) == 0, "step wraps forward")
+    c.check(ui.findStep(count: 5, selected: 0, delta: -1) == 4, "step wraps back")
+    c.check(ui.findStep(count: 5, selected: 2, delta: 1) == 3, "step")
+    c.check(ui.findStep(count: 5, selected: -1, delta: 1) == 0, "step from none")
+    c.check(ui.findStep(count: 5, selected: -1, delta: -1) == 4, "step back from none")
+    c.check(ui.findStep(count: 0, selected: 0, delta: 1) == -1, "step none")
+    let (a, b, d) = ui.findPieces("I was at the café, waiting", from: 13, to: 17)
+    c.same(a, "I was at the ", "pieces before")
+    c.same(b, "café", "pieces match")
+    c.same(d, ", waiting", "pieces after")
+    let (a2, b2, _) = ui.findPieces("A very long line of dialogue that goes on and on before the word", from: 60, to: 64, keep: 10)
+    c.same(a2, "…efore the ", "pieces shortened")
+    c.same(b2, "word", "pieces long match")
+    let (a3, b3, d3) = ui.findPieces("abc", from: 5, to: 9)
+    c.check(a3 == "abc" && b3 == "" && d3 == "", "pieces out of range")
+    c.same(ui.findCountText(0, searched: true), "No results", "count none")
+    c.same(ui.findCountText(1, searched: true), "1 result", "count one")
+    c.same(ui.findCountText(7, searched: true), "7 results", "count many")
+    c.same(ui.findCountText(300, searched: true, limit: 300), "First 300 results", "count limit")
+    c.same(ui.findCountText(3, searched: false), "", "count before search")
+    c.check(ui.findKey("cafe ", source: 1, lines: 5) == ui.findKey("cafe", source: 1, lines: 5), "key trims")
+    c.check(ui.findKey("cafe", source: 0, lines: 5) != ui.findKey("cafe", source: 1, lines: 5), "key has source")
+
+    let ix = findIndex()
+    let hits = ix.search("cafe")
+    c.check(hits.count == 2, "index search finds both cafés ({hits.count})")
+    if hits.count == 2 {
+        let (_, m, _) = ui.findPieces(hits[0].text, from: hits[0].matchFrom, to: hits[0].matchTo)
+        c.same(m, "café", "highlight from the index")
+    }
+    c.check(ui.transcriptRow(ix, source: 0, at: 0.5) == -1, "transcript before the first line")
+    c.check(ui.transcriptRow(ix, source: 0, at: 6.0) == 1, "transcript showing line")
+    c.check(ui.transcriptRow(ix, source: 0, at: 8.0) == 1, "transcript gap keeps the last line")
+    c.check(ui.transcriptRow(ix, source: 1, at: 6.0) == 1, "transcript second source row")
+    c.check(ui.transcriptRow(ix, source: 5, at: 6.0) == -1, "transcript bad source")
+}
+
+fn opensubs(_ c: bind Checks) {
+    let f = ui.subtitleSearchForm(videoPath: "/v/The.Night.Train.S02E05.720p.WEB.mkv", languages: ["en", "fr"])
+    c.same(f.title, "The Night Train", "form title")
+    c.same(f.season, "2", "form season")
+    c.same(f.episode, "5", "form episode")
+    c.same(f.languages, "en, fr", "form languages")
+    let m = ui.subtitleSearchForm(videoPath: "/v/Movie Name (2019) 1080p.mp4")
+    c.check(m.season == "" && m.episode == "", "movie has no episode")
+    c.same(ui.subtitleLanguageCodes("en, French; pt-BR de en").joined(separator: ","), "en,fr,pt-br,de", "language codes")
+    c.same(ui.subtitleLanguageProblems("en, klingon").joined(separator: ","), "klingon", "language problems")
+    let q = ui.subtitleQuery(f, movieHash: "8e245d9679d31e12")
+    c.check(q.query == "The Night Train" && q.season == 2 && q.episode == 5 && q.type == "episode", "query fields")
+    c.same(q.movieHash, "8e245d9679d31e12", "query hash")
+    c.same(q.languages.joined(separator: ","), "en,fr", "query languages")
+    var noHash = f
+    noHash.useHash = false
+    c.same(ui.subtitleQuery(noHash, movieHash: "abc").movieHash, "", "hash left out")
+    c.same(ui.subtitleFormProblem(f, hasHash: true), "", "form ok")
+    var empty = ui.SubtitleSearchForm()
+    c.same(ui.subtitleFormProblem(empty, hasHash: true), "", "hash alone is enough")
+    empty.useHash = false
+    c.check(!ui.subtitleFormProblem(empty, hasHash: true).isEmpty, "needs a title without hash")
+    var bad = f
+    bad.season = "two"
+    c.same(ui.subtitleFormProblem(bad, hasHash: true), "The season should be a number.", "season problem")
+    bad = f
+    bad.languages = "en, xx1"
+    c.check(ui.subtitleFormProblem(bad, hasHash: true).contains("xx1"), "language problem")
+
+    let s = subs.OsSubtitle(language: "en", release: "", hearingImpaired: true, foreignPartsOnly: true, aiTranslated: true, title: "Show", season: 1, episode: 4, files: [subs.OsFile(fileId: 1, fileName: "a.srt"), subs.OsFile(fileId: 2, fileName: "b.srt")])
+    c.same(ui.subtitleTitleText(s), "Show S01E04", "title episode")
+    c.same(ui.subtitleTitleText(subs.OsSubtitle(title: "Film", year: 2019)), "Film (2019)", "title film")
+    c.same(ui.subtitleReleaseText(s), "a.srt", "release falls back to file")
+    c.same(ui.subtitleFlags(s).joined(separator: ","), "HI,Forced,AI,2 CDs", "flags")
+    c.same(ui.subtitleQuotaText(subs.OsUser(), loggedIn: false), "Not logged in: searching works without an account, downloading needs one.", "quota logged out")
+    c.same(ui.subtitleQuotaText(subs.OsUser(level: "Sub leecher", allowedDownloads: 20, remainingDownloads: 7), loggedIn: true), "Logged in (Sub leecher) · 7 of 20 downloads left today", "quota")
+    c.same(ui.subtitleQuotaText(subs.OsUser(vip: true), loggedIn: true), "Logged in (VIP)", "quota vip")
+}
+
+fn encodings(_ c: bind Checks) {
+    let groups = ui.encodingGroups()
+    var n = 0
+    for g in groups {
+        n += g.names.count
+    }
+    c.check(n == subs.encodingList.count, "every encoding in a group")
+    c.same(groups[0].script, "Unicode", "first group")
+    var scripts: [String] = []
+    for g in groups {
+        scripts.append(g.script)
+    }
+    c.same(scripts.joined(separator: "|"), "Unicode|Latin|Cyrillic|Greek|Hebrew|Arabic|Thai|Chinese, Japanese, Korean", "group order")
+    c.same(ui.encodingScript("koi8-u"), "Cyrillic", "script koi8-u")
+    c.same(ui.encodingScript("windows-1258"), "Latin", "script vietnamese")
+    c.same(ui.encodingScript("big5"), "Chinese, Japanese, Korean", "script big5")
+    c.same(ui.confidenceText(0.923), "92%", "confidence")
+    c.same(ui.confidenceText(1.7), "100%", "confidence capped")
+    let guesses = [subs.EncodingGuess(name: "windows-1251", confidence: 0.9), subs.EncodingGuess(name: "koi8-r", confidence: 0.2)]
+    c.near(ui.encodingConfidence("koi8-r", guesses: guesses), 0.2, "guess confidence")
+    c.near(ui.encodingConfidence("utf-8", guesses: guesses), -1.0, "not guessed")
+}
+
+fn clipMedia() -> core.Media {
+    var m = core.Media(format: "mkv", duration: 600.0)
+    m.tracks = [
+        core.Track(index: 0, kind: .video, codec: "h264", width: 1920, height: 1080),
+        core.Track(index: 1, kind: .audio, codec: "aac", language: "eng", channels: 6),
+        core.Track(index: 2, kind: .audio, codec: "dts", channels: 2),
+        core.Track(index: 3, kind: .subtitle, codec: "srt", language: "fre"),
+        core.Track(index: 4, kind: .subtitle, codec: "ass"),
+        core.Track(index: 5, kind: .other, codec: "unknown:x"),
+        core.Track(index: 6, kind: .video, codec: "av1"),
+        core.Track(index: 7, kind: .audio, codec: "flac", extra: Data(bytes: [1, 2, 3])),
+    ]
+    m
+}
+
+fn clips(_ c: bind Checks) {
+    let m = clipMedia()
+    var f = ui.exportClipForm(m, path: "/films/Night Train.mkv", from: 83.4, to: 105.0)
+    c.same(f.fromText, "1:23.4", "clip from text")
+    c.same(f.toText, "1:45.0", "clip to text")
+    c.same(f.output, "/films/Night Train 1m23s-1m45s.mkv", "clip name")
+    c.check(f.include.count == 8 && f.include[0] && !f.include[5], "clip default tracks")
+    c.same(ui.exportClipName(videoPath: "/a/b.mp4", from: 3725.0, to: -1.0, container: "mp4"), "/a/b 1h02m05s-end.mp4", "clip name to end")
+    c.same(ui.exportOutputPath("/a/clip.mkv", container: "mp4"), "/a/clip.mp4", "output extension")
+    c.same(ui.exportOutputPath("", container: "mp4"), "", "no output")
+    c.near(ui.exportClipStart(f), 83.4, "clip start")
+    c.near(ui.exportClipEnd(f), 105.0, "clip end")
+    c.near(ui.exportClipLength(f, duration: 600.0), 21.6, "clip length")
+    c.same(ui.exportClipTracks(f, m).map { i in "{i}" }.joined(separator: ","), "0,1,2,3,4,6,7", "mkv tracks")
+    f.container = "mp4"
+    c.same(ui.exportClipTracks(f, m).map { i in "{i}" }.joined(separator: ","), "0,1,3", "mp4 tracks")
+    c.check(ui.mp4Carries(m.tracks[0]) && ui.mp4Carries(m.tracks[1]) && ui.mp4Carries(m.tracks[3]), "mp4 carries h264 aac srt")
+    c.check(!ui.mp4Carries(m.tracks[2]) && !ui.mp4Carries(m.tracks[4]) && !ui.mp4Carries(m.tracks[6]) && !ui.mp4Carries(m.tracks[7]), "mp4 refuses dts ass bare-av1 bare-flac")
+    c.same(ui.exportTrackNote(m.tracks[3], container: "mp4"), "becomes MP4 timed text", "note srt in mp4")
+    c.same(ui.exportTrackNote(m.tracks[3], container: "mkv"), "", "note srt in mkv")
+    c.same(ui.exportTrackNote(m.tracks[2], container: "mp4"), "MP4 can't hold DTS", "note dts")
+    c.same(ui.exportTrackNote(m.tracks[4], container: "mp4"), "MP4 holds only text subtitles", "note ass")
+    c.same(ui.exportTrackNote(core.Track(index: 0, kind: .subtitle, codec: "tx3g"), container: "mkv"), "becomes plain text", "note tx3g in mkv")
+    c.same(ui.exportTrackLabel(m.tracks[1]), "Audio 2 · AAC · 5.1 · English (eng)", "track label")
+    c.same(ui.exportClipProblem(f, m), "", "clip ok")
+    var g = f
+    g.toText = "1:00"
+    c.same(ui.exportClipProblem(g, m), "The end must come after the start.", "end before start")
+    g = f
+    g.fromText = "x"
+    c.check(ui.exportClipProblem(g, m).hasPrefix("The start time can't be read"), "bad start")
+    g = f
+    g.toText = ""
+    c.same(ui.exportClipProblem(g, m), "", "to the end ok")
+    c.near(ui.exportClipEnd(g), -1.0, "to the end is -1")
+    c.near(ui.exportClipLength(g, duration: 600.0), 516.6, "length to the end")
+    g = f
+    g.fromText = "11:00"
+    g.toText = ""
+    c.same(ui.exportClipProblem(g, m), "The start is past the end of the file.", "start past end")
+    g = f
+    g.include = [false, false, true, false, true, false, true, true]
+    c.same(ui.exportClipProblem(g, m), "Choose at least one track.", "no mp4 tracks")
+    g = f
+    g.output = ""
+    c.same(ui.exportClipProblem(g, m), "Choose where to save the clip.", "no output path")
+    // The helpers feed the planner as the view's comment says.
+    var p = f
+    p.container = "mkv"
+    if let plan = export.planClip(m, tracks: ui.exportClipTracks(p, m), from: ui.exportClipStart(p), to: ui.exportClipEnd(p), exactStart: p.exactStart).value() {
+        c.check(plan.tracks.count == 7, "plan takes the chosen tracks")
+    } else {
+        c.check(false, "plan from the form")
+    }
+}
+
+fn gifs(_ c: bind Checks) {
+    let f = ui.exportGifForm(position: 83.4, duration: 85.0, path: "/films/Night Train.mkv", sourceWidth: 1920)
+    c.same(f.fromText, "1:23.4", "gif from")
+    c.same(f.toText, "1:25.0", "gif to clamped at the end")
+    c.same(f.output, "/films/Night Train 1m23s.gif", "gif name")
+    c.check(f.width == 480, "gif width")
+    c.check(ui.exportGifForm(position: 0.0, duration: 10.0, path: "/a.mp4", sourceWidth: 320).width == 320, "gif width small source")
+    c.check(ui.gifHeight(width: 480, sourceWidth: 1920, sourceHeight: 1080) == 270, "gif height 16:9")
+    c.check(ui.gifHeight(width: 480, sourceWidth: 720, sourceHeight: 576, sarNum: 16, sarDen: 15) == 360, "gif height anamorphic")
+    c.check(ui.gifHeight(width: 320, sourceWidth: 0, sourceHeight: 0) == 180, "gif height unknown")
+    c.check(ui.gifFrameCount(seconds: 3.0, fps: 12) == 36, "frames")
+    c.check(ui.gifFrameCount(seconds: 0.0, fps: 12) == 1, "frames at least one")
+    let small = ui.gifEstimateBytes(width: 320, height: 180, frames: 30, colors: 64, dither: false)
+    let big = ui.gifEstimateBytes(width: 320, height: 180, frames: 30, colors: 256, dither: true)
+    c.check(small < big, "estimate grows with colours and dither")
+    c.check(ui.gifEstimateBytes(width: 480, height: 270, frames: 36, colors: 256, dither: true) > 2000000, "estimate magnitude")
+    let o = ui.gifOptions(f)
+    c.check(o.colors == 256 && o.dither && o.loop == 0, "gif options")
+    var once = f
+    once.loop = false
+    once.colors = 999
+    let o2 = ui.gifOptions(once)
+    c.check(o2.loop == -1 && o2.colors == 256, "gif options once, capped colours")
+    c.same(ui.exportGifProblem(f, duration: 85.0), "", "gif ok")
+    var g = f
+    g.toText = "1:00"
+    c.same(ui.exportGifProblem(g, duration: 85.0), "The end must come after the start.", "gif order")
+    g = f
+    g.fromText = "0:00"
+    g.toText = "2:00"
+    c.same(ui.exportGifProblem(g, duration: 600.0), "A GIF this long would be huge; keep it under a minute.", "gif too long")
+    g = f
+    g.width = 4000
+    c.check(ui.exportGifProblem(g, duration: 85.0).hasPrefix("The width"), "gif width problem")
+    // An encoded GIF of the form's options decodes back.
+    let px = [0xFF0000FF, 0x00FF00FF, 0x0000FFFF, 0xFFFFFFFF]
+    let px2 = [0xFFFFFFFF, 0x0000FFFF, 0x00FF00FF, 0xFF0000FF]
+    let data = export.encodeGif([px, px2], width: 2, height: 2, delays: [0.1], options: ui.gifOptions(f))
+    if let img = export.decodeGif(data).value() {
+        c.check(img.frames.count == 2 && img.loop == 0, "gif round trip ({img.frames.count} frames, loop {img.loop})")
+    } else {
+        c.check(false, "gif decodes")
+    }
+}
+
+fn discs(_ c: bind Checks) {
+    var d = disc.Disc(kind: "bluray", path: "/BD", volumeName: "FILM")
+    let a1 = disc.Stream(kind: .audio, codec: "truehd", language: "eng", channels: 8)
+    let a2 = disc.Stream(kind: .audio, codec: "ac3", languageCode: "fr", note: "Commentary", channels: 2)
+    let a3 = disc.Stream(kind: .audio, codec: "ac3", language: "eng", channels: 2)
+    let s1 = disc.Stream(kind: .subtitle, codec: "pgs", language: "ger", forced: true)
+    d.titles = [
+        disc.Title(number: 1, duration: 20.0),
+        disc.Title(number: 800, duration: 7000.0, streams: [a1, a2, a3, s1], mainFeature: true),
+        disc.Title(number: 801, duration: 30.0),
+        disc.Title(number: 802, duration: 300.0),
+    ]
+    d.main = 1
+    c.same(ui.discTitleLanguages(d.titles[1], kind: .audio), "EN, FR", "audio languages")
+    c.same(ui.discTitleLanguages(d.titles[1], kind: .subtitle), "DE", "subtitle languages")
+    c.same(ui.discTitleLanguages(d.titles[0], kind: .audio), "", "no languages")
+    c.same(ui.discShownTitles(d, hideShort: true).map { i in "{i}" }.joined(separator: ","), "1,3", "short titles hidden")
+    c.same(ui.discShownTitles(d, hideShort: false).map { i in "{i}" }.joined(separator: ","), "0,1,2,3", "all titles")
+    d.main = 2
+    c.same(ui.discShownTitles(d, hideShort: true).map { i in "{i}" }.joined(separator: ","), "1,2,3", "main stays")
+    c.same(ui.discSummary(d), "Blu-ray · FILM · 4 titles", "summary")
+    c.same(ui.discStreamText(a2), "AC-3 · stereo · French · Commentary", "stream text")
+    c.same(ui.discStreamText(s1), "PGS (Blu-ray) · German · forced", "stream forced")
+}
+
+fn sleep(_ c: bind Checks) {
+    c.near(ui.sleepTimerSeconds("off", customMinutes: 5), -1.0, "sleep off")
+    c.near(ui.sleepTimerSeconds("end", customMinutes: 5), 0.0, "sleep end")
+    c.near(ui.sleepTimerSeconds("45", customMinutes: 5), 2700.0, "sleep 45")
+    c.near(ui.sleepTimerSeconds("custom", customMinutes: 7), 420.0, "sleep custom")
+    c.near(ui.sleepTimerSeconds("custom", customMinutes: 0), 60.0, "sleep custom at least 1")
+    c.near(ui.sleepTimerSeconds("zz", customMinutes: 7), -1.0, "sleep unknown")
+    c.check(ui.sleepChoices.count == 8, "sleep choices")
+    c.same(ui.sleepTimerStatus(-1.0, choice: "30"), "The sleep timer is off.", "status off")
+    c.same(ui.sleepTimerStatus(754.0, choice: "30"), "Playback stops in 12:34.", "status")
+    c.same(ui.sleepTimerStatus(190.0, choice: "end"), "Playback stops at the end of this item (3:10 left).", "status end")
+}
+
+fn info(_ c: bind Checks) {
+    var m = core.Media(format: "mkv", duration: 5400.0)
+    m.tracks = [
+        core.Track(index: 0, kind: .video, codec: "h264", width: 1920, height: 1080, sarNum: 4, sarDen: 3, fpsNum: 24000, fpsDen: 1001),
+        core.Track(index: 1, kind: .audio, codec: "eac3", language: "eng", isDefault: true, sampleRate: 48000, channels: 6),
+        core.Track(index: 2, kind: .subtitle, codec: "unknown:S_KATE", isForced: true),
+    ]
+    m.tags = ["title": "Film", "delay": "1024", "artist": "Someone"]
+    m.chapters = [core.Chapter(start: 0.0, title: "Start"), core.Chapter(start: 65.0)]
+    m.attachments = [core.Attachment(name: "f.ttf", mime: "font/ttf", data: Data(bytes: [1, 2]))]
+    let g = ui.mediaGeneralRows(m, path: "/films/Film.mkv", fileSize: 1834567890)
+    var labels: [String] = []
+    for r in g {
+        labels.append(r.label)
+    }
+    c.same(labels.joined(separator: ","), "File,Folder,Size,Container,Duration,Overall bit rate,Tracks,Title,Chapters,Attachments", "general labels")
+    c.same(g[2].value, "1.71 GB (1,834,567,890 bytes)", "general size")
+    c.same(g[5].value, "2718 kb/s", "general bit rate")
+    c.same(g[6].value, "1 video, 1 audio, 1 subtitles", "general tracks")
+    let v = ui.mediaTrackRows(m.tracks[0], info: "High profile")
+    c.check(v.count == 5 && v[2].value == "4:3" && v[3].value == "23.976 fps" && v[4].value == "High profile", "video rows")
+    let a = ui.mediaTrackRows(m.tracks[1], note: "Reel can't decode this yet")
+    c.same(a[0].value, "E-AC-3", "audio codec")
+    c.same(a[1].value, "English (eng)", "audio language")
+    c.same(a[3].value, "5.1", "audio channels")
+    c.same(a[a.count - 1].value, "Reel can't decode this yet", "audio note")
+    let s = ui.mediaTrackRows(m.tracks[2])
+    c.same(s[0].value, "Unknown (S_KATE)", "unknown codec")
+    c.same(s[s.count - 1].value, "forced", "flags")
+    let meta = ui.mediaMetadataRows(m)
+    c.check(meta.count == 3 && meta[0].label == "Artist" && meta[1].label == "Title" && meta[2].value == "f.ttf (font/ttf), 2 bytes", "metadata rows skip delay")
+    let ch = ui.mediaChapterRows(m)
+    c.check(ch.count == 2 && ch[1].label == "1:05" && ch[1].value == "Chapter 2", "chapter rows")
+    let text = ui.mediaInfoText(m, path: "/films/Film.mkv", fileSize: 1000, streamInfo: ["High profile"], stats: [ui.MediaInfoRow(label: "Dropped", value: "3")], warnings: ["late audio"])
+    c.check(text.hasPrefix("General\n    File: Film.mkv\n"), "text starts with General")
+    c.check(text.contains("\nTrack 1: Video\n    Codec: H.264\n"), "text has tracks")
+    c.check(text.contains("    Decoder: High profile\n"), "text has stream info")
+    c.check(text.contains("\nStatistics\n    Dropped: 3\n"), "text has statistics")
+    c.check(text.contains("\nWarnings\n    late audio\n"), "text has warnings")
+    c.check(text.contains("\nChapters\n    0:00: Start\n"), "text has chapters")
+    c.same(ui.codecTitle("msmpeg4v3"), "DivX 3 (MS-MPEG4 v3)", "codec title")
+    c.same(ui.codecTitle("weird"), "WEIRD", "codec title fallback")
+    c.same(ui.channelsText(8), "7.1", "channels")
+    c.same(ui.containerTitle("ts"), "MPEG transport stream", "container")
+    c.same(ui.languageText("fre"), "French (fre)", "language 639-2")
+    c.same(ui.languageText("pt-BR"), "Portuguese (Brazil) (pt-BR)", "language region")
+    c.same(ui.languageText(""), "", "language none")
+}

@@ -1,0 +1,182 @@
+// Sound out of the render module: WAV files (how the player hands audio
+// to playSound, and for "save audio"), gain and peak level.
+//
+// WAV layout (Microsoft RIFF/WAVE, "Multimedia Programming Interface and
+// Data Specifications 1.0" and the WAVEFORMATEXTENSIBLE note): "RIFF"
+// size "WAVE", a "fmt " chunk, then "data" size and the samples,
+// little-endian, interleaved. bits 8 is unsigned PCM, 16 and 24 signed
+// PCM, 32 IEEE float. More than 2 channels, or 24/32 bits, use
+// WAVE_FORMAT_EXTENSIBLE with the channel mask of the layout. Writing 8 or
+// 16 bits adds TPDF dither (the difference of two uniform random numbers,
+// ±1 LSB peak), which turns rounding distortion into a little steady
+// noise.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../core"
+
+// The WAVEFORMATEXTENSIBLE speaker bit of each channel name.
+fn speakerBit(_ name: String) -> Int {
+    match name {
+        "FL" -> 0x1
+        "FR" -> 0x2
+        "FC" -> 0x4
+        "LFE" -> 0x8
+        "BL" -> 0x10
+        "BR" -> 0x20
+        "FLC" -> 0x40
+        "FRC" -> 0x80
+        "BC" -> 0x100
+        "SL" -> 0x200
+        "SR" -> 0x400
+        "TC" -> 0x800
+        "TFL" -> 0x1000
+        "TFC" -> 0x2000
+        "TFR" -> 0x4000
+        "TBL" -> 0x8000
+        "TBC" -> 0x10000
+        "TBR" -> 0x20000
+        _ -> 0
+    }
+}
+
+fn appendLe(_ d: bind Data, _ v: Int, _ count: Int) {
+    for i in 0..count {
+        d.append(byte: (v >> (8 * i)) & 255)
+    }
+}
+
+// The 44 (or 68, extensible) bytes before the samples of a WAV file with
+// `frames` frames. `layout` names the channels (for the channel mask of
+// files with more than 2 channels; default order when empty).
+public fn wavHeader(rate: Int, channels: Int, frames: Int, bits: Int = 16, layout: [String] = []) -> Data {
+    let b = if bits == 8 || bits == 24 || bits == 32 { bits } else { 16 }
+    let ch = max(1, channels)
+    let align = ch * b / 8
+    let dataBytes = frames * align
+    let extensible = ch > 2 || b > 16
+    var d = Data(text: "RIFF")
+    let fmtSize = if extensible { 40 } else { 16 }
+    appendLe(d, 4 + (8 + fmtSize) + 8 + dataBytes + (dataBytes & 1), 4)
+    d.append(Data(text: "WAVEfmt "))
+    appendLe(d, fmtSize, 4)
+    let tag = if b == 32 { 3 } else { 1 }
+    appendLe(d, if extensible { 0xfffe } else { tag }, 2)
+    appendLe(d, ch, 2)
+    appendLe(d, rate, 4)
+    appendLe(d, rate * align, 4)
+    appendLe(d, align, 2)
+    appendLe(d, b, 2)
+    if extensible {
+        appendLe(d, 22, 2)
+        appendLe(d, b, 2)
+        let names = if layout.count == ch { layout } else { core.defaultLayout(ch) }
+        var mask = 0
+        for n in names {
+            mask = mask | speakerBit(n)
+        }
+        appendLe(d, mask, 4)
+        // The sub-format GUID: tag-0000-0010-8000-00aa00389b71.
+        appendLe(d, tag, 4)
+        for v in [0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71] {
+            d.append(byte: v)
+        }
+    }
+    d.append(Data(text: "data"))
+    appendLe(d, dataBytes, 4)
+    d
+}
+
+// The samples as WAV sample bytes: 16 (default) or 8 bits with TPDF
+// dither, 24 bits rounded, 32 bits float.
+public fn wavData(_ s: core.Samples, bits: Int = 16) -> Data {
+    let b = if bits == 8 || bits == 24 || bits == 32 { bits } else { 16 }
+    let n = s.data.count
+    let src = s.data
+    var bytes: [Int] = []
+    if b == 32 {
+        for i in 0..n {
+            bytes.appendAll(src[i].bytes(count: 4))
+        }
+        return Data(bytes: bytes)
+    }
+    if b == 24 {
+        for i in 0..n {
+            let v = Int(floor(max(-1.0, min(src[i], 1.0)) * 8388607.0 + 0.5))
+            bytes.append(v & 255)
+            bytes.append((v >> 8) & 255)
+            bytes.append((v >> 16) & 255)
+        }
+        return Data(bytes: bytes)
+    }
+    let scale = if b == 16 { 32767.0 } else { 127.0 }
+    let lo = if b == 16 { -32768 } else { -128 }
+    let hi = if b == 16 { 32767 } else { 127 }
+    // xorshift64 random numbers for the dither (fixed start: the same
+    // samples always give the same file).
+    var rng = 0x2545f4914f6cdd1d
+    let unit = 1.0 / 9007199254740992.0
+    for i in 0..n {
+        rng = rng ^ (rng << 13)
+        rng = rng ^ ((rng >> 7) & 0x01ffffffffffffff)
+        rng = rng ^ (rng << 17)
+        let r1 = Float((rng >> 11) & 0x1fffffffffffff) * unit
+        rng = rng ^ (rng << 13)
+        rng = rng ^ ((rng >> 7) & 0x01ffffffffffffff)
+        rng = rng ^ (rng << 17)
+        let r2 = Float((rng >> 11) & 0x1fffffffffffff) * unit
+        let x = src[i]
+        var v = 0
+        if x.isNaN {
+            v = 0
+        } else {
+            v = Int(floor(x * scale + (r1 - r2) + 0.5))
+        }
+        v = max(lo, min(v, hi))
+        if b == 16 {
+            bytes.append(v & 255)
+            bytes.append((v >> 8) & 255)
+        } else {
+            bytes.append(v + 128)
+        }
+    }
+    Data(bytes: bytes)
+}
+
+// A whole WAV file of the samples, 16-bit.
+public fn wavFile(_ s: core.Samples) -> Data {
+    let ch = max(1, s.channels)
+    var d = wavHeader(rate: s.rate, channels: ch, frames: s.data.count / ch, bits: 16, layout: s.layout)
+    d.append(wavData(s))
+    d
+}
+
+// The samples scaled by g (a factor: 0.5 is −6 dB).
+public fn gain(_ s: core.Samples, _ g: Float) -> core.Samples {
+    var out = s
+    var i = 0
+    let n = out.data.count
+    while i < n {
+        out.data[i] = out.data[i] * g
+        i += 1
+    }
+    out
+}
+
+// The largest absolute sample (0 for silence, 1 for full scale).
+public fn peak(_ s: core.Samples) -> Float {
+    var m = 0.0
+    for x in s.data {
+        let a = abs(x)
+        if a > m {
+            m = a
+        }
+    }
+    m
+}
+
+// A gain factor from decibels (−6 → about 0.5).
+public fn dbToGain(_ db: Float) -> Float {
+    pow(10.0, db / 20.0)
+}

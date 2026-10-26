@@ -1,0 +1,371 @@
+// Tests for the MPEG-1/2 video decoder: the fixtures mpeg1.mpg,
+// mpeg2.mpg and mpeg2.ts against ffmpeg's decoded pictures (PSNR with the
+// first ten, md5 of every one), display order and pts, damaged data, a
+// seek, and extra streams made with ffmpeg (tests/mpeg12/fixtures:
+// interlaced field/frame coding, 4:2:2, MPEG-2 coding tools) plus public
+// MPEG-2 conformance streams when they are in build/conformance/mpeg12.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../../core"
+import "../../testkit"
+import "../../mpeg12"
+
+struct RunResult {
+    tools: [String] = []
+    pictures: [core.Picture] = []
+    ms: Float = 0.0
+    warnings: [String] = []
+}
+
+// Decodes the frames of an elementary stream (cuts from splitFrames) with
+// the given pts per packet (or none).
+fn decodeEs(_ es: Data, _ cuts: [Int], _ pts: [Int], _ track: core.Track) -> RunResult {
+    var r = RunResult()
+    var dec = mpeg12.newDecoder(track).value() ?? mpeg12.Decoder()
+    let t0 = now()
+    var k = 0
+    while k + 1 < cuts.count {
+        let packet = es.slice(from: cuts[k], to: cuts[k] + cuts[k + 1])
+        let i = k / 2
+        let p = if i < pts.count { pts[i] } else { core.noTime }
+        r.pictures += dec.decode(packet, pts: p, dts: core.noTime, key: false)
+        k += 2
+    }
+    r.pictures += dec.flush()
+    r.ms = (now() - t0) * 1000.0
+    r.warnings = dec.warnings
+    r.tools = dec.toolsUsed()
+    r
+}
+
+struct Compare {
+    md5Same: Int = 0
+    psnrMin: Float = 99.0
+    psnrAvg: Float = 0.0
+    compared: Int = 0
+}
+
+// Compares pictures with ffmpeg's md5s and its first raw pictures.
+fn compare(_ pics: [core.Picture], md5s: [String], yuv: [core.Picture]) -> Compare {
+    var c = Compare()
+    for i in 0..min(pics.count, md5s.count) {
+        if testkit.pictureMd5(pics[i]) == md5s[i] {
+            c.md5Same += 1
+        }
+    }
+    var sum = 0.0
+    for i in 0..min(pics.count, yuv.count) {
+        let p = testkit.psnr(pics[i], yuv[i])
+        c.psnrMin = min(c.psnrMin, p)
+        sum += p
+        c.compared += 1
+    }
+    if c.compared > 0 {
+        c.psnrAvg = sum / Float(c.compared)
+    }
+    c
+}
+
+// ffmpeg's sample aspect ratio from a framemd5 file's "#sar 0: a/b".
+fn refSar(_ path: String) -> String {
+    let text = readFile(path) ?? ""
+    for line in text.lines() {
+        if line.hasPrefix("#sar 0:") {
+            return line.substring(from: 7, to: line.count).trim()
+        }
+    }
+    ""
+}
+
+fn fmt(_ x: Float) -> String {
+    x.formatted(decimals: 2)
+}
+
+fn main() {
+    var passed = 0
+    var total = 0
+    fn check(_ ok: Bool, _ what: String) {
+        total += 1
+        if ok { passed += 1 } else { print("FAIL: {what}") }
+    }
+
+    // ---- The fixtures ----
+    let names = ["mpeg1.mpg", "mpeg2.mpg", "mpeg2.ts"]
+    var keepEs = Data()
+    var keepCuts: [Int] = []
+    var keepPts: [Int] = []
+    var keepTrack = core.Track(index: 0, kind: .video, codec: "mpeg2")
+    for name in names {
+        let file = testkit.fixture(name)
+        let ref = testkit.loadRef(name)
+        var vt = 0
+        for t in ref.tracks {
+            if t.kind == "video" {
+                vt = t.index
+                break
+            }
+        }
+        let track = testkit.trackFromRef(ref.tracks[vt])
+        let es = if name.hasSuffix(".ts") { tsVideo(file) } else { psVideo(file) }
+        let cuts = splitFrames(es)
+        var pts: [Int] = []
+        for p in ref.packets {
+            if p.track == vt {
+                pts.append(p.pts)
+            }
+        }
+        check(cuts.count / 2 == pts.count, "{name}: {cuts.count / 2} frames in the stream, ref has {pts.count}")
+        let r = decodeEs(es, cuts, pts, track)
+        let md5s = testkit.frameMd5s(name)
+        let yuv = testkit.referenceYuv(name, width: track.width, height: track.height)
+        let c = compare(r.pictures, md5s: md5s, yuv: yuv)
+        check(r.pictures.count == md5s.count, "{name}: {r.pictures.count} pictures, ffmpeg {md5s.count}")
+        check(c.compared == 10 && c.psnrMin >= 45.0, "{name}: PSNR min {fmt(c.psnrMin)} dB")
+        check(r.warnings.isEmpty, "{name}: warnings {r.warnings.count}: {r.warnings.first ?? ""}")
+        print("{name}: PSNR min {fmt(c.psnrMin)} avg {fmt(c.psnrAvg)} dB over {c.compared}; md5 same as ffmpeg {c.md5Same} of {md5s.count}")
+        // Display order: one frame (3600 ticks) apart from the smallest
+        // pts on, and every pts the stream gave is among them (packets
+        // without one get the previous picture's plus a frame).
+        var known: [Int] = []
+        for p in pts {
+            if p != core.noTime {
+                known.append(p)
+            }
+        }
+        let sorted = known.sorted()
+        var ptsOk = r.pictures.count == pts.count && !sorted.isEmpty
+        if ptsOk {
+            for i in 0..r.pictures.count {
+                if r.pictures[i].pts != sorted[0] + i * 3600 {
+                    ptsOk = false
+                }
+            }
+            for p in sorted {
+                if (p - sorted[0]) % 3600 != 0 {
+                    ptsOk = false
+                }
+            }
+        }
+        check(ptsOk, "{name}: pictures in display order with their packets' pts")
+        if let first = r.pictures.first {
+            check(first.key && first.width == track.width && first.height == track.height, "{name}: first picture key, size")
+            check(first.sarNum == 1 && first.sarDen == 1 && first.matrix == .bt601 && !first.fullRange, "{name}: sar {first.sarNum}:{first.sarDen}, matrix")
+            check(first.duration == 3600, "{name}: duration {first.duration}")
+        }
+        if r.pictures.count > 0 {
+            print("time mpeg12 {name} per {track.width}×{track.height} picture: {fmt(r.ms / Float(r.pictures.count))} ms")
+        }
+        if name == "mpeg2.mpg" {
+            keepEs = es
+            keepCuts = cuts
+            keepPts = pts
+            keepTrack = track
+        }
+    }
+
+    // ---- Streams made for these tests (make_fixtures.sh) ----
+    let own = ["interlaced.m2v", "yuv422.m2v", "mpeg1_odd.m1v"]
+    for s in own {
+        let path = "tests/mpeg12/fixtures/" + s
+        let es = readData(path) ?? Data()
+        let cuts = splitFrames(es)
+        let codec = if s.hasSuffix(".m1v") { "mpeg1" } else { "mpeg2" }
+        var track = core.Track(index: 0, kind: .video, codec: codec)
+        track.timescale = 25
+        let r = decodeEs(es, cuts, [], track)
+        let md5s = testkit.frameMd5s("../mpeg12/fixtures/" + s)
+        let c = compare(r.pictures, md5s: md5s, yuv: [])
+        print("{s}: {r.pictures.count} pictures, md5 same {c.md5Same} of {md5s.count}; tools: {r.tools.joined(separator: ", ")}")
+        check(!es.isEmpty && r.pictures.count == md5s.count && c.md5Same == md5s.count && r.warnings.isEmpty, "{s}: bit-exact with ffmpeg")
+        if let p = r.pictures.first {
+            if s == "interlaced.m2v" {
+                check(p.matrix == .bt709 && p.width == 240 && p.height == 160, "{s}: BT.709 from the display extension")
+                check(r.tools.count >= 6, "{s}: interlaced tools used")
+            } else if s == "yuv422.m2v" {
+                check(p.chroma == .yuv422 && p.cStride == p.yStride / 2 && p.u.count == p.y.count / 2, "{s}: 4:2:2 planes")
+            } else {
+                // 200×120 with -aspect 16:9: ffmpeg picks pel aspect
+                // code 8 (0.9157), which it reads as 178:163.
+                check(p.width == 200 && p.height == 120 && p.yStride == 208, "{s}: odd size")
+                check(p.sarNum == 178 && p.sarDen == 163, "{s}: sar {p.sarNum}:{p.sarDen}")
+            }
+            check(p.pts == core.noTime || p.pts == 0, "{s}: no pts given")
+        }
+    }
+
+    // ---- Seeking, skipping B pictures, damage ----
+    if !keepCuts.isEmpty {
+        let md5s = testkit.frameMd5s("mpeg2.mpg")
+        var dec = mpeg12.newDecoder(keepTrack).value() ?? mpeg12.Decoder()
+        var pics: [core.Picture] = []
+        for i in 0..20 {
+            let k = i * 2
+            pics += dec.decode(keepEs.slice(from: keepCuts[k], to: keepCuts[k] + keepCuts[k + 1]), pts: keepPts[i], dts: core.noTime, key: false)
+        }
+        dec.reset()
+        var after: [core.Picture] = []
+        for i in 23..keepPts.count {
+            let k = i * 2
+            after += dec.decode(keepEs.slice(from: keepCuts[k], to: keepCuts[k] + keepCuts[k + 1]), pts: keepPts[i], dts: core.noTime, key: false)
+        }
+        after += dec.flush()
+        var seekOk = !after.isEmpty && after[0].key
+        if seekOk {
+            let at = md5s.index(of: testkit.pictureMd5(after[0])) ?? -1
+            seekOk = at > 20
+            for i in 0..after.count {
+                if at < 0 || at + i >= md5s.count || testkit.pictureMd5(after[i]) != md5s[at + i] {
+                    seekOk = false
+                }
+            }
+        }
+        check(seekOk, "reset: waits for an I picture, then decodes exactly ({after.count} pictures)")
+
+        // skipNonReference: only I and P pictures, still exact.
+        var refOnly = mpeg12.newDecoder(keepTrack).value() ?? mpeg12.Decoder()
+        refOnly.skipNonReference = true
+        var refs: [core.Picture] = []
+        var k = 0
+        while k + 1 < keepCuts.count {
+            refs += refOnly.decode(keepEs.slice(from: keepCuts[k], to: keepCuts[k] + keepCuts[k + 1]), pts: keepPts[k / 2], dts: core.noTime, key: false)
+            k += 2
+        }
+        refs += refOnly.flush()
+        var refsOk = refs.count > 10 && refs.count < 25
+        for p in refs {
+            if !md5s.contains(testkit.pictureMd5(p)) {
+                refsOk = false
+            }
+        }
+        check(refsOk, "skipNonReference: {refs.count} reference pictures, all exact")
+
+        // Damage: bytes overwritten in the middle of a P picture, a cut
+        // packet and a packet of noise. Decoding goes on and conceals.
+        var hurt = mpeg12.newDecoder(keepTrack).value() ?? mpeg12.Decoder()
+        var got: [core.Picture] = []
+        k = 0
+        while k + 1 < keepCuts.count {
+            var packet = keepEs.slice(from: keepCuts[k], to: keepCuts[k] + keepCuts[k + 1])
+            let i = k / 2
+            if i == 4 {
+                var b = packet.bytes
+                for j in 3000..3200 {
+                    b[j] = (j * 37) & 255
+                }
+                packet = Data(bytes: b)
+            } else if i == 9 {
+                packet = packet.slice(from: 0, to: packet.count / 3)
+            } else if i == 15 {
+                var b: [Int] = []
+                for j in 0..5000 {
+                    b.append((j * 7919 + 13) & 255)
+                }
+                got += hurt.decode(Data(bytes: b), pts: core.noTime, dts: core.noTime, key: false)
+            }
+            got += hurt.decode(packet, pts: keepPts[i], dts: core.noTime, key: false)
+            k += 2
+        }
+        got += hurt.flush()
+        let yuv = testkit.referenceYuv("mpeg2.mpg", width: 320, height: 240)
+        var worst = 99.0
+        for i in 0..min(got.count, yuv.count) {
+            worst = min(worst, testkit.psnr(got[i], yuv[i]))
+        }
+        check(got.count >= 49 && !hurt.warnings.isEmpty, "damage: {got.count} pictures, {hurt.warnings.count} warnings")
+        check(worst > 15.0, "damage: concealed pictures stay close (worst PSNR {fmt(worst)} dB)")
+        print("damage: {got.count} pictures, warnings: {hurt.warnings.joined(separator: "; ")}; worst PSNR of the first 10 {fmt(worst)} dB")
+
+        check(dec.info == "MPEG-2 Main@Main, 320×240, 4:2:0", "info: {dec.info}")
+        check(mpeg12.videoInfo(keepTrack) == "MPEG-2 Main@Main, 320×240, 4:2:0", "videoInfo from the track's extra")
+        let bad = mpeg12.newDecoder(core.Track(index: 0, kind: .video, codec: "h264"))
+        check(!bad.isOk(), "newDecoder refuses other codecs")
+    }
+
+    // ---- Fuzzing: random bytes changed all over; nothing may stop
+    // the program, and every frame still gives a picture ----
+    if !keepCuts.isEmpty {
+        var seed = 12345
+        var fuzzOk = true
+        for round in 0..6 {
+            var fz = mpeg12.newDecoder(keepTrack).value() ?? mpeg12.Decoder()
+            var count = 0
+            var k = 0
+            while k + 1 < keepCuts.count {
+                var b = keepEs.slice(from: keepCuts[k], to: keepCuts[k] + keepCuts[k + 1]).bytes
+                let hits = 1 + round * 4
+                for _ in 0..hits {
+                    seed = (seed * 1103515245 + 12345) % 2147483648
+                    let at = seed % b.count
+                    seed = (seed * 1103515245 + 12345) % 2147483648
+                    b[at] = seed % 256
+                }
+                count += fz.decode(Data(bytes: b), pts: keepPts[k / 2], dts: core.noTime, key: false).count
+                k += 2
+            }
+            count += fz.flush().count
+            if count < 30 {
+                fuzzOk = false
+                print("fuzz round {round}: {count} pictures")
+            }
+        }
+        check(fuzzOk, "fuzzing: damaged streams decode on")
+    }
+
+    // ---- Speed: 1920×1080 at 15 Mbit/s (made by make_fixtures.sh) ----
+    let hd = readData("build/scratch/mpeg12/hd1080.m2v") ?? Data()
+    if !hd.isEmpty {
+        let cuts = splitFrames(hd)
+        var track = core.Track(index: 0, kind: .video, codec: "mpeg2")
+        track.timescale = 25
+        let r = decodeEs(hd, cuts, [], track)
+        if r.pictures.count > 0 {
+            print("time mpeg12 1080p per picture ({hd.count * 8 / 1000000 * 25 / max(r.pictures.count, 1)} Mbit/s): {fmt(r.ms / Float(r.pictures.count))} ms")
+        }
+    }
+
+    // ---- Conformance and sample streams (when downloaded) ----
+    let conf = "build/conformance/mpeg12"
+    let streams = ["sony-ct3.bs", "tcela-6.bits", "hhi_burst_422_short.bits", "mpeg2_field_encoding.ts", "dvd_single_frame.vob", "matrixbench_mpeg2.lq1.mpg", "xdcam8mp2-1s_small.ts"]
+    for s in streams {
+        let path = joinPath(conf, s)
+        if !fileExists(path) {
+            continue
+        }
+        let file = readData(path) ?? Data()
+        let es = if s.hasSuffix(".ts") { tsVideo(file) } else if s.hasSuffix(".mpg") || s.hasSuffix(".vob") { psVideo(file) } else { file }
+        let cuts = splitFrames(es)
+        var track = core.Track(index: 0, kind: .video, codec: "mpeg2")
+        track.timescale = 90000
+        let r = decodeEs(es, cuts, [], track)
+        let md5s = testkit.frameMd5s("../../" + path)
+        let c = compare(r.pictures, md5s: md5s, yuv: [])
+        let size = if let p = r.pictures.first { "{p.width}×{p.height} {p.chroma}" } else { "-" }
+        print("{s}: {r.pictures.count} pictures ({size}), ffmpeg {md5s.count}; md5 same {c.md5Same}; warnings {r.warnings.count} {r.warnings.first ?? ""}")
+        print("    tools: {r.tools.joined(separator: ", ")}")
+        // The sample cut off at 800000 bytes ends in a damaged picture,
+        // which ffmpeg conceals its own way.
+        let damaged = if s == "mpeg2_field_encoding.ts" { 1 } else { 0 }
+        check(r.pictures.count == md5s.count && c.md5Same == md5s.count - damaged, "{s}: bit-exact with ffmpeg")
+        if let p = r.pictures.first {
+            let want = refSar(path + ".v.framemd5")
+            check(want == "{p.sarNum}/{p.sarDen}", "{s}: sar {p.sarNum}/{p.sarDen}, ffmpeg {want}")
+        }
+        if r.pictures.count > 0 {
+            print("time mpeg12 {s} per picture: {fmt(r.ms / Float(r.pictures.count))} ms")
+        }
+        if s == "sony-ct3.bs" {
+            // Each field picture in its own packet, and every packet cut
+            // in two between slices: the same pictures.
+            let fields = decodeEs(es, splitFrames(es, pairFields: false), [], track)
+            let halves = decodeEs(es, splitHalves(es, cuts), [], track)
+            let cf = compare(fields.pictures, md5s: md5s, yuv: [])
+            let ch = compare(halves.pictures, md5s: md5s, yuv: [])
+            check(fields.pictures.count == md5s.count && cf.md5Same == md5s.count, "{s}: one field per packet")
+            check(halves.pictures.count == md5s.count && ch.md5Same == md5s.count, "{s}: pictures split across packets")
+        }
+    }
+
+    print("mpeg12: {passed} of {total} passed")
+}

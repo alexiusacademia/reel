@@ -1,0 +1,28 @@
+// Tests for the fx module (Reel's audio effects): the equalizer against
+// its designed curves, the loudness meter against the EBU Tech 3341/3342
+// test signals and ffmpeg's ebur128 (tests/fx/make_refs.py), dynamics,
+// the stereo stage, the whole chain (JSON settings, timing,
+// normalisation, smooth changes, visualiser) and its speed.
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+import "../../fx"
+import "../../core"
+
+fn main() {
+    var tally = Tally()
+    var t0 = now()
+    eqTests(tally)
+    print("time fx equalizer tests: {((now() - t0) * 1000.0).formatted(decimals: 0)} ms")
+    t0 = now()
+    loudnessTests(tally)
+    print("time fx loudness tests: {((now() - t0) * 1000.0).formatted(decimals: 0)} ms")
+    t0 = now()
+    dynamicsTests(tally)
+    stereoTests(tally)
+    chainTests(tally)
+    print("time fx dynamics, stereo and chain tests: {((now() - t0) * 1000.0).formatted(decimals: 0)} ms")
+    speedTests(tally)
+    print("fx: {tally.passed} of {tally.total} passed")
+}

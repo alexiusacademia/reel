@@ -1,0 +1,122 @@
+// The plain data the parser hands the reconstructor: a frame's header
+// (VP9 spec 6.2 uncompressed_header, plus what 7.2 derives from it) and a
+// ParsedFrame with one record per coded block and the block's non-zero
+// dequantised coefficients.
+//
+// Block record (blockSize Ints, in decoding order):
+//   0 row, 1 col (in 8x8 units), 2 block size bs (0 = 64x64 … 12 = 4x4),
+//   3 tx size, 4 uv tx size, 5 skip, 6 is intra, 7 is compound,
+//   8 ref frame 0, 9 ref frame 1 (0 LAST, 1 GOLDEN, 2 ALTREF),
+//   10…13 the y modes of the four 4x4 sub-blocks (intra modes 0…9, inter
+//   modes 10…13), 14 uv mode, 15 interpolation filter, 16 loop filter
+//   level (8.8.1), 17 index of the block's first coefficient entry,
+//   18 first 8x8 column of the block's tile, 19…26 motion vectors of the
+//   four sub-blocks b for ref r at 19 + b * 2 + r, packed y * 65536 + x
+//   (x as 16 bits; see vp9MvX / vp9MvY).
+// Coefficients: for every transform block of a block that isn't skipped
+// (y in raster order, then u, then v), the count n of non-zero
+// coefficients and n entries value * 1024 + raster position.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+let blockSize = 27
+
+public struct FrameHeader {
+    profile: Int = 0
+    bitDepth: Int = 8
+    ssH: Int = 1
+    ssV: Int = 1
+    // color_space (6.2.2): 0 unknown, 1 BT.601, 2 BT.709, 3 SMPTE-170,
+    // 4 SMPTE-240, 5 BT.2020, 6 reserved, 7 sRGB.
+    colorSpace: Int = 0
+    fullRange: Bool = false
+    showExisting: Bool = false
+    existingIdx: Int = 0
+    keyframe: Bool = false
+    show: Bool = true
+    errorRes: Bool = false
+    intraOnly: Bool = false
+    resetCtx: Int = 0
+    width: Int = 0
+    height: Int = 0
+    refreshMask: Int = 0
+    refIdx: [Int] = [0, 0, 0]
+    signBias: [Int] = [0, 0, 0]
+    highPrecisionMv: Bool = false
+    interpFilter: Int = 0
+    allowCompInter: Bool = false
+    fixCompRef: Int = 0
+    varCompRef: [Int] = [0, 0]
+    refreshCtx: Bool = false
+    parallelMode: Bool = false
+    ctxId: Int = 0
+    ctxRead: Int = 0
+    filterLevel: Int = 0
+    sharpness: Int = 0
+    lfDeltaEnabled: Bool = false
+    lfRef: [Int] = [1, 0, -1, -1]
+    lfMode: [Int] = [0, 0]
+    baseQ: Int = 0
+    dqYDc: Int = 0
+    dqUvDc: Int = 0
+    dqUvAc: Int = 0
+    lossless: Bool = false
+    segEnabled: Bool = false
+    segUpdateMap: Bool = false
+    segTemporal: Bool = false
+    segAbs: Bool = false
+    segProb: [Int] = [255, 255, 255, 255, 255, 255, 255]
+    segPredProb: [Int] = [255, 255, 255]
+    // Per segment features (6.2.11): enabled flags and values.
+    segQEn: [Int] = [0, 0, 0, 0, 0, 0, 0, 0]
+    segQVal: [Int] = [0, 0, 0, 0, 0, 0, 0, 0]
+    segLfEn: [Int] = [0, 0, 0, 0, 0, 0, 0, 0]
+    segLfVal: [Int] = [0, 0, 0, 0, 0, 0, 0, 0]
+    segRefEn: [Int] = [0, 0, 0, 0, 0, 0, 0, 0]
+    segRefVal: [Int] = [0, 0, 0, 0, 0, 0, 0, 0]
+    segSkip: [Int] = [0, 0, 0, 0, 0, 0, 0, 0]
+    // Dequantisation factors per segment: y dc, y ac, uv dc, uv ac.
+    qmul: [Int] = []
+    // Loop filter levels [segment 8][ref 4 (intra, last, golden, altref)]
+    // [mode (zero mv, other)].
+    lflvl: [Int] = []
+    tileColsLog2: Int = 0
+    tileRowsLog2: Int = 0
+    txMode: Int = 0
+    compPredMode: Int = 0
+    headerBytes: Int = 0
+    compressedBytes: Int = 0
+}
+
+// One frame of the stream as parsed.
+//   kind 0  a coded frame to reconstruct (shown when hdr.show)
+//        1  show_existing_frame: show reference slot hdr.existingIdx again
+//        2  damaged: show the last picture again (no reference changes)
+//        3  parsed but not needed (skipNonReference): nothing to show
+public struct ParsedFrame {
+    kind: Int = 0
+    hdr: FrameHeader = FrameHeader()
+    pts: Int = -9223372036854775807
+    key: Bool = false
+    cols: Int = 0
+    rows: Int = 0
+    sbCols: Int = 0
+    sbRows: Int = 0
+    nBlocks: Int = 0
+    blocks: [Int] = []
+    coefs: [Int] = []
+}
+
+// The parts of a packed motion vector.
+fn vp9MvX(_ p: Int) -> Int {
+    ((p & 0xffff) ^ 0x8000) - 0x8000
+}
+
+fn vp9MvY(_ p: Int) -> Int {
+    p >> 16
+}
+
+fn vp9Mv(_ x: Int, _ y: Int) -> Int {
+    (y << 16) + (x & 0xffff)
+}

@@ -1,0 +1,71 @@
+// What the HEVC parser hands to the reconstructor for one picture: a
+// stream of reconstruction operations in decoding order (intra prediction,
+// residual blocks, inter prediction, PCM samples), the tables the in-loop
+// filters need (an HevcFilter without planes), and the decoded picture
+// buffer actions to perform before and after (output a picture, free it).
+//
+// Everything is plain data so the two stages can run as separate
+// background jobs: parse(packet) -> [ParsedPicture] on one core,
+// reconstruct(ParsedPicture) -> [core.Picture] on another.
+//
+// Operation stream (flat Int list), each op starting with its code:
+//   opIntra   cIdx, x0, y0 (component samples), log2 size, mode,
+//             availability mask (bit k = reference unit k available)
+//   opResidual cIdx, x0, y0, log2 size: add the residual samples at that
+//             block of the picture's residual plane (resY / resU / resV,
+//             which the parser filled by the inverse transforms)
+//   opResDc   cIdx, x0, y0, log2 size, value: add one value to the block
+//   opInter   x0, y0, w, h (luma), flags (bit 0 list 0, bit 1 list 1,
+//             bit 2 explicit weights), slot0, mv0, slot1, mv1 (packed),
+//             and with weights: luma denom, chroma denom, then for lists 0
+//             and 1: luma w, o, Cb w, o, Cr w, o (offsets at bit depth)
+//   opPcm     x0, y0, log2 size, then the luma and chroma samples
+//   opConceal x0, y0, w, h (luma) of an area that wasn't decoded
+//
+// Actions: pairs (actOutput | actFree, slot).
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../core"
+
+let opIntra = 1
+let opResidual = 2
+let opInter = 3
+let opPcm = 4
+let opConceal = 5
+let opResDc = 6
+let actOutput = 1
+let actFree = 2
+
+public struct ParsedPicture {
+    // False for an entry that only carries actions (end of stream).
+    hasPicture: Bool = false
+    slot: Int = 0
+    poc: Int = 0
+    pts: Int = -9223372036854775807
+    key: Bool = false
+    width: Int = 0
+    height: Int = 0
+    chromaIdc: Int = 1
+    bitDepth: Int = 8
+    cropLeft: Int = 0
+    cropRight: Int = 0
+    cropTop: Int = 0
+    cropBottom: Int = 0
+    sarNum: Int = 1
+    sarDen: Int = 1
+    matrix: core.ColorMatrix = .unknown
+    fullRange: Bool = false
+    strongSmoothing: Bool = false
+    ops: [Int] = []
+    // Residual samples of the coded transform blocks (only those areas
+    // are meaningful), full picture size per colour.
+    resY: [Int] = []
+    resU: [Int] = []
+    resV: [Int] = []
+    filter: HevcFilter = HevcFilter()
+    before: [Int] = []
+    after: [Int] = []
+    warnings: [String] = []
+}

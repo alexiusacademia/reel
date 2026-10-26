@@ -1,0 +1,670 @@
+// Codec setup records and packet rewrites the writers need when a track
+// moves from one container to another:
+//   - H.264/HEVC in Annex B form (MPEG-TS, raw streams) → length-prefixed
+//     NAL units with an avcC (ISO/IEC 14496-15 §5.3.3) or hvcC (§8.3.3)
+//     built from the parameter sets found in the stream;
+//   - AAC with ADTS headers (ISO/IEC 14496-3 §1.A.2) → raw frames and an
+//     AudioSpecificConfig (§1.6.2.1);
+//   - AC-3 / E-AC-3 → dac3 / dec3 (ETSI TS 102 366 Annex F) read from the
+//     first frame's syncinfo and bit stream information (§4.4, §E.1.2);
+//   - OpusHead (RFC 7845 §5.1) ↔ dOps ("Encapsulation of Opus in ISOBMFF"
+//     §4.3.2); VP9 → vpcC ("VP Codec ISO Media File Format Binding" §2);
+//   - Vorbis/Theora headers → Matroska Xiph lacing (RFC 9559 §6.1 + the
+//     codec mappings); BITMAPINFOHEADER / WAVEFORMATEX for Matroska's
+//     V_MS/VFW/FOURCC and A_MS/ACM;
+//   - 3GPP timed text (TS 26.245 §5.17) ↔ plain UTF-8 subtitle text.
+// Written from those specifications only.
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+import "../core"
+
+// How a packet's bytes are changed on the way out.
+public let exCopy = 0
+public let exAnnexB = 1      // Annex B start codes → 4-byte lengths, AUDs dropped
+public let exAdts = 2        // ADTS header stripped
+public let exFromTx3g = 3    // 16-bit length + text (+ style boxes) → text
+public let exToTx3g = 4      // text → 16-bit length + text
+
+// NAL unit ranges in an Annex B stream as start, end pairs (trailing zero
+// bytes, which belong to the next start code, left out). ITU-T H.264 B.2.
+public fn exAnnexBNals(_ d: Data) -> [Int] {
+    var out: [Int] = []
+    let n = d.count
+    var i = 0
+    var start = -1
+    while i + 2 < n {
+        if d[i + 2] > 1 {
+            i += 3
+            continue
+        }
+        if d[i] == 0 && d[i + 1] == 0 && d[i + 2] == 1 {
+            if start >= 0 {
+                var e = i
+                while e > start && d[e - 1] == 0 {
+                    e -= 1
+                }
+                out.append(start)
+                out.append(e)
+            }
+            start = i + 3
+            i += 3
+        } else {
+            i += 1
+        }
+    }
+    if start >= 0 && start < n {
+        var e = n
+        while e > start && d[e - 1] == 0 {
+            e -= 1
+        }
+        out.append(start)
+        out.append(e)
+    }
+    out
+}
+
+// Whether data looks like Annex B (starts with a start code).
+public fn exIsAnnexB(_ d: Data) -> Bool {
+    d.count >= 4 && d[0] == 0 && d[1] == 0 && (d[2] == 1 || (d[2] == 0 && d[3] == 1))
+}
+
+fn exNalType(_ d: Data, _ at: Int, _ hevc: Bool) -> Int {
+    if hevc { (d[at] >> 1) & 63 } else { d[at] & 31 }
+}
+
+// An Annex B access unit as 4-byte-length NAL units, access unit
+// delimiters dropped (H.264 type 9, HEVC type 35).
+public fn exAnnexBToLengths(_ d: Data, _ hevc: Bool) -> Data {
+    let nals = exAnnexBNals(d)
+    var out = Data()
+    var k = 0
+    while k + 1 < nals.count {
+        let s = nals[k]
+        let e = nals[k + 1]
+        k += 2
+        if e <= s {
+            continue
+        }
+        let t = exNalType(d, s, hevc)
+        if (!hevc && t == 9) || (hevc && t == 35) {
+            continue
+        }
+        let len = e - s
+        out.append(byte: (len >> 24) & 255)
+        out.append(byte: (len >> 16) & 255)
+        out.append(byte: (len >> 8) & 255)
+        out.append(byte: len & 255)
+        out += d.slice(from: s, to: e)
+    }
+    out
+}
+
+// Parameter sets collected from Annex B packets.
+public struct ExParamSets {
+    vps: [Data] = []
+    sps: [Data] = []
+    pps: [Data] = []
+
+    fn complete(_ hevc: Bool) -> Bool {
+        !sps.isEmpty && !pps.isEmpty && (!hevc || !vps.isEmpty)
+    }
+
+    // Adds the parameter sets in one access unit (each distinct one once).
+    fn collect(_ d: Data, _ hevc: Bool) {
+        let nals = exAnnexBNals(d)
+        var k = 0
+        while k + 1 < nals.count {
+            let s = nals[k]
+            let e = nals[k + 1]
+            k += 2
+            if e <= s {
+                continue
+            }
+            let t = exNalType(d, s, hevc)
+            let nal = d.slice(from: s, to: e)
+            if hevc {
+                if t == 32 && !vps.contains(nal) {
+                    vps.append(nal)
+                } else if t == 33 && !sps.contains(nal) {
+                    sps.append(nal)
+                } else if t == 34 && !pps.contains(nal) {
+                    pps.append(nal)
+                }
+            } else {
+                if t == 7 && !sps.contains(nal) {
+                    sps.append(nal)
+                } else if t == 8 && !pps.contains(nal) {
+                    pps.append(nal)
+                }
+            }
+        }
+    }
+}
+
+// AVCDecoderConfigurationRecord (ISO/IEC 14496-15 §5.3.3.1) from SPS and
+// PPS NAL units; for High profiles the chroma format and bit depths from
+// the SPS (H.264 §7.3.2.1.1) are added.
+public fn exBuildAvcC(_ ps: ExParamSets) -> Data {
+    if ps.sps.isEmpty {
+        return Data()
+    }
+    let sps = ps.sps[0]
+    var b = ExBuf()
+    b.u8(1)
+    b.u8(if sps.count > 1 { sps[1] } else { 66 })
+    b.u8(if sps.count > 2 { sps[2] } else { 0 })
+    b.u8(if sps.count > 3 { sps[3] } else { 30 })
+    b.u8(0xFF)    // 6 reserved bits, lengthSizeMinusOne = 3
+    b.u8(0xE0 | min(31, ps.sps.count))
+    for s in ps.sps {
+        b.u16(s.count)
+        b.bytes(s)
+    }
+    b.u8(min(255, ps.pps.count))
+    for p in ps.pps {
+        b.u16(p.count)
+        b.bytes(p)
+    }
+    let profile = if sps.count > 1 { sps[1] } else { 0 }
+    if profile == 100 || profile == 110 || profile == 122 || profile == 144 {
+        let rbsp = core.unescapeRbsp(sps, from: 1, to: sps.count)
+        var r = core.bitReader(rbsp)
+        r.bits(24)
+        r.ue()
+        let chroma = r.ue()
+        if chroma == 3 {
+            r.bits(1)
+        }
+        let bl = r.ue()
+        let bc = r.ue()
+        b.u8(0xFC | (chroma & 3))
+        b.u8(0xF8 | (bl & 7))
+        b.u8(0xF8 | (bc & 7))
+        b.u8(0)
+    }
+    b.data
+}
+
+// HEVCDecoderConfigurationRecord (ISO/IEC 14496-15 §8.3.3.1) from VPS,
+// SPS and PPS NAL units. The general profile/tier/level bytes are the 12
+// bytes of the SPS's profile_tier_level (H.265 §7.3.3) that follow its
+// first byte; chroma format and bit depths are read further on.
+public fn exBuildHvcC(_ ps: ExParamSets) -> Data {
+    if ps.sps.isEmpty {
+        return Data()
+    }
+    let sps = ps.sps[0]
+    let rbsp = core.unescapeRbsp(sps, from: 2, to: sps.count)
+    var b = ExBuf()
+    b.u8(1)
+    var r = core.bitReader(rbsp)
+    r.bits(4)
+    let maxSub = r.bits(3)
+    r.bits(1)
+    // general_profile_space … general_level_idc: 12 bytes.
+    for k in 0..12 {
+        b.u8(if 1 + k < rbsp.count { rbsp[1 + k] } else { 0 })
+    }
+    r.bits(32)
+    r.bits(32)
+    r.bits(32)
+    var subProfile: [Bool] = []
+    var subLevel: [Bool] = []
+    for _ in 0..maxSub {
+        subProfile.append(r.flag())
+        subLevel.append(r.flag())
+    }
+    if maxSub > 0 {
+        for _ in maxSub..8 {
+            r.bits(2)
+        }
+    }
+    for i in 0..maxSub {
+        if subProfile[i] {
+            r.bits(32)
+            r.bits(32)
+            r.bits(24)
+        }
+        if subLevel[i] {
+            r.bits(8)
+        }
+    }
+    r.ue()
+    let chroma = r.ue()
+    if chroma == 3 {
+        r.bits(1)
+    }
+    r.ue()
+    r.ue()
+    if r.flag() {
+        r.ue()
+        r.ue()
+        r.ue()
+        r.ue()
+    }
+    let bl = r.ue()
+    let bc = r.ue()
+    b.u16(0xF000)          // min_spatial_segmentation_idc 0
+    b.u8(0xFC)             // parallelismType 0
+    b.u8(0xFC | (chroma & 3))
+    b.u8(0xF8 | (bl & 7))
+    b.u8(0xF8 | (bc & 7))
+    b.u16(0)               // avgFrameRate
+    // constantFrameRate 0, numTemporalLayers, temporalIdNested 1,
+    // lengthSizeMinusOne 3.
+    b.u8(((maxSub + 1) & 7) << 3 | 4 | 3)
+    var arrays: [(Int, [Data])] = []
+    if !ps.vps.isEmpty {
+        arrays.append((32, ps.vps))
+    }
+    arrays.append((33, ps.sps))
+    if !ps.pps.isEmpty {
+        arrays.append((34, ps.pps))
+    }
+    b.u8(arrays.count)
+    for (type, list) in arrays {
+        b.u8(0x80 | type)  // array_completeness 1
+        b.u16(list.count)
+        for nal in list {
+            b.u16(nal.count)
+            b.bytes(nal)
+        }
+    }
+    b.data
+}
+
+// ---------------------------------------------------------------------------
+// AAC
+
+// The length of an ADTS header (7, or 9 with a CRC), 0 when d doesn't start
+// with one (ISO/IEC 14496-3 §1.A.2.2).
+public fn exAdtsHeaderLen(_ d: Data) -> Int {
+    if d.count < 7 || d[0] != 0xFF || (d[1] & 0xF6) != 0xF0 {
+        return 0
+    }
+    if (d[1] & 1) == 1 { 7 } else { 9 }
+}
+
+// The AudioSpecificConfig an ADTS header describes: object type =
+// profile + 1, sampling frequency index, channel configuration.
+public fn exAscFromAdts(_ d: Data) -> Data {
+    if exAdtsHeaderLen(d) == 0 {
+        return Data()
+    }
+    let object = ((d[2] >> 6) & 3) + 1
+    let sfi = (d[2] >> 2) & 15
+    let chans = ((d[2] & 1) << 2) | ((d[3] >> 6) & 3)
+    Data(bytes: [(object << 3) | (sfi >> 1), ((sfi & 1) << 7) | (chans << 3)])
+}
+
+// An AudioSpecificConfig for AAC-LC at a rate and channel count (when a
+// track has none and no ADTS header to read it from).
+public fn exAscFor(_ rate: Int, _ channels: Int) -> Data {
+    let rates = [96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350]
+    var sfi = 4
+    for (i, r) in rates.enumerated() {
+        if r == rate {
+            sfi = i
+        }
+    }
+    let ch = if channels == 8 { 7 } else { min(7, max(1, channels)) }
+    Data(bytes: [(2 << 3) | (sfi >> 1), ((sfi & 1) << 7) | (ch << 3)])
+}
+
+// ---------------------------------------------------------------------------
+// AC-3 and E-AC-3 (ETSI TS 102 366)
+
+// dac3 body (Annex F.4): fscod, bsid, bsmod, acmod, lfeon, bit_rate_code
+// from the first syncframe (§4.4.1 syncinfo, §4.4.2 bsi).
+public fn exDac3(_ frame: Data) -> Data {
+    if frame.count < 8 || frame[0] != 0x0B || frame[1] != 0x77 {
+        return Data(bytes: [0x10, 0x3D, 0xE0])
+    }
+    var r = core.bitReaderRange(frame, from: 4, to: frame.count)
+    let fscod = r.bits(2)
+    let frmsizecod = r.bits(6)
+    let bsid = r.bits(5)
+    let bsmod = r.bits(3)
+    let acmod = r.bits(3)
+    if (acmod & 1) != 0 && acmod != 1 {
+        r.bits(2)
+    }
+    if (acmod & 4) != 0 {
+        r.bits(2)
+    }
+    if acmod == 2 {
+        r.bits(2)
+    }
+    let lfeon = r.bits(1)
+    let v = (fscod << 22) | (bsid << 17) | (bsmod << 14) | (acmod << 11) | (lfeon << 10) | ((frmsizecod >> 1) << 5)
+    Data(bytes: [(v >> 16) & 255, (v >> 8) & 255, v & 255])
+}
+
+// dec3 body (Annex F.6) for independent substream 0 of the first frame
+// (§E.1.2.1–2); data_rate from the frame size and rate.
+public fn exDec3(_ frame: Data) -> Data {
+    if frame.count < 6 || frame[0] != 0x0B || frame[1] != 0x77 {
+        return Data()
+    }
+    var r = core.bitReaderRange(frame, from: 2, to: frame.count)
+    r.bits(2)    // strmtyp
+    r.bits(3)    // substreamid
+    let frmsiz = r.bits(11)
+    var fscod = r.bits(2)
+    var blocks = 6
+    var rate = 48000
+    if fscod == 3 {
+        let fscod2 = r.bits(2)
+        rate = [24000, 22050, 16000, 0][fscod2]
+        fscod = 3
+    } else {
+        let code = r.bits(2)
+        blocks = [1, 2, 3, 6][code]
+        rate = [48000, 44100, 32000, 0][fscod]
+    }
+    let acmod = r.bits(3)
+    let lfeon = r.bits(1)
+    let bsid = r.bits(5)
+    let bytes = (frmsiz + 1) * 2
+    let samples = 256 * blocks
+    let kbps = if rate > 0 { bytes * 8 * rate / samples / 1000 } else { 0 }
+    var b = ExBuf()
+    // data_rate (13) | num_ind_sub − 1 (3) = 0
+    b.u16((kbps & 0x1FFF) << 3)
+    // fscod 2, bsid 5, reserved 1, asvc 1, bsmod 3, acmod 3, lfeon 1,
+    // reserved 3, num_dep_sub 4, reserved 1: 24 bits.
+    let v = (fscod << 22) | (bsid << 17) | (acmod << 9) | (lfeon << 8)
+    b.u24(v)
+    b.data
+}
+
+// ---------------------------------------------------------------------------
+// Opus
+
+// dOps body from OpusHead: version 0 and big-endian fields.
+public fn exDopsFromOpusHead(_ h: Data) -> Data {
+    if h.count < 19 {
+        return Data()
+    }
+    var b = ExBuf()
+    b.u8(0)
+    let channels = h[9]
+    b.u8(channels)
+    b.u16(h.uint16(at: 10))
+    b.u32(h.uint32(at: 12))
+    b.u16(h.uint16(at: 16))
+    let family = h[18]
+    b.u8(family)
+    if family != 0 {
+        b.bytes(h.slice(from: 19, to: min(h.count, 21 + channels)))
+    }
+    b.data
+}
+
+// OpusHead's pre-skip (48 kHz samples).
+public fn exOpusPreSkip(_ h: Data) -> Int {
+    if h.count >= 12 { h.uint16(at: 10) } else { 312 }
+}
+
+// A plain stereo OpusHead (for a track that has none).
+public fn exOpusHeadFor(_ channels: Int) -> Data {
+    var out = Data(text: "OpusHead")
+    out += Data(bytes: [1, max(1, min(2, channels)), 0x38, 0x01, 0x80, 0xBB, 0, 0, 0, 0, 0])
+    out
+}
+
+// ---------------------------------------------------------------------------
+// VP9
+
+// vpcC body (version 1 FullBox contents) from the first keyframe's
+// uncompressed header (VP9 bitstream spec §6.2, color_config §6.2.2).
+public fn exVpcC(_ frame: Data, _ t: core.Track) -> Data {
+    var profile = 0
+    var depth = 8
+    var sub = 1
+    var full = if t.fullRange { 1 } else { 0 }
+    if frame.count >= 10 {
+        var r = core.bitReader(frame)
+        r.bits(2)
+        let lo = r.bits(1)
+        let hi = r.bits(1)
+        profile = (hi << 1) | lo
+        if profile == 3 {
+            r.bits(1)
+        }
+        let showExisting = r.bits(1)
+        let frameType = r.bits(1)
+        if showExisting == 0 && frameType == 0 {
+            r.bits(2)
+            if r.bits(24) == 0x498342 {
+                if profile >= 2 {
+                    depth = if r.bits(1) == 1 { 12 } else { 10 }
+                }
+                let cs = r.bits(3)
+                if cs != 7 {
+                    full = r.bits(1)
+                    if profile == 1 || profile == 3 {
+                        let sx = r.bits(1)
+                        let sy = r.bits(1)
+                        sub = if sx == 1 && sy == 1 { 1 } else if sx == 1 { 2 } else { 3 }
+                    }
+                } else {
+                    sub = 3
+                    full = 1
+                }
+            }
+        }
+    }
+    let matrix = match t.matrix {
+        .bt709 -> 1
+        .bt601 -> 6
+        .bt2020 -> 9
+        _ -> 2
+    }
+    var b = ExBuf()
+    b.u8(1)
+    b.u24(0)
+    b.u8(profile)
+    b.u8(0)          // level: not given
+    b.u8((depth << 4) | (sub << 1) | full)
+    b.u8(2)          // colour primaries, transfer: unspecified
+    b.u8(2)
+    b.u8(matrix)
+    b.u16(0)
+    b.data
+}
+
+// ---------------------------------------------------------------------------
+// Xiph headers, Windows structures
+
+// core's three-header form (4-byte lengths) → Matroska Xiph lacing.
+public fn exXiphLace(_ core3: Data) -> Data {
+    var parts: [Data] = []
+    var at = 0
+    while at + 4 <= core3.count && parts.count < 3 {
+        let len = core3.uint32(at: at, bigEndian: true)
+        parts.append(core3.slice(from: at + 4, to: at + 4 + len))
+        at += 4 + len
+    }
+    if parts.count != 3 {
+        return Data()
+    }
+    var out = Data()
+    out.append(byte: 2)
+    for k in 0..2 {
+        var n = parts[k].count
+        while n >= 255 {
+            out.append(byte: 255)
+            n -= 255
+        }
+        out.append(byte: n)
+    }
+    out += parts[0]
+    out += parts[1]
+    out += parts[2]
+    out
+}
+
+// BITMAPINFOHEADER (40 bytes, little-endian) + the codec's setup bytes.
+public fn exBitmapInfo(_ fourcc: String, _ w: Int, _ h: Int, _ extra: Data) -> Data {
+    var out = Data()
+    for v in [40 + extra.count, w, h] {
+        out += Data(bytes: v.bytes(count: 4))
+    }
+    out += Data(bytes: (1).bytes(count: 2))
+    out += Data(bytes: (24).bytes(count: 2))
+    out += exLatin1(fourcc, 4)
+    out += Data(bytes: (w * h * 3).bytes(count: 4))
+    for _ in 0..4 {
+        out += Data(bytes: (0).bytes(count: 4))
+    }
+    out += extra
+    out
+}
+
+// WAVEFORMATEX (18 bytes, little-endian) + cbSize bytes of setup.
+public fn exWaveFormat(_ tag: Int, _ t: core.Track) -> Data {
+    let ch = max(1, t.channels)
+    let bits = t.bitsPerSample
+    let align = if t.blockAlign > 0 { t.blockAlign } else { max(1, ch * max(8, bits) / 8) }
+    var out = Data()
+    out += Data(bytes: tag.bytes(count: 2))
+    out += Data(bytes: ch.bytes(count: 2))
+    out += Data(bytes: t.sampleRate.bytes(count: 4))
+    out += Data(bytes: (t.bitrate / 8).bytes(count: 4))
+    out += Data(bytes: align.bytes(count: 2))
+    out += Data(bytes: bits.bytes(count: 2))
+    out += Data(bytes: t.extra.count.bytes(count: 2))
+    out += t.extra
+    out
+}
+
+// The fourcc Matroska's V_MS/VFW/FOURCC needs for codecs it has no own ID
+// for (the inverse of the demuxers' mappings).
+public fn exVfwFourcc(_ codec: String) -> String {
+    match codec {
+        "vc1" -> "WVC1"
+        "wmv3" -> "WMV3"
+        "wmv2" -> "WMV2"
+        "wmv1" -> "WMV1"
+        "msmpeg4v2" -> "MP42"
+        "msmpeg4v1" -> "MPG4"
+        "dnxhd" -> "AVdn"
+        _ -> ""
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Subtitle text
+
+// The text of a 3GPP timed text sample: a 16-bit length, then that many
+// bytes of UTF-8 (style boxes after it are dropped).
+public fn exTx3gText(_ d: Data) -> Data {
+    if d.count < 2 {
+        return Data()
+    }
+    let n = d.uint16(at: 0, bigEndian: true)
+    d.slice(from: 2, to: min(d.count, 2 + n))
+}
+
+public fn exTextToTx3g(_ d: Data) -> Data {
+    var text = d
+    // Matroska SRT text uses \n or \r\n; tx3g wants \n.
+    if let s = d.text {
+        text = Data(text: s.replace("\r\n", with: "\n"))
+    }
+    let n = min(text.count, 65535)
+    var out = Data(bytes: [(n >> 8) & 255, n & 255])
+    out += text.slice(from: 0, to: n)
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Packet bytes
+
+// A packet's bytes from the source file (core.packetBytes without a Media:
+// the track's stripped prefix put back, split parts joined).
+public fn exSourceBytes(_ file: Data, _ prefix: Data, _ p: core.PacketRef) -> Data {
+    if p.parts.isEmpty {
+        let body = file.slice(from: p.offset, to: p.offset + p.size)
+        if prefix.isEmpty {
+            return body
+        }
+        return prefix + body
+    }
+    var out = prefix
+    var i = 0
+    while i + 1 < p.parts.count {
+        out += file.slice(from: p.parts[i], to: p.parts[i] + p.parts[i + 1])
+        i += 2
+    }
+    out
+}
+
+// A packet's bytes after the track's rewrite.
+public fn exTransform(_ d: Data, _ mode: Int, _ hevc: Bool) -> Data {
+    if mode == exAnnexB {
+        if exIsAnnexB(d) {
+            return exAnnexBToLengths(d, hevc)
+        }
+        return d
+    }
+    if mode == exAdts {
+        let n = exAdtsHeaderLen(d)
+        return if n > 0 { d.slice(from: n, to: d.count) } else { d }
+    }
+    if mode == exFromTx3g {
+        return exTx3gText(d)
+    }
+    if mode == exToTx3g {
+        return exTextToTx3g(d)
+    }
+    d
+}
+
+// The rewrite a track's packets get on the way into Matroska (mp4: false)
+// or MP4 (mp4: true).
+public fn payloadMode(_ t: core.Track, mp4: Bool) -> Int {
+    let c = t.codec
+    if (c == "h264" || c == "hevc") && (t.extra.isEmpty || exIsAnnexB(t.extra)) {
+        return exAnnexB
+    }
+    if c == "aac" && (t.adts || t.extra.isEmpty) {
+        return exAdts
+    }
+    if !mp4 && c == "tx3g" {
+        return exFromTx3g
+    }
+    if mp4 && (c == "srt" || c == "text" || c == "webvtt") {
+        return exToTx3g
+    }
+    exCopy
+}
+
+// A plan packet's bytes as a writer stores them.
+public fn packetPayload(_ file: Data, _ plan: ClipPlan, _ p: core.PacketRef, mp4: Bool) -> Data {
+    let t = plan.tracks[p.track]
+    let d = exSourceBytes(file, plan.prefixes[p.track], p)
+    let mode = payloadMode(t, mp4: mp4)
+    if mode == exCopy { d } else { exTransform(d, mode, t.codec == "hevc") }
+}
+
+// The plan without subtitle packets that carry no text (3GPP timed text
+// marks the gaps between cues with empty samples; Matroska has no use for
+// them). The Matroska writer applies it itself.
+public fn withoutEmptySubtitles(_ file: Data, _ plan: ClipPlan) -> ClipPlan {
+    var out = plan
+    var any = false
+    for t in plan.tracks {
+        if t.codec == "tx3g" {
+            any = true
+        }
+    }
+    if !any {
+        return out
+    }
+    out.packets = plan.packets.filter { p in plan.tracks[p.track].codec != "tx3g" || exTx3gText(exSourceBytes(file, plan.prefixes[p.track], p)).count > 0 }
+    out
+}

@@ -1,0 +1,362 @@
+// DVD subtitles (VobSub, "dvdsub"): sub-picture units (SPU) as in the DVD
+// Video specification's sub-picture stream, the way ffmpeg's dvdsubdec and
+// the public "DVD sub-picture" notes (dvd.sourceforge.net/spu_notes)
+// describe them:
+//
+//   SPU = size (2) + offset of the control sequences (2) + pixel data
+//         + control sequences
+//   control sequence = delay (2, in units of 1024/90000 s) + offset of the
+//         next one (2) + commands until 0xFF:
+//     00 forced start   01 start display   02 stop display
+//     03 palette: 4 nibbles, the 16-colour palette entry of colours 3..0
+//     04 alpha:   4 nibbles, 0 (clear) … 15 (solid) for colours 3..0
+//     05 area: x1, x2, y1, y2 (12 bits each)
+//     06 pixel data offsets of the top and bottom field
+//   pixels: interlaced, each field run-length coded in nibbles:
+//     1 nibble  01CC..11CC              runs of 1–3
+//     2 nibbles 0001 LLCC … 0011 LLCC   runs of 4–15
+//     3 nibbles 0000 01LL LLCC …        runs of 16–63
+//     4 nibbles 0000 00LL LLLL LLCC     runs of 64–255
+//     0000 0000 0000 00CC               fill to the end of the line
+//     lines start on a byte boundary.
+//
+// The 16-colour palette (RGB) and the frame size come from the .idx file
+// (in Matroska: the track's CodecPrivate): "size: 720x480",
+// "palette: 000000, ffffff, …".
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../core"
+
+public struct DvdSetup {
+    width: Int = 720
+    height: Int = 480
+    // 16 colours, rgba packed (opaque).
+    palette: [Int] = [0x000000FF, 0xFFFFFFFF, 0x808080FF, 0x404040FF, 0x000000FF, 0xFFFFFFFF, 0x808080FF, 0x404040FF, 0x000000FF, 0xFFFFFFFF, 0x808080FF, 0x404040FF, 0x000000FF, 0xFFFFFFFF, 0x808080FF, 0x404040FF]
+    hasPalette: Bool = false
+}
+
+// The idx text's size and palette.
+public fn parseIdx(_ text: String) -> DvdSetup {
+    var s = DvdSetup()
+    for raw in text.lines() {
+        let line = raw.trim()
+        let lower = line.lowercase()
+        if lower.hasPrefix("size:") {
+            let v = line.substring(from: 5, to: line.count).trim().lowercase().split("x")
+            if v.count == 2 {
+                s.width = Int(v[0].trim()) ?? 720
+                s.height = Int(v[1].trim()) ?? 480
+            }
+        } else if lower.hasPrefix("palette:") {
+            var pal: [Int] = []
+            for p in line.substring(from: 8, to: line.count).split(",") {
+                let h = subsHex(p.trim())
+                if h >= 0 {
+                    pal.append(h << 8 | 0xFF)
+                }
+            }
+            if pal.count >= 16 {
+                s.palette = pal.prefix(16)
+                s.hasPalette = true
+            }
+        }
+    }
+    s
+}
+
+struct DvdState {
+    setup: DvdSetup = DvdSetup()
+    canvas: [Int] = []
+    nextId: Int = 1
+    showing: [Cue] = []
+    warnings: [String] = []
+
+    // A nibble of the packet at nibble position `at`.
+    fn nib(_ d: Data, _ at: Int) -> Int {
+        let b = d[at >> 1]
+        if at & 1 == 0 { b >> 4 } else { b & 15 }
+    }
+
+    // One field: lines y0, y0 + 2, … of a w × h area, from byte `from`.
+    fn field(_ d: Data, from: Int, y0: Int, w: Int, h: Int, colors: [Int]) {
+        let limit = d.count * 2
+        var p = from * 2
+        var y = y0
+        while y < h {
+            var x = 0
+            while x < w {
+                if p >= limit {
+                    return
+                }
+                // ffmpeg's decode_run_4bit: read nibbles while the value is
+                // below 1, 4, 16, 64.
+                var v = nib(d, p)
+                p += 1
+                var t = 4
+                while v < t && t <= 0x40 && p < limit {
+                    v = v << 4 | nib(d, p)
+                    p += 1
+                    t = t << 2
+                }
+                let color = v & 3
+                var len = v >> 2
+                if v < 4 {
+                    len = w - x
+                }
+                len = min(len, w - x)
+                let c = colors[color]
+                if c & 0xFF != 0 {
+                    let row = y * w
+                    for k in 0..len {
+                        canvas[row + x + k] = c
+                    }
+                }
+                x += len
+            }
+            // Each line starts on a byte boundary.
+            if p & 1 == 1 {
+                p += 1
+            }
+            y += 2
+        }
+    }
+
+    fn spu(_ d: Data, time: Float, duration: Float) -> [Cue] {
+        var out: [Cue] = []
+        if d.count < 4 {
+            return out
+        }
+        let size = min(d.count, d.uint16(at: 0, bigEndian: true))
+        var cmd = d.uint16(at: 2, bigEndian: true)
+        var startMs = 0.0
+        var stopMs = -1.0
+        var forced = false
+        var idx = [0, 0, 0, 0]
+        var alpha = [0, 15, 15, 15]
+        var x1 = 0
+        var x2 = -1
+        var y1 = 0
+        var y2 = -1
+        var off1 = -1
+        var off2 = -1
+        var guard = 0
+        while cmd + 4 <= size && guard < 64 {
+            guard += 1
+            let date = d.uint16(at: cmd, bigEndian: true)
+            let next = d.uint16(at: cmd + 2, bigEndian: true)
+            let ms = Float(date << 10) / 90.0
+            var p = cmd + 4
+            var done = false
+            while p < size && !done {
+                let c = d[p]
+                p += 1
+                if c == 0x00 {
+                    forced = true
+                    startMs = ms
+                } else if c == 0x01 {
+                    startMs = ms
+                } else if c == 0x02 {
+                    stopMs = ms
+                } else if c == 0x03 && p + 2 <= size {
+                    idx = [d[p + 1] & 15, d[p + 1] >> 4, d[p] & 15, d[p] >> 4]
+                    p += 2
+                } else if c == 0x04 && p + 2 <= size {
+                    alpha = [d[p + 1] & 15, d[p + 1] >> 4, d[p] & 15, d[p] >> 4]
+                    p += 2
+                } else if c == 0x05 && p + 6 <= size {
+                    x1 = d[p] << 4 | d[p + 1] >> 4
+                    x2 = (d[p + 1] & 15) << 8 | d[p + 2]
+                    y1 = d[p + 3] << 4 | d[p + 4] >> 4
+                    y2 = (d[p + 4] & 15) << 8 | d[p + 5]
+                    p += 6
+                } else if c == 0x06 && p + 4 <= size {
+                    off1 = d.uint16(at: p, bigEndian: true)
+                    off2 = d.uint16(at: p + 2, bigEndian: true)
+                    p += 4
+                } else if c == 0x07 && p + 2 <= size {
+                    // Colour/contrast changes per area: skipped.
+                    p += d.uint16(at: p, bigEndian: true)
+                } else {
+                    // 0xFF ends the sequence (and anything unknown).
+                    done = true
+                }
+            }
+            if next <= cmd {
+                break
+            }
+            cmd = next
+        }
+        let w = x2 - x1 + 1
+        let h = y2 - y1 + 1
+        if w <= 0 || h <= 0 || off1 < 0 || off2 < 0 {
+            return out
+        }
+        var colors: [Int] = []
+        for k in 0..4 {
+            let base = setup.palette[idx[k] & 15]
+            colors.append((base & 0xFFFFFF00) | alpha[k] * 17)
+        }
+        canvas = core.zeros(w * h)
+        field(d, from: off1, y0: 0, w: w, h: h, colors: colors)
+        field(d, from: off2, y0: 1, w: w, h: h, colors: colors)
+        let start = time + startMs / 1000.0
+        var end = openEnd
+        if stopMs > startMs {
+            end = time + stopMs / 1000.0
+        } else if duration > 0.0 {
+            end = time + duration
+        }
+        if !showing.isEmpty {
+            var old = showing[0]
+            if old.end > start {
+                old.end = start
+                out.append(old)
+            }
+            showing = []
+        }
+        var cue = Cue(start: start, end: end)
+        cue.bitmap = SubBitmap(x: x1, y: y1, w: w, h: h, pixels: canvas, frameWidth: setup.width, frameHeight: setup.height)
+        cue.forced = forced
+        cue.id = nextId
+        nextId += 1
+        canvas = []
+        out.append(cue)
+        if end >= openEnd {
+            showing = [cue]
+        }
+        out
+    }
+}
+
+// The .idx "timestamp: hh:mm:ss:mmm, filepos: hex" lines of one
+// subtitle stream (the "id: xx, index: N" section `track`), with any
+// "delay:" applied: the file position of each SPU's pack and its time.
+// VobSub players (and ffmpeg) use these times, not the PES PTS.
+fn vobIdxTimes(_ idx: String, track: Int) -> [Int: Float] {
+    var out: [Int: Float] = [:]
+    var current = 0
+    var delay = 0.0
+    for raw in idx.lines() {
+        let line = raw.trim()
+        let lower = line.lowercase()
+        if lower.hasPrefix("id:") {
+            current = -1
+            if let k = lower.find("index:") {
+                current = Int(lower.substring(from: k + 6, to: lower.count).trim()) ?? -1
+            }
+            delay = 0.0
+        } else if lower.hasPrefix("delay:") {
+            var v = line.substring(from: 6, to: line.count).trim()
+            var sign = 1.0
+            if v.hasPrefix("-") {
+                sign = -1.0
+                v = v.substring(from: 1, to: v.count)
+            }
+            delay = sign * vobClock(v)
+        } else if lower.hasPrefix("timestamp:") && current == track {
+            let parts = line.substring(from: 10, to: line.count).split(",")
+            if parts.count >= 2 {
+                let t = vobClock(parts[0].trim())
+                let fp = parts[1].trim()
+                if fp.lowercase().hasPrefix("filepos:") {
+                    let pos = subsHex(fp.substring(from: 8, to: fp.count).trim())
+                    if pos >= 0 && t >= 0.0 {
+                        out[pos] = t + delay
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+// "hh:mm:ss:mmm" (the last part is milliseconds) in seconds.
+fn vobClock(_ s: String) -> Float {
+    let p = s.split(":")
+    if p.count != 4 {
+        return -1.0
+    }
+    Float(Int(p[0]) ?? 0) * 3600.0 + Float(Int(p[1]) ?? 0) * 60.0 + Float(Int(p[2]) ?? 0) + Float(Int(p[3]) ?? 0) / 1000.0
+}
+
+// A VobSub pair: the .idx text and the .sub file (MPEG program stream
+// whose private stream 1 carries the SPUs, substream 0x20 + track).
+// `track` picks the subtitle stream (0 = the first).
+public fn parseVobSub(idx: String, sub: Data, track: Int = 0) -> Result<SubTrack> {
+    var st = DvdState()
+    st.setup = parseIdx(idx)
+    let want = 0x20 + track
+    var cues: [Cue] = []
+    var pending = Data()
+    var pendingTime = 0.0
+    var need = 0
+    var p = 0
+    let n = sub.count
+    var packs = 0
+    var packAt = 0
+    let idxTimes = vobIdxTimes(idx, track: track)
+    while p + 6 <= n {
+        if sub[p] != 0 || sub[p + 1] != 0 || sub[p + 2] != 1 {
+            p += 1
+            continue
+        }
+        let code = sub[p + 3]
+        if code == 0xBA {
+            // Pack header: MPEG-2 (14 bytes + stuffing) or MPEG-1 (12).
+            packs += 1
+            packAt = p
+            if p + 14 <= n && sub[p + 4] & 0xC0 == 0x40 {
+                p += 14 + (sub[p + 13] & 7)
+            } else {
+                p += 12
+            }
+            continue
+        }
+        if code < 0xBB {
+            p += 4
+            continue
+        }
+        let len = sub.uint16(at: p + 4, bigEndian: true)
+        let end = min(n, p + 6 + len)
+        if code == 0xBD && p + 9 <= n {
+            // PES header (MPEG-2): flags, header length, PTS.
+            let hlen = sub[p + 8]
+            var pts = -1
+            if sub[p + 7] & 0x80 != 0 && p + 14 <= n {
+                let q = p + 9
+                pts = (sub[q] >> 1 & 7) << 30 | sub[q + 1] << 22 | (sub[q + 2] >> 1) << 15 | sub[q + 3] << 7 | sub[q + 4] >> 1
+            }
+            let at = p + 9 + hlen
+            if at < end {
+                let sid = sub[at]
+                if sid == want {
+                    let payload = sub.slice(from: at + 1, to: end)
+                    if pts >= 0 && (need <= 0 || pending.count >= need) {
+                        pending = payload
+                        pendingTime = idxTimes[packAt] ?? (Float(pts) / 90000.0)
+                        need = if payload.count >= 2 { payload.uint16(at: 0, bigEndian: true) } else { 0 }
+                    } else {
+                        pending = pending + payload
+                    }
+                    if need > 0 && pending.count >= need {
+                        cues = replaceCues(cues, st.spu(pending, time: pendingTime, duration: 0.0))
+                        pending = Data()
+                        need = 0
+                    }
+                }
+            }
+        }
+        p = end
+    }
+    if packs == 0 {
+        return .failure(error: Error("not a VobSub .sub file (no MPEG program stream packs)"))
+    }
+    var t = SubTrack(format: "dvdsub")
+    t.cues = cues.sorted(by: { a, b in a.start < b.start })
+    t.playResX = st.setup.width
+    t.playResY = st.setup.height
+    t.warnings = st.warnings
+    Result.ok(value: t)
+}

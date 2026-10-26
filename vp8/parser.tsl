@@ -1,0 +1,1133 @@
+// The first stage of the VP8 decoder: reads a frame's header (RFC 6386
+// section 9), its per-macroblock modes and motion vectors from the first
+// partition (sections 11, 16, 17), and its DCT tokens from the token
+// partitions (section 13), and hands the reconstructor a ParsedFrame of
+// plain records (vp8/frame.tsl). It keeps what VP8 carries from frame to
+// frame: probabilities (with the save/restore of refresh_entropy_probs),
+// the segment map and segment data, loop filter deltas, quantiser indices.
+//
+// Follows the RFC's reference decoder (dixie) and libvpx where they
+// differ in ways the test vectors show (loop filter deltas keep their old
+// value when not updated; segments are ignored when segmentation is off).
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../core"
+
+public struct Parser {
+    skipNonReference: Bool = false
+    warnings: [String] = []
+    ready: Bool = false
+    hasKey: Bool = false
+    // The first partition (header and modes) and the token partition
+    // being read.
+    bd: Vp8Bool = Vp8Bool()
+    tk: Vp8Bool = Vp8Bool()
+    // Frame size and the header kept between frames.
+    hdr: FrameHeader = FrameHeader()
+    width: Int = 0
+    height: Int = 0
+    mbCols: Int = 0
+    mbRows: Int = 0
+    // Probabilities (9.9, 13.4, 16.2, 17.2) and their saved copies.
+    coefP: [Int] = []
+    mvP: [Int] = []
+    yP: [Int] = []
+    uvP: [Int] = []
+    savedCoef: [Int] = []
+    savedMv: [Int] = []
+    savedY: [Int] = []
+    savedUv: [Int] = []
+    skipOn: Bool = false
+    skipProb: Int = 0
+    probIntra: Int = 0
+    probLast: Int = 0
+    probGolden: Int = 0
+    // Segmentation (9.3).
+    segOn: Bool = false
+    segUpdateMap: Bool = false
+    segAbs: Bool = false
+    segTree: [Int] = [255, 255, 255]
+    segQ: [Int] = [0, 0, 0, 0]
+    segLf: [Int] = [0, 0, 0, 0]
+    segMap: [Int] = []
+    // Loop filter deltas (9.4).
+    lfDeltaOn: Bool = false
+    lfRef: [Int] = [0, 0, 0, 0]
+    lfMode: [Int] = [0, 0, 0, 0]
+    // Quantiser indices (9.6): base and the five deltas.
+    qY1dc: Int = 0
+    qY2dc: Int = 0
+    qY2ac: Int = 0
+    qUvdc: Int = 0
+    qUvac: Int = 0
+    // Dequantisation factors per segment: y dc, y ac, uv dc, uv ac,
+    // y2 dc, y2 ac.
+    dq: [Int] = []
+    // Loop filter level per segment and [ref 4][mode 4] (15.1).
+    lfLevels: [Int] = []
+    // Partitions.
+    partStart: [Int] = [0, 0, 0, 0, 0, 0, 0, 0]
+    partSize: [Int] = [0, 0, 0, 0, 0, 0, 0, 0]
+    // Output of the frame being parsed.
+    mbs: [Int] = []
+    coefs: [Int] = []
+    nCoef: Int = 0
+    // Token contexts: 9 per macroblock column above, 9 on the left.
+    aboveCtx: [Int] = []
+    leftCtx: [Int] = [0, 0, 0, 0, 0, 0, 0, 0, 0]
+    // Tables copied into fields (module-level lists are slow to read).
+    tKfYTree: [Int] = []
+    tYTree: [Int] = []
+    tUvTree: [Int] = []
+    tBTree: [Int] = []
+    tKfB: [Int] = []
+    tKfY: [Int] = []
+    tKfUv: [Int] = []
+    tDefB: [Int] = []
+    tMvRefTree: [Int] = []
+    tSubMvRefTree: [Int] = []
+    tSubMvRefP: [Int] = []
+    tSplitTree: [Int] = []
+    tSplitP: [Int] = []
+    tParts: [Int] = []
+    tModeCtx: [Int] = []
+    tSmallMvTree: [Int] = []
+    tCoefUpd: [Int] = []
+    tMvUpd: [Int] = []
+    tBands: [Int] = []
+    tZigzag: [Int] = []
+    tDcQ: [Int] = []
+    tAcQ: [Int] = []
+    // Near motion vector search scratch (16.3): 4 vectors, 4 counts.
+    nearMv: [Int] = [0, 0, 0, 0]
+    nearCnt: [Int] = [0, 0, 0, 0]
+    probs4: [Int] = [0, 0, 0, 0]
+    // Time spent (seconds), for benchmarks.
+    tModes: Float = 0.0
+    tTokens: Float = 0.0
+
+    fn setup() {
+        if ready {
+            return
+        }
+        ready = true
+        bd.setup()
+        tk.setup()
+        tKfYTree = vp8KfYModeTree
+        tYTree = vp8YModeTree
+        tUvTree = vp8UvModeTree
+        tBTree = vp8BModeTree
+        tKfB = vp8KfBModeProbs
+        tKfY = vp8KfYModeProbs
+        tKfUv = vp8KfUvModeProbs
+        tDefB = vp8DefaultBModeProbs
+        tMvRefTree = vp8MvRefTree
+        tSubMvRefTree = vp8SubMvRefTree
+        tSubMvRefP = vp8SubMvRefProbs
+        tSplitTree = vp8SplitMvTree
+        tSplitP = vp8SplitMvProbs
+        tParts = vp8MvPartitions
+        tModeCtx = vp8ModeContexts
+        tSmallMvTree = vp8SmallMvTree
+        tCoefUpd = vp8CoefUpdateProbs
+        tMvUpd = vp8MvUpdateProbs
+        tBands = [0, 1, 2, 3, 6, 4, 5, 6, 6, 6, 6, 6, 6, 6, 6, 7, 0]
+        tZigzag = [0, 1, 4, 8, 5, 2, 3, 6, 9, 12, 13, 10, 7, 11, 14, 15]
+        tDcQ = vp8DcQ
+        tAcQ = vp8AcQ
+        coefP = vp8DefaultCoefProbs
+        mvP = vp8DefaultMvProbs
+        yP = vp8DefaultYModeProbs
+        uvP = vp8DefaultUvModeProbs
+        dq = vp8Zeros(24)
+        lfLevels = vp8Zeros(64)
+    }
+
+    fn warn(_ s: String) {
+        if warnings.count < 200 {
+            warnings.append(s)
+        }
+    }
+
+    // After a seek: wait for a keyframe.
+    fn reset() {
+        setup()
+        hasKey = false
+    }
+
+    // End of stream: VP8 holds nothing back.
+    fn flush() -> [ParsedFrame] {
+        []
+    }
+
+    // Parses one packet (one VP8 frame).
+    fn parse(_ packet: Data, pts: Int, dts: Int, key: Bool) -> [ParsedFrame] {
+        setup()
+        var pf = ParsedFrame()
+        pf.pts = pts
+        if packet.count == 0 {
+            // A dropped frame: nothing to show (as ffmpeg).
+            pf.kind = 3
+            return [pf]
+        }
+        let d = packet.bytes
+        let r = parseFrame(d, pts)
+        if r == 0 {
+            pf.kind = 0
+            pf.hdr = hdr
+            pf.key = hdr.keyframe
+            pf.mbs = mbs
+            pf.coefs = coefs
+            pf.nCoefs = nCoef
+        } else if r == 1 {
+            pf.kind = 3
+        } else {
+            pf.kind = 2
+            pf.hdr = hdr
+        }
+        [pf]
+    }
+
+    // 0 parsed, 1 nothing to do, 2 damaged.
+    fn parseFrame(_ d: [Int], _ pts: Int) -> Int {
+        let n = d.count
+        if n < 3 {
+            warn("vp8: frame of {n} bytes")
+            return if hasKey { 2 } else { 1 }
+        }
+        // 9.1: the frame tag.
+        let raw = d[0] | (d[1] << 8) | (d[2] << 16)
+        let isKey = (raw & 1) == 0
+        let version = (raw >> 1) & 7
+        let show = ((raw >> 4) & 1) == 1
+        let firstSize = (raw >> 5) & 0x7ffff
+        var at = 3
+        if isKey {
+            if n < 10 || d[3] != 0x9d || d[4] != 0x01 || d[5] != 0x2a {
+                warn("vp8: keyframe without its start code")
+                return if hasKey { 2 } else { 1 }
+            }
+            let sz = d[6] | (d[7] << 8) | (d[8] << 16) | (d[9] << 24)
+            let w = sz & 0x3fff
+            let h = (sz >> 16) & 0x3fff
+            if w == 0 || h == 0 {
+                warn("vp8: keyframe of size 0")
+                return if hasKey { 2 } else { 1 }
+            }
+            // Larger than 8K UHD: a damaged header (the planes would take
+            // gigabytes).
+            if w * h > 7680 * 4320 {
+                warn("vp8: keyframe of {w}×{h} refused")
+                return if hasKey { 2 } else { 1 }
+            }
+            hdr.hScale = (sz >> 14) & 3
+            hdr.vScale = (sz >> 30) & 3
+            if w != width || h != height || mbs.isEmpty {
+                width = w
+                height = h
+                mbCols = (w + 15) / 16
+                mbRows = (h + 15) / 16
+                mbs = vp8Zeros(mbCols * mbRows * vp8MbSize)
+                segMap = vp8Zeros(mbCols * mbRows)
+                aboveCtx = vp8Zeros(mbCols * 9)
+            }
+            at = 10
+        } else if !hasKey {
+            return 1
+        }
+        hdr.keyframe = isKey
+        hdr.version = version
+        hdr.show = show
+        hdr.width = width
+        hdr.height = height
+        hdr.mbCols = mbCols
+        hdr.mbRows = mbRows
+        hdr.firstPartSize = firstSize
+        if at + firstSize > n {
+            warn("vp8: first partition cut short")
+            return if hasKey || isKey { 2 } else { 1 }
+        }
+        bd.start(d, at, firstSize)
+        if isKey {
+            hdr.colorSpace = bd.bit()
+            hdr.clampType = bd.bit()
+        }
+        readSegmentation(isKey)
+        readLoopFilter(isKey)
+        if !readPartitions(d, at + firstSize) {
+            return if hasKey || isKey { 2 } else { 1 }
+        }
+        readQuant()
+        readRefs(isKey)
+        if isKey {
+            coefP = vp8DefaultCoefProbs
+            mvP = vp8DefaultMvProbs
+            yP = vp8DefaultYModeProbs
+            uvP = vp8DefaultUvModeProbs
+        }
+        if !hdr.refreshEntropy {
+            savedCoef = coefP
+            savedMv = mvP
+            savedY = yP
+            savedUv = uvP
+        }
+        readProbs(isKey)
+        // A frame that refreshes no reference can be dropped when asked
+        // (unless it updates the segment map, which later frames keep).
+        if skipNonReference && !isKey && !hdr.refreshGolden && !hdr.refreshAltref && !hdr.refreshLast &&
+            hdr.copyGolden == 0 && hdr.copyAltref == 0 && !segUpdateMap {
+            restoreProbs()
+            return 1
+        }
+        computeDequant()
+        computeFilterLevels(isKey)
+        let t0 = now()
+        readModes(isKey)
+        let t1 = now()
+        readTokens()
+        let t2 = now()
+        tModes += t1 - t0
+        tTokens += t2 - t1
+        restoreProbs()
+        if bd.damaged() {
+            warn("vp8: first partition damaged")
+            return 2
+        }
+        if isKey {
+            hasKey = true
+        }
+        0
+    }
+
+    fn restoreProbs() {
+        if !hdr.refreshEntropy {
+            coefP = savedCoef
+            mvP = savedMv
+            yP = savedY
+            uvP = savedUv
+        }
+    }
+
+    // 9.3 segmentation header.
+    fn readSegmentation(_ isKey: Bool) {
+        if isKey {
+            segAbs = false
+            segQ = [0, 0, 0, 0]
+            segLf = [0, 0, 0, 0]
+        }
+        segOn = bd.bit() == 1
+        segUpdateMap = false
+        if segOn {
+            segUpdateMap = bd.bit() == 1
+            let updateData = bd.bit() == 1
+            if updateData {
+                segAbs = bd.bit() == 1
+                for i in 0..4 {
+                    segQ[i] = bd.maybeSigned(7)
+                }
+                for i in 0..4 {
+                    segLf[i] = bd.maybeSigned(6)
+                }
+            }
+            if segUpdateMap {
+                for i in 0..3 {
+                    segTree[i] = if bd.bit() == 1 { bd.literal(8) } else { 255 }
+                }
+            }
+        }
+        hdr.segmentation = segOn
+    }
+
+    // 9.4 loop filter type, level, sharpness and deltas. A delta whose
+    // update flag is clear keeps its value (libvpx).
+    fn readLoopFilter(_ isKey: Bool) {
+        if isKey {
+            lfRef = [0, 0, 0, 0]
+            lfMode = [0, 0, 0, 0]
+        }
+        hdr.simpleFilter = bd.bit() == 1
+        hdr.filterLevel = bd.literal(6)
+        hdr.sharpness = bd.literal(3)
+        lfDeltaOn = bd.bit() == 1
+        if lfDeltaOn && bd.bit() == 1 {
+            for i in 0..4 {
+                if bd.bit() == 1 {
+                    lfRef[i] = bd.signedLiteral(6)
+                }
+            }
+            for i in 0..4 {
+                if bd.bit() == 1 {
+                    lfMode[i] = bd.signedLiteral(6)
+                }
+            }
+        }
+    }
+
+    // 9.5 token partitions: their count and sizes (3-byte little-endian
+    // sizes of all but the last after the first partition).
+    fn readPartitions(_ d: [Int], _ from: Int) -> Bool {
+        let np = 1 << bd.literal(2)
+        hdr.partitions = np
+        let n = d.count
+        var at = from + 3 * (np - 1)
+        if at > n {
+            warn("vp8: partition sizes cut short")
+            return false
+        }
+        var ok = true
+        for i in 0..np {
+            var sz = 0
+            if i < np - 1 {
+                let p = from + 3 * i
+                sz = d[p] | (d[p + 1] << 8) | (d[p + 2] << 16)
+            } else {
+                sz = n - at
+            }
+            if at + sz > n {
+                if ok {
+                    warn("vp8: token partition {i} cut short")
+                }
+                ok = false
+                sz = max(0, n - at)
+            }
+            partStart[i] = at
+            partSize[i] = sz
+            at += sz
+        }
+        true
+    }
+
+    // 9.6 quantiser indices.
+    fn readQuant() {
+        hdr.qIndex = bd.literal(7)
+        qY1dc = bd.maybeSigned(4)
+        qY2dc = bd.maybeSigned(4)
+        qY2ac = bd.maybeSigned(4)
+        qUvdc = bd.maybeSigned(4)
+        qUvac = bd.maybeSigned(4)
+    }
+
+    // 9.7, 9.8 reference frame updates and sign bias; refresh_entropy_probs.
+    fn readRefs(_ isKey: Bool) {
+        if isKey {
+            hdr.refreshGolden = true
+            hdr.refreshAltref = true
+            hdr.copyGolden = 0
+            hdr.copyAltref = 0
+            hdr.signBiasGolden = 0
+            hdr.signBiasAltref = 0
+            hdr.refreshEntropy = bd.bit() == 1
+            hdr.refreshLast = true
+            return
+        }
+        hdr.refreshGolden = bd.bit() == 1
+        hdr.refreshAltref = bd.bit() == 1
+        hdr.copyGolden = 0
+        if !hdr.refreshGolden {
+            hdr.copyGolden = bd.literal(2)
+        }
+        hdr.copyAltref = 0
+        if !hdr.refreshAltref {
+            hdr.copyAltref = bd.literal(2)
+        }
+        hdr.signBiasGolden = bd.bit()
+        hdr.signBiasAltref = bd.bit()
+        hdr.refreshEntropy = bd.bit() == 1
+        hdr.refreshLast = bd.bit() == 1
+    }
+
+    // 9.9, 9.10, 9.11: token probability updates, the skip probability,
+    // and for inter frames the reference and mode probabilities and the
+    // motion vector probability updates (17.2).
+    fn readProbs(_ isKey: Bool) {
+        let upd = tCoefUpd
+        for i in 0..1056 {
+            if bd.read(upd[i]) == 1 {
+                coefP[i] = bd.literal(8)
+            }
+        }
+        skipOn = bd.bit() == 1
+        skipProb = 0
+        if skipOn {
+            skipProb = bd.literal(8)
+        }
+        if !isKey {
+            probIntra = bd.literal(8)
+            probLast = bd.literal(8)
+            probGolden = bd.literal(8)
+            if bd.bit() == 1 {
+                for i in 0..4 {
+                    yP[i] = bd.literal(8)
+                }
+            }
+            if bd.bit() == 1 {
+                for i in 0..3 {
+                    uvP[i] = bd.literal(8)
+                }
+            }
+            let mu = tMvUpd
+            for i in 0..38 {
+                if bd.read(mu[i]) == 1 {
+                    let x = bd.literal(7)
+                    mvP[i] = if x != 0 { x << 1 } else { 1 }
+                }
+            }
+        }
+    }
+
+    // 14.1 dequantisation factors for each segment.
+    fn computeDequant() {
+        let nseg = if segOn { 4 } else { 1 }
+        for s in 0..nseg {
+            var q = hdr.qIndex
+            if segOn {
+                q = if segAbs { segQ[s] } else { q + segQ[s] }
+            }
+            let b = s * 6
+            dq[b] = tDcQ[vp8ClampQ(q + qY1dc)]
+            dq[b + 1] = tAcQ[vp8ClampQ(q)]
+            dq[b + 2] = min(tDcQ[vp8ClampQ(q + qUvdc)], 132)
+            dq[b + 3] = tAcQ[vp8ClampQ(q + qUvac)]
+            dq[b + 4] = tDcQ[vp8ClampQ(q + qY2dc)] * 2
+            dq[b + 5] = max(tAcQ[vp8ClampQ(q + qY2ac)] * 155 / 100, 8)
+        }
+    }
+
+    // 15.1 / 9.6: loop filter level for each segment, reference frame and
+    // mode class (0 B_PRED, 1 ZEROMV / other intra, 2 other inter, 3
+    // SPLITMV), as libvpx's vp8_loop_filter_frame_init.
+    fn computeFilterLevels(_ isKey: Bool) {
+        for s in 0..4 {
+            var lv = hdr.filterLevel
+            if segOn {
+                lv = if segAbs { segLf[s] } else { lv + segLf[s] }
+            }
+            lv = max(0, min(63, lv))
+            for ref in 0..4 {
+                for mode in 0..4 {
+                    var l = lv
+                    if lfDeltaOn {
+                        l += lfRef[ref]
+                        if ref == 0 {
+                            if mode == 0 {
+                                l += lfMode[0]
+                            }
+                        } else {
+                            l += lfMode[mode]
+                        }
+                    }
+                    lfLevels[s * 16 + ref * 4 + mode] = max(0, min(63, l))
+                }
+            }
+        }
+    }
+
+    // Sections 11 and 16: every macroblock's segment, skip flag, modes and
+    // motion vectors, from the first partition.
+    fn readModes(_ isKey: Bool) {
+        let cols = mbCols
+        let rows = mbRows
+        let R = vp8MbSize
+        for row in 0..rows {
+            // 16.3 / dixie: eighth-sample bounds for clamping, one
+            // macroblock beyond the frame.
+            var toLeft = -128
+            var toRight = (cols - 0) << 7
+            let toTop = -((row + 1) << 7)
+            let toBottom = (rows - row) << 7
+            for col in 0..cols {
+                let i = row * cols + col
+                let b = i * R
+                var seg = 0
+                if segUpdateMap {
+                    seg = if bd.read(segTree[0]) == 1 { 2 + bd.read(segTree[2]) } else { bd.read(segTree[1]) }
+                    segMap[i] = seg
+                } else if isKey {
+                    segMap[i] = 0
+                } else {
+                    seg = segMap[i]
+                }
+                let segUse = if segOn { segMap[i] } else { 0 }
+                mbs[b + 7] = segUse
+                var skip = 0
+                if skipOn {
+                    skip = bd.read(skipProb)
+                }
+                // Record field 4 (inner edges) holds the skip flag until
+                // the tokens are read.
+                mbs[b + 4] = skip
+                if isKey {
+                    kfModes(b, row, col)
+                } else if bd.read(probIntra) == 1 {
+                    interModes(b, row, col, toLeft, toRight, toTop, toBottom)
+                } else {
+                    intraModes(b)
+                }
+                toLeft -= 128
+                toRight -= 128
+            }
+        }
+    }
+
+    // 11.2-11.4 keyframe modes, with the subblock mode contexts of the
+    // macroblocks above and to the left (B_DC_PRED outside the frame).
+    fn kfModes(_ b: Int, _ row: Int, _ col: Int) {
+        let R = vp8MbSize
+        let cols = mbCols
+        let ym = bd.tree(tKfYTree, tKfY, 0)
+        mbs[b] = ym
+        mbs[b + 2] = 0
+        mbs[b + 6] = 0
+        if ym == 4 {
+            for k in 0..16 {
+                var a = 0
+                if k < 4 {
+                    if row > 0 {
+                        a = mbs[b - cols * R + 8 + k + 12]
+                    }
+                } else {
+                    a = mbs[b + 8 + k - 4]
+                }
+                var l = 0
+                if (k & 3) == 0 {
+                    if col > 0 {
+                        l = mbs[b - R + 8 + k + 3]
+                    }
+                } else {
+                    l = mbs[b + 8 + k - 1]
+                }
+                mbs[b + 8 + k] = bd.tree(tBTree, tKfB, (a * 10 + l) * 9)
+            }
+        } else {
+            let implied = vp8ImpliedBMode(ym)
+            for k in 0..16 {
+                mbs[b + 8 + k] = implied
+            }
+        }
+        mbs[b + 1] = bd.tree(tUvTree, tKfUv, 0)
+    }
+
+    // 16.1 intra macroblocks of inter frames: the frame's mode
+    // probabilities, no subblock contexts.
+    fn intraModes(_ b: Int) {
+        let ym = bd.tree(tYTree, yP, 0)
+        mbs[b] = ym
+        mbs[b + 2] = 0
+        mbs[b + 6] = 0
+        if ym == 4 {
+            for k in 0..16 {
+                mbs[b + 8 + k] = bd.tree(tBTree, tDefB, 0)
+            }
+        } else {
+            // Inter neighbours read these as motion vectors: zero.
+            for k in 0..16 {
+                mbs[b + 8 + k] = 0
+            }
+        }
+        mbs[b + 1] = bd.tree(tUvTree, uvP, 0)
+    }
+
+    // 17.1 one motion vector component (in the RFC's units, × 2).
+    fn mvComponent(_ base: Int) -> Int {
+        var x = 0
+        let p = mvP
+        if bd.read(p[base]) == 1 {
+            for i in 0..3 {
+                x += bd.read(p[base + 9 + i]) << i
+            }
+            var i = 9
+            while i > 3 {
+                x += bd.read(p[base + 9 + i]) << i
+                i -= 1
+            }
+            if (x & 0xfff0) == 0 || bd.read(p[base + 9 + 3]) == 1 {
+                x += 8
+            }
+        } else {
+            x = bd.tree(tSmallMvTree, p, base + 2)
+        }
+        if x != 0 && bd.read(p[base + 1]) == 1 {
+            x = -x
+        }
+        x << 1
+    }
+
+    // A motion vector: row then column component.
+    fn readMv() -> Int {
+        let y = mvComponent(0)
+        let x = mvComponent(19)
+        vp8Mv(x, y)
+    }
+
+    // The sign-bias-corrected vector of a neighbour (16.3 mv_bias).
+    fn biased(_ mv: Int, _ nref: Int, _ ref: Int) -> Int {
+        if vp8SignBias(nref, hdr) != vp8SignBias(ref, hdr) {
+            return vp8Mv(-vp8MvX(mv), -vp8MvY(mv))
+        }
+        mv
+    }
+
+    // 16.3 find_near_mvs: the candidate vectors of the above, left and
+    // above-left macroblocks with their weights, into nearMv / nearCnt.
+    fn findNear(_ b: Int, _ row: Int, _ col: Int, _ ref: Int) {
+        let R = vp8MbSize
+        let cols = mbCols
+        nearMv[0] = 0
+        nearMv[1] = 0
+        nearMv[2] = 0
+        nearMv[3] = 0
+        nearCnt[0] = 0
+        nearCnt[1] = 0
+        nearCnt[2] = 0
+        nearCnt[3] = 0
+        var m = 0
+        var splitCnt = 0
+        // Above.
+        if row > 0 {
+            let a = b - cols * R
+            if mbs[a + 2] != 0 {
+                let mv = mbs[a + 6]
+                if mv != 0 {
+                    m += 1
+                    nearMv[m] = biased(mv, mbs[a + 2], ref)
+                }
+                nearCnt[m] += 2
+            }
+            if mbs[a] == 9 {
+                splitCnt += 2
+            }
+        }
+        // Left.
+        if col > 0 {
+            let l = b - R
+            if mbs[l + 2] != 0 {
+                let mv = mbs[l + 6]
+                if mv != 0 {
+                    let t = biased(mv, mbs[l + 2], ref)
+                    if t != nearMv[m] {
+                        m += 1
+                        nearMv[m] = t
+                    }
+                    nearCnt[m] += 2
+                } else {
+                    nearCnt[0] += 2
+                }
+            }
+            if mbs[l] == 9 {
+                splitCnt += 2
+            }
+        }
+        // Above-left.
+        if row > 0 && col > 0 {
+            let al = b - cols * R - R
+            if mbs[al + 2] != 0 {
+                let mv = mbs[al + 6]
+                if mv != 0 {
+                    let t = biased(mv, mbs[al + 2], ref)
+                    if t != nearMv[m] {
+                        m += 1
+                        nearMv[m] = t
+                    }
+                    nearCnt[m] += 1
+                } else {
+                    nearCnt[0] += 1
+                }
+            }
+            if mbs[al] == 9 {
+                splitCnt += 1
+            }
+        }
+        // Three different vectors: merge above-left with nearest if equal.
+        if nearCnt[3] > 0 && nearMv[m] == nearMv[1] {
+            nearCnt[1] += 1
+        }
+        nearCnt[3] = splitCnt
+        if nearCnt[2] > nearCnt[1] {
+            let tc = nearCnt[1]
+            nearCnt[1] = nearCnt[2]
+            nearCnt[2] = tc
+            let tm = nearMv[1]
+            nearMv[1] = nearMv[2]
+            nearMv[2] = tm
+        }
+        if nearCnt[1] >= nearCnt[0] {
+            nearMv[0] = nearMv[1]
+        }
+    }
+
+    // 16.2-16.4 an inter macroblock: reference frame, mode, vectors.
+    fn interModes(_ b: Int, _ row: Int, _ col: Int, _ toLeft: Int, _ toRight: Int, _ toTop: Int, _ toBottom: Int) {
+        let ref = if bd.read(probLast) == 1 { 2 + bd.read(probGolden) } else { 1 }
+        mbs[b + 2] = ref
+        findNear(b, row, col, ref)
+        let mc = tModeCtx
+        probs4[0] = mc[nearCnt[0] * 4]
+        probs4[1] = mc[nearCnt[1] * 4 + 1]
+        probs4[2] = mc[nearCnt[2] * 4 + 2]
+        probs4[3] = mc[nearCnt[3] * 4 + 3]
+        let mode = bd.tree(tMvRefTree, probs4, 0)
+        mbs[b] = mode
+        mbs[b + 1] = mode
+        var mv = 0
+        if mode == 5 {
+            mv = vp8ClampMv(nearMv[1], toLeft, toRight, toTop, toBottom)
+        } else if mode == 6 {
+            mv = vp8ClampMv(nearMv[2], toLeft, toRight, toTop, toBottom)
+        } else if mode == 8 {
+            let best = vp8ClampMv(nearMv[0], toLeft, toRight, toTop, toBottom)
+            let d = readMv()
+            mv = vp8Mv(vp8MvX(d) + vp8MvX(best), vp8MvY(d) + vp8MvY(best))
+        } else if mode == 9 {
+            let best = vp8ClampMv(nearMv[0], toLeft, toRight, toTop, toBottom)
+            splitMvs(b, row, col, best)
+            mv = mbs[b + 8 + 15]
+        }
+        mbs[b + 6] = mv
+        if mode != 9 {
+            for k in 0..16 {
+                mbs[b + 8 + k] = mv
+            }
+        }
+    }
+
+    // 16.4 split prediction: the partitioning, then one vector per
+    // partition (from the left or above subblock, zero, or new).
+    fn splitMvs(_ b: Int, _ row: Int, _ col: Int, _ best: Int) {
+        let R = vp8MbSize
+        let cols = mbCols
+        let pid = bd.tree(tSplitTree, tSplitP, 0)
+        let parts = tParts
+        let pBase = pid * 16
+        var j = 0
+        var mask = 0
+        while mask < 65535 {
+            var k = 0
+            while k < 16 && parts[pBase + k] != j {
+                k += 1
+            }
+            if k == 16 {
+                break
+            }
+            var lmv = 0
+            if (k & 3) == 0 {
+                if col > 0 {
+                    let l = b - R
+                    lmv = if mbs[l] == 9 { mbs[l + 8 + k + 3] } else { mbs[l + 6] }
+                }
+            } else {
+                lmv = mbs[b + 8 + k - 1]
+            }
+            var amv = 0
+            if k < 4 {
+                if row > 0 {
+                    let a = b - cols * R
+                    amv = if mbs[a] == 9 { mbs[a + 8 + k + 12] } else { mbs[a + 6] }
+                }
+            } else {
+                amv = mbs[b + 8 + k - 4]
+            }
+            // submv_ref contexts (16.4).
+            var ctx = 0
+            let lez = lmv == 0
+            let aez = amv == 0
+            let lea = lmv == amv
+            if lea && lez {
+                ctx = 4
+            } else if lea {
+                ctx = 3
+            } else if aez {
+                ctx = 2
+            } else if lez {
+                ctx = 1
+            }
+            let sm = bd.tree(tSubMvRefTree, tSubMvRefP, ctx * 3)
+            var mv = 0
+            if sm == 10 {
+                mv = lmv
+            } else if sm == 11 {
+                mv = amv
+            } else if sm == 13 {
+                let d = readMv()
+                mv = vp8Mv(vp8MvX(d) + vp8MvX(best), vp8MvY(d) + vp8MvY(best))
+            }
+            var kk = k
+            while kk < 16 {
+                if parts[pBase + kk] == j {
+                    mbs[b + 8 + kk] = mv
+                    mask = mask | (1 << kk)
+                }
+                kk += 1
+            }
+            j += 1
+        }
+    }
+
+    // Section 13: every macroblock's tokens, rows taking turns among the
+    // token partitions; then each macroblock's loop filter level and
+    // inner-edge flag.
+    fn readTokens() {
+        let cols = mbCols
+        let rows = mbRows
+        let R = vp8MbSize
+        let np = hdr.partitions
+        // Each partition's decoder state, saved between its rows.
+        var states: [Vp8Bool] = []
+        for p in 0..np {
+            var t = Vp8Bool()
+            t.setup()
+            states.append(t)
+        }
+        var started = [0, 0, 0, 0, 0, 0, 0, 0]
+        for i in 0..(cols * 9) {
+            aboveCtx[i] = 0
+        }
+        nCoef = 0
+        var damagedRows = 0
+        for row in 0..rows {
+            let p = row % np
+            if started[p] == 0 {
+                tk.start(bdData(), partStart[p], partSize[p])
+                started[p] = 1
+            } else {
+                tk = states[p]
+            }
+            for i in 0..9 {
+                leftCtx[i] = 0
+            }
+            for col in 0..cols {
+                let b = (row * cols + col) * R
+                let mode = mbs[b]
+                let hasY2 = mode != 4 && mode != 9
+                var any = 0
+                if mbs[b + 4] == 1 {
+                    // Skipped: reset the contexts (the Y2 one only when the
+                    // macroblock would have had a Y2 block).
+                    for i in 0..8 {
+                        leftCtx[i] = 0
+                        aboveCtx[col * 9 + i] = 0
+                    }
+                    if hasY2 {
+                        leftCtx[8] = 0
+                        aboveCtx[col * 9 + 8] = 0
+                    }
+                    mbs[b + 5] = -1
+                } else {
+                    any = mbTokens(b, col, hasY2, mbs[b + 7])
+                }
+                // Loop filter level and inner edges (15.1).
+                let ref = mbs[b + 2]
+                var mclass = 2
+                if mode == 4 {
+                    mclass = 0
+                } else if mode < 4 || mode == 7 {
+                    mclass = 1
+                } else if mode == 9 {
+                    mclass = 3
+                }
+                mbs[b + 3] = lfLevels[mbs[b + 7] * 16 + ref * 4 + mclass]
+                mbs[b + 4] = if any == 1 || !hasY2 { 1 } else { 0 }
+            }
+            if tk.damaged() {
+                damagedRows += 1
+            }
+            states[p] = tk
+        }
+        if damagedRows > 0 {
+            warn("vp8: token partition damaged ({damagedRows} rows read past the end)")
+        }
+    }
+
+    fn bdData() -> [Int] {
+        bd.data
+    }
+
+    // 13.2-13.3 the tokens of one macroblock (decode_mb_tokens): Y2 first
+    // when the mode has it, then the 16 Y blocks, then U and V. Writes
+    // the entries to coefs; returns 1 when any block had tokens.
+    fn mbTokens(_ b: Int, _ col: Int, _ hasY2: Bool, _ seg: Int) -> Int {
+        let start = nCoef
+        mbs[b + 5] = start
+        put(0)
+        var any = 0
+        let q = seg * 6
+        let ab = col * 9
+        if hasY2 {
+            let ctx = leftCtx[8] + aboveCtx[ab + 8]
+            let nz = blockTokens(1, 0, ctx, 24, dq[q + 4], dq[q + 5])
+            leftCtx[8] = nz
+            aboveCtx[ab + 8] = nz
+            any = any | nz
+        }
+        let ytype = if hasY2 { 0 } else { 3 }
+        let first = if hasY2 { 1 } else { 0 }
+        for k in 0..16 {
+            let li = k >> 2
+            let ai = ab + (k & 3)
+            let ctx = leftCtx[li] + aboveCtx[ai]
+            let nz = blockTokens(ytype, first, ctx, k, dq[q], dq[q + 1])
+            leftCtx[li] = nz
+            aboveCtx[ai] = nz
+            any = any | nz
+        }
+        for k in 16..24 {
+            // U: left 4, 4, 5, 5, above 4, 5, 4, 5; V: 6, 6, 7, 7 / 6, 7, 6, 7.
+            let u = k - 16
+            let base = if u < 4 { 4 } else { 6 }
+            let li = base + ((u & 3) >> 1)
+            let ai = ab + base + (u & 1)
+            let ctx = leftCtx[li] + aboveCtx[ai]
+            let nz = blockTokens(2, 0, ctx, k, dq[q + 2], dq[q + 3])
+            leftCtx[li] = nz
+            aboveCtx[ai] = nz
+            any = any | nz
+        }
+        coefs[start] = nCoef - start - 1
+        if nCoef == start + 1 {
+            // No non-zero values after all.
+            nCoef = start
+            mbs[b + 5] = -1
+        }
+        any
+    }
+
+    fn put(_ v: Int) {
+        if nCoef < coefs.count {
+            coefs[nCoef] = v
+        } else {
+            coefs.append(v)
+        }
+        nCoef += 1
+    }
+
+    // One block's tokens (13.2): type 0 Y after Y2, 1 Y2, 2 chroma, 3 Y
+    // with DC; first position; context 0…2. Returns 1 when any token
+    // came before the end of block.
+    fn blockTokens(_ type: Int, _ first: Int, _ ctx0: Int, _ blk: Int, _ dcQ: Int, _ acQ: Int) -> Int {
+        let cp = coefP
+        let bands = tBands
+        let zz = tZigzag
+        var c = first
+        var p = ((type * 8 + bands[c]) * 3 + ctx0) * 11
+        if tk.read(cp[p]) == 0 {
+            return 0
+        }
+        while true {
+            // Zero tokens (no end of block may follow one).
+            var atEnd = false
+            while tk.read(cp[p + 1]) == 0 {
+                c += 1
+                if c == 16 {
+                    atEnd = true
+                    break
+                }
+                p = ((type * 8 + bands[c]) * 3) * 11
+            }
+            if atEnd {
+                break
+            }
+            var v = 1
+            var nctx = 2
+            if tk.read(cp[p + 2]) == 0 {
+                nctx = 1
+            } else if tk.read(cp[p + 3]) == 0 {
+                if tk.read(cp[p + 4]) == 0 {
+                    v = 2
+                } else {
+                    v = 3 + tk.read(cp[p + 5])
+                }
+            } else if tk.read(cp[p + 6]) == 0 {
+                if tk.read(cp[p + 7]) == 0 {
+                    v = 5 + tk.read(159)
+                } else {
+                    v = 7 + (tk.read(165) << 1)
+                    v += tk.read(145)
+                }
+            } else if tk.read(cp[p + 8]) == 0 {
+                if tk.read(cp[p + 9]) == 0 {
+                    v = 11 + (tk.read(173) << 2)
+                    v += tk.read(148) << 1
+                    v += tk.read(140)
+                } else {
+                    v = 19 + (tk.read(176) << 3)
+                    v += tk.read(155) << 2
+                    v += tk.read(140) << 1
+                    v += tk.read(135)
+                }
+            } else if tk.read(cp[p + 10]) == 0 {
+                v = 35 + (tk.read(180) << 4)
+                v += tk.read(157) << 3
+                v += tk.read(141) << 2
+                v += tk.read(134) << 1
+                v += tk.read(130)
+            } else {
+                v = 67 + (tk.read(254) << 10)
+                v += tk.read(254) << 9
+                v += tk.read(243) << 8
+                v += tk.read(230) << 7
+                v += tk.read(196) << 6
+                v += tk.read(177) << 5
+                v += tk.read(153) << 4
+                v += tk.read(140) << 3
+                v += tk.read(133) << 2
+                v += tk.read(130) << 1
+                v += tk.read(129)
+            }
+            if tk.read(128) == 1 {
+                v = -v
+            }
+            let q = if c == 0 { dcQ } else { acQ }
+            // The coefficient store is 16-bit (libvpx and ffmpeg).
+            let dv = ((v * q + 32768) & 65535) - 32768
+            if dv != 0 {
+                put(dv * 512 + blk * 16 + zz[c])
+            }
+            c += 1
+            if c == 16 {
+                break
+            }
+            p = ((type * 8 + bands[c]) * 3 + nctx) * 11
+            if tk.read(cp[p]) == 0 {
+                break
+            }
+        }
+        1
+    }
+}
+
+fn vp8ClampQ(_ q: Int) -> Int {
+    max(0, min(127, q))
+}
+
+// The 4×4 intra mode a macroblock's 16×16 mode implies for its
+// neighbours' contexts (11.3): DC → B_DC, V → B_VE, H → B_HE, TM → B_TM.
+fn vp8ImpliedBMode(_ ym: Int) -> Int {
+    if ym == 1 {
+        return 2
+    }
+    if ym == 2 {
+        return 3
+    }
+    if ym == 3 {
+        return 1
+    }
+    0
+}
+
+fn vp8SignBias(_ ref: Int, _ h: FrameHeader) -> Int {
+    if ref == 2 {
+        return h.signBiasGolden
+    }
+    if ref == 3 {
+        return h.signBiasAltref
+    }
+    0
+}
+
+// clamp_mv: a vector clamped to the eighth-sample bounds.
+fn vp8ClampMv(_ mv: Int, _ toLeft: Int, _ toRight: Int, _ toTop: Int, _ toBottom: Int) -> Int {
+    let x = vp8MvX(mv)
+    let y = vp8MvY(mv)
+    vp8Mv(max(toLeft, min(toRight, x)), max(toTop, min(toBottom, y)))
+}

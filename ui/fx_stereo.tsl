@@ -1,0 +1,70 @@
+// The Stereo tab of the "Effects and Filters" window: the stereo mode
+// (stereo, mono, swap, left or right only), mid-side width, balance, and
+// the headphone crossfeed (on/off, amount, corner frequency). They act on
+// two-channel sound only; other layouts pass through fx's stereo stage.
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+import "../fx"
+
+public view StereoView(audio: bind fx.Settings, onChange: fn()) {
+    fn pickMode(_ name: String) {
+        audio.stereoMode = fxStereoMode(named: name)
+        onChange()
+    }
+
+    fn crossfeedEdited() {
+        audio.crossfeedOn = true
+        onChange()
+    }
+
+    fn reset() {
+        let d = fx.Settings()
+        audio.stereoMode = d.stereoMode
+        audio.width = d.width
+        audio.balance = d.balance
+        audio.crossfeedOn = d.crossfeedOn
+        audio.crossfeedAmount = d.crossfeedAmount
+        audio.crossfeedHz = d.crossfeedHz
+        onChange()
+    }
+
+    VStack(spacing: 12, alignment: .leading) {
+        FxuSection(title: "Channels") {
+            FxuSegments(label: "Mode", options: fxStereoModeNames, selected: fxStereoModeName(audio.stereoMode), onPick: pickMode)
+            FxuSliderRow(label: "Width", value: audio.width, from: 0, to: 2, step: 0.05, text: fxWidthText(audio.width), onChange: onChange)
+                .disabled(audio.stereoMode != .stereo && audio.stereoMode != .swap)
+            FxuSliderRow(label: "Balance", value: audio.balance, from: -1, to: 1, step: 0.05, text: fxBalanceText(audio.balance), onChange: onChange)
+        }
+
+        FxuSwitchSection(title: "Headphone crossfeed", isOn: audio.crossfeedOn, onChange: onChange, extra: Button("Reset stereo") { reset() }) {
+            Text("Feeds a little of each channel, low-passed, to the other ear, so wide stereo sounds less tiring on headphones.")
+                .font(size: 12)
+                .color(.secondary)
+            FxuSliderRow(label: "Amount", value: audio.crossfeedAmount, from: 0, to: 1, step: 0.05, text: "{Int(floor(audio.crossfeedAmount * 100.0 + 0.5))} %", onChange: crossfeedEdited)
+            FxuSliderRow(label: "Corner", value: audio.crossfeedHz, from: 300, to: 1500, step: 10, text: "{Int(floor(audio.crossfeedHz + 0.5))} Hz", onChange: crossfeedEdited)
+        }
+        .opacity(if audio.crossfeedOn { 1.0 } else { 0.8 })
+    }
+}
+
+// "Mono", "As recorded", "150 %".
+public fn fxWidthText(_ w: Float) -> String {
+    if w < 0.025 {
+        return "Mono"
+    }
+    if abs(w - 1.0) < 0.025 {
+        return "As recorded"
+    }
+    "{Int(floor(w * 100.0 + 0.5))} %"
+}
+
+// "Centre", "L 30 %", "R 100 %".
+public fn fxBalanceText(_ b: Float) -> String {
+    let pct = Int(floor(abs(b) * 100.0 + 0.5))
+    if pct == 0 {
+        return "Centre"
+    }
+    if b < 0.0 { "L {pct} %" } else { "R {pct} %" }
+}

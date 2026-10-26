@@ -1,0 +1,323 @@
+// Tests for the AVI, MPEG-TS and MPEG-PS demuxers (demux/avi.tsl,
+// demux/ts.tsl, demux/ps.tsl): every AVI/TS/MPG fixture against ffmpeg's
+// reference (F.ref.json, and F.hashes.json from tests/demux_c/make_refs.py
+// with each stream's exact time base and every packet's md5), extra files
+// made by tests/demux_c/make_fixtures.sh (no index, OpenDML, M2TS, damaged
+// sync, timestamp wraparound, VOB with AC-3/LPCM/DVD subtitles), and a
+// speed measurement on a big synthetic TS when build/scratch/demux_c has
+// one.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../../demux"
+import "../../core"
+import "../../testkit"
+
+struct Hashes {
+    timeBases: [[Int]] = []
+    hashes: [[String]] = []
+}
+
+struct Tally {
+    passed: Int = 0
+    total: Int = 0
+
+    fn check(_ ok: Bool, _ what: String) {
+        total += 1
+        if ok {
+            passed += 1
+        } else {
+            print("FAIL: {what}")
+        }
+    }
+}
+
+// What a fixture is, and how its packets' byte positions relate to
+// ffprobe's: "avi" (the chunk's data), "ts" (the
+// TS packet the PES starts in), "ps" (the PES packet the frame starts in).
+struct Case {
+    name: String
+    folder: String
+    container: String
+    // Reasons to skip comparisons where ffmpeg's view differs on purpose.
+    skipPts: Bool = false
+    durationTolerance: Float = 0.05
+    // Compare with another file's reference (a variant of it), and
+    // whether byte positions are the same as there.
+    refName: String = ""
+    checkPos: Bool = true
+    // Ticks a track duration may differ by (see the cases).
+    trackSlack: Int = 0
+    // Ticks a packet's duration may differ by.
+    durationSlack: Int = 0
+    // Timestamps wrap past 2^33 in the file: ffmpeg moves the ones before
+    // the wrap below zero, Reel keeps counting up; compare modulo 2^33.
+    modWrap: Bool = false
+}
+
+fn loadHashes(_ path: String) -> Hashes {
+    let text = readFile(path) ?? ""
+    let h: Hashes = fromJson(text) ?? Hashes()
+    h
+}
+
+fn loadRefAt(_ folder: String, _ name: String) -> testkit.Ref {
+    let text = readFile(joinPath(folder, name + ".ref.json")) ?? ""
+    let ref: testkit.Ref = fromJson(text) ?? testkit.Ref()
+    ref
+}
+
+fn formatName(_ ff: String) -> String {
+    if ff == "mpegts" {
+        return "ts"
+    }
+    if ff == "mpeg" || ff == "vob" {
+        return "ps"
+    }
+    ff
+}
+
+// Compares one file with ffmpeg's view of it.
+fn compare(_ c: Case, _ t: bind Tally) {
+    let path = joinPath(c.folder, c.name)
+    let file = readData(path) ?? Data()
+    let refName = if c.refName.isEmpty { c.name } else { c.refName }
+    let ref = loadRefAt(c.folder, refName)
+    let hs = loadHashes(joinPath("tests/demux_c/fixtures", refName + ".hashes.json"))
+    let started = now()
+    let opened = demux.open(file, name: c.name)
+    let ms = Int((now() - started) * 1000.0)
+    print("time demux {c.name}: {ms} ms")
+    var media = core.Media()
+    match opened {
+        .ok(m) -> { media = m }
+        .failure(e) -> {
+            t.check(false, "{c.name}: open: {e.message}")
+            return
+        }
+    }
+    t.check(true, "{c.name}: opens")
+    for w in media.warnings {
+        print("  warning {c.name}: {w}")
+    }
+    t.check(media.format == formatName(ref.format), "{c.name}: format {media.format} vs {ref.format}")
+    t.check(media.tracks.count == ref.tracks.count, "{c.name}: {media.tracks.count} tracks, ffmpeg {ref.tracks.count}")
+    if ref.duration > 0.0 {
+        let d = abs(media.duration - ref.duration)
+        t.check(d <= c.durationTolerance, "{c.name}: duration {media.duration} vs {ref.duration}")
+    }
+    if let sw = ref.tags["software"] {
+        t.check(media.tags["encoder"] == sw, "{c.name}: encoder tag {media.tags["encoder"] ?? "-"} vs {sw}")
+    }
+    let n = min(media.tracks.count, ref.tracks.count)
+    for ti in 0..n {
+        let mt = media.tracks[ti]
+        let rt = ref.tracks[ti]
+        let label = "{c.name} track {ti}"
+        t.check(mt.codec == rt.codec && testkit.trackKind(rt.kind) == mt.kind, "{label}: codec {mt.codec} vs {rt.codec}")
+        if mt.kind == core.TrackKind.video {
+            t.check(mt.width == rt.width && mt.height == rt.height, "{label}: size {mt.width}x{mt.height} vs {rt.width}x{rt.height}")
+            t.check(mt.sarNum * rt.sarDen == rt.sarNum * mt.sarDen, "{label}: sar {mt.sarNum}:{mt.sarDen} vs {rt.sarNum}:{rt.sarDen}")
+            if rt.fpsNum > 0 {
+                t.check(mt.fpsNum * rt.fpsDen == rt.fpsNum * mt.fpsDen, "{label}: fps {mt.fpsNum}/{mt.fpsDen} vs {rt.fpsNum}/{rt.fpsDen}")
+            }
+        }
+        if mt.kind == core.TrackKind.audio {
+            t.check(mt.sampleRate == rt.sampleRate && mt.channels == rt.channels, "{label}: {mt.sampleRate} Hz {mt.channels} ch vs {rt.sampleRate} Hz {rt.channels} ch")
+            // make_ref.py doesn't know ffmpeg's pcm_dvd (DVD LPCM is 16-bit
+            // big-endian), so its pcm fields are only defaults there.
+            if mt.codec == "pcm" && rt.ffCodec != "pcm_dvd" {
+                t.check(mt.pcm.bits == rt.pcm.bits && mt.pcm.signed == rt.pcm.signed && mt.pcm.bigEndian == rt.pcm.bigEndian && mt.pcm.float == rt.pcm.float, "{label}: pcm format")
+            }
+        }
+        t.check(mt.language == rt.language, "{label}: language '{mt.language}' vs '{rt.language}'")
+        if !mt.extra.isEmpty {
+            t.check(mt.extra.hex == rt.extraHex, "{label}: extra {mt.extra.hex} vs {rt.extraHex}")
+        }
+
+        // Packets.
+        let mine = core.packetsOf(media, ti)
+        let theirs = ref.packets.filter { p in p.track == ti }
+        t.check(mine.count == theirs.count, "{label}: {mine.count} packets, ffmpeg {theirs.count}")
+        var tbNum = 1
+        var tbDen = rt.timescale
+        if ti < hs.timeBases.count && hs.timeBases[ti].count == 2 {
+            tbNum = hs.timeBases[ti][0]
+            tbDen = hs.timeBases[ti][1]
+        }
+        let ts = mt.timescale
+        var badSize = 0
+        var badPos = 0
+        var badDts = 0
+        var badPts = 0
+        var badKey = 0
+        var badHash = 0
+        var badDur = 0
+        var shown = 0
+        let hashes = if ti < hs.hashes.count { hs.hashes[ti] } else { [] }
+        // Same time, in my ticks and ffmpeg's time base, within one tick.
+        fn same(_ mine: Int, _ theirs: Int) -> Bool {
+            if mine == core.noTime || theirs == core.noTime {
+                return mine == theirs
+            }
+            if c.modWrap {
+                let wrap = 8589934592
+                let d = ((mine - theirs) % wrap + wrap) % wrap
+                return d <= 1 || d >= wrap - 1
+            }
+            abs(mine * tbDen - theirs * tbNum * ts) <= tbDen
+        }
+        for i in 0..min(mine.count, theirs.count) {
+            let a = mine[i]
+            let b = theirs[i]
+            var bad = ""
+            // ffmpeg's DVD LPCM packets keep the 3-byte audio header
+            // (quantization, rate, channels) that Reel's leave out, so
+            // the PCM decoder gets plain samples.
+            let extraHead = if rt.ffCodec == "pcm_dvd" { 3 } else { 0 }
+            if a.size + extraHead != b.size {
+                badSize += 1
+                bad += " size {a.size}/{b.size}"
+            }
+            if b.pos >= 0 && c.checkPos {
+                var ok = true
+                if c.container == "avi" {
+                    ok = a.offset == b.pos
+                } else if c.container == "ts" {
+                    ok = a.offset >= b.pos && a.offset < b.pos + 192
+                } else {
+                    ok = a.offset - extraHead >= b.pos && a.offset < b.pos + 2048
+                }
+                if !ok {
+                    badPos += 1
+                    bad += " offset {a.offset}/pos {b.pos}"
+                }
+            }
+            if b.dts != core.noTime && !same(a.dts, b.dts) {
+                badDts += 1
+                bad += " dts {a.dts}/{b.dts}"
+            }
+            if !c.skipPts && b.pts != core.noTime && !same(a.pts, b.pts) {
+                badPts += 1
+                bad += " pts {a.pts}/{b.pts}"
+            }
+            if b.duration > 0 && !same(a.duration, b.duration) && abs(a.duration - b.duration) > c.durationSlack {
+                badDur += 1
+                bad += " duration {a.duration}/{b.duration}"
+            }
+            if a.key != b.key {
+                badKey += 1
+                bad += " key {a.key}/{b.key}"
+            }
+            if i < hashes.count {
+                let body = file.slice(from: a.offset - extraHead, to: a.offset) + core.packetBytes(file, media, a)
+                let h = body.hash("md5").hex
+                if h != hashes[i] {
+                    badHash += 1
+                    bad += " md5"
+                }
+            }
+            if !bad.isEmpty && shown < 4 {
+                print("  {label} packet {i}:{bad}")
+                shown += 1
+            }
+        }
+        t.check(badSize == 0, "{label}: {badSize} packet sizes differ")
+        t.check(badPos == 0, "{label}: {badPos} packet positions differ")
+        t.check(badDts == 0, "{label}: {badDts} dts differ")
+        t.check(badPts == 0, "{label}: {badPts} pts differ")
+        t.check(badDur == 0, "{label}: {badDur} durations differ")
+        t.check(badKey == 0, "{label}: {badKey} key flags differ")
+        t.check(badHash == 0 && hashes.count == theirs.count, "{label}: {badHash} packets' bytes differ")
+        // ffmpeg estimates TS/PS audio track durations from a read of the
+        // file's end that stops early; the file's duration is compared
+        // above instead.
+        let estimated = c.container != "avi" && mt.kind == core.TrackKind.audio
+        if rt.duration != core.noTime && rt.duration > 0 && !estimated {
+            t.check(same(mt.duration, rt.duration) || (mt.duration != core.noTime && abs(mt.duration - rt.duration) <= c.trackSlack), "{label}: duration {mt.duration} vs {rt.duration} (time base {tbNum}/{tbDen})")
+        }
+    }
+}
+
+// Speed on a big synthetic TS (tests/demux_c/make_fixtures.sh makes it
+// in build/scratch/demux_c; skipped when it isn't there).
+fn speed(_ t: bind Tally) {
+    let path = "build/scratch/demux_c/big.ts"
+    if !fileExists(path) {
+        print("(no {path}: speed not measured)")
+        return
+    }
+    let file = readData(path) ?? Data()
+    let started = now()
+    let r = demux.open(file, name: "big.ts")
+    let ms = Int((now() - started) * 1000.0)
+    let mb = file.count / 1000000
+    print("time ts big: {ms} ms")
+    print("time ts per GB: {ms * 1000000000 / max(file.count, 1)} ms")
+    if let m = r.value() {
+        print("  big.ts: {mb} MB, {file.count / 188} TS packets, {m.packets.count} packets out")
+        t.check(m.packets.count > 100000, "big.ts: {m.packets.count} packets")
+    } else {
+        t.check(false, "big.ts opens")
+    }
+}
+
+fn main() {
+    var t = Tally()
+    let fx = testkit.fixtures
+    let own = "tests/demux_c/fixtures"
+    let cases = [
+        Case(name: "mjpeg.avi", folder: fx, container: "avi"),
+        Case(name: "mjpeg422.avi", folder: fx, container: "avi"),
+        Case(name: "mpeg4.avi", folder: fx, container: "avi"),
+        Case(name: "h264.ts", folder: fx, container: "ts"),
+        Case(name: "h264_interlaced.ts", folder: fx, container: "ts"),
+        Case(name: "mpeg2.ts", folder: fx, container: "ts"),
+        // ffmpeg estimates this file's video duration half a frame short
+        // (178200: it ends the stream at the last packet's pts plus half
+        // its duration); every packet's timing agrees.
+        Case(name: "mpeg1.mpg", folder: fx, container: "ps", trackSlack: 1800),
+        Case(name: "mpeg2.mpg", folder: fx, container: "ps"),
+        Case(name: "small.avi", folder: own, container: "avi"),
+        // Variants of small.avi: compared with small.avi's reference, as
+        // ffmpeg's view of a file with a broken index is not the truth.
+        Case(name: "small_noidx.avi", folder: own, container: "avi", refName: "small.avi"),
+        Case(name: "small_absidx.avi", folder: own, container: "avi", refName: "small.avi"),
+        Case(name: "small_odml.avi", folder: own, container: "avi", refName: "small.avi", checkPos: false),
+        Case(name: "h264_pcm.avi", folder: own, container: "avi"),
+        Case(name: "ac3.avi", folder: own, container: "avi"),
+        Case(name: "multi.ts", folder: own, container: "ts"),
+        Case(name: "multi_junk.ts", folder: own, container: "ts"),
+        Case(name: "multi_204.ts", folder: own, container: "ts"),
+        Case(name: "small.m2ts", folder: own, container: "ts"),
+        Case(name: "hevc.ts", folder: own, container: "ts"),
+        Case(name: "mpeg4.ts", folder: own, container: "ts"),
+        Case(name: "wrap.ts", folder: own, container: "ts", modWrap: true),
+        Case(name: "dvd.vob", folder: own, container: "ps"),
+        // One LPCM packet's duration: ffmpeg says 1867 ticks for 997
+        // samples at 48 kHz (1869.4).
+        Case(name: "lpcm.vob", folder: own, container: "ps", durationSlack: 2),
+        // H.264 frames without a PES timestamp have no known pts (ffmpeg
+        // agrees), so the track's span is counted from the frames that
+        // have one; ffmpeg's estimate is a frame longer.
+        Case(name: "h264.mpg", folder: own, container: "ps", trackSlack: 3600),
+    ]
+    for c in cases {
+        compare(c, t)
+    }
+    // Wraparound: Reel's timestamps keep rising through the wrap.
+    if let w = demux.open(readData(joinPath(own, "wrap.ts")) ?? Data(), name: "wrap.ts").value() {
+        var rising = true
+        var last = -1
+        for p in core.packetsOf(w, 0) {
+            if p.dts < last {
+                rising = false
+            }
+            last = p.dts
+        }
+        t.check(rising && last > 8589934592, "wrap.ts: dts rise past 2^33 (last {last})")
+    }
+    speed(t)
+    print("demux_c: {t.passed} of {t.total} passed")
+}

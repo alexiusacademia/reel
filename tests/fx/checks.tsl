@@ -1,0 +1,129 @@
+// Helpers for the fx tests: the tally, test signals and measurements.
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+import "../../core"
+
+struct Tally {
+    passed: Int = 0
+    total: Int = 0
+
+    fn check(_ ok: Bool, _ what: String) {
+        total += 1
+        if ok {
+            passed += 1
+        } else {
+            print("FAIL: {what}")
+        }
+    }
+
+    // |got − want| ≤ tol, with the numbers in the message.
+    fn near(_ got: Float, _ want: Float, _ tol: Float, _ what: String) {
+        check(abs(got - want) <= tol, "{what}: got {got.formatted(decimals: 4)}, want {want.formatted(decimals: 4)} ± {tol}")
+    }
+}
+
+// Interleaved sine frames, the same on every channel (or only on the
+// channels where `on` says so).
+fn sine(_ freq: Float, amp: Float, frames: Int, rate: Int = 48000, channels: Int = 2, phase: Float = 0.0) -> [Float] {
+    var d: [Float] = []
+    let w = 2.0 * pi * freq / Float(rate)
+    for i in 0..frames {
+        let v = amp * sin(w * Float(i) + phase)
+        for _ in 0..channels {
+            d.append(v)
+        }
+    }
+    d
+}
+
+fn stereo(_ d: [Float], rate: Int = 48000) -> core.Samples {
+    core.Samples(rate: rate, channels: 2, data: d, layout: ["FL", "FR"])
+}
+
+// One channel out of interleaved data.
+fn channel(_ d: [Float], _ ch: Int, _ c: Int) -> [Float] {
+    var out: [Float] = []
+    var i = ch
+    while i < d.count {
+        out.append(d[i])
+        i += c
+    }
+    out
+}
+
+// The amplitude of the `freq` component of x[from..<to] (a lock-in:
+// correlation with sin and cos over a whole number of periods).
+fn amplitudeAt(_ x: [Float], _ freq: Float, rate: Int, from: Int, to: Int) -> Float {
+    let w = 2.0 * pi * freq / Float(rate)
+    let periods = floor(Float(to - from) * freq / Float(rate))
+    let n = max(1, Int(floor(periods * Float(rate) / freq + 0.5)))
+    var s = 0.0
+    var c = 0.0
+    for i in from..min(from + n, x.count) {
+        s += x[i] * sin(w * Float(i))
+        c += x[i] * cos(w * Float(i))
+    }
+    2.0 * sqrt(s * s + c * c) / Float(n)
+}
+
+// How much a sine of frequency `freq` jumps, sample by sample. The
+// filter r[n] = x[n+1] − 2cos(w)·x[n] + x[n−1] is zero for any pure sine
+// at w; run twice, it is also close to zero when the sine's level or
+// phase glides (the first pass leaves a slowly changing sine, the second
+// removes that), while a click (a jump in value or slope) stands out.
+// Returns max |r²[n]| / amp.
+fn clickiness(_ x: [Float], _ freq: Float, rate: Int, amp: Float) -> Float {
+    let k = 2.0 * cos(2.0 * pi * freq / Float(rate))
+    var r: [Float] = []
+    for i in 1..(x.count - 1) {
+        r.append(x[i + 1] - k * x[i] + x[i - 1])
+    }
+    var worst = 0.0
+    for i in 1..(r.count - 1) {
+        worst = max(worst, abs(r[i + 1] - k * r[i] + r[i - 1]))
+    }
+    worst / amp
+}
+
+fn peakOf(_ x: [Float]) -> Float {
+    var p = 0.0
+    for v in x {
+        p = max(p, abs(v))
+    }
+    p
+}
+
+// Little-endian float32 samples from a file.
+fn readF32(_ path: String) -> [Float] {
+    var out: [Float] = []
+    if let d = readData(path) {
+        let n = d.count / 4
+        for i in 0..n {
+            out.append(d.float32(at: i * 4, bigEndian: false))
+        }
+    }
+    out
+}
+
+fn db(_ x: Float) -> Float {
+    20.0 * log10(max(x, 1e-30))
+}
+
+// The LCG noise programme of make_refs.py: a second at each level (dBFS
+// of the noise's full-scale amplitude), channels interleaved.
+fn lcgProgramme(channels: Int, levels: [Float], seed: Int, rate: Int = 48000) -> [Float] {
+    var x = seed
+    var d: [Float] = []
+    for lv in levels {
+        let amp = pow(10.0, lv / 20.0)
+        for _ in 0..rate {
+            for _ in 0..channels {
+                x = (1103515245 * x + 12345) % 2147483648
+                d.append((Float(x) / 1073741824.0 - 1.0) * amp)
+            }
+        }
+    }
+    d
+}

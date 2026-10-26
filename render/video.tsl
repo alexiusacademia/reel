@@ -1,0 +1,975 @@
+// The video half of the render module: turns a decoded core.Picture
+// (planes of Y'CbCr samples) into packed RGBA screen pixels at any size.
+//
+// Colour: R'G'B' from Y'CbCr by the picture's matrix (ITU-R BT.601,
+// BT.709 or BT.2020 non-constant luminance; each one's "derivation of
+// luminance and colour-difference signals"), with video range (Y' 16…235,
+// Cb/Cr 16…240, scaled by 2^(depth−8)) or full range (0…2^depth−1), for
+// depths 8 to 12. No transfer function or gamut conversion is done: the
+// screen gets the stream's R'G'B' as it is.
+//
+// Chroma siting: 4:2:0 and 4:2:2 chroma is taken as MPEG-2/H.264's
+// default ("left": co-sited with the even luma columns, and for 4:2:0
+// half-way between two luma rows). Missing chroma is interpolated
+// linearly: even columns use their chroma sample, odd columns the mean of
+// the two neighbours, and 4:2:0 rows mix the two nearest chroma rows 3:1.
+//
+// Two paths:
+//   * same size (a window that fits the video): luma as it is, chroma
+//     interpolated as above, all in one pass per row;
+//   * scaled: separable filters (vertical, then horizontal) on luma and
+//     on chroma: bilinear, area-averaging when shrinking by 2× or more,
+//     or nearest luma when `smooth` is false (chroma is then interpolated
+//     at the luma sample shown).
+//
+// The arithmetic adds R, G and B inside one Int ("packed"): three 21-bit
+// fields, B in bits 0–20, G in 21–41, R in 42–62, each holding a channel
+// in fixed point with `frac` fraction bits plus a bias of 512 that keeps
+// it positive. Adding packed numbers adds each field; so do sums with
+// small positive weights followed by a right shift, when a mask clears
+// the bits the shift moves from one field into the next. Each chroma
+// sample becomes one packed number once (linear in Cb and Cr), so that
+// interpolating chroma costs one multiply-add per tap instead of one per
+// tap and per component, and luma adds Y × (cy in all three fields). One
+// test tells whether all three channels landed in 0…255 (the usual case);
+// otherwise each is clamped on its own.
+//
+// The output is a list of Ints r<<24 | g<<16 | b<<8 | 255, row by row,
+// for Graphics.image(pixels:…).
+//
+// A render.View (view.tsl) adds picture adjustments, crop, zoom, aspect
+// and flips at no extra pass (2026-10-26): luma adjustments (brightness,
+// contrast, gamma) go into the luma tables (the same-size path's table by
+// sample, and a table by filtered luma at 1/16 code steps for the scaled
+// path); hue and saturation turn each chroma sample's (Cb, Cr) before it
+// is packed; crop and zoom move the plane offsets; flips reverse the
+// scaled path's filter outputs, or at the same size write rows bottom up
+// and mirror rows in place. `Renderer.frame` does it all plus rotation.
+//
+// Speed notes (measured on this Mac): writing an Int into a list is about
+// a nanosecond (a uniqueness and a bounds check each time), appending one
+// about 2.4 ns, and copying a whole list (copy-on-write) is a memcpy. So
+// the output buffer is made by copying a plane of the right size when
+// there is one, and a Renderer keeps its buffers between pictures.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../core"
+
+// Bias of each packed field, and the part of it carried by luma (so that
+// luma below black, Y < 16, still gives a positive field).
+let packBias = 512
+let packYBias = 32
+let packG = 1 << 21
+let packR = 1 << 42
+let packOnes = 1 + (1 << 21) + (1 << 42)
+// Fraction bits of the same-size path, and of the scaled path (which
+// needs room in each field for the filter weights).
+let fineFrac = 8
+let coarseFrac = 4
+// Chroma filter weights in the packed domain sum to 2^chromaWeightBits:
+// (bias + chroma) · 2^coarseFrac · 2^chromaWeightBits stays below 2^21.
+let chromaWeightBits = 7
+// Luma filter weights sum to 2^lumaWeightBits per direction.
+let lumaWeightBits = 12
+
+// Masks that clear, after a right shift by n of a packed number, the n
+// top bits of the G and B fields (they came from the field above).
+fn packShiftMask(_ n: Int) -> Int {
+    let top = ((1 << n) - 1) << (21 - n)
+    ~(top | (top << 21))
+}
+
+// With v in 0…255, a field (v + 512)·2^frac + fraction has the bits above
+// v's exactly 0…010. packRangeMask/Want test all three fields at once.
+fn packRangeMask(_ frac: Int) -> Int {
+    (((1 << (13 - frac)) - 1) << (frac + 8)) * packOnes
+}
+
+fn packRangeWant(_ frac: Int) -> Int {
+    (1 << (frac + 9)) * packOnes
+}
+
+// A packed sum whose channels aren't all in 0…255, clamped and moved into
+// place (plain arithmetic: no tables, so it stays cheap when saturated
+// colours make it common).
+fn packedClamp(_ s: Int, _ frac: Int) -> Int {
+    let r = max(0, min(((s >> (42 + frac)) & 2047) - packBias, 255))
+    let g = max(0, min(((s >> (21 + frac)) & 2047) - packBias, 255))
+    let b = max(0, min(((s >> frac) & 2047) - packBias, 255))
+    (r << 24) | (g << 16) | (b << 8) | 255
+}
+
+// The coefficients that turn a picture's samples into 8-bit R'G'B':
+//   R = cy·(Y − yOff) + rv·(Cr − cOff)
+//   G = cy·(Y − yOff) − gu·(Cb − cOff) − gv·(Cr − cOff)
+//   B = cy·(Y − yOff) + bu·(Cb − cOff)
+// in sample units of the picture's own depth.
+public struct ColorCoefficients {
+    cy: Float = 1.0
+    rv: Float = 0.0
+    gu: Float = 0.0
+    gv: Float = 0.0
+    bu: Float = 0.0
+    yOff: Float = 0.0
+    cOff: Float = 0.0
+}
+
+// The matrix a picture uses, guessing by size when the stream didn't say.
+public fn effectiveMatrix(_ p: core.Picture) -> core.ColorMatrix {
+    if p.matrix == .unknown {
+        return core.guessMatrix(width: p.width, height: p.height)
+    }
+    p.matrix
+}
+
+// Kr and Kb of each matrix (BT.601 table 3, BT.709 item 3.2, BT.2020
+// table 4).
+fn matrixKrKb(_ m: core.ColorMatrix) -> (Float, Float) {
+    match m {
+        .bt601 -> (0.299, 0.114)
+        .bt709 -> (0.2126, 0.0722)
+        .bt2020 -> (0.2627, 0.0593)
+        .unknown -> (0.2126, 0.0722)
+        .rgb -> (0.2126, 0.0722)
+    }
+}
+
+// E'R = E'Y + 2(1 − Kr)·E'Pr, E'B = E'Y + 2(1 − Kb)·E'Pb, and E'G from
+// E'Y = Kr·E'R + Kg·E'G + Kb·E'B, with the quantisation of the range.
+public fn colorCoefficients(_ m: core.ColorMatrix, fullRange: Bool, depth: Int) -> ColorCoefficients {
+    let (kr, kb) = matrixKrKb(m)
+    let kg = 1.0 - kr - kb
+    let s = Float(1 << (depth - 8))
+    var c = ColorCoefficients()
+    var cc = 0.0
+    if fullRange {
+        let top = Float((1 << depth) - 1)
+        c.cy = 255.0 / top
+        cc = 255.0 / top
+        c.yOff = 0.0
+    } else {
+        c.cy = 255.0 / (219.0 * s)
+        cc = 255.0 / (224.0 * s)
+        c.yOff = 16.0 * s
+    }
+    c.cOff = 128.0 * s
+    c.rv = cc * 2.0 * (1.0 - kr)
+    c.bu = cc * 2.0 * (1.0 - kb)
+    c.gu = cc * 2.0 * kb * (1.0 - kb) / kg
+    c.gv = cc * 2.0 * kr * (1.0 - kr) / kg
+    c
+}
+
+// One 8-bit channel, clamped to 0…255.
+fn clampChannel(_ v: Int) -> Int {
+    if v < 0 {
+        return 0
+    }
+    if v > 255 {
+        return 255
+    }
+    v
+}
+
+// A separable resampling filter: output sample i takes `count` taps, tap t
+// at source index index[i·count + t] (clamped into the source) with weight
+// weights[i·count + t]; the weights of each output sum to 2^bits. For
+// one- and two-tap filters `pair[i]` is (first << 16) | w1: `first` the
+// first tap's index + 1 before clamping (0…n), for rows padded with one
+// repeated sample at each end, where the second tap is always first + 1,
+// and w1 the second tap's weight (so the first's is 2^bits − w1). One list
+// read instead of two in the inner loop. `direct[i]` is the same for
+// unpadded rows: (index0 << 32) | (index1 << 16) | w1.
+struct ScaleFilter {
+    count: Int = 1
+    index: [Int] = []
+    pair: [Int] = []
+    direct: [Int] = []
+    weights: [Int] = []
+}
+
+// How a filter picks its taps.
+let filterNearest = 0
+let filterSmooth = 1
+
+// Builds the filter that maps a plane of `srcN` samples onto `dstN`.
+// Output sample i shows luma position (i + 0.5)·lumaN/dstN − 0.5 (rounded
+// to a whole luma sample with `snap`), which is
+// lumaPos·toPlane + planeShift in this plane's samples. `mode` is
+// filterNearest (one tap), or filterSmooth: bilinear, or area-averaging
+// when one output sample covers 2 or more plane samples.
+fn buildFilter(srcN: Int, lumaN: Int, dstN: Int, toPlane: Float, planeShift: Float, snap: Bool, mode: Int, bits: Int) -> ScaleFilter {
+    var f = ScaleFilter()
+    let step = Float(lumaN) / Float(dstN)
+    let r = step * toPlane
+    let one = 1 << bits
+    var count = 2
+    if mode == filterNearest {
+        count = 1
+    } else if r >= 2.0 {
+        count = Int(ceil(r)) + 2
+    }
+    f.count = count
+    var tmp: [Float] = []
+    for _ in 0..count {
+        tmp.append(0.0)
+    }
+    for i in 0..dstN {
+        var lumaPos = (Float(i) + 0.5) * step - 0.5
+        if snap {
+            lumaPos = max(0.0, min(floor(lumaPos + 0.5), Float(lumaN - 1)))
+        }
+        let c = lumaPos * toPlane + planeShift
+        if count == 1 {
+            let k = max(0, min(Int(floor(c + 0.5)), srcN - 1))
+            f.index.append(k)
+            f.pair.append((k + 1) << 16)
+            f.direct.append((k << 32) | (k << 16))
+            f.weights.append(one)
+            continue
+        }
+        var start = 0
+        if r < 2.0 {
+            // Bilinear: the two samples around c.
+            let cc = max(-0.5, min(c, Float(srcN) - 0.5))
+            let k0 = Int(floor(cc))
+            let frac = cc - Float(k0)
+            start = k0
+            tmp[0] = 1.0 - frac
+            tmp[1] = frac
+        } else {
+            // Area: sample k covers [k − 0.5, k + 0.5] and the output
+            // sample [c − r/2, c + r/2]; each tap weighs by the overlap.
+            let lo = c - r / 2.0
+            let hi = c + r / 2.0
+            start = Int(floor(lo + 0.5))
+            for t in 0..count {
+                let k = start + t
+                let a = max(lo, Float(k) - 0.5)
+                let b = min(hi, Float(k) + 0.5)
+                tmp[t] = if b > a { (b - a) / r } else { 0.0 }
+            }
+        }
+        var total = 0
+        var best = 0
+        var bestW = -1
+        let base = f.weights.count
+        for t in 0..count {
+            let w = Int(floor(tmp[t] * Float(one) + 0.5))
+            f.weights.append(w)
+            f.index.append(max(0, min(start + t, srcN - 1)))
+            total += w
+            if w > bestW {
+                bestW = w
+                best = t
+            }
+        }
+        // Make the weights sum to exactly 2^bits.
+        f.weights[base + best] += one - total
+        f.pair.append((max(0, min(start + 1, srcN)) << 16) | f.weights[base + 1])
+        if count == 2 {
+            f.direct.append((f.index[base] << 32) | (f.index[base + 1] << 16) | f.weights[base + 1])
+        }
+    }
+    f
+}
+
+// A filter with its outputs in reverse order (a mirror image).
+fn reversedFilter(_ f: ScaleFilter, _ n: Int) -> ScaleFilter {
+    var r = f
+    let k = f.count
+    for i in 0..n {
+        let j = n - 1 - i
+        for t in 0..k {
+            r.index[i * k + t] = f.index[j * k + t]
+            r.weights[i * k + t] = f.weights[j * k + t]
+        }
+        r.pair[i] = f.pair[j]
+        if f.direct.count == n {
+            r.direct[i] = f.direct[j]
+        }
+    }
+    r
+}
+
+// Turns pictures into RGBA pixels, keeping its tables and buffers from one
+// picture to the next. The player keeps one per video track; `toRgba`
+// below makes a fresh one for a single picture.
+public struct Renderer {
+    // Lookup tables, made for `tableKey`: luma for the same-size path
+    // (fineFrac) and gray pictures.
+    tableKey: Int = -1
+    yFine: [Int] = []
+    grayTable: [Int] = []
+    // For 8-bit pictures, luma as Y × yMultiplier + yMultiplierOffset
+    // (fine fraction bits) when that is exact enough; 0 when not.
+    yMultiplier: Int = 0
+    yMultiplierOffset: Int = 0
+    // Scaled path: luma = (Y·2^16 · lumaK + lumaOff) >> 28, coarse bits.
+    lumaK: Int = 0
+    lumaOff: Int = 0
+    // Packed chroma contributions, one per chroma sample.
+    chromaPlane: [Int] = []
+    // Scaled path: filters made for `filterKey`, and rows after the
+    // vertical pass (padded by one sample at each end).
+    filterKey: String = ""
+    hLuma: ScaleFilter = ScaleFilter()
+    vLuma: ScaleFilter = ScaleFilter()
+    hChroma: ScaleFilter = ScaleFilter()
+    vChroma: ScaleFilter = ScaleFilter()
+    tmpY: [Int] = []
+    tmpC: [Int] = []
+    // The pixels of the last picture.
+    out: [Int] = []
+    // The colour adjustments of the picture being converted (view.tsl),
+    // the adjustments the tables were made for, and the scaled path's
+    // luma table when luma is adjusted: indexed by filtered Y·16, giving
+    // the packed luma part (coarse fraction bits).
+    adj: View = View()
+    tableAdj: String = ""
+    lumaTab: [Int] = []
+    useLumaTab: Bool = false
+
+    // The visible picture scaled to width×height, as packed RGBA.
+    fn toRgba(_ p: core.Picture, width: Int, height: Int, smooth: Bool = true) -> [Int] {
+        adj = View()
+        convert(p, width, height, smooth, false, false)
+    }
+
+    // The picture as a view shows it (colour adjustments, crop, zoom and
+    // pan; flips as given in the view, applied to the picture as decoded:
+    // no rotation is done here), scaled to width×height. Use `frame` for
+    // the whole job, rotation and screen-space flips included.
+    fn render(_ p: core.Picture, settings: View, width: Int, height: Int, smooth: Bool = true) -> [Int] {
+        adj = settings
+        let (x, y, ww, wh) = viewWindow(p, settings)
+        convert(windowed(p, x, y, ww, wh), width, height, smooth, settings.flipH, settings.flipV)
+    }
+
+    // Everything the player needs for one picture: the view's window fitted
+    // into a box of boxW×boxH (0 = natural size, see frameSize), colour
+    // adjusted, flipped and rotated (track rotation + view rotation).
+    fn frame(_ p: core.Picture, settings: View, boxW: Int, boxH: Int, trackRotation: Int = 0, smooth: Bool = true) -> Frame {
+        let d = viewRotation(settings, trackRotation: trackRotation)
+        let (fw, fh) = frameSize(p, settings, boxW: boxW, boxH: boxH, trackRotation: trackRotation)
+        let turned = d == 90 || d == 270
+        let w = if turned { fh } else { fw }
+        let h = if turned { fw } else { fh }
+        var v = settings
+        let (sh, sv) = sourceFlips(settings, degrees: d)
+        v.flipH = sh
+        v.flipV = sv
+        var px = render(p, settings: v, width: w, height: h, smooth: smooth)
+        if d != 0 {
+            px = rotate(px, width: w, height: h, degrees: d)
+        }
+        Frame(width: fw, height: fh, pixels: px)
+    }
+
+    fn convert(_ p: core.Picture, _ width: Int, _ height: Int, _ smooth: Bool, _ flipH: Bool, _ flipV: Bool) -> [Int] {
+        let w = max(width, 0)
+        let h = max(height, 0)
+        if w == 0 || h == 0 {
+            return []
+        }
+        prepareOut(p, w * h)
+        if !planesFit(p) {
+            // A picture whose planes are too small for its size (a broken
+            // decoder): show black rather than stop the program.
+            var i = 0
+            while i < w * h {
+                out[i] = 255
+                i += 1
+            }
+            return out
+        }
+        prepareTables(p)
+        if w == p.width && h == p.height {
+            sameSize(p, flipV)
+            if flipH {
+                mirrorRows(w, h)
+            }
+        } else {
+            scaled(p, w, h, smooth, flipH, flipV)
+        }
+        out
+    }
+
+    // Mirrors each row of `out` in place (a horizontal flip at the same
+    // size: cheaper than the scaled path's mirrored filters there).
+    fn mirrorRows(_ w: Int, _ h: Int) {
+        for row in 0..h {
+            var a = row * w
+            var b = a + w - 1
+            while a < b {
+                let t = out[a]
+                out[a] = out[b]
+                out[b] = t
+                a += 1
+                b -= 1
+            }
+        }
+    }
+
+    // Makes `out` hold n items. Copying a list is a memcpy while building
+    // one appends item by item, so a plane of about the right size is
+    // copied (and trimmed) when there is one.
+    fn prepareOut(_ p: core.Picture, _ n: Int) {
+        if out.count == n {
+            return
+        }
+        if p.y.count >= n && p.y.count - n <= n / 8 {
+            out = p.y
+        } else if p.u.count >= n && p.u.count - n <= n / 8 {
+            out = p.u
+        }
+        if out.count >= n && out.count - n <= n / 8 {
+            var extra = out.count - n
+            while extra > 0 {
+                out.removeLast()
+                extra -= 1
+            }
+            return
+        }
+        var fresh: [Int] = []
+        var i = 0
+        while i < n {
+            fresh.append(255)
+            i += 1
+        }
+        out = fresh
+    }
+
+    // Builds the lookup tables for the picture's matrix, range and depth.
+    fn prepareTables(_ p: core.Picture) {
+        let depth = max(8, min(p.depth, 12))
+        let m = effectiveMatrix(p)
+        let mi = match m {
+            .bt601 -> 0
+            .bt709 -> 1
+            .bt2020 -> 2
+            .unknown -> 1
+            .rgb -> 1
+        }
+        let key = mi * 1000 + depth * 10 + (if p.fullRange { 1 } else { 0 })
+        let lumaAdj = adj.lumaAdjusted
+        let akey = if lumaAdj { "{adj.brightness} {adj.contrast} {adj.gamma}" } else { "" }
+        if key == tableKey && akey == tableAdj {
+            return
+        }
+        tableKey = key
+        tableAdj = akey
+        let c = colorCoefficients(m, fullRange: p.fullRange, depth: depth)
+        let n = 1 << depth
+        let fine = Float(1 << fineFrac)
+        yFine = []
+        grayTable = []
+        for s in 0..n {
+            let sv = if lumaAdj { adjustedLuma(Float(s), adj, depth: depth) } else { Float(s) }
+            let yv = Int(floor(c.cy * (sv - c.yOff) * fine + 0.5)) + (packYBias << fineFrac)
+            yFine.append(yv * packOnes)
+            let g = clampChannel(((yv + (1 << (fineFrac - 1))) >> fineFrac) - packYBias)
+            grayTable.append((g << 24) | (g << 16) | (g << 8) | 255)
+        }
+        // For 8-bit, Y·cy·2^fineFrac as a whole multiplier, when that is
+        // within 0.05 % (an error of at most 0.15 of a level).
+        yMultiplier = 0
+        yMultiplierOffset = 0
+        if depth == 8 && !lumaAdj {
+            let k = c.cy * fine
+            let kr = floor(k + 0.5)
+            if abs(kr - k) / k < 0.0005 {
+                yMultiplier = Int(kr)
+                yMultiplierOffset = Int(floor(-c.yOff * k + 0.5)) + (packYBias << fineFrac)
+            }
+        }
+        let coarse = Float(1 << coarseFrac)
+        lumaK = Int(floor(c.cy * coarse * Float(1 << 12) + 0.5))
+        lumaOff = Int(floor((Float(packYBias) - c.yOff * c.cy) * coarse * Float(1 << 28) + 0.5)) + (1 << 27)
+        // With luma adjusted, the scaled path looks its luma up by the
+        // filtered value at 1/16 of a code step.
+        useLumaTab = lumaAdj
+        lumaTab = []
+        if lumaAdj {
+            for i in 0..(n << 4) {
+                let sv = adjustedLuma(Float(i) / 16.0, adj, depth: depth)
+                lumaTab.append(Int(floor((c.cy * (sv - c.yOff) + Float(packYBias)) * coarse + 0.5)))
+            }
+        }
+    }
+
+    // Each chroma sample's packed contribution (frac fraction bits, with
+    // the bias), plus `add`, into chromaPlane (cw × ch, tight). Each field
+    // is a linear function of Cb and Cr, worked out with 20 extra bits and
+    // rounded, which is cheaper here than table lookups.
+    fn packChroma(_ p: core.Picture, _ frac: Int, _ add: Int) {
+        let us = p.u
+        let vs = p.v
+        let cw = p.chromaWidth
+        let ch = p.chromaHeight
+        let depth = max(8, min(p.depth, 12))
+        let top = (1 << depth) - 1
+        let c = colorCoefficients(effectiveMatrix(p), fullRange: p.fullRange, depth: depth)
+        let one = Float(1 << (frac + 20))
+        let bias = (((packBias - packYBias) << frac) << 20) + (1 << (frac - 1) << 20) + (1 << 19)
+        let kRV = Int(floor(c.rv * one + 0.5))
+        let kGU = Int(floor(-c.gu * one + 0.5))
+        let kGV = Int(floor(-c.gv * one + 0.5))
+        let kBU = Int(floor(c.bu * one + 0.5))
+        let cR = bias - Int(floor(c.rv * c.cOff * one + 0.5))
+        let cG = bias + Int(floor((c.gu + c.gv) * c.cOff * one + 0.5))
+        let cB = bias - Int(floor(c.bu * c.cOff * one + 0.5))
+        if chromaPlane.count < cw * ch {
+            // A copy of a chroma plane (a memcpy) is quicker to make than
+            // a list of zeros, and every item used is overwritten.
+            chromaPlane = if us.count >= cw * ch { us } else { core.zeros(cw * ch) }
+        }
+        if adj.chromaAdjusted {
+            // Hue rotation and saturation on (Cb, Cr) about mid-code, in
+            // 16-bit fixed point, clamped to the code range.
+            let mid = 1 << (depth - 1)
+            let hr = adj.hue * pi / 180.0
+            let ca = Int(floor(cos(hr) * adj.saturation * 65536.0 + 0.5))
+            let sa = Int(floor(sin(hr) * adj.saturation * 65536.0 + 0.5))
+            for k in 0..ch {
+                let src = p.cOffset + k * p.cStride
+                let dst = k * cw
+                var j = 0
+                while j < cw {
+                    let du = (us[src + j] & top) - mid
+                    let dv = (vs[src + j] & top) - mid
+                    let u = max(0, min(mid + ((du * ca - dv * sa + 32768) >> 16), top))
+                    let v = max(0, min(mid + ((du * sa + dv * ca + 32768) >> 16), top))
+                    let r = (v * kRV + cR) >> 20
+                    let g = (u * kGU + v * kGV + cG) >> 20
+                    let b = (u * kBU + cB) >> 20
+                    chromaPlane[dst + j] = (r << 42) + (g << 21) + b + add
+                    j += 1
+                }
+            }
+            return
+        }
+        for k in 0..ch {
+            let src = p.cOffset + k * p.cStride
+            let dst = k * cw
+            var j = 0
+            while j < cw {
+                let u = us[src + j] & top
+                let v = vs[src + j] & top
+                let r = (v * kRV + cR) >> 20
+                let g = (u * kGU + v * kGV + cG) >> 20
+                let b = (u * kBU + cB) >> 20
+                chromaPlane[dst + j] = (r << 42) + (g << 21) + b + add
+                j += 1
+            }
+        }
+    }
+
+    // Same size: every output pixel is one luma sample. `flipV` writes
+    // the rows bottom up.
+    fn sameSize(_ p: core.Picture, _ flipV: Bool) {
+        let w = p.width
+        let h = p.height
+        let ys = p.y
+        let depth = max(8, min(p.depth, 12))
+        let top = (1 << depth) - 1
+        if p.chroma == .gray || p.u.isEmpty || p.v.isEmpty {
+            let gt = grayTable
+            for row in 0..h {
+                let yb = p.yOffset + row * p.yStride
+                var o = (if flipV { h - 1 - row } else { row }) * w
+                var x = 0
+                while x < w {
+                    out[o] = gt[ys[yb + x] & top]
+                    o += 1
+                    x += 1
+                }
+            }
+            return
+        }
+        let multiply = depth == 8 && yMultiplier > 0
+        let kY = yMultiplier * packOnes
+        let yAdd = if multiply { yMultiplierOffset * packOnes } else { 0 }
+        let rangeMask = packRangeMask(fineFrac)
+        let rangeWant = packRangeWant(fineFrac)
+        let shR = 42 + fineFrac - 24
+        let shG = 21 + fineFrac - 16
+        let shB = fineFrac - 8
+        let avgMask = packShiftMask(1)
+        let quarterMask = packShiftMask(2)
+        // 1. Each chroma sample's packed contribution (with the luma
+        // offset when luma is a multiplication).
+        packChroma(p, fineFrac, yAdd)
+        let cp = chromaPlane
+        let yt = yFine
+        let cw = p.chromaWidth
+        let ch = p.chromaHeight
+        let vertical = p.chroma == .yuv420
+        let halfWidth = p.chroma != .yuv444
+        // 2. Each row: its chroma (mixed 3:1 from the two nearest chroma
+        // rows for 4:2:0; odd columns get the mean of their neighbours),
+        // plus luma, then the channels moved into place.
+        for row in 0..h {
+            var k = row
+            var k2 = row
+            if vertical {
+                k = row >> 1
+                k2 = if (row & 1) == 0 { max(k - 1, 0) } else { min(k + 1, ch - 1) }
+            }
+            let c1 = k * cw
+            let c2 = k2 * cw
+            let yb = p.yOffset + row * p.yStride
+            let o = (if flipV { h - 1 - row } else { row }) * w
+            if !halfWidth {
+                var x = 0
+                while x < w {
+                    let yp = if multiply { (ys[yb + x] & 255) * kY } else { yt[ys[yb + x] & top] }
+                    let s = yp + cp[c1 + x]
+                    if (s & rangeMask) == rangeWant {
+                        out[o + x] = ((s >> shR) & 0xff000000) | ((s >> shG) & 0xff0000) | ((s >> shB) & 0xff00) | 255
+                    } else {
+                        out[o + x] = packedClamp(s, fineFrac)
+                    }
+                    x += 1
+                }
+                continue
+            }
+            // Pixel 2j uses chroma j; pixel 2j − 1 the mean of j − 1 and j.
+            var prev = 0
+            var j = 0
+            while j < cw {
+                var c = cp[c1 + j]
+                if vertical {
+                    c = ((3 * c + cp[c2 + j]) >> 2) & quarterMask
+                }
+                let x = 2 * j
+                if j > 0 {
+                    let cm = ((prev + c) >> 1) & avgMask
+                    let yp = if multiply { (ys[yb + x - 1] & 255) * kY } else { yt[ys[yb + x - 1] & top] }
+                    let s = yp + cm
+                    if (s & rangeMask) == rangeWant {
+                        out[o + x - 1] = ((s >> shR) & 0xff000000) | ((s >> shG) & 0xff0000) | ((s >> shB) & 0xff00) | 255
+                    } else {
+                        out[o + x - 1] = packedClamp(s, fineFrac)
+                    }
+                }
+                let yp = if multiply { (ys[yb + x] & 255) * kY } else { yt[ys[yb + x] & top] }
+                let s = yp + c
+                if (s & rangeMask) == rangeWant {
+                    out[o + x] = ((s >> shR) & 0xff000000) | ((s >> shG) & 0xff0000) | ((s >> shB) & 0xff00) | 255
+                } else {
+                    out[o + x] = packedClamp(s, fineFrac)
+                }
+                prev = c
+                j += 1
+            }
+            // An even width's last (odd) column has no right neighbour.
+            if 2 * cw - 1 < w {
+                let x = 2 * cw - 1
+                let yp = if multiply { (ys[yb + x] & 255) * kY } else { yt[ys[yb + x] & top] }
+                let s = yp + prev
+                if (s & rangeMask) == rangeWant {
+                    out[o + x] = ((s >> shR) & 0xff000000) | ((s >> shG) & 0xff0000) | ((s >> shB) & 0xff00) | 255
+                } else {
+                    out[o + x] = packedClamp(s, fineFrac)
+                }
+            }
+        }
+    }
+
+    // Makes the four filters for this picture shape and output size.
+    fn prepareFilters(_ p: core.Picture, _ w: Int, _ h: Int, _ smooth: Bool, _ flipH: Bool, _ flipV: Bool) {
+        let key = "{p.width}x{p.height} {p.chroma} {w}x{h} {smooth} {flipH} {flipV}"
+        if key == filterKey {
+            return
+        }
+        filterKey = key
+        let mode = if smooth { filterSmooth } else { filterNearest }
+        let snap = !smooth
+        let lb = lumaWeightBits
+        let cb = chromaWeightBits
+        hLuma = buildFilter(srcN: p.width, lumaN: p.width, dstN: w, toPlane: 1.0, planeShift: 0.0, snap: snap, mode: mode, bits: lb)
+        vLuma = buildFilter(srcN: p.height, lumaN: p.height, dstN: h, toPlane: 1.0, planeShift: 0.0, snap: snap, mode: mode, bits: lb)
+        // Flips: output i takes the taps of output n − 1 − i.
+        if flipH {
+            hLuma = reversedFilter(hLuma, w)
+        }
+        if flipV {
+            vLuma = reversedFilter(vLuma, h)
+        }
+        if p.chroma == .gray {
+            return
+        }
+        let cw = p.chromaWidth
+        let ch = p.chromaHeight
+        // Chroma positions: 4:2:0/4:2:2 column j sits on luma column 2j;
+        // 4:2:0 row k half-way between luma rows 2k and 2k + 1.
+        let hScale = if p.chroma == .yuv444 { 1.0 } else { 0.5 }
+        hChroma = buildFilter(srcN: cw, lumaN: p.width, dstN: w, toPlane: hScale, planeShift: 0.0, snap: snap, mode: filterSmooth, bits: cb)
+        if p.chroma == .yuv420 {
+            vChroma = buildFilter(srcN: ch, lumaN: p.height, dstN: h, toPlane: 0.5, planeShift: -0.25, snap: snap, mode: filterSmooth, bits: cb)
+        } else {
+            vChroma = buildFilter(srcN: ch, lumaN: p.height, dstN: h, toPlane: 1.0, planeShift: 0.0, snap: snap, mode: filterSmooth, bits: cb)
+        }
+        if flipH {
+            hChroma = reversedFilter(hChroma, w)
+        }
+        if flipV {
+            vChroma = reversedFilter(vChroma, h)
+        }
+    }
+
+    // Luma rows `f` mixes for output row oy, into tmpY[1…n] (scaled by
+    // 2^lumaWeightBits), with tmpY[0] and tmpY[n + 1] repeating the ends.
+    fn lumaRow(_ p: core.Picture, _ f: ScaleFilter, _ oy: Int) {
+        let ys = p.y
+        let n = p.width
+        let k = f.count
+        let fb = oy * k
+        if k == 1 {
+            let b = p.yOffset + f.index[fb] * p.yStride - 1
+            var x = 1
+            while x <= n {
+                tmpY[x] = ys[b + x] << lumaWeightBits
+                x += 1
+            }
+        } else if k == 2 {
+            let b0 = p.yOffset + f.index[fb] * p.yStride - 1
+            let b1 = p.yOffset + f.index[fb + 1] * p.yStride - 1
+            let w0 = f.weights[fb]
+            let w1 = f.weights[fb + 1]
+            var x = 1
+            while x <= n {
+                tmpY[x] = ys[b0 + x] * w0 + ys[b1 + x] * w1
+                x += 1
+            }
+        } else {
+            var x = 1
+            while x <= n {
+                tmpY[x] = 0
+                x += 1
+            }
+            for t in 0..k {
+                let wt = f.weights[fb + t]
+                if wt == 0 {
+                    continue
+                }
+                let b = p.yOffset + f.index[fb + t] * p.yStride - 1
+                x = 1
+                while x <= n {
+                    tmpY[x] += ys[b + x] * wt
+                    x += 1
+                }
+            }
+        }
+        tmpY[0] = tmpY[1]
+        tmpY[n + 1] = tmpY[n]
+    }
+
+    // The packed chroma rows `f` mixes for output row oy, into tmpC[1…cw]
+    // (back to coarse fraction bits), ends repeated.
+    fn chromaRow(_ cw: Int, _ f: ScaleFilter, _ oy: Int) {
+        let cp = chromaPlane
+        let k = f.count
+        let fb = oy * k
+        let mask = packShiftMask(chromaWeightBits)
+        if k == 2 {
+            let b0 = f.index[fb] * cw - 1
+            let b1 = f.index[fb + 1] * cw - 1
+            let w0 = f.weights[fb]
+            let w1 = f.weights[fb + 1]
+            var x = 1
+            while x <= cw {
+                tmpC[x] = ((cp[b0 + x] * w0 + cp[b1 + x] * w1) >> chromaWeightBits) & mask
+                x += 1
+            }
+        } else {
+            var x = 1
+            while x <= cw {
+                var sum = 0
+                for t in 0..k {
+                    sum += cp[f.index[fb + t] * cw + x - 1] * f.weights[fb + t]
+                }
+                tmpC[x] = (sum >> chromaWeightBits) & mask
+                x += 1
+            }
+        }
+        tmpC[0] = tmpC[1]
+        tmpC[cw + 1] = tmpC[cw]
+    }
+
+    // Scaled: vertical pass into tmpY/tmpC, then the horizontal pass, luma
+    // turned into its packed part, and the channels moved into place.
+    fn scaled(_ p: core.Picture, _ w: Int, _ h: Int, _ smooth: Bool, _ flipH: Bool, _ flipV: Bool) {
+        prepareFilters(p, w, h, smooth, flipH, flipV)
+        let gray = p.chroma == .gray || p.u.isEmpty || p.v.isEmpty
+        let sw = p.width
+        let cw = p.chromaWidth
+        if tmpY.count < sw + 2 {
+            tmpY = core.zeros(sw + 2)
+        }
+        if !gray {
+            if tmpC.count < cw + 2 {
+                tmpC = core.zeros(cw + 2)
+            }
+            packChroma(p, coarseFrac, 0)
+        }
+        let rangeMask = packRangeMask(coarseFrac)
+        let rangeWant = packRangeWant(coarseFrac)
+        let shR = 42 + coarseFrac - 24
+        let shG = 21 + coarseFrac - 16
+        let shBLeft = 8 - coarseFrac
+        let cmask = packShiftMask(chromaWeightBits)
+        // Filtered luma is Y·2^24 (two directions of 12-bit weights);
+        // lumaK/lumaOff expect Y·2^16 and give coarse fraction bits.
+        let ydown = 2 * lumaWeightBits - 16
+        let kl = lumaK
+        let lo = lumaOff
+        let hl = hLuma
+        let hc = hChroma
+        let lPair = hl.pair
+        let lIndex = hl.index
+        let lW = hl.weights
+        let cPair = hc.pair
+        let cIndex = hc.index
+        let cW = hc.weights
+        let nl = hl.count
+        let nc = hc.count
+        let coarseHalf = 1 << (coarseFrac - 1)
+        // Shrinking with bilinear luma: read the four source samples of
+        // each output pixel directly (cheaper than a vertical pass over
+        // more columns than there are outputs).
+        let direct = nl == 2 && vLuma.count == 2 && sw > w
+        let lDirect = hl.direct
+        let ys = p.y
+        let lumaOne = 1 << lumaWeightBits
+        let useTab = useLumaTab
+        let lt = lumaTab
+        let tabTop = lumaTab.count - 1
+        let tabDown = 2 * lumaWeightBits - 4
+        for oy in 0..h {
+            var b0 = 0
+            var b1 = 0
+            var wv0 = 0
+            var wv1 = 0
+            if direct {
+                b0 = p.yOffset + vLuma.index[2 * oy] * p.yStride
+                b1 = p.yOffset + vLuma.index[2 * oy + 1] * p.yStride
+                wv0 = vLuma.weights[2 * oy]
+                wv1 = vLuma.weights[2 * oy + 1]
+            } else {
+                lumaRow(p, vLuma, oy)
+            }
+            if !gray {
+                chromaRow(cw, vChroma, oy)
+            }
+            let ty = tmpY
+            let tc = tmpC
+            var o = oy * w
+            var ox = 0
+            while ox < w {
+                // Luma: Y·2^24 from the horizontal taps.
+                var yv = 0
+                if direct {
+                    let dr = lDirect[ox]
+                    let i0 = dr >> 32
+                    let i1 = (dr >> 16) & 0xffff
+                    let w1 = dr & 0xffff
+                    let w0 = lumaOne - w1
+                    yv = (ys[b0 + i0] * w0 + ys[b0 + i1] * w1) * wv0 + (ys[b1 + i0] * w0 + ys[b1 + i1] * w1) * wv1
+                } else if nl == 1 {
+                    yv = ty[lPair[ox] >> 16] << lumaWeightBits
+                } else if nl == 2 {
+                    let pr = lPair[ox]
+                    let i = pr >> 16
+                    let w1 = pr & 0xffff
+                    yv = ty[i] * ((1 << lumaWeightBits) - w1) + ty[i + 1] * w1
+                } else {
+                    let fb = ox * nl
+                    for t in 0..nl {
+                        yv += ty[lIndex[fb + t] + 1] * lW[fb + t]
+                    }
+                }
+                let lumaPart = if useTab { lt[min(yv >> tabDown, tabTop)] } else { (((yv >> ydown) * kl + lo) >> 28) }
+                if gray {
+                    let g = clampChannel(((lumaPart + coarseHalf) >> coarseFrac) - packYBias)
+                    out[o] = (g << 24) | (g << 16) | (g << 8) | 255
+                    o += 1
+                    ox += 1
+                    continue
+                }
+                // Chroma: packed, from its horizontal taps.
+                var c = 0
+                if nc == 2 {
+                    let pr = cPair[ox]
+                    let i = pr >> 16
+                    let w1 = pr & 0xffff
+                    c = ((tc[i] * ((1 << chromaWeightBits) - w1) + tc[i + 1] * w1) >> chromaWeightBits) & cmask
+                } else {
+                    let fb = ox * nc
+                    var sum = 0
+                    for t in 0..nc {
+                        sum += tc[cIndex[fb + t] + 1] * cW[fb + t]
+                    }
+                    c = (sum >> chromaWeightBits) & cmask
+                }
+                let s = lumaPart * packOnes + c
+                if (s & rangeMask) == rangeWant {
+                    out[o] = ((s >> shR) & 0xff000000) | ((s >> shG) & 0xff0000) | ((s << shBLeft) & 0xff00) | 255
+                } else {
+                    out[o] = packedClamp(s, coarseFrac)
+                }
+                o += 1
+                ox += 1
+            }
+        }
+    }
+}
+
+// Whether a picture's planes hold every sample its size, strides and
+// offsets point at.
+public fn planesFit(_ p: core.Picture) -> Bool {
+    if p.width <= 0 || p.height <= 0 || p.yStride < p.width || p.yOffset < 0 {
+        return false
+    }
+    if p.y.count < p.yOffset + (p.height - 1) * p.yStride + p.width {
+        return false
+    }
+    if p.chroma == .gray || (p.u.isEmpty && p.v.isEmpty) {
+        return true
+    }
+    let cw = p.chromaWidth
+    let ch = p.chromaHeight
+    let need = p.cOffset + (ch - 1) * p.cStride + cw
+    p.cStride >= cw && p.cOffset >= 0 && p.u.count >= need && p.v.count >= need
+}
+
+// A fresh renderer.
+public fn newRenderer() -> Renderer {
+    Renderer()
+}
+
+// The visible picture scaled to width×height, colour converted with its
+// matrix and range, packed r<<24|g<<16|b<<8|255 for g.image(pixels:…).
+// smooth: bilinear scaling (area-averaged when shrinking by 2× or more);
+// otherwise nearest. Chroma is always interpolated. For a stream of
+// pictures, keep a Renderer instead: it keeps its tables and buffers.
+public fn toRgba(_ p: core.Picture, width: Int, height: Int, smooth: Bool = true) -> [Int] {
+    var r = Renderer()
+    r.toRgba(p, width: width, height: height, smooth: smooth)
+}
+
+// The size to show a picture at inside a box of boxW×boxH, keeping its
+// display aspect ratio (sample aspect ratio included): (width, height).
+public fn fitSize(_ p: core.Picture, boxW: Int, boxH: Int) -> (Int, Int) {
+    let sar = if p.sarNum > 0 && p.sarDen > 0 { Float(p.sarNum) / Float(p.sarDen) } else { 1.0 }
+    let dw = Float(p.width) * sar
+    let dh = Float(p.height)
+    if dw <= 0.0 || dh <= 0.0 || boxW <= 0 || boxH <= 0 {
+        return (0, 0)
+    }
+    let s = min(Float(boxW) / dw, Float(boxH) / dh)
+    (max(1, Int(floor(dw * s + 0.5))), max(1, Int(floor(dh * s + 0.5))))
+}

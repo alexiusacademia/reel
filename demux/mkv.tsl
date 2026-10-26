@@ -1,0 +1,1502 @@
+// Matroska and WebM files (mkvOpen): .mkv .mka .mks .webm.
+//
+// Matroska (RFC 9559) is built from EBML (RFC 8794): every element is an
+// ID (1–4 bytes, its length marked by the leading zero bits of the first
+// byte, the marker kept), a size (1–8 bytes, same marking, marker
+// dropped; all value bits 1 = "unknown size", used by live WebM), and a
+// body. Master elements hold more elements. The file is
+//   EBML header (DocType "matroska" or "webm")
+//   Segment
+//     SeekHead, Info, Tracks, Chapters, Tags, Attachments, Cues
+//     Cluster* (Timestamp, then SimpleBlock or BlockGroup/Block…)
+// The whole Segment is scanned once, skipping bodies by their sizes, so
+// even a long file costs time in proportion to its elements, not its
+// bytes. Packets come from the clusters (in stored order); Cues are only
+// used to check that they point at clusters that exist.
+//
+// Times: block times count in TimestampScale nanoseconds (normally 1 ms),
+// so every track's timescale is 1e9 / TimestampScale (normally 1000). A
+// frame's pts is the cluster's Timestamp + the block's 16-bit offset −
+// the track's CodecDelay (RFC 9559 §5.1.4.1.17; ffmpeg reports times that
+// way too, so an Opus or AAC track's first packet is a little before 0).
+// Matroska stores no decode times: dts is noTime.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../core"
+
+// What mkvOpen keeps about each track besides its core.Track.
+struct MkvTrackInfo {
+    number: Int = 0
+    uid: Int = 0
+    defaultDurationNs: Int = 0
+    codecDelayNs: Int = 0
+    // The same in track ticks (worked out once the TimestampScale is known).
+    defaultTicks: Int = 0
+    codecDelayTicks: Int = 0
+    // How to tell a frame's length when the block doesn't say (see
+    // MkvParser.frameSamples): 0 unknown, 1 AAC, 2 MPEG audio, 3 AC-3,
+    // 4 E-AC-3, 5 Opus, 6 FLAC, 7 Vorbis, 8 PCM, 9 DTS.
+    framing: Int = 0
+    // The rate frames are counted at (AAC: the core rate, before SBR).
+    frameRate: Int = 0
+    pcmFrameBytes: Int = 0
+    vorbisModes: [Int] = []
+    vorbisBlocks: [Int] = [256, 2048]
+    vorbisPrev: Int = 2048
+}
+
+struct MkvParser {
+    file: Data
+    fileEnd: Int
+    media: core.Media = core.Media()
+    infos: [MkvTrackInfo] = []
+    // TrackNumber → index in media.tracks (-1: none), for small numbers.
+    numToIndex: [Int] = []
+    // The element header readHeader read last: ID, body start, body end
+    // (the parent's end when the size is unknown).
+    hId: Int = 0
+    hBody: Int = 0
+    hEnd: Int = 0
+    hUnknown: Bool = false
+    timestampScale: Int = 1000000
+    timescale: Int = 1000
+    segmentBody: Int = 0
+    infoDuration: Float = -1.0
+    muxingApp: String = ""
+    tracksSeen: Bool = false
+    // Clusters found before the Tracks: body, end, parsed once tracks are known.
+    pendingClusters: [Int] = []
+    // Cluster element positions (from the segment body) and cue targets.
+    clusterStarts: Set<Int> = []
+    cuePositions: [Int] = []
+    // Per-track DURATION tags by TrackUID.
+    trackDurations: [Int: String] = [:]
+    unknownTrackBlocks: Int = 0
+    badLacing: Int = 0
+    damaged: Int = 0
+    truncated: Bool = false
+
+    // Reads the element header at `at` (RFC 8794 §4–6) inside a parent
+    // that ends at `limit`. False when there isn't a valid one.
+    fn readHeader(_ at: Int, _ limit: Int) -> Bool {
+        if at >= limit {
+            return false
+        }
+        let b0 = file[at]
+        var idLen = 0
+        if b0 >= 0x80 {
+            idLen = 1
+        } else if b0 >= 0x40 {
+            idLen = 2
+        } else if b0 >= 0x20 {
+            idLen = 3
+        } else if b0 >= 0x10 {
+            idLen = 4
+        } else {
+            return false
+        }
+        let s = at + idLen
+        if s >= limit {
+            return false
+        }
+        var id = b0
+        var i = 1
+        while i < idLen {
+            id = (id << 8) | file[at + i]
+            i += 1
+        }
+        let s0 = file[s]
+        if s0 == 0 {
+            return false
+        }
+        var sizeLen = 1
+        var mask = 0x80
+        while s0 & mask == 0 {
+            sizeLen += 1
+            mask = mask >> 1
+        }
+        if s + sizeLen > limit {
+            return false
+        }
+        var size = s0 & (mask - 1)
+        var allOnes = size == mask - 1
+        i = 1
+        while i < sizeLen {
+            let b = file[s + i]
+            if b != 0xFF {
+                allOnes = false
+            }
+            size = (size << 8) | b
+            i += 1
+        }
+        hId = id
+        hBody = s + sizeLen
+        hUnknown = allOnes
+        if allOnes {
+            hEnd = limit
+        } else if size > limit - hBody {
+            hEnd = limit
+            truncated = true
+        } else {
+            hEnd = hBody + size
+        }
+        true
+    }
+
+    // An unsigned integer element's body (RFC 8794 §7.2); 64-bit values
+    // keep their bits (UIDs may come out negative, which is fine for
+    // comparing).
+    fn uint(_ b: Int, _ e: Int) -> Int {
+        var v = 0
+        var i = b
+        while i < e && i < b + 8 {
+            v = (v << 8) | file[i]
+            i += 1
+        }
+        v
+    }
+
+    // A signed integer element's body (RFC 8794 §7.1).
+    fn sint(_ b: Int, _ e: Int) -> Int {
+        let n = min(e - b, 8)
+        if n <= 0 {
+            return 0
+        }
+        var v = uint(b, e)
+        if n < 8 && file[b] >= 0x80 {
+            v = v - (1 << (8 * n))
+        }
+        v
+    }
+
+    // A float element's body: 0, 4 or 8 bytes (RFC 8794 §7.3).
+    fn float(_ b: Int, _ e: Int) -> Float {
+        if e - b == 4 {
+            return file.float32(at: b, bigEndian: true)
+        }
+        if e - b == 8 {
+            return file.float64(at: b, bigEndian: true)
+        }
+        0.0
+    }
+
+    // A string or UTF-8 element's body, up to its first zero byte.
+    fn text(_ b: Int, _ e: Int) -> String {
+        var end = b
+        while end < e && file[end] != 0 {
+            end += 1
+        }
+        let d = file.slice(from: b, to: end)
+        d.text ?? d.latin1
+    }
+
+    fn parse() -> Error? {
+        if !readHeader(0, fileEnd) || hId != 0x1A45DFA3 {
+            return Error("this isn't a Matroska file (no EBML header)")
+        }
+        // EBML header: DocType (0x4282) says matroska or webm.
+        media.format = "mkv"
+        var p = hBody
+        let headerEnd = hEnd
+        while p < headerEnd && readHeader(p, headerEnd) {
+            if hId == 0x4282 && text(hBody, hEnd) == "webm" {
+                media.format = "webm"
+            }
+            p = hEnd
+        }
+        p = headerEnd
+        var found = false
+        while p < fileEnd {
+            if !readHeader(p, fileEnd) {
+                break
+            }
+            if hId == 0x18538067 {
+                found = true
+                let body = hBody
+                let end = hEnd
+                parseSegment(body, end)
+                p = end
+                break
+            }
+            p = hEnd
+        }
+        if !found {
+            return Error("this Matroska file has no Segment")
+        }
+        if p + 4 <= fileEnd && readHeader(p, fileEnd) && hId == 0x1A45DFA3 {
+            media.warnings.append("the file has more than one Matroska segment; only the first is read")
+        }
+        finish()
+        nil
+    }
+
+    // The Segment's top-level elements (RFC 9559 §5.1).
+    fn parseSegment(_ body: Int, _ end: Int) {
+        segmentBody = body
+        var p = body
+        while p < end {
+            if !readHeader(p, end) {
+                // Damaged bytes: go on at the next Cluster.
+                let next = findCluster(p + 1, end)
+                damaged += (if next < 0 { end } else { next }) - p
+                if next < 0 {
+                    break
+                }
+                p = next
+                continue
+            }
+            let id = hId
+            let b = hBody
+            var e = hEnd
+            let unknown = hUnknown
+            if id == 0x1F43B675 {
+                // Cluster.
+                clusterStarts.insert(p - segmentBody)
+                if tracksSeen {
+                    e = parseCluster(b, e, unknown, true)
+                } else {
+                    e = parseCluster(b, e, unknown, false)
+                    pendingClusters.append(b)
+                    pendingClusters.append(e)
+                }
+            } else if id == 0x1549A966 {
+                parseInfo(b, e)
+            } else if id == 0x1654AE6B {
+                parseTracks(b, e)
+            } else if id == 0x1C53BB6B {
+                parseCues(b, e)
+            } else if id == 0x1043A770 {
+                parseChapters(b, e)
+            } else if id == 0x1254C367 {
+                parseTags(b, e)
+            } else if id == 0x1941A469 {
+                parseAttachments(b, e)
+            } else if id == 0x1A45DFA3 || id == 0x18538067 {
+                // A second (chained) segment inside an unknown-size one.
+                media.warnings.append("the file has more than one Matroska segment; only the first is read")
+                break
+            }
+            p = e
+        }
+    }
+
+    // The next Cluster ID (1F 43 B6 75) at or after `from`, or -1.
+    fn findCluster(_ from: Int, _ end: Int) -> Int {
+        var i = from
+        while i + 4 <= end {
+            if file[i] == 0x1F && file[i + 1] == 0x43 && file[i + 2] == 0xB6 && file[i + 3] == 0x75 && readHeader(i, end) {
+                return i
+            }
+            i += 1
+        }
+        -1
+    }
+
+    // Is this an element that can only be a child of the Segment (or a
+    // new EBML document)? Ends an unknown-size Cluster (RFC 9559 §6.2).
+    fn isTopLevel(_ id: Int) -> Bool {
+        id == 0x1F43B675 || id == 0x1C53BB6B || id == 0x1254C367 || id == 0x1043A770 || id == 0x1941A469 || id == 0x1549A966 || id == 0x1654AE6B || id == 0x114D9B74 || id == 0x1A45DFA3 || id == 0x18538067
+    }
+
+    // A Cluster's children (RFC 9559 §5.1.3): Timestamp, SimpleBlocks,
+    // BlockGroups. Returns where the cluster ends (for an unknown size,
+    // at the next top-level element). With emit false only finds the end.
+    fn parseCluster(_ body: Int, _ limit: Int, _ unknown: Bool, _ emit: Bool) -> Int {
+        var clusterTime = 0
+        var p = body
+        while p < limit {
+            if !readHeader(p, limit) {
+                let next = findCluster(p + 1, limit)
+                damaged += (if next < 0 { limit } else { next }) - p
+                return if next < 0 { limit } else { next }
+            }
+            let id = hId
+            if unknown && isTopLevel(id) {
+                return p
+            }
+            let b = hBody
+            let e = hEnd
+            if id == 0xA3 {
+                if emit {
+                    addBlock(b, e, clusterTime, true, -1, false)
+                }
+            } else if id == 0xA0 {
+                if emit {
+                    parseBlockGroup(b, e, clusterTime)
+                }
+            } else if id == 0xE7 {
+                clusterTime = uint(b, e)
+            }
+            p = e
+        }
+        limit
+    }
+
+    // BlockGroup (RFC 9559 §5.1.3.5): a Block with its BlockDuration and
+    // ReferenceBlocks (a block that refers to none is a keyframe).
+    fn parseBlockGroup(_ body: Int, _ end: Int, _ clusterTime: Int) {
+        var blockBody = -1
+        var blockEnd = -1
+        var duration = -1
+        var hasReference = false
+        var p = body
+        while p < end && readHeader(p, end) {
+            let id = hId
+            if id == 0xA1 {
+                blockBody = hBody
+                blockEnd = hEnd
+            } else if id == 0x9B {
+                duration = uint(hBody, hEnd)
+            } else if id == 0xFB {
+                hasReference = true
+            }
+            p = hEnd
+        }
+        if blockBody >= 0 {
+            addBlock(blockBody, blockEnd, clusterTime, false, duration, hasReference)
+        }
+    }
+
+    // A Block or SimpleBlock body (RFC 9559 §10): track number (EBML
+    // vint), 16-bit signed time offset, flags, then one frame or a lace
+    // of several (§10.4: Xiph, EBML or fixed-size lacing).
+    fn addBlock(_ b: Int, _ e: Int, _ clusterTime: Int, _ simple: Bool, _ blockDuration: Int, _ hasReference: Bool) {
+        if e - b < 4 {
+            return
+        }
+        let b0 = file[b]
+        var len = 1
+        var mask = 0x80
+        while len <= 8 && b0 & mask == 0 {
+            len += 1
+            mask = mask >> 1
+        }
+        if len > 8 || b + len + 3 > e {
+            return
+        }
+        var num = b0 & (mask - 1)
+        var i = 1
+        while i < len {
+            num = (num << 8) | file[b + i]
+            i += 1
+        }
+        let idx = if num < numToIndex.count { numToIndex[num] } else { -1 }
+        if idx < 0 {
+            unknownTrackBlocks += 1
+            return
+        }
+        let raw = (file[b + len] << 8) | file[b + len + 1]
+        let offset = if raw >= 32768 { raw - 65536 } else { raw }
+        let flags = file[b + len + 2]
+        var pos = b + len + 3
+        let key = if simple { flags & 0x80 != 0 } else { !hasReference }
+        let lacing = (flags >> 1) & 3
+        let pts = clusterTime + offset - infos[idx].codecDelayTicks
+        if lacing == 0 {
+            addFrame(idx, pts, pos, e - pos, key, blockDuration)
+            return
+        }
+        if pos >= e {
+            badLacing += 1
+            return
+        }
+        let count = file[pos] + 1
+        pos += 1
+        var sizes: [Int] = []
+        var used = 0
+        if lacing == 1 {
+            // Xiph lacing: each size as bytes of 255 and a last one below.
+            for _ in 0..(count - 1) {
+                var s = 0
+                var more = true
+                while more && pos < e {
+                    let v = file[pos]
+                    pos += 1
+                    s += v
+                    more = v == 255
+                }
+                sizes.append(s)
+                used += s
+            }
+        } else if lacing == 3 {
+            // EBML lacing: the first size as a vint, then signed differences.
+            for k in 0..(count - 1) {
+                if pos >= e {
+                    break
+                }
+                let c0 = file[pos]
+                var l = 1
+                var m = 0x80
+                while l <= 8 && c0 & m == 0 {
+                    l += 1
+                    m = m >> 1
+                }
+                if l > 8 || pos + l > e {
+                    badLacing += 1
+                    return
+                }
+                var v = c0 & (m - 1)
+                for j in 1..l {
+                    v = (v << 8) | file[pos + j]
+                }
+                pos += l
+                var s = v
+                if k > 0 {
+                    s = sizes[k - 1] + v - ((1 << (7 * l - 1)) - 1)
+                }
+                sizes.append(s)
+                used += s
+            }
+        } else {
+            // Fixed-size lacing: equal parts.
+            let each = (e - pos) / count
+            for _ in 0..(count - 1) {
+                sizes.append(each)
+                used += each
+            }
+        }
+        let last = e - pos - used
+        if sizes.count != count - 1 || last < 0 || sizes.any(where: { s in s < 0 }) {
+            badLacing += 1
+            return
+        }
+        sizes.append(last)
+        // Laced frames follow each other: DefaultDuration apart, or the
+        // BlockDuration shared out, or by each frame's own length.
+        var at = pos
+        var t = pts
+        let dd = infos[idx].defaultDurationNs
+        for k in 0..count {
+            var framePts = t
+            var dur = -1
+            if dd > 0 {
+                framePts = pts + (k * dd + timestampScale / 2) / timestampScale
+            } else if blockDuration >= 0 {
+                framePts = pts + blockDuration * k / count
+                dur = blockDuration * (k + 1) / count - blockDuration * k / count
+            }
+            let added = addFrame(idx, framePts, at, sizes[k], key, dur)
+            t = framePts + added
+            at += sizes[k]
+        }
+    }
+
+    // One frame as a packet; returns its duration in ticks.
+    fn addFrame(_ idx: Int, _ pts: Int, _ at: Int, _ size: Int, _ key: Bool, _ blockDuration: Int) -> Int {
+        var dur = blockDuration
+        if dur < 0 {
+            dur = infos[idx].defaultTicks
+            if dur == 0 && infos[idx].framing != 0 {
+                let rate = infos[idx].frameRate
+                if rate > 0 {
+                    // ffmpeg rounds these lengths down to whole ticks.
+                    dur = frameSamples(idx, at, size) * timescale / rate
+                }
+            }
+        } else if infos[idx].framing == 7 {
+            // Keep the Vorbis block history right.
+            frameSamples(idx, at, size)
+        }
+        media.packets.append(core.PacketRef(track: idx, pts: pts, dts: core.noTime, duration: dur, key: key, offset: at, size: size))
+        dur
+    }
+
+    // A frame's length in samples, from its codec's header.
+    fn frameSamples(_ idx: Int, _ at: Int, _ size: Int) -> Int {
+        let framing = infos[idx].framing
+        if size <= 0 {
+            return 0
+        }
+        if framing == 1 {
+            return 1024
+        }
+        if framing == 2 {
+            // MPEG audio header (ISO 11172-3 §2.4.1.3): version and layer.
+            if size < 4 || file[at] != 0xFF || file[at + 1] & 0xE0 != 0xE0 {
+                return 0
+            }
+            let version = (file[at + 1] >> 3) & 3
+            let layer = (file[at + 1] >> 1) & 3
+            if layer == 3 {
+                return 384
+            }
+            if layer == 2 || version == 3 {
+                return 1152
+            }
+            return 576
+        }
+        if framing == 3 {
+            return 1536
+        }
+        if framing == 4 {
+            // E-AC-3 (ATSC A/52 §E.1.2.2): fscod and numblkscod.
+            if size < 5 {
+                return 0
+            }
+            let b4 = file[at + 4]
+            if b4 >> 6 == 3 {
+                return 1536
+            }
+            return [256, 512, 768, 1536][(b4 >> 4) & 3]
+        }
+        if framing == 5 {
+            return oggOpusSamples(file, at, size)
+        }
+        if framing == 6 {
+            return oggFlacBlockSize(file, at, size)
+        }
+        if framing == 7 {
+            // Vorbis: (previous block + this block) / 4, as in ogg.tsl.
+            let b0 = file[at]
+            if b0 & 1 != 0 {
+                return 0
+            }
+            let modes = infos[idx].vorbisModes
+            let blocks = infos[idx].vorbisBlocks
+            var cur = blocks[1]
+            if modes.count > 1 {
+                let bits = oggIlog(modes.count - 1)
+                var v = b0
+                if size > 1 {
+                    v = v | (file[at + 1] << 8)
+                }
+                let mode = (v >> 1) & ((1 << bits) - 1)
+                if mode < modes.count {
+                    cur = blocks[modes[mode]]
+                }
+            } else if modes.count == 1 {
+                cur = blocks[modes[0]]
+            }
+            let prev = infos[idx].vorbisPrev
+            infos[idx].vorbisPrev = cur
+            return (prev + cur) / 4
+        }
+        if framing == 8 {
+            let fb = infos[idx].pcmFrameBytes
+            return if fb > 0 { size / fb } else { 0 }
+        }
+        if framing == 9 {
+            // DTS core frame header: NBLKS after the 32-bit sync word.
+            if size < 6 || file[at] != 0x7F || file[at + 1] != 0xFE {
+                return 0
+            }
+            let nblks = ((file[at + 4] & 1) << 6) | (file[at + 5] >> 2)
+            return (nblks + 1) * 32
+        }
+        0
+    }
+
+    // Info (RFC 9559 §5.1.2).
+    fn parseInfo(_ body: Int, _ end: Int) {
+        var p = body
+        while p < end && readHeader(p, end) {
+            let b = hBody
+            let e = hEnd
+            match hId {
+                0x2AD7B1 -> {
+                    let s = uint(b, e)
+                    if s > 0 {
+                        timestampScale = s
+                    }
+                }
+                0x4489 -> { infoDuration = float(b, e) }
+                0x7BA9 -> {
+                    let t = text(b, e)
+                    if !t.isEmpty {
+                        media.tags["title"] = t
+                    }
+                }
+                0x4D80 -> { muxingApp = text(b, e) }
+                _ -> {}
+            }
+            p = e
+        }
+        timescale = if 1000000000 % timestampScale == 0 { 1000000000 / timestampScale } else { max(1, (1000000000 + timestampScale / 2) / timestampScale) }
+        updateTicks()
+    }
+
+    // Track times in ticks of the TimestampScale (ffmpeg rounds these to
+    // the nearest tick).
+    fn updateTicks() {
+        for i in infos.indices {
+            infos[i].defaultTicks = (infos[i].defaultDurationNs + timestampScale / 2) / timestampScale
+            infos[i].codecDelayTicks = (infos[i].codecDelayNs + timestampScale / 2) / timestampScale
+            media.tracks[i].timescale = timescale
+        }
+    }
+
+    // Tracks (RFC 9559 §5.1.4).
+    fn parseTracks(_ body: Int, _ end: Int) {
+        var p = body
+        while p < end && readHeader(p, end) {
+            let e = hEnd
+            if hId == 0xAE {
+                parseTrackEntry(hBody, e)
+            }
+            p = e
+        }
+        tracksSeen = true
+        updateTicks()
+        // Clusters that came before the Tracks.
+        var i = 0
+        while i + 1 < pendingClusters.count {
+            parseCluster(pendingClusters[i], pendingClusters[i + 1], false, true)
+            i += 2
+        }
+        pendingClusters = []
+    }
+
+    // TrackEntry (RFC 9559 §5.1.4.1).
+    fn parseTrackEntry(_ body: Int, _ end: Int) {
+        var number = 0
+        var uid = 0
+        var type = 0
+        var codecId = ""
+        var priv = Data()
+        var name = ""
+        // The default language is English (RFC 9559 §5.1.4.1.19).
+        var language = "eng"
+        var bcp47 = ""
+        var isDefault = true
+        var isForced = false
+        var defaultDurationNs = 0
+        var codecDelayNs = 0
+        var pixelW = 0
+        var pixelH = 0
+        var displayW = 0
+        var displayH = 0
+        var rate = 8000.0
+        var outRate = 0.0
+        var channels = 1
+        var bitDepth = 0
+        var compAlgo = -1
+        var compScope = 1
+        var compSettings = Data()
+        var encrypted = false
+        var p = body
+        while p < end && readHeader(p, end) {
+            let b = hBody
+            let e = hEnd
+            match hId {
+                0xD7 -> { number = uint(b, e) }
+                0x73C5 -> { uid = uint(b, e) }
+                0x83 -> { type = uint(b, e) }
+                0x86 -> { codecId = text(b, e) }
+                0x63A2 -> { priv = file.slice(from: b, to: e) }
+                0x536E -> { name = text(b, e) }
+                0x22B59C -> { language = text(b, e) }
+                0x22B59D -> { bcp47 = text(b, e) }
+                0x88 -> { isDefault = uint(b, e) != 0 }
+                0x55AA -> { isForced = uint(b, e) != 0 }
+                0x23E383 -> { defaultDurationNs = uint(b, e) }
+                0x56AA -> { codecDelayNs = uint(b, e) }
+                0xE0 -> {
+                    // Video (§5.1.4.1.28).
+                    var q = b
+                    while q < e && readHeader(q, e) {
+                        match hId {
+                            0xB0 -> { pixelW = uint(hBody, hEnd) }
+                            0xBA -> { pixelH = uint(hBody, hEnd) }
+                            0x54B0 -> { displayW = uint(hBody, hEnd) }
+                            0x54BA -> { displayH = uint(hBody, hEnd) }
+                            _ -> {}
+                        }
+                        q = hEnd
+                    }
+                }
+                0xE1 -> {
+                    // Audio (§5.1.4.1.29).
+                    var q = b
+                    while q < e && readHeader(q, e) {
+                        match hId {
+                            0xB5 -> { rate = float(hBody, hEnd) }
+                            0x78B5 -> { outRate = float(hBody, hEnd) }
+                            0x9F -> { channels = uint(hBody, hEnd) }
+                            0x6264 -> { bitDepth = uint(hBody, hEnd) }
+                            _ -> {}
+                        }
+                        q = hEnd
+                    }
+                }
+                0x6D80 -> {
+                    // ContentEncodings (§5.1.4.1.31): compression or
+                    // encryption of frames or the CodecPrivate.
+                    var q = b
+                    while q < e && readHeader(q, e) {
+                        if hId == 0x6240 {
+                            let ce = hEnd
+                            var r = hBody
+                            var encType = 0
+                            var scope = 1
+                            var algo = 0
+                            var settings = Data()
+                            var hasCompression = false
+                            while r < ce && readHeader(r, ce) {
+                                match hId {
+                                    0x5032 -> { scope = uint(hBody, hEnd) }
+                                    0x5033 -> { encType = uint(hBody, hEnd) }
+                                    0x5035 -> { encType = 1 }
+                                    0x5034 -> {
+                                        hasCompression = true
+                                        let ccEnd = hEnd
+                                        var c = hBody
+                                        while c < ccEnd && readHeader(c, ccEnd) {
+                                            if hId == 0x4254 {
+                                                algo = uint(hBody, hEnd)
+                                            } else if hId == 0x4255 {
+                                                settings = file.slice(from: hBody, to: hEnd)
+                                            }
+                                            c = hEnd
+                                        }
+                                    }
+                                    _ -> {}
+                                }
+                                r = hEnd
+                            }
+                            if encType == 1 {
+                                encrypted = true
+                            } else if hasCompression || encType == 0 {
+                                compAlgo = algo
+                                compScope = scope
+                                compSettings = settings
+                            }
+                            q = ce
+                        } else {
+                            q = hEnd
+                        }
+                    }
+                }
+                _ -> {}
+            }
+            p = e
+        }
+        if number <= 0 {
+            media.warnings.append("a Matroska track without a TrackNumber was skipped")
+            return
+        }
+        let index = media.tracks.count
+        var t = core.Track(index: index, id: number, kind: .other, codec: "")
+        var info = MkvTrackInfo(number: number, uid: uid, defaultDurationNs: defaultDurationNs, codecDelayNs: codecDelayNs)
+        t.kind = match type {
+            1 -> core.TrackKind.video
+            2 -> core.TrackKind.audio
+            0x11 -> core.TrackKind.subtitle
+            _ -> core.TrackKind.other
+        }
+        t.title = name
+        t.isDefault = isDefault
+        t.isForced = isForced
+        t.language = mkvLanguage(if bcp47.isEmpty { language } else { bcp47 })
+        // Compressed CodecPrivate (scope 2) can be undone here.
+        if compAlgo == 0 && compScope & 2 != 0 {
+            if let d = priv.decompressed("zlib") {
+                priv = d
+            }
+        }
+        // Video.
+        t.width = pixelW
+        t.height = pixelH
+        if displayW > 0 && displayH > 0 && pixelW > 0 && pixelH > 0 {
+            // The pixel shape that shows PixelWidth×PixelHeight at the
+            // display size (§5.1.4.1.28.12).
+            let num = displayW * pixelH
+            let den = displayH * pixelW
+            let g = oggGcd(num, den)
+            t.sarNum = num / g
+            t.sarDen = den / g
+        }
+        if t.kind == .video && defaultDurationNs > 0 {
+            let (fn0, fd0) = mkvFrameRate(defaultDurationNs)
+            t.fpsNum = fn0
+            t.fpsDen = fd0
+        }
+        // Audio.
+        if t.kind == .audio {
+            t.sampleRate = Int(rate + 0.5)
+            if outRate > 0.0 {
+                t.sampleRate = Int(outRate + 0.5)
+            }
+            t.channels = channels
+            info.frameRate = Int(rate + 0.5)
+        }
+        mkvSetCodec(t, info, codecId, priv, bitDepth)
+        if codecId == "A_OPUS" {
+            info.framing = 5
+            info.frameRate = 48000
+        } else if t.codec == "aac" {
+            info.framing = 1
+        } else if t.codec == "mp3" || t.codec == "mp2" || t.codec == "mp1" {
+            info.framing = 2
+        } else if t.codec == "ac3" {
+            info.framing = 3
+        } else if t.codec == "eac3" {
+            info.framing = 4
+        } else if t.codec == "flac" {
+            info.framing = 6
+        } else if t.codec == "dts" {
+            info.framing = 9
+        } else if t.codec == "pcm" {
+            info.framing = 8
+            info.pcmFrameBytes = max(1, t.channels) * max(1, t.pcm.bits / 8)
+        } else if t.codec == "vorbis" {
+            info.framing = 7
+            if let (id, _, setup) = mkvSplitThree(t.extra) {
+                if id.count >= 30 {
+                    let bs = id[28]
+                    info.vorbisBlocks = [1 << (bs & 15), 1 << (bs >> 4)]
+                    info.vorbisPrev = 1 << (bs >> 4)
+                }
+                info.vorbisModes = oggVorbisModes(setup)
+            }
+        }
+        // Content encodings on frames.
+        if encrypted {
+            media.warnings.append("track {number} is encrypted")
+            t.codec = "unknown:encrypted"
+            info.framing = 0
+        } else if compAlgo == 3 && compScope & 1 != 0 {
+            // Header stripping: these bytes were cut from every frame.
+            t.prefix = compSettings
+            info.framing = 0
+        } else if compAlgo >= 0 && compAlgo != 3 && compScope & 1 != 0 {
+            let algoName = match compAlgo {
+                0 -> "zlib"
+                1 -> "bzlib"
+                2 -> "lzo"
+                _ -> "compressed"
+            }
+            media.warnings.append("track {number}'s frames are {algoName}-compressed, which Reel can't read")
+            t.codec = "unknown:" + algoName
+            info.framing = 0
+        }
+        while numToIndex.count <= number && number < 65536 {
+            numToIndex.append(-1)
+        }
+        if number < numToIndex.count {
+            if numToIndex[number] >= 0 {
+                media.warnings.append("two Matroska tracks share number {number}")
+                return
+            }
+            numToIndex[number] = index
+        }
+        media.tracks.append(t)
+        infos.append(info)
+    }
+
+    // Cues (RFC 9559 §5.1.5): only their cluster positions, for checking.
+    fn parseCues(_ body: Int, _ end: Int) {
+        var p = body
+        while p < end && readHeader(p, end) {
+            let pe = hEnd
+            if hId == 0xBB {
+                var q = hBody
+                while q < pe && readHeader(q, pe) {
+                    let qe = hEnd
+                    if hId == 0xB7 {
+                        var r = hBody
+                        while r < qe && readHeader(r, qe) {
+                            if hId == 0xF1 {
+                                cuePositions.append(uint(hBody, hEnd))
+                            }
+                            r = hEnd
+                        }
+                    }
+                    q = qe
+                }
+            }
+            p = pe
+        }
+    }
+
+    // Chapters (RFC 9559 §5.1.7): the default edition's atoms, nested
+    // ones included, in order.
+    fn parseChapters(_ body: Int, _ end: Int) {
+        var chosen = -1
+        var chosenEnd = -1
+        var p = body
+        while p < end && readHeader(p, end) {
+            let eb = hBody
+            let ee = hEnd
+            if hId == 0x45B9 {
+                var isDefault = false
+                var q = eb
+                while q < ee && readHeader(q, ee) {
+                    if hId == 0x45DB && uint(hBody, hEnd) != 0 {
+                        isDefault = true
+                    }
+                    q = hEnd
+                }
+                if chosen < 0 || (isDefault && media.chapters.isEmpty) {
+                    chosen = eb
+                    chosenEnd = ee
+                }
+            }
+            p = ee
+        }
+        if chosen >= 0 && media.chapters.isEmpty {
+            parseAtoms(chosen, chosenEnd)
+        }
+    }
+
+    fn parseAtoms(_ body: Int, _ end: Int) {
+        var p = body
+        while p < end && readHeader(p, end) {
+            let ab = hBody
+            let ae = hEnd
+            if hId == 0xB6 {
+                var start = 0
+                var stop = -1
+                var title = ""
+                var hidden = false
+                var nested: [Int] = []
+                var q = ab
+                while q < ae && readHeader(q, ae) {
+                    let b = hBody
+                    let e = hEnd
+                    match hId {
+                        0x91 -> { start = uint(b, e) }
+                        0x92 -> { stop = uint(b, e) }
+                        0x98 -> { hidden = uint(b, e) != 0 }
+                        0x80 -> {
+                            if title.isEmpty {
+                                var r = b
+                                while r < e && readHeader(r, e) {
+                                    if hId == 0x85 && title.isEmpty {
+                                        title = text(hBody, hEnd)
+                                    }
+                                    r = hEnd
+                                }
+                            }
+                        }
+                        0xB6 -> {
+                            nested.append(q)
+                            nested.append(e)
+                        }
+                        _ -> {}
+                    }
+                    q = e
+                }
+                if !hidden {
+                    let endSeconds = if stop >= 0 { Float(stop) / 1e9 } else { -1.0 }
+                    media.chapters.append(core.Chapter(start: Float(start) / 1e9, end: endSeconds, title: title))
+                }
+                var i = 0
+                while i + 1 < nested.count {
+                    parseAtoms(nested[i], nested[i + 1])
+                    i += 2
+                }
+            }
+            p = ae
+        }
+    }
+
+    // Tags (RFC 9559 §5.1.8): tags without a track, chapter, edition or
+    // attachment target describe the file; a track's DURATION tag
+    // (written by ffmpeg) gives its length.
+    fn parseTags(_ body: Int, _ end: Int) {
+        var p = body
+        while p < end && readHeader(p, end) {
+            let tb = hBody
+            let te = hEnd
+            if hId == 0x7373 {
+                var trackUid = 0
+                var targeted = false
+                var names: [String] = []
+                var values: [String] = []
+                var q = tb
+                while q < te && readHeader(q, te) {
+                    let b = hBody
+                    let e = hEnd
+                    if hId == 0x63C0 {
+                        var r = b
+                        while r < e && readHeader(r, e) {
+                            let id = hId
+                            if id == 0x63C5 {
+                                trackUid = uint(hBody, hEnd)
+                                targeted = true
+                            } else if id == 0x63C9 || id == 0x63C4 || id == 0x63C6 {
+                                if uint(hBody, hEnd) != 0 {
+                                    targeted = true
+                                }
+                            }
+                            r = hEnd
+                        }
+                    } else if hId == 0x67C8 {
+                        var tagName = ""
+                        var tagValue = ""
+                        var r = b
+                        while r < e && readHeader(r, e) {
+                            if hId == 0x45A3 {
+                                tagName = text(hBody, hEnd)
+                            } else if hId == 0x4487 {
+                                tagValue = text(hBody, hEnd)
+                            }
+                            r = hEnd
+                        }
+                        names.append(tagName)
+                        values.append(tagValue)
+                    }
+                    q = e
+                }
+                for (i, n) in names.enumerated() {
+                    if targeted {
+                        if trackUid != 0 && n.uppercase() == "DURATION" {
+                            trackDurations[trackUid] = values[i]
+                        }
+                    } else if !n.isEmpty {
+                        let key = mkvTagName(n)
+                        if !media.tags.contains(key: key) {
+                            media.tags[key] = values[i]
+                        }
+                    }
+                }
+            }
+            p = te
+        }
+    }
+
+    // Attachments (RFC 9559 §5.1.6): fonts for ASS subtitles, cover art
+    // (an attachment named cover.* is also Media.cover; Matroska's cover
+    // art guidelines, RFC 9559 §21).
+    fn parseAttachments(_ body: Int, _ end: Int) {
+        var p = body
+        while p < end && readHeader(p, end) {
+            let fb = hBody
+            let fe = hEnd
+            if hId == 0x61A7 {
+                var a = core.Attachment(name: "")
+                var q = fb
+                while q < fe && readHeader(q, fe) {
+                    match hId {
+                        0x466E -> { a.name = text(hBody, hEnd) }
+                        0x4660 -> { a.mime = text(hBody, hEnd) }
+                        0x465C -> { a.data = file.slice(from: hBody, to: hEnd) }
+                        _ -> {}
+                    }
+                    q = hEnd
+                }
+                let lower = a.name.lowercase()
+                if lower.hasPrefix("cover.") || (media.cover.isEmpty && lower.hasPrefix("cover_land.")) {
+                    media.cover = a.data
+                }
+                media.attachments.append(a)
+            }
+            p = fe
+        }
+    }
+
+    fn finish() {
+        if !pendingClusters.isEmpty {
+            media.warnings.append("this Matroska file has clusters but no Tracks")
+        }
+        // Track lengths from DURATION tags ("HH:MM:SS.nnnnnnnnn").
+        for (i, info) in infos.enumerated() {
+            if let d = trackDurations[info.uid] {
+                let ns = mkvParseDuration(d)
+                if ns >= 0 {
+                    media.tracks[i].duration = (ns + timestampScale / 2) / timestampScale
+                }
+            }
+        }
+        if infoDuration >= 0.0 {
+            media.duration = infoDuration * Float(timestampScale) / 1e9
+        } else {
+            var end = 0
+            for p in media.packets {
+                if p.pts != core.noTime {
+                    end = max(end, p.pts + p.duration)
+                }
+            }
+            media.duration = if media.packets.isEmpty { -1.0 } else { Float(end) / Float(timescale) }
+        }
+        if !media.tags.contains(key: "encoder") && !muxingApp.isEmpty {
+            media.tags["encoder"] = muxingApp
+        }
+        var missing = 0
+        for c in cuePositions {
+            if !clusterStarts.contains(c) {
+                missing += 1
+            }
+        }
+        if missing > 0 {
+            media.warnings.append("{missing} cue points don't point at a cluster (the index is ignored; packets come from the clusters)")
+        }
+        if unknownTrackBlocks > 0 {
+            media.warnings.append("{unknownTrackBlocks} blocks belong to no listed track and were skipped")
+        }
+        if badLacing > 0 {
+            media.warnings.append("{badLacing} blocks had damaged lacing and were skipped")
+        }
+        if damaged > 0 {
+            media.warnings.append("skipped {damaged} damaged bytes")
+        }
+        if truncated {
+            media.warnings.append("the file is cut short (an element runs past its end)")
+        }
+    }
+}
+
+// Opens a Matroska or WebM file.
+public fn mkvOpen(_ file: Data) -> Result<core.Media> {
+    var p = MkvParser(file: file, fileEnd: file.count)
+    let err = p.parse()
+    if let e = err {
+        return Result.failure(error: e)
+    }
+    Result.ok(value: p.media)
+}
+
+// Frames per second from a frame's length in ns: exact whole and NTSC
+// (×1000/1001) rates are recognised, as ffprobe reports them.
+fn mkvFrameRate(_ ns: Int) -> (Int, Int) {
+    let f = 1e9 / Float(ns)
+    let whole = Int(f + 0.5)
+    if whole > 0 && abs(f - Float(whole)) < 0.001 * f / 1000.0 + 0.0005 {
+        return (whole, 1)
+    }
+    let ntsc = f * 1001.0 / 1000.0
+    let w2 = Int(ntsc + 0.5)
+    if w2 > 0 && abs(ntsc - Float(w2)) < 0.002 {
+        return (w2 * 1000, 1001)
+    }
+    let g = oggGcd(1000000000, ns)
+    (1000000000 / g, ns / g)
+}
+
+// "HH:MM:SS.nnnnnnnnn" (ffmpeg's DURATION tag) in ns, or -1.
+fn mkvParseDuration(_ s: String) -> Int {
+    let parts = s.trim().split(":")
+    if parts.count != 3 {
+        return -1
+    }
+    let h = Int(parts[0]) ?? -1
+    let m = Int(parts[1]) ?? -1
+    let secParts = parts[2].split(".")
+    let sec = Int(secParts[0]) ?? -1
+    if h < 0 || m < 0 || sec < 0 {
+        return -1
+    }
+    var frac = 0
+    if secParts.count > 1 {
+        let digits = (secParts[1] + "000000000").substring(from: 0, to: 9)
+        frac = Int(digits) ?? 0
+    }
+    ((h * 60 + m) * 60 + sec) * 1000000000 + frac
+}
+
+// Matroska tag names (RFC 9559 §5.1.8, "Matroska tags") as Reel's keys.
+fn mkvTagName(_ name: String) -> String {
+    let n = name.lowercase()
+    match n {
+        "part_number" -> "track"
+        "date_released" -> "date"
+        "date_recorded" -> "date"
+        "album_artist" -> "albumartist"
+        "lead_performer" -> "performer"
+        "description" -> "comment"
+        _ -> n
+    }
+}
+
+// Two-letter ISO 639-1 codes (and BCP 47 tags that start with one) as
+// ISO 639-2/B, the form Matroska's Language and Reel use.
+let mkvIso1 = ["en": "eng", "fr": "fre", "de": "ger", "es": "spa", "it": "ita", "pt": "por", "ja": "jpn", "zh": "chi", "ko": "kor", "ru": "rus", "ar": "ara", "hi": "hin", "nl": "dut", "sv": "swe", "no": "nor", "nb": "nob", "nn": "nno", "da": "dan", "fi": "fin", "pl": "pol", "cs": "cze", "sk": "slo", "hu": "hun", "ro": "rum", "el": "gre", "tr": "tur", "he": "heb", "th": "tha", "vi": "vie", "id": "ind", "ms": "may", "tl": "tgl", "fil": "fil", "uk": "ukr", "bg": "bul", "hr": "hrv", "sr": "srp", "sl": "slv", "et": "est", "lv": "lav", "lt": "lit", "fa": "per", "ur": "urd", "bn": "ben", "ta": "tam", "te": "tel", "ca": "cat", "eu": "baq", "gl": "glg", "is": "ice", "ga": "gle", "cy": "wel", "la": "lat"]
+
+fn mkvLanguage(_ code: String) -> String {
+    let base = code.split("-")[0].lowercase()
+    if base == "und" || base.isEmpty || base == "zxx" || base == "mis" || base == "mul" {
+        return ""
+    }
+    if base.count == 2 {
+        return mkvIso1[base] ?? base
+    }
+    base
+}
+
+// Matroska's Xiph-laced CodecPrivate (Vorbis, Theora: RFC 9559 §19.1,
+// a count−1 byte, Xiph sizes of all but the last) as its three packets.
+fn mkvSplitThree(_ core3: Data) -> (Data, Data, Data)? {
+    // core3 is already in core's form: 4-byte lengths.
+    var parts: [Data] = []
+    var at = 0
+    while at + 4 <= core3.count && parts.count < 3 {
+        let len = core3.uint32(at: at, bigEndian: true)
+        if at + 4 + len > core3.count {
+            return nil
+        }
+        parts.append(core3.slice(from: at + 4, to: at + 4 + len))
+        at += 4 + len
+    }
+    if parts.count != 3 {
+        return nil
+    }
+    (parts[0], parts[1], parts[2])
+}
+
+fn mkvXiphToCore(_ d: Data) -> Data {
+    if d.count < 3 || d[0] != 2 {
+        return Data()
+    }
+    var at = 1
+    var sizes: [Int] = []
+    for _ in 0..2 {
+        var s = 0
+        var more = true
+        while more && at < d.count {
+            let v = d[at]
+            at += 1
+            s += v
+            more = v == 255
+        }
+        sizes.append(s)
+    }
+    let third = d.count - at - sizes[0] - sizes[1]
+    if third < 0 {
+        return Data()
+    }
+    let a = d.slice(from: at, to: at + sizes[0])
+    let b = d.slice(from: at + sizes[0], to: at + sizes[0] + sizes[1])
+    let c = d.slice(from: at + sizes[0] + sizes[1], to: d.count)
+    oggThreeHeaders(a, b, c)
+}
+
+// AAC sampling frequency index (ISO 14496-3 §1.6.3.4).
+fn mkvAacRateIndex(_ rate: Int) -> Int {
+    let rates = [96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350]
+    var best = 0
+    for (i, r) in rates.enumerated() {
+        if abs(r - rate) < abs(rates[best] - rate) {
+            best = i
+        }
+    }
+    best
+}
+
+// Sets the codec name and core's `extra` from CodecID and CodecPrivate
+// (RFC 9559 §19 and the Matroska codec mappings).
+fn mkvSetCodec(_ t: bind core.Track, _ info: MkvTrackInfo, _ id: String, _ priv: Data, _ bitDepth: Int) {
+    t.extra = priv
+    if id.hasPrefix("A_AAC") {
+        t.codec = "aac"
+        if priv.isEmpty {
+            // Old CodecIDs (A_AAC/MPEG4/LC …) with no CodecPrivate: build
+            // the AudioSpecificConfig (ISO 14496-3 §1.6.2.1) the way
+            // ffmpeg does, with explicit SBR signalling for …/SBR.
+            var object = 2
+            if id.hasSuffix("/MAIN") {
+                object = 1
+            } else if id.hasSuffix("/SSR") {
+                object = 3
+            } else if id.hasSuffix("/LTP") {
+                object = 4
+            }
+            let sri = mkvAacRateIndex(info.frameRate)
+            var asc = Data()
+            asc.append(byte: (object << 3) | (sri >> 1))
+            asc.append(byte: ((sri & 1) << 7) | ((t.channels & 15) << 3))
+            if id.contains("SBR") {
+                let outIndex = mkvAacRateIndex(if t.sampleRate > info.frameRate { t.sampleRate } else { info.frameRate * 2 })
+                asc.append(byte: 0x56)
+                asc.append(byte: 0xE5)
+                asc.append(byte: 0x80 | (outIndex << 3))
+                if t.sampleRate <= info.frameRate {
+                    t.sampleRate = info.frameRate * 2
+                }
+            }
+            t.extra = asc
+        }
+        return
+    }
+    if id == "A_MS/ACM" {
+        mkvWaveFormat(t, priv)
+        return
+    }
+    if id == "V_MS/VFW/FOURCC" {
+        // BITMAPINFOHEADER: the codec's fourcc at byte 16, its setup after
+        // the 40-byte header.
+        if priv.count >= 40 {
+            let fourcc = priv.slice(from: 16, to: 20).latin1
+            t.codec = mkvFourcc(fourcc)
+            t.extra = priv.slice(from: 40, to: priv.count)
+            if t.width == 0 {
+                t.width = priv.int32(at: 4)
+                t.height = abs(priv.int32(at: 8))
+            }
+        } else {
+            t.codec = "unknown:" + id
+        }
+        return
+    }
+    if id.hasPrefix("A_PCM/") {
+        t.codec = "pcm"
+        let bits = if bitDepth > 0 { bitDepth } else { 16 }
+        t.bitsPerSample = bits
+        if id == "A_PCM/FLOAT/IEEE" {
+            t.pcm = core.PcmFormat(bits: bits, float: true, bigEndian: false, signed: true)
+        } else if id == "A_PCM/INT/BIG" {
+            t.pcm = core.PcmFormat(bits: bits, float: false, bigEndian: true, signed: true)
+        } else {
+            // A_PCM/INT/LIT: 8-bit samples are unsigned, as in WAV.
+            t.pcm = core.PcmFormat(bits: bits, float: false, bigEndian: false, signed: bits > 8)
+        }
+        t.extra = Data()
+        return
+    }
+    t.codec = match id {
+        "V_MPEG4/ISO/AVC" -> "h264"
+        "V_MPEGH/ISO/HEVC" -> "hevc"
+        "V_VP8" -> "vp8"
+        "V_VP9" -> "vp9"
+        "V_AV1" -> "av1"
+        "V_MPEG1" -> "mpeg1"
+        "V_MPEG2" -> "mpeg2"
+        "V_MPEG4/ISO/SP" -> "mpeg4"
+        "V_MPEG4/ISO/ASP" -> "mpeg4"
+        "V_MPEG4/ISO/AP" -> "mpeg4"
+        "V_MPEG4/MS/V3" -> "msmpeg4v3"
+        "V_MJPEG" -> "mjpeg"
+        "V_THEORA" -> "theora"
+        "V_PRORES" -> "prores"
+        "V_UNCOMPRESSED" -> "rawvideo"
+        "A_MPEG/L3" -> "mp3"
+        "A_MPEG/L2" -> "mp2"
+        "A_MPEG/L1" -> "mp1"
+        "A_FLAC" -> "flac"
+        "A_VORBIS" -> "vorbis"
+        "A_OPUS" -> "opus"
+        "A_AC3" -> "ac3"
+        "A_AC3/BSID9" -> "ac3"
+        "A_AC3/BSID10" -> "ac3"
+        "A_EAC3" -> "eac3"
+        "A_TRUEHD" -> "truehd"
+        "A_MLP" -> "mlp"
+        "A_DTS" -> "dts"
+        "A_DTS/EXPRESS" -> "dts"
+        "A_DTS/LOSSLESS" -> "dts"
+        "A_ALAC" -> "alac"
+        "S_TEXT/UTF8" -> "srt"
+        "S_TEXT/ASCII" -> "srt"
+        "S_TEXT/ASS" -> "ass"
+        "S_TEXT/SSA" -> "ass"
+        "S_ASS" -> "ass"
+        "S_SSA" -> "ass"
+        "S_TEXT/WEBVTT" -> "webvtt"
+        "D_WEBVTT/SUBTITLES" -> "webvtt"
+        "D_WEBVTT/CAPTIONS" -> "webvtt"
+        "D_WEBVTT/DESCRIPTIONS" -> "webvtt"
+        "S_HDMV/PGS" -> "pgs"
+        "S_VOBSUB" -> "dvdsub"
+        "S_DVBSUB" -> "dvbsub"
+        _ -> "unknown:" + id
+    }
+    if t.codec == "vorbis" || t.codec == "theora" {
+        t.extra = mkvXiphToCore(priv)
+    } else if t.codec == "alac" && priv.count >= 36 && priv.slice(from: 4, to: 8).latin1 == "alac" {
+        // ffmpeg stores the whole 'alac' atom; core wants the cookie
+        // (ALACSpecificConfig) after its 12-byte atom header.
+        t.extra = priv.slice(from: 12, to: priv.count)
+    }
+    if t.codec == "flac" || t.codec == "alac" {
+        t.bitsPerSample = bitDepth
+    }
+    if id.hasPrefix("S_") || id.hasPrefix("D_") {
+        t.kind = .subtitle
+    }
+}
+
+// WAVEFORMATEX (A_MS/ACM CodecPrivate): format tag → codec.
+fn mkvWaveFormat(_ t: bind core.Track, _ d: Data) {
+    if d.count < 16 {
+        t.codec = "unknown:A_MS/ACM"
+        return
+    }
+    var tag = d.uint16(at: 0)
+    let bits = d.uint16(at: 14)
+    if d.count >= 18 {
+        let cb = d.uint16(at: 16)
+        t.extra = d.slice(from: 18, to: min(d.count, 18 + cb))
+    } else {
+        t.extra = Data()
+    }
+    if tag == 0xFFFE && d.count >= 26 {
+        // WAVE_FORMAT_EXTENSIBLE: the real tag starts the SubFormat GUID.
+        tag = d.uint16(at: 24)
+        t.extra = Data()
+    }
+    t.channels = d.uint16(at: 2)
+    t.sampleRate = d.uint32(at: 4)
+    t.bitrate = d.uint32(at: 8) * 8
+    t.blockAlign = d.uint16(at: 12)
+    t.codec = match tag {
+        0x55 -> "mp3"
+        0x50 -> "mp2"
+        0x2000 -> "ac3"
+        0x2001 -> "dts"
+        0xFF -> "aac"
+        0x1610 -> "aac"
+        0x160 -> "wmav1"
+        0x161 -> "wmav2"
+        0x162 -> "wmapro"
+        0x163 -> "wmalossless"
+        1 -> "pcm"
+        3 -> "pcm"
+        6 -> "alaw"
+        7 -> "ulaw"
+        _ -> "unknown:acm{tag}"
+    }
+    if tag == 1 || tag == 3 {
+        let b = if bits > 0 { bits } else { 16 }
+        t.pcm = core.PcmFormat(bits: b, float: tag == 3, bigEndian: false, signed: b > 8)
+        t.bitsPerSample = b
+        t.extra = Data()
+    }
+    if tag == 0x1610 {
+        // ADTS-framed AAC.
+        t.adts = true
+        t.extra = Data()
+    }
+}
+
+fn mkvFourcc(_ f: String) -> String {
+    match f {
+        "H264" -> "h264"
+        "h264" -> "h264"
+        "avc1" -> "h264"
+        "X264" -> "h264"
+        "x264" -> "h264"
+        "HEVC" -> "hevc"
+        "hvc1" -> "hevc"
+        "XVID" -> "mpeg4"
+        "xvid" -> "mpeg4"
+        "DIVX" -> "mpeg4"
+        "divx" -> "mpeg4"
+        "DX50" -> "mpeg4"
+        "FMP4" -> "mpeg4"
+        "MP4V" -> "mpeg4"
+        "mp4v" -> "mpeg4"
+        "MJPG" -> "mjpeg"
+        "mjpg" -> "mjpeg"
+        "mpg1" -> "mpeg1"
+        "MPG1" -> "mpeg1"
+        "mpg2" -> "mpeg2"
+        "MPG2" -> "mpeg2"
+        "VP80" -> "vp8"
+        "VP90" -> "vp9"
+        "AV01" -> "av1"
+        "WVC1" -> "vc1"
+        "WMVA" -> "vc1"
+        "WMV3" -> "wmv3"
+        "WMV2" -> "wmv2"
+        "WMV1" -> "wmv1"
+        "MP43" -> "msmpeg4v3"
+        "DIV3" -> "msmpeg4v3"
+        "DIV4" -> "msmpeg4v3"
+        "MP42" -> "msmpeg4v2"
+        "MPG4" -> "msmpeg4v1"
+        "AVdn" -> "dnxhd"
+        "AVdh" -> "dnxhd"
+        _ -> "unknown:" + f
+    }
+}

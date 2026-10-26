@@ -1,0 +1,180 @@
+// The inverse MDCT of the WMA decoders, for every power-of-two size from
+// 64 to 8192 coefficients, computed through a DCT-IV, which in turn is a
+// complex FFT of a quarter of the window length.
+//
+// For N coefficients X[k] the inverse MDCT gives 2N samples
+//     y[n] = s * sum_k X[k] cos(pi/N (n + N/2 + 1/2)(k + 1/2)),
+// which is the DCT-IV u[j] = sum_k X[k] cos(pi/N (j + 1/2)(k + 1/2)) read
+// at j = n + N/2, using u[2N-1-j] = -u[j] and u[2N+j] = -u[j]. The DCT-IV
+// takes N/2 complex values (X[2p] + i X[N-1-2p]) twisted by
+// e^(-i pi (p + 1/4)/N), an FFT of N/2 points, a twist by e^(-i pi q/N),
+// and reads u[2q] = Re, u[N-1-2q] = -Im.
+//
+// One struct holds the tables of all sizes (flat lists, an offset per
+// size) and its buffers, so the decoders keep a single value.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+let wmaMdctMaxBits = 13
+
+struct WmaMdct {
+    // Per log2(N): where its pre/post twiddles and bit reversal start.
+    at: [Int] = []
+    preCos: [Float] = []
+    preSin: [Float] = []
+    postCos: [Float] = []
+    postSin: [Float] = []
+    rev: [Int] = []
+    // FFT twiddles e^(-2 pi i k / H) for the largest FFT (H = 4096);
+    // smaller FFTs step through them.
+    twCos: [Float] = []
+    twSin: [Float] = []
+    re: [Float] = []
+    im: [Float] = []
+    // In: N coefficients. Out: 2N samples (the full inverse MDCT).
+    inp: [Float] = []
+    out: [Float] = []
+    u: [Float] = []
+
+    // The middle half of the inverse MDCT (ffmpeg's av_tx inverse MDCT
+    // without AV_TX_FULL_IMDCT, the sign as ffmpeg's): out[0..<n] =
+    // scale * u[n-1-i], u the DCT-IV of inp[0..<n].
+    fn inverseHalf(_ n: Int, _ scale: Float) {
+        dct4(n, scale)
+        for i in 0..n {
+            out[i] = u[n - 1 - i]
+        }
+    }
+
+    // The inverse MDCT of inp[0..<n] into out[0..<2n], times `scale`.
+    fn inverse(_ n: Int, _ scale: Float) {
+        dct4(n, scale)
+        // Unfold into 2N samples.
+        let half = n / 2
+        for i in 0..half {
+            out[i] = u[i + half]
+        }
+        for i in half..(n + half) {
+            out[i] = -u[n + n - 1 - (i + half)]
+        }
+        for i in (n + half)..(2 * n) {
+            out[i] = -u[i + half - 2 * n]
+        }
+    }
+
+    // The DCT-IV of inp[0..<n] into u[0..<n], times `scale`.
+    fn dct4(_ n: Int, _ scale: Float) {
+        var bits = 0
+        while (1 << bits) < n {
+            bits += 1
+        }
+        let h = n / 2
+        let base = at[bits]
+        // Pre-twist, stored in bit-reversed order for the FFT.
+        for p in 0..h {
+            let a = inp[2 * p]
+            let b = inp[n - 1 - 2 * p]
+            let c = preCos[base + p]
+            let s = preSin[base + p]
+            let q = rev[base + p]
+            re[q] = a * c - b * s
+            im[q] = a * s + b * c
+        }
+        // Radix-2 decimation-in-time FFT (forward, e^(-2 pi i pq/h)).
+        let full = 1 << (wmaMdctMaxBits - 1)
+        var size = 2
+        while size <= h {
+            let halfSize = size / 2
+            let step = full / size
+            var start = 0
+            while start < h {
+                var k = 0
+                for j in start..(start + halfSize) {
+                    let wc = twCos[k]
+                    let ws = twSin[k]
+                    let l = j + halfSize
+                    let tr = re[l] * wc - im[l] * ws
+                    let ti = re[l] * ws + im[l] * wc
+                    re[l] = re[j] - tr
+                    im[l] = im[j] - ti
+                    re[j] = re[j] + tr
+                    im[j] = im[j] + ti
+                    k += step
+                }
+                start += size
+            }
+            size *= 2
+        }
+        // Post-twist: the DCT-IV, scaled.
+        for q in 0..h {
+            let c = postCos[base + q]
+            let s = postSin[base + q]
+            let wr = re[q] * c - im[q] * s
+            let wi = re[q] * s + im[q] * c
+            u[2 * q] = wr * scale
+            u[n - 1 - 2 * q] = -wi * scale
+        }
+    }
+}
+
+fn wmaNewMdct() -> WmaMdct {
+    var d = WmaMdct()
+    // Sizes 2^0 .. 2^13: only 64 and up are used; small ones get empty
+    // ranges.
+    var off = 0
+    for bits in 0..(wmaMdctMaxBits + 1) {
+        d.at.append(off)
+        let n = 1 << bits
+        if bits < 2 {
+            continue
+        }
+        let h = n / 2
+        var rb = 0
+        while (1 << rb) < h {
+            rb += 1
+        }
+        for p in 0..h {
+            let a = -pi * (Float(p) + 0.25) / Float(n)
+            d.preCos.append(cos(a))
+            d.preSin.append(sin(a))
+            let b = -pi * Float(p) / Float(n)
+            d.postCos.append(cos(b))
+            d.postSin.append(sin(b))
+            var r = 0
+            for k in 0..rb {
+                if (p >> k) & 1 == 1 {
+                    r = r | (1 << (rb - 1 - k))
+                }
+            }
+            d.rev.append(r)
+        }
+        off += h
+    }
+    let full = 1 << (wmaMdctMaxBits - 1)
+    for k in 0..full {
+        let t = -2.0 * pi * Float(k) / Float(full)
+        d.twCos.append(cos(t))
+        d.twSin.append(sin(t))
+        d.re.append(0.0)
+        d.im.append(0.0)
+    }
+    let maxN = 1 << wmaMdctMaxBits
+    for _ in 0..maxN {
+        d.inp.append(0.0)
+        d.u.append(0.0)
+        d.out.append(0.0)
+        d.out.append(0.0)
+    }
+    d
+}
+
+// The rising half of a sine window of 2n samples: sin((i + 1/2) pi / 2n),
+// as ffmpeg's ff_sine_windows.
+fn wmaSineWindow(_ n: Int) -> [Float] {
+    var w: [Float] = []
+    for i in 0..n {
+        w.append(sin((Float(i) + 0.5) * (pi / (2.0 * Float(n)))))
+    }
+    w
+}

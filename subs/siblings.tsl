@@ -1,0 +1,383 @@
+// Finding the subtitle files that belong to a video in its folder listing
+// (movie.srt, movie.en.srt, Movie.eng.forced.srt, movie_French.ass,
+// Subs/2_English.srt, Subs/<episode>/3_Spanish.srt …), with the language
+// and flags (forced, SDH) read from the names; and language codes: ISO
+// 639-1/-2 codes and English names to one code and back.
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+// A subtitle file found beside a video.
+public struct SiblingFile {
+    // The path to load: the listing entry joined to the video's folder
+    // (entries that are absolute paths are kept as they are).
+    path: String
+    // The entry's file name.
+    name: String
+    // "srt" "ass" "ssa" "vtt" "sup" "idx" (VobSub: the .sub is beside it).
+    format: String
+    // ISO 639-1 code with a region where the name gives one ("en",
+    // "pt-BR", "zh-Hant"); "" if the name doesn't say.
+    language: String = ""
+    // The language in English ("English", "Portuguese (Brazil)").
+    languageName: String = ""
+    forced: Bool = false
+    hearingImpaired: Bool = false
+    // Other words of the name after the video's name ("commentary", a
+    // release group …), lower case.
+    tags: [String] = []
+    // How surely it belongs to the video: 100 the same name, 90 the same
+    // name plus language/flags, 80 plus other words, 70 the same name
+    // loosely (case, separators), 60 in a Subs folder named after the
+    // video, 50 in a Subs folder beside the only video, 30 the only
+    // subtitles beside the only video.
+    score: Int = 0
+}
+
+let sibSubtitleExts = ["srt", "ass", "ssa", "vtt", "sup", "idx"]
+let sibVideoExts = ["mkv", "mp4", "m4v", "avi", "mov", "wmv", "mpg", "mpeg", "ts", "m2ts", "mts", "webm", "flv", "ogv", "3gp", "vob", "divx", "asf", "rmvb"]
+
+// Languages: ISO 639-1, ISO 639-2 (B and T) codes and names that subtitle
+// file names use.
+let sibLanguages = [
+    "en|eng|english", "fr|fre|fra|french|francais|français", "de|ger|deu|german|deutsch",
+    "es|spa|spanish|espanol|español|castellano", "it|ita|italian|italiano", "pt|por|portuguese|portugues|português",
+    "nl|dut|nld|dutch|nederlands", "sv|swe|swedish|svenska", "da|dan|danish|dansk", "no|nor|nob|nb|nn|nno|norwegian|norsk",
+    "fi|fin|finnish|suomi", "is|ice|isl|icelandic", "pl|pol|polish|polski", "cs|cze|ces|czech|cesky|čeština",
+    "sk|slo|slk|slovak", "hu|hun|hungarian|magyar", "sl|slv|slovenian|slovene", "hr|hrv|croatian|hrvatski",
+    "sr|srp|scc|serbian|srpski", "bs|bos|bosnian", "mk|mac|mkd|macedonian", "bg|bul|bulgarian",
+    "ro|rum|ron|romanian|romana|română", "ru|rus|russian|русский", "uk|ukr|ukrainian", "be|bel|belarusian",
+    "el|gre|ell|greek", "tr|tur|turkish|turkce|türkçe", "he|heb|hebrew|iw", "ar|ara|arabic",
+    "fa|per|fas|persian|farsi", "ur|urd|urdu", "hi|hin|hindi", "bn|ben|bengali", "ta|tam|tamil", "te|tel|telugu",
+    "ml|mal|malayalam", "kn|kan|kannada", "mr|mar|marathi", "pa|pan|punjabi", "gu|guj|gujarati",
+    "th|tha|thai", "vi|vie|vietnamese", "id|ind|indonesian|bahasa", "ms|may|msa|malay", "tl|tgl|fil|tagalog|filipino",
+    "ja|jpn|japanese|jp|日本語", "zh|chi|zho|chinese|中文", "ko|kor|korean|한국어", "lt|lit|lithuanian",
+    "lv|lav|latvian", "et|est|estonian", "ca|cat|catalan|català", "eu|baq|eus|basque", "gl|glg|galician",
+    "sq|alb|sqi|albanian", "hy|arm|hye|armenian", "ka|geo|kat|georgian", "az|aze|azerbaijani", "kk|kaz|kazakh",
+    "uz|uzb|uzbek", "mn|mon|mongolian", "km|khm|khmer", "lo|lao", "my|bur|mya|burmese", "si|sin|sinhala",
+    "ne|nep|nepali", "sw|swa|swahili", "af|afr|afrikaans", "cy|wel|cym|welsh", "ga|gle|irish", "mt|mlt|maltese",
+    "eo|epo|esperanto", "la|lat|latin", "lb|ltz|luxembourgish",
+]
+
+// The ISO 639-1 code of a language code or English name ("eng",
+// "English", "pt", "fre" → "en", "en", "pt", "fr"); "" if unknown. Regions
+// are left out ("pt-BR" → "pt").
+public fn languageCode(_ text: String) -> String {
+    var t = text.trim().lowercase().replace("_", with: "-")
+    if let dash = t.find("-") {
+        t = t.substring(from: 0, to: dash)
+    }
+    if t.isEmpty {
+        return ""
+    }
+    if t == "chs" || t == "cht" || t == "sc" || t == "tc" {
+        return "zh"
+    }
+    for row in sibLanguages {
+        let names = row.split("|")
+        for nm in names {
+            if nm == t {
+                return names[0]
+            }
+        }
+    }
+    ""
+}
+
+// The English name of a language code ("pt-BR" → "Portuguese (Brazil)").
+public fn languageName(_ code: String) -> String {
+    let c = code.trim().lowercase().replace("_", with: "-")
+    match c {
+        "pt-br" -> { return "Portuguese (Brazil)" }
+        "pt-pt" -> { return "Portuguese (Portugal)" }
+        "zh-hans", "zh-cn" -> { return "Chinese (Simplified)" }
+        "zh-hant", "zh-tw" -> { return "Chinese (Traditional)" }
+        "zh-hk" -> { return "Chinese (Hong Kong)" }
+        "es-419", "es-la" -> { return "Spanish (Latin America)" }
+        "es-es" -> { return "Spanish (Spain)" }
+        "fr-ca" -> { return "French (Canada)" }
+        _ -> {}
+    }
+    let base = languageCode(c)
+    for row in sibLanguages {
+        let names = row.split("|")
+        if names[0] == base {
+            // The first full name (the entry after the codes).
+            for nm in names {
+                if nm.count > 3 {
+                    return nm.capitalized()
+                }
+            }
+        }
+    }
+    code
+}
+
+fn sibIsLetterOrDigit(_ c: String) -> Bool {
+    if c.count != 1 {
+        return false
+    }
+    (c >= "a" && c <= "z") || (c >= "0" && c <= "9") || Data(text: c)[0] >= 0x80
+}
+
+// A name made comparable: lower case, only letters and digits.
+fn sibLoose(_ s: String) -> String {
+    var out = ""
+    for c in s.lowercase().characters {
+        if sibIsLetterOrDigit(c) {
+            out += c
+        }
+    }
+    out
+}
+
+// The words of a name split at . _ - space ( ) [ ], lower case.
+fn sibTokens(_ s: String) -> [String] {
+    var out: [String] = []
+    var cur = ""
+    for c in s.lowercase().characters {
+        if c == "." || c == "_" || c == "-" || c == " " || c == "(" || c == ")" || c == "[" || c == "]" || c == "," {
+            if !cur.isEmpty {
+                out.append(cur)
+            }
+            cur = ""
+        } else {
+            cur += c
+        }
+    }
+    if !cur.isEmpty {
+        out.append(cur)
+    }
+    out
+}
+
+fn sibBase(_ name: String) -> String {
+    if let dot = name.findLast(".") {
+        if dot > 0 {
+            return name.substring(from: 0, to: dot)
+        }
+    }
+    name
+}
+
+// Reads language and flags from the words of a name; returns whether
+// every word was understood.
+fn sibReadTags(_ f: SiblingFile, _ words: [String]) -> (SiblingFile, Bool) {
+    var out = f
+    var all = true
+    var i = 0
+    while i < words.count {
+        let w = words[i]
+        let next = if i + 1 < words.count { words[i + 1] } else { "" }
+        if w == "forced" || w == "foreign" {
+            out.forced = true
+        } else if w == "sdh" || w == "cc" || w == "hoh" || w == "deaf" || (w == "hi" && !out.language.isEmpty) {
+            out.hearingImpaired = true
+        } else if w == "default" || w == "full" || w == "dialog" || w == "dialogue" {
+            // Common words that say nothing to choose by.
+        } else if w == "chs" || w == "sc" || w == "简体" || (w == "chi" && next == "sim") {
+            out.language = "zh-Hans"
+            if next == "sim" { i += 1 }
+        } else if w == "cht" || w == "tc" || w == "繁體" || (w == "chi" && next == "tra") {
+            out.language = "zh-Hant"
+            if next == "tra" { i += 1 }
+        } else if out.language.isEmpty && !languageCode(w).isEmpty && (w.count >= 2) && Int(w) == nil {
+            out.language = languageCode(w)
+            // A region after it: pt-BR, zh-TW, es-419, fr-CA, en-US.
+            if next.count == 2 || next == "419" {
+                if Int(next) == nil || next == "419" {
+                    if languageCode(next).isEmpty || next == "br" || next == "tw" || next == "hk" || next == "cn" || next == "ca" || next == "us" || next == "gb" {
+                        out.language = out.language + "-" + next.uppercase()
+                        i += 1
+                    }
+                }
+            } else if next == "hans" || next == "hant" {
+                out.language = out.language + "-" + next.capitalized()
+                i += 1
+            } else if next == "brazil" || next == "brazilian" {
+                out.language = out.language + "-BR"
+                i += 1
+            }
+        } else if w == "brazilian" {
+            out.language = "pt-BR"
+        } else if Int(w) != nil && w.count <= 2 {
+            // Track numbers like Subs/2_English.srt.
+        } else {
+            out.tags.append(w)
+            all = false
+        }
+        i += 1
+    }
+    if out.language == "zh-CN" { out.language = "zh-Hans" }
+    if out.language == "zh-TW" { out.language = "zh-Hant" }
+    if !out.language.isEmpty {
+        out.languageName = languageName(out.language)
+    }
+    (out, all)
+}
+
+// The subtitle files in a video's folder listing that belong to it, best
+// first: by how surely they match, then by `languages` (preferred
+// language codes, first is best), then full before forced, then plain
+// before SDH. `folderListing` holds names in the video's folder (from
+// listFolder), optionally with entries of subfolders written as
+// "Subs/2_English.srt" or "Subs/Episode/3_French.srt" (the app lists
+// "Subs", "Subtitles" … when they're there; see subtitleFolders).
+public fn siblingFiles(_ videoPath: String, _ folderListing: [String], languages: [String] = []) -> [SiblingFile] {
+    let folder = videoPath.folder
+    let videoName = videoPath.fileName
+    let vb = sibBase(videoName).lowercase()
+    let vl = sibLoose(sibBase(videoName))
+    // How many videos are in the folder itself.
+    var videos = 0
+    var subsInFolder = 0
+    var names: [String: Bool] = [:]
+    for e in folderListing {
+        names[e.lowercase()] = true
+        if e.contains("/") {
+            continue
+        }
+        let ext = e.fileExtension.lowercase()
+        if sibVideoExts.contains(ext) {
+            videos += 1
+        }
+        if sibSubtitleExts.contains(ext) {
+            subsInFolder += 1
+        }
+    }
+    var out: [SiblingFile] = []
+    for e in folderListing {
+        let ext = e.fileExtension.lowercase()
+        if !sibSubtitleExts.contains(ext) {
+            continue
+        }
+        // VobSub needs its .sub.
+        if ext == "idx" && names[(sibBase(e) + ".sub").lowercase()] == nil {
+            continue
+        }
+        let name = e.fileName
+        let base = sibBase(name)
+        let bl = base.lowercase()
+        let path = if e.hasPrefix("/") { e } else { joinPath(folder, e) }
+        var f = SiblingFile(path: path, name: name, format: ext)
+        let parts = e.split("/")
+        let inSub = parts.count > 1
+        var m = 0
+        var words: [String] = []
+        if bl == vb {
+            m = 100
+        } else if bl.hasPrefix(vb) && vb.count > 0 && bl.count > vb.count && sibTokens(bl.substring(from: vb.count, to: vb.count + 1)).isEmpty {
+            words = sibTokens(base.substring(from: vb.count, to: base.count))
+            m = 90
+        } else if vl.count > 0 && sibLoose(base).hasPrefix(vl) {
+            // Same name written differently: compare word by word.
+            let vt = sibTokens(sibBase(videoName))
+            let bt = sibTokens(base)
+            var k = 0
+            var j = 0
+            var joined = ""
+            while j < bt.count && sibLoose(joined).count < vl.count {
+                joined += bt[j]
+                j += 1
+            }
+            k = j
+            if sibLoose(joined) == vl {
+                words = bt.dropFirst(k)
+                m = 70
+            } else if vt.count > 0 {
+                m = 0
+            }
+        }
+        if m == 0 && inSub {
+            // Subs/<video name>/x.srt, or Subs/x.srt beside the only video.
+            var named = false
+            for p in parts.dropLast(1) {
+                if p.lowercase() == vb || sibLoose(p) == vl {
+                    named = true
+                }
+            }
+            if named {
+                m = 60
+                words = sibTokens(base)
+            } else if videos == 1 && parts.count == 2 {
+                m = 50
+                words = sibTokens(base)
+            }
+        }
+        if m == 0 && !inSub && videos == 1 && subsInFolder >= 1 {
+            m = 30
+            words = sibTokens(base)
+        }
+        if m == 0 {
+            continue
+        }
+        let (tagged, all) = sibReadTags(f, words)
+        f = tagged
+        if m == 90 && !all {
+            m = 80
+        }
+        f.score = m
+        out.append(f)
+    }
+    var prefs: [String] = []
+    for l in languages {
+        prefs.append(l.lowercase())
+    }
+    out.sorted(by: { a, b in sibBefore(a, b, prefs) })
+}
+
+// The rank of a file's language among the preferred ones (lower is
+// better; not preferred = after them).
+fn sibRank(_ f: SiblingFile, _ prefs: [String]) -> Int {
+    let l = f.language.lowercase()
+    for (i, p) in prefs.enumerated() {
+        if l == p {
+            return i * 2
+        }
+        if !l.isEmpty && languageCode(l) == languageCode(p) {
+            return i * 2 + 1
+        }
+    }
+    if l.isEmpty {
+        return prefs.count * 2 + 1
+    }
+    prefs.count * 2 + 2
+}
+
+fn sibBefore(_ a: SiblingFile, _ b: SiblingFile, _ prefs: [String]) -> Bool {
+    if a.score != b.score {
+        return a.score > b.score
+    }
+    let ra = sibRank(a, prefs)
+    let rb = sibRank(b, prefs)
+    if ra != rb {
+        return ra < rb
+    }
+    if a.forced != b.forced {
+        return !a.forced
+    }
+    if a.hearingImpaired != b.hearingImpaired {
+        return !a.hearingImpaired
+    }
+    a.name < b.name
+}
+
+// The subfolders of a listing worth looking into for subtitles ("Subs",
+// "Subtitles", "Sub", "Subtitle", any case): the app lists them and adds
+// their entries as "Subs/name" (one level deeper too, for
+// Subs/<episode>/…) before calling siblingFiles.
+public fn subtitleFolders(_ folderListing: [String]) -> [String] {
+    var out: [String] = []
+    for e in folderListing {
+        let l = e.lowercase()
+        if l == "subs" || l == "subtitles" || l == "sub" || l == "subtitle" || l == "subtitulos" || l == "untertitel" {
+            out.append(e)
+        }
+    }
+    out
+}
+
+// Whether a file name is a subtitle file siblingFiles would consider.
+public fn isSubtitleFile(_ name: String) -> Bool {
+    sibSubtitleExts.contains(name.fileExtension.lowercase())
+}

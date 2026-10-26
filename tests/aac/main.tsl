@@ -1,0 +1,472 @@
+// Tests for the aac module: decodes the AAC fixtures (and the extra ones
+// in tests/aac/fixtures) and compares the samples with ffmpeg's, by SNR
+// after finding the best alignment (containers trim the priming
+// differently).
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../../aac"
+import "../../core"
+import "../../testkit"
+
+struct Decoded {
+    samples: [Float] = []
+    rate: Int = 0
+    channels: Int = 0
+    layout: [String] = []
+    delay: Int = 0
+    warnings: [String] = []
+    packets: Int = 0
+    ms: Float = 0.0
+    error: String = ""
+    tools: [String: Int] = [:]
+}
+
+// Decodes every packet of a media's first audio track.
+fn decodeMedia(_ file: Data, _ media: core.Media) -> Decoded {
+    var out = Decoded()
+    var track = -1
+    for t in media.tracks {
+        if t.kind == .audio && track < 0 {
+            track = t.index
+        }
+    }
+    if track < 0 {
+        out.error = "no audio track"
+        return out
+    }
+    match aac.newDecoder(media.tracks[track]) {
+        .failure(e) -> {
+            out.error = e.message
+            return out
+        }
+        .ok(d) -> {
+            var dec = d
+            let started = now()
+            for p in media.packets {
+                if p.track != track {
+                    continue
+                }
+                let s = dec.decode(core.packetBytes(file, media, p), pts: p.pts)
+                out.samples += s.data
+                out.packets += 1
+            }
+            out.ms = (now() - started) * 1000.0
+            out.rate = dec.rate
+            out.channels = dec.channels
+            out.layout = dec.layout
+            out.delay = dec.delay
+            out.warnings = dec.warnings
+            out.tools = dec.tools()
+        }
+    }
+    out
+}
+
+// Splits an ADTS stream into frames (for .aac files made here).
+fn adtsMedia(_ file: Data) -> core.Media {
+    var m = core.Media(format: "aac")
+    m.tracks.append(core.Track(index: 0, kind: .audio, codec: "aac", adts: true))
+    var at = 0
+    while at + 7 <= file.count && file[at] == 0xff && (file[at + 1] & 0xf0) == 0xf0 {
+        let len = ((file[at + 3] & 3) << 11) | (file[at + 4] << 3) | (file[at + 5] >> 5)
+        if len < 7 {
+            break
+        }
+        m.packets.append(core.PacketRef(track: 0, key: true, offset: at, size: min(len, file.count - at)))
+        at += len
+    }
+    m
+}
+
+// The AAC audio of an MPEG-TS file: the payloads of the PES packets of
+// the stream with type 0x0F, joined (ADTS frames), as one media.
+fn tsAdts(_ file: Data) -> Data {
+    // Find the PMT PID from the PAT, then the AAC PID from the PMT.
+    var pmtPid = -1
+    var aacPid = -1
+    var out = Data()
+    var pos = 0
+    while pos + 188 <= file.count {
+        if file[pos] != 0x47 {
+            pos += 1
+            continue
+        }
+        let pusi = (file[pos + 1] & 0x40) != 0
+        let pid = ((file[pos + 1] & 0x1f) << 8) | file[pos + 2]
+        let afc = (file[pos + 3] >> 4) & 3
+        var p = pos + 4
+        if afc == 2 || afc == 0 {
+            pos += 188
+            continue
+        }
+        if afc == 3 {
+            p += 1 + file[p]
+        }
+        if pid == 0 && pusi && pmtPid < 0 {
+            p += 1 + file[p]
+            // program_association_section: first program's PMT PID.
+            pmtPid = ((file[p + 10] & 0x1f) << 8) | file[p + 11]
+        } else if pid == pmtPid && pusi && aacPid < 0 {
+            p += 1 + file[p]
+            let sectionLength = ((file[p + 1] & 0x0f) << 8) | file[p + 2]
+            let infoLength = ((file[p + 10] & 0x0f) << 8) | file[p + 11]
+            var e = p + 12 + infoLength
+            let end = p + 3 + sectionLength - 4
+            while e + 5 <= end {
+                let st = file[e]
+                let epid = ((file[e + 1] & 0x1f) << 8) | file[e + 2]
+                let esLen = ((file[e + 3] & 0x0f) << 8) | file[e + 4]
+                if st == 0x0f && aacPid < 0 {
+                    aacPid = epid
+                }
+                e += 5 + esLen
+            }
+        } else if pid == aacPid && aacPid >= 0 {
+            if pusi {
+                // PES header: 00 00 01 id len(2) flags(2) hdrlen.
+                p += 9 + file[p + 8]
+            }
+            if p < pos + 188 {
+                out += file.slice(from: p, to: pos + 188)
+            }
+        }
+        pos += 188
+    }
+    out
+}
+
+// The offset (in frames, reference minus ours) where our samples line up
+// best with the reference, searched within ±range frames on the loudest
+// 2048-frame window; ties go to the smaller offset.
+fn bestOffset(_ got: [Float], _ want: [Float], channels: Int, range: Int) -> Int {
+    let frames = got.count / channels
+    let wantFrames = want.count / channels
+    let win = 2048
+    var mid = 0
+    var loudest = -1.0
+    var at = 0
+    while at + win <= frames {
+        var e = 0.0
+        var i = at * channels
+        while i < (at + win) * channels {
+            e += got[i] * got[i]
+            i += 7
+        }
+        if e > loudest {
+            loudest = e
+            mid = at
+        }
+        at += win / 2
+    }
+    var best = 0
+    var bestErr = -1.0
+    for off in (-range)..(range + 1) {
+        let r0 = mid + off
+        if r0 < 0 || r0 + win > wantFrames {
+            continue
+        }
+        var err = 0.0
+        var i = 0
+        let a = mid * channels
+        let b = r0 * channels
+        let n = win * channels
+        while i < n {
+            let d = got[a + i] - want[b + i]
+            err += d * d
+            i += 1
+        }
+        if bestErr < 0.0 || err < bestErr || (err == bestErr && abs(off) < abs(best)) {
+            bestErr = err
+            best = off
+        }
+    }
+    best
+}
+
+// SNR over the frames both have, with our frame f against reference
+// frame f + offset.
+fn alignedSnr(_ got: [Float], _ want: [Float], channels: Int, offset: Int) -> Float {
+    if offset >= 0 {
+        return testkit.snr(got, want, offset: offset * channels)
+    }
+    testkit.snr(got.slice(from: -offset * channels, to: got.count), want)
+}
+
+// SNR per channel (for checking the channel order).
+fn channelSnr(_ got: [Float], _ want: [Float], channels: Int, offset: Int, channel: Int) -> Float {
+    var a: [Float] = []
+    var b: [Float] = []
+    var f = 0
+    while (f * channels + channel) < got.count {
+        let r = f + offset
+        if r >= 0 && r * channels + channel < want.count {
+            a.append(got[f * channels + channel])
+            b.append(want[r * channels + channel])
+        }
+        f += 1
+    }
+    testkit.snr(a, b)
+}
+
+
+// Flips pseudo-random bytes of a packet (about one in `every`).
+fn damage(_ d: Data, seed: Int, every: Int) -> Data {
+    var b = d.bytes
+    var rnd = seed
+    for i in 0..b.count {
+        rnd = (rnd * 1103515245 + 12345) & 0x7fffffff
+        if rnd % every == 0 {
+            b[i] = (b[i] ^ (rnd >> 8)) & 0xff
+        }
+    }
+    Data(bytes: b)
+}
+
+// Decodes every packet of the first audio track through `change`
+// (0 as is, 1 damaged bytes, 2 cut in half, 3 reset half way); returns
+// (packets, samples, all finite).
+fn decodeChanged(_ file: Data, _ media: core.Media, _ change: Int) -> (Int, Int, Bool) {
+    var n = 0
+    var count = 0
+    var finite = true
+    match aac.newDecoder(media.tracks[0]) {
+        .failure(_) -> {
+            return (0, 0, false)
+        }
+        .ok(d) -> {
+            var dec = d
+            let total = media.packets.count
+            for p in media.packets {
+                if p.track != 0 {
+                    continue
+                }
+                var bytes = core.packetBytes(file, media, p)
+                if change == 1 {
+                    bytes = damage(bytes, seed: n * 7919 + 17, every: 40)
+                } else if change == 2 {
+                    bytes = bytes.slice(from: 0, to: bytes.count / 2)
+                } else if change == 3 && n == total / 2 {
+                    dec.reset()
+                }
+                let s = dec.decode(bytes, pts: p.pts)
+                for v in s.data {
+                    if !v.isFinite {
+                        finite = false
+                    }
+                }
+                count += s.data.count
+                n += 1
+            }
+            let f = dec.flush()
+            count += f.data.count
+        }
+    }
+    (n, count, finite)
+}
+
+fn main() {
+    var passed = 0
+    var total = 0
+    fn check(_ ok: Bool, _ what: String) {
+        total += 1
+        if ok { passed += 1 } else { print("FAIL: {what}") }
+    }
+
+    // Building blocks.
+    let dct = aac.selfTestDct4()
+    check(dct < 1e-9, "DCT-IV differs from its definition by {dct}")
+    let (qmfSnr, qmfDelay) = aac.selfTestQmf()
+    print("QMF analysis + synthesis: SNR {qmfSnr.formatted(decimals: 1)} dB at delay {qmfDelay}")
+    check(qmfSnr > 50.0, "QMF bank reconstruction SNR {qmfSnr}")
+
+
+    // ADTS with CRC words (protection_absent = 0): the same samples.
+    let mono = testkit.fixture("aac_mono.aac")
+    var crcFile = Data()
+    var at = 0
+    while at + 7 <= mono.count {
+        let len = ((mono[at + 3] & 3) << 11) | (mono[at + 4] << 3) | (mono[at + 5] >> 5)
+        var hdr = mono.slice(from: at, to: at + 7).bytes
+        let newLen = len + 2
+        hdr[1] = hdr[1] & 0xfe
+        hdr[3] = (hdr[3] & 0xfc) | ((newLen >> 11) & 3)
+        hdr[4] = (newLen >> 3) & 0xff
+        hdr[5] = ((newLen & 7) << 5) | (hdr[5] & 0x1f)
+        crcFile += Data(bytes: hdr) + Data(bytes: [0x5a, 0xa5]) + mono.slice(from: at + 7, to: at + len)
+        at += len
+    }
+    let plain = decodeMedia(mono, adtsMedia(mono))
+    let withCrc = decodeMedia(crcFile, adtsMedia(crcFile))
+    check(withCrc.samples.count == plain.samples.count && testkit.snr(withCrc.samples, plain.samples) >= 150.0, "ADTS with CRC decodes the same")
+
+    // The setup is known before the first packet when the container gives
+    // an AudioSpecificConfig (explicit SBR: the doubled rate too).
+    let heRef = testkit.loadRef("../aac/fixtures/he_music.m4a")
+    let heFile = readData("tests/aac/fixtures/he_music.m4a") ?? Data()
+    let heMedia = testkit.mediaFromRef(heFile, heRef)
+    match aac.newDecoder(heMedia.tracks[0]) {
+        .ok(d) -> check(d.rate == 44100 && d.channels == 2 && d.delay == 2048 && d.layout == ["FL", "FR"], "HE-AAC setup before decoding: {d.rate} Hz {d.channels} ch delay {d.delay}")
+        .failure(e) -> check(false, "HE-AAC decoder: {e.message}")
+    }
+    let lcRef = testkit.loadRef("aac_51.m4a")
+    match aac.newDecoder(testkit.trackFromRef(lcRef.tracks[0])) {
+        .ok(d) -> check(d.rate == 48000 && d.channels == 6 && d.delay == 1024 && d.layout == ["FL", "FR", "FC", "LFE", "BL", "BR"], "5.1 setup before decoding")
+        .failure(e) -> check(false, "5.1 decoder: {e.message}")
+    }
+    var wrong = core.Track(index: 0, kind: .audio, codec: "mp3")
+    check(!aac.newDecoder(wrong).isOk(), "refuses other codecs")
+    wrong.codec = "aac"
+    wrong.extra = Data(bytes: [0x19, 0x90])
+    check(!aac.newDecoder(wrong).isOk(), "refuses AAC SSR (object type 3)")
+
+    // Damaged, cut and reset streams never stop the program.
+    let damagedCases = ["lc_music.m4a", "he_music.m4a", "hev2_music.m4a", "conf_cce.m4a", "conf_ps_34.m4a", "lc_71.m4a"]
+    for name in damagedCases {
+        let f = readData("tests/aac/fixtures/" + name) ?? Data()
+        let m = testkit.mediaFromRef(f, testkit.loadRef("../aac/fixtures/" + name))
+        for change in 1..4 {
+            let (n, count, finite) = decodeChanged(f, m, change)
+            check(n > 0 && count > 0 && finite, "{name}: change {change}: {n} packets, {count} samples, finite {finite}")
+        }
+    }
+    let adtsDamaged = readData("tests/aac/fixtures/hev2_music.aac") ?? Data()
+    let dm = adtsMedia(damage(adtsDamaged, seed: 99, every: 60))
+    let (dn, _, dfinite) = decodeChanged(damage(adtsDamaged, seed: 99, every: 60), dm, 0)
+    check(dfinite, "damaged ADTS stream: {dn} frames decoded, finite")
+    // Garbage and empty packets.
+    match aac.newDecoder(heMedia.tracks[0]) {
+        .ok(d) -> {
+            var dec = d
+            let e = dec.decode(Data(), pts: 0)
+            let g = dec.decode(Data(bytes: [0xff, 0xf1, 0x00, 0x00, 0x00, 0x00, 0x00, 0x12, 0x34]), pts: 0)
+            let z = dec.decode(Data(bytes: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]), pts: 0)
+            check(e.data.isEmpty && g.channels > 0 && z.channels > 0, "empty and garbage packets")
+        }
+        .failure(_) -> check(false, "decoder for garbage test")
+    }
+
+    // name, where, wanted SNR, rate, channels
+    let cases: [(String, String, Float, Int, Int)] = [
+        ("aac_lc.m4a", "fixtures", 90.0, 44100, 2),
+        ("aac_mono.aac", "fixtures", 90.0, 22050, 1),
+        ("aac_51.m4a", "fixtures", 90.0, 48000, 6),
+        ("cover.m4a", "fixtures", 90.0, 44100, 2),
+        ("h264_main_bframes.mp4", "fixtures", 90.0, 48000, 2),
+        ("h264_720p.mp4", "fixtures", 90.0, 48000, 2),
+        ("h264_fragmented.mp4", "fixtures", 90.0, 48000, 2),
+        ("multi.mkv", "fixtures", 90.0, 48000, 2),
+        ("multi.mp4", "fixtures", 90.0, 48000, 2),
+        ("h264.ts", "fixtures", 90.0, 48000, 2),
+        ("lc_music.m4a", "own", 90.0, 44100, 2),
+        ("lc_music_lowrate.m4a", "own", 90.0, 44100, 2),
+        ("lc_music_apple.m4a", "own", 90.0, 44100, 2),
+        ("lc_30.m4a", "own", 90.0, 48000, 3),
+        ("lc_40.m4a", "own", 90.0, 48000, 4),
+        ("lc_71.m4a", "own", 90.0, 48000, 8),
+        ("lc_21_pce.m4a", "own", 90.0, 48000, 3),
+        ("lc_61_pce.m4a", "own", 90.0, 48000, 7),
+        ("he_aac.m4a", "fixtures", 90.0, 44100, 2),
+        // A steady tone in an SBR source band makes the inverse filtering
+        // (4.6.18.6.2) ill-conditioned: FFmpeg's float32 rounding there
+        // decides a few HF bands, so ~88 dB is as close as it gets.
+        ("he_music.m4a", "own", 85.0, 44100, 2),
+        ("he_music.aac", "own", 85.0, 44100, 2),
+        ("he_mono.m4a", "own", 90.0, 44100, 2),
+        ("hev2_music.m4a", "own", 90.0, 44100, 2),
+        ("hev2_music.aac", "own", 90.0, 44100, 2),
+        ("conf_pulse.m4a", "own", 90.0, 44100, 1),
+        ("conf_cce.m4a", "own", 90.0, 44100, 6),
+        ("conf_ps_ipd.m4a", "own", 90.0, 32000, 2),
+        ("conf_ps_34.m4a", "own", 90.0, 32000, 2),
+        ("conf_sbr_down.m4a", "own", 90.0, 24000, 2),
+    ]
+    var seen: [String: Int] = [:]
+    var speed: [String: Float] = [:]
+    var totalAudio = 0.0
+    var totalMs = 0.0
+    for (name, where, want, rate, channels) in cases {
+        var file = Data()
+        var media = core.Media()
+        var refName = name
+        if where == "fixtures" {
+            file = testkit.fixture(name)
+        } else {
+            file = readData(joinPath("tests/aac/fixtures", name)) ?? Data()
+        }
+        if file.isEmpty {
+            check(false, "{name}: fixture missing")
+            continue
+        }
+        if name.hasSuffix(".ts") {
+            file = tsAdts(file)
+            media = adtsMedia(file)
+        } else if name.hasSuffix(".aac") && where != "fixtures" {
+            media = adtsMedia(file)
+        } else {
+            let ref = if where == "fixtures" { testkit.loadRef(name) } else { testkit.loadRef("../aac/fixtures/" + name) }
+            media = testkit.mediaFromRef(file, ref)
+            if ref.format.hasPrefix("matroska") {
+                // ffprobe's pos is the block's start: skip the track
+                // number (a vint) and the timecode and flags (see
+                // build/NEEDED.md).
+                for i in 0..media.packets.count {
+                    let at = media.packets[i].offset
+                    var len = 1
+                    while len < 8 && (file[at] & (0x80 >> (len - 1))) == 0 {
+                        len += 1
+                    }
+                    media.packets[i].offset = at + len + 3
+                }
+            }
+        }
+        let d = decodeMedia(file, media)
+        if !d.error.isEmpty {
+            check(false, "{name}: {d.error}")
+            continue
+        }
+        let ref = if where == "fixtures" { testkit.referenceSamples(refName) } else { testkit.referenceSamples("../aac/fixtures/" + refName) }
+        check(d.rate == rate && d.channels == channels, "{name}: rate {d.rate} channels {d.channels}, want {rate} {channels}")
+        if d.channels <= 0 || d.samples.isEmpty || ref.isEmpty {
+            check(false, "{name}: nothing decoded ({d.samples.count} samples, ref {ref.count})")
+            continue
+        }
+        let off = bestOffset(d.samples, ref, channels: d.channels, range: 4096)
+        let s = alignedSnr(d.samples, ref, channels: d.channels, offset: off)
+        let secs = Float(d.samples.count / d.channels) / Float(max(d.rate, 1))
+        totalAudio += secs
+        totalMs += d.ms
+        speed[name] = d.ms * 1000.0 / max(secs * 1000.0, 1.0)
+        print("{name}: SNR {s.formatted(decimals: 1)} dB at offset {off}, {d.packets} packets, {d.channels} ch {d.layout.joined(separator: " ")}, {(secs * 1000.0 / max(d.ms, 0.001)).formatted(decimals: 0)}x real time")
+        if s < want {
+            var per = ""
+            for c in 0..d.channels {
+                per += " {channelSnr(d.samples, ref, channels: d.channels, offset: off, channel: c).formatted(decimals: 1)}"
+            }
+            print("  per channel:{per}")
+        }
+        for (tool, n) in d.tools {
+            seen[tool] = (seen[tool] ?? 0) + n
+        }
+        for w in d.warnings {
+            print("  warning: {w}")
+        }
+        check(s >= want, "{name}: SNR {s.formatted(decimals: 1)} dB, want {want}")
+    }
+    // Every coding tool should have been exercised by some fixture.
+    var used: [String] = []
+    for (tool, n) in seen {
+        used.append("{tool} {n}")
+        if tool != "coupling elements" {
+            check(n > 0, "no fixture uses {tool}")
+        }
+    }
+    print("tools seen: {used.joined(separator: ", ")}")
+    for (what, name) in [("LC stereo 48 kHz", "h264_720p.mp4"), ("LC 5.1", "aac_51.m4a"), ("HE-AAC v1 stereo", "he_aac.m4a"), ("HE-AAC v2", "hev2_music.m4a")] {
+        let msPerSecond = speed[name] ?? 0.0
+        print("time aac {what}: {msPerSecond.formatted(decimals: 1)} ms per second of audio ({(1000.0 / max(msPerSecond, 0.001)).formatted(decimals: 0)}x real time)")
+    }
+    print("time aac decode: {totalMs.formatted(decimals: 0)} ms for {totalAudio.formatted(decimals: 1)} s of audio")
+    print("aac: {passed} of {total} passed")
+}

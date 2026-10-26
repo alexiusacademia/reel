@@ -1,0 +1,383 @@
+// The "Effects and Filters" window's plain data and pure helpers: the
+// synchronisation settings and meter readout structs the views take,
+// number formatting and parsing for the value labels and text fields, the
+// equalizer's response curve, the compressor's transfer curve, and the
+// names of the choices (stereo mode, normalisation, deinterlacing, aspect
+// ratio, rotation). The views are in fx_eq.tsl, fx_dynamics.tsl,
+// fx_stereo.tsl, fx_video.tsl, fx_sync.tsl and fx_effects.tsl.
+//
+// The response curve is the product of the ten peaking filters fx designs
+// (fx.peaking, the Audio EQ Cookbook) at 48 kHz, plus the preamp. The
+// compressor's static curve is the soft-knee curve of Giannoulis, Massberg
+// and Reiss, "Digital Dynamic Range Compressor Design — A Tutorial and
+// Analysis" (JAES 60(6), 2012), §2.2, the one fx/dynamics.tsl follows.
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+import "../fx"
+import "../render"
+import "../vfx"
+
+// Audio and subtitle timing and the playback speed, as the
+// Synchronisation tab edits them. Delays are in milliseconds, positive =
+// later (library.FileSettings keeps seconds: divide by 1000).
+public struct SyncSettings {
+    audioDelayMs: Int = 0
+    subtitleDelayMs: Int = 0
+    secondarySubtitleDelayMs: Int = 0
+    // 0.25 … 4.
+    speed: Float = 1.0
+}
+
+// What the Loudness tab's meter shows, passed in by the app (see
+// meterReadout). Loudness values at fx.silenceLufs (−120) or below show
+// as "—".
+public struct MeterReadout {
+    // EBU R128 momentary (400 ms), short-term (3 s) and integrated LUFS,
+    // loudness range (LU) and true peak (dBTP).
+    momentary: Float = -120.0
+    shortTerm: Float = -120.0
+    integrated: Float = -120.0
+    range: Float = 0.0
+    truePeak: Float = -120.0
+    // The normalisation gain now applied (dB), the compressor's gain
+    // reduction (dB, ≥ 0) and the limiter's (dB, ≥ 0).
+    gain: Float = 0.0
+    compressorReduction: Float = 0.0
+    limiterReduction: Float = 0.0
+    // Whether anything has been measured (false: the readout is greyed).
+    active: Bool = false
+}
+
+// The readout of an effects chain now.
+public fn meterReadout(_ chain: fx.Chain) -> MeterReadout {
+    var c = chain
+    let l = c.loudness()
+    MeterReadout(momentary: c.meter.momentary, shortTerm: c.meter.shortTerm, integrated: l.integrated, range: l.range, truePeak: l.truePeak, gain: c.gainDb, compressorReduction: max(0.0, c.compressorReduction), limiterReduction: max(0.0, -fx.toDb(max(c.limiterGain, 0.000001))), active: l.seconds > 0.0)
+}
+
+// ---- Number text ----
+
+let fxuMinus = "−"
+
+// A number with a sign ("+3.5", "−3.5", "0.0"), `decimals` digits.
+public fn fxSigned(_ v: Float, decimals: Int = 1) -> String {
+    let t = abs(v).formatted(decimals: decimals)
+    // A value that rounds to zero has no sign.
+    let z = Float(t) ?? 1.0
+    if z == 0.0 {
+        return t
+    }
+    if v < 0.0 { fxuMinus + t } else { "+" + t }
+}
+
+// "+3.5 dB".
+public fn fxDb(_ v: Float, decimals: Int = 1) -> String {
+    "{fxSigned(v, decimals: decimals)} dB"
+}
+
+// A band's centre frequency as a short label: "31", "63", "500", "1k", "16k".
+public fn fxFreqLabel(_ f: Float) -> String {
+    if f >= 1000.0 {
+        let k = f / 1000.0
+        if abs(k - floor(k + 0.5)) < 0.05 {
+            return "{Int(floor(k + 0.5))}k"
+        }
+        return "{k.formatted(decimals: 1)}k"
+    }
+    "{Int(floor(f + 0.5))}"
+}
+
+// A loudness value: "−23.0 LUFS" (or the unit given), "—" for silence.
+public fn fxLufs(_ v: Float, unit: String = "LUFS") -> String {
+    if v <= fx.silenceLufs + 0.5 {
+        return "—"
+    }
+    "{fxSigned(v, decimals: 1)} {unit}"
+}
+
+// "+120 ms", "0 ms".
+public fn fxMs(_ ms: Int) -> String {
+    if ms > 0 { "+{ms} ms" } else if ms < 0 { "{fxuMinus}{-ms} ms" } else { "0 ms" }
+}
+
+// "1×", "1.25×", "0.5×".
+public fn fxSpeed(_ s: Float) -> String {
+    var t = s.formatted(decimals: 2)
+    while t.contains(".") && (t.hasSuffix("0") || t.hasSuffix(".")) {
+        t = t.substring(from: 0, to: t.count - 1)
+    }
+    "{t}×"
+}
+
+// A plain number with up to `decimals` digits, no sign: "1.5", "2", "0.25".
+public fn fxPlain(_ v: Float, decimals: Int = 2) -> String {
+    var t = v.formatted(decimals: decimals)
+    while t.contains(".") && (t.hasSuffix("0") || t.hasSuffix(".")) {
+        t = t.substring(from: 0, to: t.count - 1)
+    }
+    if t == "-0" { "0" } else { t.replace("-", with: fxuMinus) }
+}
+
+// Text with the typographic minus and spaces made plain, lower case.
+fn fxuNormalise(_ text: String) -> String {
+    text.trim().lowercase().replace(fxuMinus, with: "-").replace("–", with: "-").replace(" ", with: "")
+}
+
+// A delay typed by the user, in milliseconds: "120", "-80", "+250 ms",
+// "1.5 s", "-0.2s", "−40" (typographic minus). nil when unreadable or
+// beyond ±10 minutes.
+public fn fxParseMs(_ text: String) -> Int? {
+    var t = fxuNormalise(text)
+    var scale = 1.0
+    if t.hasSuffix("ms") {
+        t = t.substring(from: 0, to: t.count - 2)
+    } else if t.hasSuffix("s") {
+        t = t.substring(from: 0, to: t.count - 1)
+        scale = 1000.0
+    }
+    if t.hasPrefix("+") {
+        t = t.substring(from: 1, to: t.count)
+    }
+    if t.isEmpty {
+        return nil
+    }
+    if let v = Float(t) {
+        let ms = v * scale
+        if abs(ms) > 600000.0 {
+            return nil
+        }
+        return Int(floor(ms + 0.5))
+    }
+    nil
+}
+
+// A speed typed by the user: "1.5", "1.5x", "1.5×", "150%". nil when
+// unreadable or outside 0.25 … 4.
+public fn fxParseSpeed(_ text: String) -> Float? {
+    var t = fxuNormalise(text).replace("×", with: "x")
+    var scale = 1.0
+    if t.hasSuffix("x") {
+        t = t.substring(from: 0, to: t.count - 1)
+    } else if t.hasSuffix("%") {
+        t = t.substring(from: 0, to: t.count - 1)
+        scale = 0.01
+    }
+    if t.isEmpty {
+        return nil
+    }
+    if let v = Float(t) {
+        let s = v * scale
+        if s < 0.25 - 0.000001 || s > 4.0 + 0.000001 {
+            return nil
+        }
+        return s
+    }
+    nil
+}
+
+// The value nearest `v` on a grid of `step` from `from`, within from…to.
+public fn fxSnap(_ v: Float, from: Float, to: Float, step: Float) -> Float {
+    var x = v
+    if step > 0.0 {
+        x = from + floor((v - from) / step + 0.5) * step
+    }
+    max(from, min(x, to))
+}
+
+// ---- Equalizer ----
+
+// n frequencies spread evenly on a log scale from lo to hi (Hz).
+public fn fxLogFrequencies(_ n: Int, lo: Float = 20.0, hi: Float = 20000.0) -> [Float] {
+    var out: [Float] = []
+    if n <= 1 {
+        return [lo]
+    }
+    let a = log(lo)
+    let b = log(hi)
+    for i in 0..n {
+        out.append(exp(a + (b - a) * Float(i) / Float(n - 1)))
+    }
+    out
+}
+
+// Where a frequency lies across a log axis from lo to hi: 0 … 1.
+public fn fxLogPosition(_ f: Float, lo: Float = 20.0, hi: Float = 20000.0) -> Float {
+    (log(max(f, 0.001)) - log(lo)) / (log(hi) - log(lo))
+}
+
+// The equalizer's response in dB at each frequency: the sum of the ten
+// peaking filters' responses (as fx designs them, at `rate`) plus the
+// preamp. Bands at 0 dB contribute nothing.
+public fn fxEqResponse(gains: [Float], preamp: Float, freqs: [Float], rate: Float = 48000.0) -> [Float] {
+    var filters: [fx.Biquad] = []
+    for (i, g) in gains.enumerated() {
+        if i < fx.eqFrequencies.count && abs(g) > 0.0001 {
+            filters.append(fx.peaking(f0: fx.eqFrequencies[i], gain: max(-fx.eqMaxDb, min(g, fx.eqMaxDb)), bw: fx.eqBandwidth, rate: rate))
+        }
+    }
+    var out: [Float] = []
+    for f in freqs {
+        var db = preamp
+        if f < rate / 2.0 {
+            for b in filters {
+                db += b.db(f, rate)
+            }
+        }
+        out.append(db)
+    }
+    out
+}
+
+// The settings' preset name when gains and preamp still equal it, else
+// "Custom".
+public fn fxPresetName(_ s: fx.Settings) -> String {
+    for p in fx.presets() {
+        if abs(p.preamp - s.eqPreamp) < 0.05 && p.gains.count == s.eqGains.count {
+            var same = true
+            for i in 0..p.gains.count {
+                if abs(p.gains[i] - s.eqGains[i]) >= 0.05 {
+                    same = false
+                }
+            }
+            if same {
+                return p.name
+            }
+        }
+    }
+    "Custom"
+}
+
+// ---- Compressor ----
+
+// The compressor's output level (dB) for an input level x (dB): the
+// soft-knee static curve plus makeup gain (see the top of the file).
+public fn fxCompressorOutput(_ x: Float, threshold: Float, ratio: Float, knee: Float, makeup: Float = 0.0) -> Float {
+    let s = 1.0 / max(1.0, ratio)
+    let w = max(0.0, knee)
+    let d = x - threshold
+    var y = x
+    if 2.0 * d < -w {
+        y = x
+    } else if w > 0.0 && 2.0 * abs(d) <= w {
+        let e = d + w / 2.0
+        y = x + (s - 1.0) * e * e / (2.0 * w)
+    } else {
+        y = threshold + d * s
+    }
+    y + makeup
+}
+
+// ---- Names of the choices ----
+
+public let fxStereoModeNames = ["Stereo", "Mono", "Swap", "Left", "Right"]
+
+public fn fxStereoModeName(_ m: fx.StereoMode) -> String {
+    match m {
+        .stereo -> "Stereo"
+        .mono -> "Mono"
+        .swap -> "Swap"
+        .left -> "Left"
+        .right -> "Right"
+    }
+}
+
+public fn fxStereoMode(named: String) -> fx.StereoMode {
+    match named {
+        "Mono" -> .mono
+        "Swap" -> .swap
+        "Left" -> .left
+        "Right" -> .right
+        _ -> .stereo
+    }
+}
+
+public let fxNormalizeNames = ["Off", "Live", "Scan", "Track gain", "Album gain"]
+
+public fn fxNormalizeName(_ m: fx.NormalizeMode) -> String {
+    match m {
+        .off -> "Off"
+        .live -> "Live"
+        .scan -> "Scan"
+        .track -> "Track gain"
+        .album -> "Album gain"
+    }
+}
+
+public fn fxNormalizeMode(named: String) -> fx.NormalizeMode {
+    match named {
+        "Live" -> .live
+        "Scan" -> .scan
+        "Track gain" -> .track
+        "Album gain" -> .album
+        _ -> .off
+    }
+}
+
+// What each normalisation mode does, for the line under the picker.
+public fn fxNormalizeHelp(_ m: fx.NormalizeMode) -> String {
+    match m {
+        .off -> "No loudness normalisation."
+        .live -> "Gain from the loudness measured so far in this track."
+        .scan -> "Gain from a whole-track scan (live until it is ready)."
+        .track -> "ReplayGain track gain from the tags (else scan, else live)."
+        .album -> "ReplayGain album gain (else track gain, scan, live)."
+    }
+}
+
+// Deinterlace modes as shown, and as vfx.Settings stores them.
+public let fxDeinterlaceNames = ["Off", "Bob", "Blend", "Adaptive"]
+
+public fn fxDeinterlaceName(_ stored: String) -> String {
+    match vfx.deinterlaceMode(stored) {
+        .off -> "Off"
+        .bob -> "Bob"
+        .blend -> "Blend"
+        .adaptive -> "Adaptive"
+    }
+}
+
+public fn fxDeinterlaceValue(_ name: String) -> String {
+    name.lowercase()
+}
+
+// The aspect preset named for a value ("Default" for 0), or "Custom".
+public fn fxAspectName(_ value: Float) -> String {
+    for (name, v) in render.aspectPresets {
+        if abs(v - value) < 0.002 {
+            return name
+        }
+    }
+    "Custom"
+}
+
+// An aspect ratio as text for the custom field: "16:9" style when it is a
+// preset, else the number ("1.66").
+public fn fxAspectText(_ value: Float) -> String {
+    if value <= 0.0 {
+        return "Default"
+    }
+    let n = fxAspectName(value)
+    if n != "Custom" { n } else { fxPlain(value, decimals: 3) }
+}
+
+// Rotation choices (degrees clockwise) and their labels.
+public let fxRotationNames = ["0°", "90°", "180°", "270°"]
+
+public fn fxRotationName(_ degrees: Int) -> String {
+    let d = ((degrees % 360) + 360) % 360
+    "{d - d % 90}°"
+}
+
+public fn fxRotation(named: String) -> Int {
+    Int(named.replace("°", with: "")) ?? 0
+}
+
+// A crop as text: "none" or "left 0, top 140, right 0, bottom 140".
+public fn fxCropText(_ v: render.View) -> String {
+    if v.cropLeft == 0 && v.cropTop == 0 && v.cropRight == 0 && v.cropBottom == 0 {
+        return "none"
+    }
+    "left {v.cropLeft}, top {v.cropTop}, right {v.cropRight}, bottom {v.cropBottom}"
+}

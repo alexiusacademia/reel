@@ -1,0 +1,173 @@
+// Small views the Preferences pages are built from: a page (scrolling,
+// padded), section titles and form rows for a Grid, notes, a colour field
+// (palette menu, swatch and hex code), an ordered language list editor,
+// and the change watcher that calls onChange after any edit (Tessel's
+// Toggle, Picker and TextField have no onChange of their own, so a hidden
+// view keyed by the settings' JSON appears again whenever they change; see
+// build/TESSEL_ISSUES.md).
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+import "../library"
+
+// The accent of selections in Reel's windows.
+let prefsAccent = Color.rgb(242, 140, 26)
+
+// A page of the Preferences window: its content scrolls, with room around.
+view PrefsPage(content: View) {
+    Scroll {
+        VStack(spacing: 10, alignment: .leading) {
+            content
+        }
+        .padding(20)
+        .frame(maxWidth: .infinity, alignment: .topLeading)
+    }
+}
+
+// A section title (a row of its own in a Grid).
+view PrefsHeader(_ title: String) {
+    Text(title)
+        .font(size: 13, weight: .semibold)
+        .padding(top: 10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+}
+
+// A form row: a label on the left (lined up on its right edge), the
+// controls on the right.
+// With `off`, the controls are greyed out and can't be used (set on the
+// row itself, `.disabled` wouldn't reach into a GridRow made by a view).
+view PrefsRow(_ label: String, off: Bool = false, content: View) {
+    GridRow {
+        Text(label)
+            .gridColumnAlignment(.trailing)
+            .opacity(if off { 0.4 } else { 1.0 })
+        HStack(spacing: 8) {
+            content
+        }
+        .disabled(off)
+    }
+}
+
+// A line of explanation under a row's controls.
+view PrefsNote(_ text: String) {
+    GridRow {
+        Text("")
+        HStack(spacing: 0) {
+            Text(text)
+                .font(size: 11)
+                .color(.secondary)
+                .frame(maxWidth: 420, alignment: .leading)
+            Spacer()
+        }
+    }
+}
+
+// Calls `onChange` after `key` changes (not when it first shows). The
+// hidden text has `key` as its identity, so a new key makes it appear
+// again, which runs its onAppear.
+view PrefsChangeWatch(key: String, onChange: fn()) {
+    state last = key
+
+    Text("")
+        .hidden()
+        .id(key)
+        .onAppear {
+            if key != last {
+                last = key
+                onChange()
+            }
+        }
+}
+
+// A colour of a subtitle style (rgba packed): a menu of named colours, a
+// swatch, and a field for a hex code. The alpha stays as it was.
+view PrefsColorField(color: bind Int, label: String) {
+    HStack(spacing: 8) {
+        Picker(selection: color, style: .menu) {
+            for (name, rgb) in prefsPalette {
+                Text(name).tag(prefsWithAlpha(rgb, alphaOf: color))
+            }
+            if prefsColorName(color) == "Custom" {
+                Text("Custom").tag(color)
+            }
+        }
+        .frame(width: 130)
+        .accessibilityLabel(label)
+        Canvas(redraw: color) { g in
+            g.fillRect(x: 0, y: 0, width: g.width, height: g.height, color: .rgb(128, 128, 128), radius: 4)
+            g.fillRect(x: 1, y: 1, width: g.width - 2.0, height: g.height - 2.0, color: prefsColor(prefsWithAlpha(color, alphaOf: 255)), radius: 3)
+        }
+        .frame(width: 22, height: 22)
+        .accessibilityLabel("{label}: {prefsHex(color)}")
+        PrefsHexField(color: color, label: label).id("{label}{color}")
+    }
+}
+
+// The hex field of a colour: Enter takes what was typed.
+view PrefsHexField(color: bind Int, label: String) {
+    state text = prefsHex(color)
+    state bad = false
+
+    TextField("#RRGGBB", text: text)
+        .frame(width: 90)
+        .accessibilityLabel("{label} as a hex code")
+        .border(if bad { .red } else { .clear }, width: 1, radius: 4)
+        .onSubmit {
+            if let v = prefsParseHex(text, alpha: color & 255) {
+                bad = false
+                color = v
+            } else {
+                bad = true
+            }
+        }
+}
+
+// An ordered list of languages (ISO 639-2/B codes), first match wins:
+// rows with up, down and remove, and a field to add one by name or code.
+view PrefsLanguageList(languages: bind [String], what: String, empty: String) {
+    state draft = ""
+    state message = ""
+
+    fn add() {
+        let (list, why) = prefsAddLanguage(languages, draft)
+        message = why
+        if why.isEmpty && list.count != languages.count {
+            languages = list
+            draft = ""
+        }
+    }
+
+    VStack(spacing: 4, alignment: .leading) {
+        if languages.isEmpty {
+            Text(empty).font(size: 12).color(.secondary)
+        }
+        for (i, code) in languages.enumerated() {
+            HStack(spacing: 6) {
+                Text("{i + 1}.").color(.secondary).frame(width: 22, alignment: .trailing)
+                Text(prefsLanguageLabel(code)).frame(minWidth: 150, alignment: .leading)
+                Button("↑") { languages = prefsMoved(languages, i, by: -1) }
+                    .disabled(i == 0)
+                    .accessibilityLabel("Move {library.languageName(code)} up")
+                Button("↓") { languages = prefsMoved(languages, i, by: 1) }
+                    .disabled(i == languages.count - 1)
+                    .accessibilityLabel("Move {library.languageName(code)} down")
+                Button("Remove") { languages.remove(at: i) }
+                    .accessibilityLabel("Remove {library.languageName(code)} from {what}")
+            }
+            .id(code)
+        }
+        HStack(spacing: 6) {
+            TextField("Add a language (name or code)", text: draft)
+                .frame(width: 220)
+                .onSubmit { add() }
+                .accessibilityLabel("Add a language to {what}")
+            Button("Add") { add() }
+                .disabled(draft.trim().isEmpty)
+                .accessibilityLabel("Add to {what}")
+        }
+        if !message.isEmpty {
+            Text(message).font(size: 11).color(.red).frame(maxWidth: 380, alignment: .leading)
+        }
+    }
+}

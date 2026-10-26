@@ -1,0 +1,66 @@
+// Glue for the player: what the disc says about a title's streams, put
+// onto the tracks a demuxer found in the title's bytes (languages,
+// commentary names, forced flags, the DVD subpicture palette as the
+// dvdsub tracks' setup), and the title's chapters and length.
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+import "../core"
+
+// A demuxed `core.Media` of (some of) a title's bytes with the disc's
+// knowledge added. Tracks are matched by id: DVD PS keys (0xE0,
+// 0xBD80 + n, 0xBD20 + n, …) as demux/ps.tsl gives them, Blu-ray PIDs as
+// demux/ts.tsl gives them.
+public fn annotate(_ m: core.Media, _ t: Title) -> core.Media {
+    var out = m
+    var i = 0
+    while i < out.tracks.count {
+        let id = out.tracks[i].id
+        for s in t.streams {
+            if s.id == id && s.kind == out.tracks[i].kind {
+                if !s.language.isEmpty {
+                    out.tracks[i].language = s.language
+                }
+                if !s.note.isEmpty && out.tracks[i].title.isEmpty {
+                    out.tracks[i].title = s.note
+                }
+                if s.forced {
+                    out.tracks[i].isForced = true
+                }
+                if s.codec == "dvdsub" {
+                    out.tracks[i].extra = dvdsubExtra(t)
+                    if out.tracks[i].width == 0 {
+                        out.tracks[i].width = t.width
+                        out.tracks[i].height = t.height
+                    }
+                }
+                break
+            }
+        }
+        i += 1
+    }
+    // The first audio stream the disc lists is the default.
+    var firstAudio = -1
+    for s in t.streams {
+        if s.kind == core.TrackKind.audio && firstAudio < 0 {
+            firstAudio = s.id
+        }
+    }
+    i = 0
+    while i < out.tracks.count {
+        let tr = out.tracks[i]
+        if tr.kind == core.TrackKind.audio {
+            out.tracks[i].isDefault = tr.id == firstAudio
+        }
+        i += 1
+    }
+    out.chapters = t.chapters
+    if t.duration > 0.0 {
+        out.duration = t.duration
+    }
+    if !t.name.isEmpty && (out.tags["title"] ?? "").isEmpty {
+        out.tags["title"] = t.name
+    }
+    out
+}

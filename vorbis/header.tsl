@@ -1,0 +1,629 @@
+// The three Vorbis header packets (Vorbis I section 4.2): identification
+// (rate, channels, block sizes), comments (tags) and setup (codebooks,
+// floors, residues, mappings and modes), and the forms `Track.extra` can
+// take.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../core"
+
+// A floor configuration (section 6.2.1 for type 0, 7.2.2 for type 1).
+struct Floor {
+    type: Int = 1
+
+    // Floor 0: LSP coefficients on a Bark scale.
+    order: Int = 0
+    rate: Int = 0
+    barkMapSize: Int = 0
+    amplitudeBits: Int = 0
+    amplitudeOffset: Int = 0
+    books: [Int] = []
+    // The Bark map for short and long blocks (n/2 + 1 items each,
+    // section 6.2.3), worked out at setup.
+    map0: [Int] = []
+    map1: [Int] = []
+
+    // Floor 1: piecewise lines through points at xList.
+    partitionClass: [Int] = []
+    classDims: [Int] = []
+    classSubclasses: [Int] = []
+    classMasterbook: [Int] = []
+    // Subclass books: class * 8 + j, -1 for none.
+    subclassBooks: [Int] = []
+    multiplier: Int = 1
+    xList: [Int] = []
+    // Worked out at setup: point indexes in ascending x order, and each
+    // point's low and high neighbours (sections 9.2.4, 9.2.5).
+    sorted: [Int] = []
+    lowNeighbor: [Int] = []
+    highNeighbor: [Int] = []
+}
+
+// A residue configuration (section 8.6.1).
+struct Residue {
+    type: Int = 0
+    begin: Int = 0
+    end: Int = 0
+    partitionSize: Int = 1
+    classifications: Int = 1
+    classbook: Int = 0
+    // Books per classification and pass: class * 8 + pass, -1 unused.
+    books: [Int] = []
+}
+
+// A mapping (section 4.2.4, "Mappings").
+struct Mapping {
+    submaps: Int = 1
+    magnitude: [Int] = []
+    angle: [Int] = []
+    // Submap of each channel.
+    mux: [Int] = []
+    submapFloor: [Int] = []
+    submapResidue: [Int] = []
+}
+
+struct Mode {
+    blockflag: Bool = false
+    mapping: Int = 0
+}
+
+// Everything the three headers say.
+struct Setup {
+    channels: Int = 0
+    rate: Int = 0
+    bitrateMax: Int = 0
+    bitrateNominal: Int = 0
+    bitrateMin: Int = 0
+    blocksize0: Int = 0
+    blocksize1: Int = 0
+    vendor: String = ""
+    tags: [String: String] = [:]
+    books: [Codebook] = []
+    floors: [Floor] = []
+    residues: [Residue] = []
+    mappings: [Mapping] = []
+    modes: [Mode] = []
+}
+
+// Whether a packet is a header of this type (1, 3 or 5) followed by
+// "vorbis".
+fn isHeader(_ p: Data, _ type: Int) -> Bool {
+    p.count >= 7 && p[0] == type && p[1] == 0x76 && p[2] == 0x6f && p[3] == 0x72 && p[4] == 0x62 && p[5] == 0x69 && p[6] == 0x73
+}
+
+// The identification header (section 4.2.2).
+fn readIdentification(_ p: Data, _ s: bind Setup) -> Error? {
+    if !isHeader(p, 1) || p.count < 30 {
+        return Error("the first Vorbis header isn't an identification header")
+    }
+    var r = core.lsbReaderRange(p, from: 7, to: p.count)
+    let version = r.bits(32)
+    s.channels = r.bits(8)
+    s.rate = r.bits(32)
+    s.bitrateMax = signed32(r.bits(32))
+    s.bitrateNominal = signed32(r.bits(32))
+    s.bitrateMin = signed32(r.bits(32))
+    s.blocksize0 = 1 << r.bits(4)
+    s.blocksize1 = 1 << r.bits(4)
+    let framing = r.flag()
+    if version != 0 {
+        return Error("Vorbis version {version} isn't Vorbis I")
+    }
+    if s.channels == 0 || s.rate == 0 {
+        return Error("the Vorbis identification header has no channels or no rate")
+    }
+    if s.blocksize0 < 64 || s.blocksize1 > 8192 || s.blocksize0 > s.blocksize1 || !framing {
+        return Error("the Vorbis identification header has bad block sizes")
+    }
+    nil
+}
+
+fn signed32(_ v: Int) -> Int {
+    if v >= 0x80000000 { v - 0x100000000 } else { v }
+}
+
+// The setup header (section 4.2.4).
+fn readSetup(_ p: Data, _ s: bind Setup) -> Error? {
+    if !isHeader(p, 5) {
+        return Error("the third Vorbis header isn't a setup header")
+    }
+    var r = core.lsbReaderRange(p, from: 7, to: p.count)
+
+    // Codebooks.
+    let bookCount = r.bits(8) + 1
+    var books: [Codebook] = []
+    for _ in 0..bookCount {
+        match readCodebook(r) {
+            .ok(b) -> books.append(b)
+            .failure(e) -> {
+                return e
+            }
+        }
+    }
+    s.books = books
+
+    // Time domain transforms: placeholders, all zero.
+    let times = r.bits(6) + 1
+    for _ in 0..times {
+        if r.bits(16) != 0 {
+            return Error("the Vorbis setup header has a time transform")
+        }
+    }
+
+    // Floors.
+    let floorCount = r.bits(6) + 1
+    var floors: [Floor] = []
+    for _ in 0..floorCount {
+        let type = r.bits(16)
+        var f = Floor(type: type)
+        if type == 0 {
+            f.order = r.bits(8)
+            f.rate = r.bits(16)
+            f.barkMapSize = r.bits(16)
+            f.amplitudeBits = r.bits(6)
+            f.amplitudeOffset = r.bits(8)
+            let n = r.bits(4) + 1
+            for _ in 0..n {
+                let b = r.bits(8)
+                if b >= bookCount {
+                    return Error("a Vorbis floor uses a missing codebook")
+                }
+                f.books.append(b)
+            }
+            if f.barkMapSize == 0 || f.order == 0 || f.amplitudeBits > 32 || f.amplitudeBits == 0 {
+                return Error("a Vorbis floor 0 has no Bark map or no order")
+            }
+            f.map0 = barkMap(f, s.blocksize0 / 2)
+            f.map1 = barkMap(f, s.blocksize1 / 2)
+        } else if type == 1 {
+            if let e = readFloor1(r, f, bookCount) {
+                return e
+            }
+        } else {
+            return Error("a Vorbis floor has type {type}")
+        }
+        floors.append(f)
+    }
+    s.floors = floors
+
+    // Residues.
+    let residueCount = r.bits(6) + 1
+    var residues: [Residue] = []
+    for _ in 0..residueCount {
+        var res = Residue(type: r.bits(16))
+        if res.type > 2 {
+            return Error("a Vorbis residue has type {res.type}")
+        }
+        res.begin = r.bits(24)
+        res.end = r.bits(24)
+        res.partitionSize = r.bits(24) + 1
+        res.classifications = r.bits(6) + 1
+        res.classbook = r.bits(8)
+        if res.classbook >= bookCount {
+            return Error("a Vorbis residue uses a missing codebook")
+        }
+        var cascade: [Int] = []
+        for _ in 0..res.classifications {
+            var high = 0
+            let low = r.bits(3)
+            if r.flag() {
+                high = r.bits(5)
+            }
+            cascade.append(high * 8 + low)
+        }
+        for c in 0..res.classifications {
+            for pass in 0..8 {
+                if (cascade[c] >> pass) & 1 == 1 {
+                    let b = r.bits(8)
+                    if b >= bookCount || books[b].lookupType == 0 {
+                        return Error("a Vorbis residue uses a missing codebook")
+                    }
+                    res.books.append(b)
+                } else {
+                    res.books.append(-1)
+                }
+            }
+        }
+        // The classification book's entries must cover every combination
+        // of classifications it codes (section 8.6.1).
+        let cb = books[res.classbook]
+        if cb.dims == 0 || intPowAbove(res.classifications, cb.dims, cb.entries) {
+            return Error("a Vorbis residue's classification book is too small")
+        }
+        residues.append(res)
+    }
+    s.residues = residues
+
+    // Mappings.
+    let mappingCount = r.bits(6) + 1
+    var mappings: [Mapping] = []
+    for _ in 0..mappingCount {
+        if r.bits(16) != 0 {
+            return Error("a Vorbis mapping isn't type 0")
+        }
+        var m = Mapping()
+        if r.flag() {
+            m.submaps = r.bits(4) + 1
+        }
+        if r.flag() {
+            let steps = r.bits(8) + 1
+            let bits = ilog(s.channels - 1)
+            for _ in 0..steps {
+                let mag = r.bits(bits)
+                let ang = r.bits(bits)
+                if mag == ang || mag >= s.channels || ang >= s.channels {
+                    return Error("a Vorbis mapping couples channels that don't exist")
+                }
+                m.magnitude.append(mag)
+                m.angle.append(ang)
+            }
+        }
+        if r.bits(2) != 0 {
+            return Error("a Vorbis mapping has reserved bits set")
+        }
+        for _ in 0..s.channels {
+            if m.submaps > 1 {
+                let x = r.bits(4)
+                if x >= m.submaps {
+                    return Error("a Vorbis mapping uses a missing submap")
+                }
+                m.mux.append(x)
+            } else {
+                m.mux.append(0)
+            }
+        }
+        for _ in 0..m.submaps {
+            r.bits(8)
+            let fl = r.bits(8)
+            let rs = r.bits(8)
+            if fl >= floorCount || rs >= residueCount {
+                return Error("a Vorbis mapping uses a missing floor or residue")
+            }
+            m.submapFloor.append(fl)
+            m.submapResidue.append(rs)
+        }
+        mappings.append(m)
+    }
+    s.mappings = mappings
+
+    // Modes.
+    let modeCount = r.bits(6) + 1
+    var modes: [Mode] = []
+    for _ in 0..modeCount {
+        let flag = r.flag()
+        let window = r.bits(16)
+        let transform = r.bits(16)
+        let mapping = r.bits(8)
+        if window != 0 || transform != 0 || mapping >= mappingCount {
+            return Error("a Vorbis mode is invalid")
+        }
+        modes.append(Mode(blockflag: flag, mapping: mapping))
+    }
+    s.modes = modes
+    if !r.flag() || r.overrun {
+        return Error("the Vorbis setup header is cut short")
+    }
+    nil
+}
+
+// Floor 1 header decode (section 7.2.2).
+fn readFloor1(_ r: bind core.LsbReader, _ f: bind Floor, _ bookCount: Int) -> Error? {
+    let partitions = r.bits(5)
+    var maxClass = -1
+    for _ in 0..partitions {
+        let c = r.bits(4)
+        f.partitionClass.append(c)
+        maxClass = max(maxClass, c)
+    }
+    for _ in 0..(maxClass + 1) {
+        f.classDims.append(r.bits(3) + 1)
+        let subs = r.bits(2)
+        f.classSubclasses.append(subs)
+        if subs > 0 {
+            let mb = r.bits(8)
+            if mb >= bookCount {
+                return Error("a Vorbis floor uses a missing codebook")
+            }
+            f.classMasterbook.append(mb)
+        } else {
+            f.classMasterbook.append(-1)
+        }
+        for j in 0..8 {
+            if j < (1 << subs) {
+                let b = r.bits(8) - 1
+                if b >= bookCount {
+                    return Error("a Vorbis floor uses a missing codebook")
+                }
+                f.subclassBooks.append(b)
+            } else {
+                f.subclassBooks.append(-1)
+            }
+        }
+    }
+    f.multiplier = r.bits(2) + 1
+    let rangeBits = r.bits(4)
+    f.xList = [0, 1 << rangeBits]
+    for i in 0..partitions {
+        let c = f.partitionClass[i]
+        for _ in 0..f.classDims[c] {
+            f.xList.append(r.bits(rangeBits))
+        }
+    }
+    let n = f.xList.count
+    if n > 65 || r.overrun {
+        return Error("a Vorbis floor 1 has too many points")
+    }
+    // Points in ascending x, and each point's neighbours.
+    var order: [Int] = []
+    for i in 0..n {
+        // Insertion sort: at most 65 points.
+        var at = order.count
+        while at > 0 && f.xList[order[at - 1]] > f.xList[i] {
+            at -= 1
+        }
+        order.insert(i, at: at)
+    }
+    f.sorted = order
+    for i in 1..n {
+        if f.xList[f.sorted[i]] == f.xList[f.sorted[i - 1]] {
+            return Error("a Vorbis floor 1 repeats a point")
+        }
+    }
+    for i in 0..n {
+        var low = 0
+        var high = 1
+        var lowX = -1
+        var highX = 1 << 30
+        for j in 0..i {
+            let x = f.xList[j]
+            if x < f.xList[i] && x > lowX {
+                lowX = x
+                low = j
+            }
+            if x > f.xList[i] && x < highX {
+                highX = x
+                high = j
+            }
+        }
+        f.lowNeighbor.append(low)
+        f.highNeighbor.append(high)
+    }
+    nil
+}
+
+// The Bark-scale map of floor 0 for an n-value curve (section 6.2.3):
+// map[i] = min(barkMapSize - 1, floor(bark(rate * i / (2n)) *
+// barkMapSize / bark(rate / 2))), and map[n] = -1.
+fn barkMap(_ f: Floor, _ n: Int) -> [Int] {
+    var out: [Int] = []
+    let rate = Float(f.rate)
+    let scale = Float(f.barkMapSize) / bark(0.5 * rate)
+    for i in 0..n {
+        let v = Int(floor(bark(rate * Float(i) / (2.0 * Float(n))) * scale))
+        out.append(min(f.barkMapSize - 1, v))
+    }
+    out.append(-1)
+    out
+}
+
+fn bark(_ x: Float) -> Float {
+    13.1 * atan(0.00074 * x) + 2.24 * atan(0.0000000185 * x * x) + 0.0001 * x
+}
+
+// Splits `Track.extra` into the three header packets. Core's form is each
+// header as a 4-byte big-endian length and its bytes; Matroska's Xiph-laced
+// CodecPrivate (a count byte of 2, two laced sizes, then the packets) is
+// read too.
+public fn splitHeaders(_ extra: Data) -> [Data] {
+    var out: [Data] = []
+    if extra.count >= 3 && extra[0] == 2 {
+        // Xiph lacing: each size is a run of 255s and a final byte < 255.
+        var pos = 1
+        var sizes: [Int] = []
+        for _ in 0..2 {
+            var size = 0
+            while pos < extra.count && extra[pos] == 255 {
+                size += 255
+                pos += 1
+            }
+            if pos < extra.count {
+                size += extra[pos]
+                pos += 1
+            }
+            sizes.append(size)
+        }
+        if pos + sizes[0] + sizes[1] <= extra.count && isHeader(extra.slice(from: pos, to: pos + 7), 1) {
+            out.append(extra.slice(from: pos, to: pos + sizes[0]))
+            out.append(extra.slice(from: pos + sizes[0], to: pos + sizes[0] + sizes[1]))
+            out.append(extra.slice(from: pos + sizes[0] + sizes[1], to: extra.count))
+            return out
+        }
+    }
+    var pos = 0
+    while pos + 4 <= extra.count && out.count < 3 {
+        let size = extra.uint32(at: pos, bigEndian: true)
+        if pos + 4 + size > extra.count {
+            break
+        }
+        out.append(extra.slice(from: pos + 4, to: pos + 4 + size))
+        pos += 4 + size
+    }
+    out
+}
+
+// The three headers in core's `Track.extra` form.
+public fn joinHeaders(_ headers: [Data]) -> Data {
+    var out = Data()
+    for h in headers {
+        out += Data(bytes: h.count.bytes(count: 4, bigEndian: true))
+        out += h
+    }
+    out
+}
+
+// The tags of a comment header (section 5): a Vorbis comment packet
+// (starting 0x03 "vorbis"), an OpusTags packet, or the bare comment block
+// (as in FLAC's VORBIS_COMMENT). Keys are lower case, with the usual names
+// mapped to core's (TRACKNUMBER → track, DISCNUMBER → disc, ALBUM ARTIST →
+// albumartist, DESCRIPTION → comment when there's no COMMENT); the vendor
+// string is under "vendor". A key given more than once has its values
+// joined with "; ".
+public fn parseComments(_ packet: Data) -> [String: String] {
+    var tags: [String: String] = [:]
+    var r = core.byteReader(packet)
+    if isHeader(packet, 3) {
+        r.pos = 7
+    } else if packet.count >= 8 && packet.slice(from: 0, to: 8).latin1 == "OpusTags" {
+        r.pos = 8
+    }
+    let vendorLen = r.u32(bigEndian: false)
+    if r.overrun || vendorLen > r.left {
+        return tags
+    }
+    let vendor = utf8OrLatin1(r.bytes(vendorLen))
+    if !vendor.isEmpty {
+        tags["vendor"] = vendor
+    }
+    let count = r.u32(bigEndian: false)
+    var i = 0
+    while i < count && !r.overrun {
+        let len = r.u32(bigEndian: false)
+        if r.overrun || len > r.left {
+            break
+        }
+        let text = utf8OrLatin1(r.bytes(len))
+        if let eq = text.find("=") {
+            let rawKey = text.substring(from: 0, to: eq).lowercase()
+            let value = text.substring(from: eq + 1, to: text.count)
+            let key = commentKey(rawKey)
+            if let old = tags[key] {
+                tags[key] = old + "; " + value
+            } else {
+                tags[key] = value
+            }
+        }
+        i += 1
+    }
+    if tags["comment"] == nil {
+        if let d = tags["description"] {
+            tags["comment"] = d
+        }
+    }
+    tags
+}
+
+fn commentKey(_ k: String) -> String {
+    match k {
+        "tracknumber" -> "track"
+        "discnumber" -> "disc"
+        "album artist" -> "albumartist"
+        "album_artist" -> "albumartist"
+        "year" -> "date"
+        _ -> k
+    }
+}
+
+fn utf8OrLatin1(_ d: Data) -> String {
+    d.text ?? d.latin1
+}
+
+// The picture of a METADATA_BLOCK_PICTURE comment value (base64 of a FLAC
+// PICTURE block: type, MIME, description, size, depth, colours, data):
+// the image file's bytes, or empty.
+public fn pictureFromComment(_ value: String) -> Data {
+    let block = decodeBase64(value) ?? Data()
+    var r = core.byteReader(block)
+    r.u32()
+    let mimeLen = r.u32()
+    r.skip(mimeLen)
+    let descLen = r.u32()
+    r.skip(descLen)
+    r.skip(16)
+    let size = r.u32()
+    if r.overrun || size > r.left {
+        return Data()
+    }
+    r.bytes(size)
+}
+
+// A summary of a stream's setup (block sizes, codebooks, floors, residues,
+// mappings, modes), for debugging and the media info window.
+public fn setupSummary(_ extra: Data) -> String {
+    let headers = splitHeaders(extra)
+    if headers.count < 3 {
+        return "no Vorbis headers"
+    }
+    var s = Setup()
+    if let e = readIdentification(headers[0], s) {
+        return e.message
+    }
+    if let e = readSetup(headers[2], s) {
+        return e.message
+    }
+    var out = "blocks {s.blocksize0}/{s.blocksize1}, {s.books.count} books"
+    var lookup = [0, 0, 0]
+    var longest = 0
+    for b in s.books {
+        lookup[b.lookupType] += 1
+        longest = max(longest, b.maxLen)
+    }
+    out += " (lookup 0/1/2: {lookup[0]}/{lookup[1]}/{lookup[2]}, longest codeword {longest})"
+    out += ", floors"
+    for f in s.floors {
+        out += " {f.type}"
+    }
+    out += ", residues"
+    for r in s.residues {
+        out += " {r.type}"
+    }
+    out += ", mappings"
+    for m in s.mappings {
+        out += " {m.submaps}sub/{m.magnitude.count}coupled"
+    }
+    out += ", {s.modes.count} modes"
+    out
+}
+
+// What a demuxer needs to time Vorbis packets: the two block sizes and
+// which modes use the long one. A packet's samples are
+// previous block size / 4 + its block size / 4 (none for the first).
+public struct BlockInfo {
+    blocksize0: Int = 0
+    blocksize1: Int = 0
+    modeLong: [Bool] = []
+    modeBits: Int = 0
+}
+
+// The block info of a stream from its headers (Track.extra form), or nil.
+public fn blockInfo(_ extra: Data) -> BlockInfo? {
+    let headers = splitHeaders(extra)
+    if headers.count < 3 {
+        return nil
+    }
+    var s = Setup()
+    if let _e = readIdentification(headers[0], s) {
+        return nil
+    }
+    if let _e = readSetup(headers[2], s) {
+        return nil
+    }
+    var info = BlockInfo(blocksize0: s.blocksize0, blocksize1: s.blocksize1, modeBits: ilog(s.modes.count - 1))
+    for m in s.modes {
+        info.modeLong.append(m.blockflag)
+    }
+    info
+}
+
+// The block size of an audio packet (section 4.3.1), 0 for a header or a
+// packet with a mode that doesn't exist.
+public fn packetBlockSize(_ info: BlockInfo, _ packet: Data) -> Int {
+    if packet.isEmpty || packet[0] & 1 == 1 {
+        return 0
+    }
+    let mode = (packet[0] >> 1) & ((1 << info.modeBits) - 1)
+    if mode >= info.modeLong.count {
+        return 0
+    }
+    if info.modeLong[mode] { info.blocksize1 } else { info.blocksize0 }
+}

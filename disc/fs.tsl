@@ -1,0 +1,144 @@
+// The files of a disc, wherever they are: a folder on disk (VIDEO_TS/,
+// BDMV/) or the file system inside an ISO image (iso.tsl, udf.tsl). Each
+// file is a byte range of a container file, so titles can point into an
+// image the same way they point at loose VOB / m2ts files.
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+public struct DiscFile {
+    // Path inside the disc, with "/" ("VIDEO_TS/VTS_01_1.VOB"), as stored.
+    name: String
+    // The file on disk holding the bytes (the file itself, or the .iso).
+    path: String
+    offset: Int = 0
+    size: Int = 0
+    folder: Bool = false
+    // A file in an image stored in pieces: (offset, size) pairs in the
+    // image, in file order; empty when it is the one run offset…offset+size.
+    extents: [Int] = []
+}
+
+public struct DiscFs {
+    // The disc's root folder, or the image file.
+    root: String
+    files: [DiscFile] = []
+    // An image's bytes (whole: Tessel reads files whole), empty for folders.
+    image: Data = Data()
+    iso: Bool = false
+    volumeName: String = ""
+    // "folder", "iso9660", "joliet", "udf".
+    source: String = "folder"
+    warnings: [String] = []
+}
+
+// A file by its disc path, ignoring case.
+public fn discFind(_ fs: DiscFs, _ name: String) -> DiscFile? {
+    let want = name.uppercase()
+    for f in fs.files {
+        if !f.folder && f.name.uppercase() == want {
+            return f
+        }
+    }
+    nil
+}
+
+// The files directly inside a disc folder ("BDMV/PLAYLIST"), sorted by name.
+public fn discFilesIn(_ fs: DiscFs, _ folder: String) -> [DiscFile] {
+    let want = folder.uppercase() + "/"
+    var out: [DiscFile] = []
+    for f in fs.files {
+        let n = f.name.uppercase()
+        if !f.folder && n.hasPrefix(want) && !n.substring(from: want.count, to: n.count).contains("/") {
+            out.append(f)
+        }
+    }
+    out.sorted(by: { a, b in a.name.uppercase() < b.name.uppercase() })
+}
+
+// A file's bytes, or nil.
+public fn discRead(_ fs: DiscFs, _ f: DiscFile) -> Data? {
+    if fs.iso {
+        if f.extents.isEmpty {
+            if f.offset < 0 || f.offset + f.size > fs.image.count {
+                return nil
+            }
+            return fs.image.slice(from: f.offset, to: f.offset + f.size)
+        }
+        var out = Data()
+        for (path, a, b) in discFileRanges(f, 0, f.size) {
+            if b > fs.image.count || path.isEmpty {
+                return nil
+            }
+            out += fs.image.slice(from: a, to: b)
+        }
+        return out
+    }
+    readData(f.path)
+}
+
+// The container ranges holding bytes from ..< to of a file: (container
+// path, start, end) pieces in order.
+public fn discFileRanges(_ f: DiscFile, _ from: Int, _ to: Int) -> [(String, Int, Int)] {
+    var out: [(String, Int, Int)] = []
+    let a = max(0, from)
+    let b = min(to, f.size)
+    if b <= a {
+        return out
+    }
+    if f.extents.isEmpty {
+        out.append((f.path, f.offset + a, f.offset + b))
+        return out
+    }
+    var base = 0
+    var i = 0
+    while i + 1 < f.extents.count {
+        let off = f.extents[i]
+        let len = f.extents[i + 1]
+        let lo = max(a, base)
+        let hi = min(b, base + len)
+        if hi > lo {
+            out.append((f.path, off + lo - base, off + hi - base))
+        }
+        base += len
+        i += 2
+    }
+    out
+}
+
+fn discReadName(_ fs: DiscFs, _ name: String) -> Data? {
+    if let f = discFind(fs, name) {
+        return discRead(fs, f)
+    }
+    nil
+}
+
+// The files of a folder on disk, three levels deep (enough for VIDEO_TS/
+// and BDMV/PLAYLIST/).
+public fn folderFs(_ root: String) -> DiscFs {
+    var fs = DiscFs(root: root)
+    fs.volumeName = root.fileName
+    fs.files = discScan(root, "", 0)
+    fs
+}
+
+fn discScan(_ dir: String, _ prefix: String, _ depth: Int) -> [DiscFile] {
+    var out: [DiscFile] = []
+    if depth > 3 {
+        return out
+    }
+    for name in listFolder(dir) ?? [] {
+        if name.hasPrefix(".") {
+            continue
+        }
+        let full = joinPath(dir, name)
+        let rel = if prefix.isEmpty { name } else { prefix + "/" + name }
+        if isFolder(full) {
+            out.append(DiscFile(name: rel, path: full, folder: true))
+            out += discScan(full, rel, depth + 1)
+        } else {
+            out.append(DiscFile(name: rel, path: full, size: fileSize(full) ?? 0))
+        }
+    }
+    out
+}

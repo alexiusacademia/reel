@@ -1,0 +1,286 @@
+// Loudness meter tests: the K-weighting filters, the EBU Tech 3341
+// minimum-requirement signals (cases 1–6, 9, 11, 12, 14, 15–23), the Tech
+// 3342 loudness-range signals (cases 1–4), ffmpeg's ebur128 filter as a
+// black-box oracle on noise programmes (tests/fx/make_refs.py), and
+// ReplayGain tags.
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+import "../../fx"
+import "../../core"
+
+// Feeds a meter stereo 1 kHz tones: (seconds, dBFS peak level, with
+// −200 meaning silence), in 0.1 s blocks, and calls back after each block.
+struct ToneFeeder {
+    rate: Int = 48000
+    phase: Int = 0
+
+    fn feed(_ m: bind fx.Meter, seconds: Float, level: Float, channels: Int = 2, gains: [Float] = []) {
+        let total = Int(floor(seconds * Float(rate) + 0.5))
+        let amp = if level <= -199.0 { 0.0 } else { pow(10.0, level / 20.0) }
+        let w = 2.0 * pi * 1000.0 / Float(rate)
+        var left = total
+        while left > 0 {
+            let n = min(left, 4800)
+            var d: [Float] = []
+            for i in 0..n {
+                let v = amp * sin(w * Float(phase + i))
+                for ch in 0..channels {
+                    let g = if ch < gains.count { gains[ch] } else { 1.0 }
+                    d.append(v * g)
+                }
+            }
+            m.addData(d)
+            phase += n
+            left -= n
+        }
+    }
+}
+
+fn stereoMeter() -> fx.Meter {
+    fx.newMeter(rate: 48000, channels: 2, layout: ["FL", "FR"])
+}
+
+fn loudnessTests(_ t: bind Tally) {
+    // K-weighting: the designed filters give the recommendation's
+    // 48 kHz coefficients back.
+    let a = fx.kShelf(48000.0)
+    let b = fx.kShelfDesigned(48000.0)
+    let c = fx.kHighpass(48000.0)
+    let d = fx.kHighpassDesigned(48000.0)
+    let shelfErr = max(max(abs(a.b0 - b.b0), abs(a.b1 - b.b1)), max(max(abs(a.b2 - b.b2), abs(a.a1 - b.a1)), abs(a.a2 - b.a2)))
+    let hpErr = max(abs(c.a1 - d.a1), abs(c.a2 - d.a2))
+    t.check(shelfErr < 1e-7 && hpErr < 1e-7, "K-weighting designed at 48 kHz matches BS.1770-4's tables ({shelfErr}, {hpErr})")
+    // At 1 kHz the K-weighting gives about +0.691 dB (which the −0.691 in
+    // the loudness formula takes out).
+    let k1 = a.db(1000.0, 48000.0) + c.db(1000.0, 48000.0)
+    t.near(k1, 0.691, 0.01, "K-weighting gain at 1 kHz")
+    // At 44.1 kHz the filters have the same shape.
+    let a44 = fx.kShelf(44100.0)
+    let c44 = fx.kHighpass(44100.0)
+    var shapeErr = 0.0
+    for f in [20.0, 50.0, 100.0, 500.0, 1000.0, 2000.0, 5000.0, 10000.0, 15000.0] {
+        let g48 = a.db(f, 48000.0) + c.db(f, 48000.0)
+        let g44 = a44.db(f, 44100.0) + c44.db(f, 44100.0)
+        shapeErr = max(shapeErr, abs(g48 - g44))
+    }
+    t.check(shapeErr < 0.05, "K-weighting at 44.1 kHz has the 48 kHz shape (worst {shapeErr} dB)")
+
+    // Tech 3341 case 1 and 2: stereo 1 kHz at −23 and −33 dBFS, 20 s.
+    for (level, want) in [(-23.0, -23.0), (-33.0, -33.0)] {
+        var m = stereoMeter()
+        var f = ToneFeeder()
+        f.feed(m, seconds: 20.0, level: level)
+        t.near(m.momentary, want, 0.1, "Tech 3341 case {if level == -23.0 { 1 } else { 2 }}: M")
+        t.near(m.shortTerm, want, 0.1, "Tech 3341 case {if level == -23.0 { 1 } else { 2 }}: S")
+        t.near(m.integrated(), want, 0.1, "Tech 3341 case {if level == -23.0 { 1 } else { 2 }}: I")
+    }
+    // Case 3: 10 s at −36, 60 s at −23, 10 s at −36.
+    var m3 = stereoMeter()
+    var f3 = ToneFeeder()
+    f3.feed(m3, seconds: 10.0, level: -36.0)
+    f3.feed(m3, seconds: 60.0, level: -23.0)
+    f3.feed(m3, seconds: 10.0, level: -36.0)
+    t.near(m3.integrated(), -23.0, 0.1, "Tech 3341 case 3: I")
+    // Case 4: −72, −36, −23, −36, −72.
+    var m4 = stereoMeter()
+    var f4 = ToneFeeder()
+    f4.feed(m4, seconds: 10.0, level: -72.0)
+    f4.feed(m4, seconds: 10.0, level: -36.0)
+    f4.feed(m4, seconds: 60.0, level: -23.0)
+    f4.feed(m4, seconds: 10.0, level: -36.0)
+    f4.feed(m4, seconds: 10.0, level: -72.0)
+    t.near(m4.integrated(), -23.0, 0.1, "Tech 3341 case 4: I")
+    // Case 5: 20 s at −26, 20.1 s at −20, 20 s at −26.
+    var m5 = stereoMeter()
+    var f5 = ToneFeeder()
+    f5.feed(m5, seconds: 20.0, level: -26.0)
+    f5.feed(m5, seconds: 20.1, level: -20.0)
+    f5.feed(m5, seconds: 20.0, level: -26.0)
+    t.near(m5.integrated(), -23.0, 0.1, "Tech 3341 case 5: I")
+    // Case 6: 5.0 channels: L R −28, C −24, Ls Rs −30 dBFS.
+    var m6 = fx.newMeter(rate: 48000, channels: 5, layout: ["FL", "FR", "FC", "BL", "BR"])
+    var f6 = ToneFeeder()
+    let gl = pow(10.0, -28.0 / 20.0)
+    let gc = pow(10.0, -24.0 / 20.0)
+    let gs = pow(10.0, -30.0 / 20.0)
+    f6.feed(m6, seconds: 20.0, level: 0.0, channels: 5, gains: [gl, gl, gc, gs, gs])
+    t.near(m6.integrated(), -23.0, 0.1, "Tech 3341 case 6 (5.0): I")
+    // The LFE doesn't count: 5.1 with a loud LFE gives the same.
+    var m6b = fx.newMeter(rate: 48000, channels: 6, layout: ["FL", "FR", "FC", "LFE", "BL", "BR"])
+    var f6b = ToneFeeder()
+    f6b.feed(m6b, seconds: 20.0, level: 0.0, channels: 6, gains: [gl, gl, gc, 1.0, gs, gs])
+    t.near(m6b.integrated(), -23.0, 0.1, "5.1 with a loud LFE: I (LFE left out)")
+
+    // Case 9: (1.34 s at −20, 1.66 s at −30) × 5: S = −23 after 3 s.
+    var m9 = stereoMeter()
+    var f9 = ToneFeeder()
+    var sWorst = 0.0
+    for _ in 0..5 {
+        for (secs, lv) in [(1.34, -20.0), (1.66, -30.0)] {
+            // Feed in 10 ms steps and read S each time.
+            var left = secs
+            while left > 0.0005 {
+                f9.feed(m9, seconds: 0.01, level: lv)
+                left -= 0.01
+                if m9.seconds >= 3.0 {
+                    sWorst = max(sWorst, abs(m9.shortTerm + 23.0))
+                }
+            }
+        }
+    }
+    t.check(sWorst <= 0.1, "Tech 3341 case 9: S stays at −23 after 3 s (worst {sWorst.formatted(decimals: 3)} LU off)")
+    // Case 12: (0.18 s at −20, 0.22 s at −30) × 25: M = −23 after 1 s.
+    var m12 = stereoMeter()
+    var f12 = ToneFeeder()
+    var mWorst = 0.0
+    for _ in 0..25 {
+        for (secs, lv) in [(0.18, -20.0), (0.22, -30.0)] {
+            var left = secs
+            while left > 0.0005 {
+                f12.feed(m12, seconds: 0.01, level: lv)
+                left -= 0.01
+                if m12.seconds >= 1.0 {
+                    mWorst = max(mWorst, abs(m12.momentary + 23.0))
+                }
+            }
+        }
+    }
+    t.check(mWorst <= 0.1, "Tech 3341 case 12: M stays at −23 after 1 s (worst {mWorst.formatted(decimals: 3)} LU off)")
+    // Case 11 (live): 20 tones of 3 s at −38 + i dBFS, each after i·0.15 s
+    // of silence and before 3 − i·0.15 s: max S per segment = −38 + i.
+    var m11 = stereoMeter()
+    var f11 = ToneFeeder()
+    var ok11 = true
+    var worst11 = 0.0
+    for i in 0..20 {
+        var best = fx.silenceLufs
+        let pieces = [(Float(i) * 0.15, -200.0), (3.0, -38.0 + Float(i)), (3.0 - Float(i) * 0.15, -200.0)]
+        for (secs, lv) in pieces {
+            var left = secs
+            while left > 0.0005 {
+                f11.feed(m11, seconds: 0.01, level: lv)
+                left -= 0.01
+                best = max(best, m11.shortTerm)
+            }
+        }
+        worst11 = max(worst11, abs(best - (-38.0 + Float(i))))
+        if abs(best - (-38.0 + Float(i))) > 0.1 {
+            ok11 = false
+        }
+    }
+    t.check(ok11, "Tech 3341 case 11: max S of each segment (worst {worst11.formatted(decimals: 3)} LU off)")
+    // Case 14 (live): 400 ms tones at −38 + i after i·20 ms: max M.
+    var m14 = stereoMeter()
+    var f14 = ToneFeeder()
+    var worst14 = 0.0
+    for i in 0..20 {
+        var best = fx.silenceLufs
+        let pieces = [(Float(i) * 0.02, -200.0), (0.4, -38.0 + Float(i)), (0.4 - Float(i) * 0.02, -200.0)]
+        for (secs, lv) in pieces {
+            var left = secs
+            while left > 0.0005 {
+                f14.feed(m14, seconds: 0.01, level: lv)
+                left -= 0.01
+                best = max(best, m14.momentary)
+            }
+        }
+        worst14 = max(worst14, abs(best - (-38.0 + Float(i))))
+    }
+    t.check(worst14 <= 0.1, "Tech 3341 case 14: max M of each segment (worst {worst14.formatted(decimals: 3)} LU off)")
+
+    // True peak, cases 15–19: sines at fs/4, fs/6, fs/8 with phases.
+    let tpCases = [(15, 4.0, 0.5, 0.0, -6.0), (16, 4.0, 0.5, 45.0, -6.0), (17, 6.0, 0.5, 60.0, -6.0), (18, 8.0, 0.5, 67.5, -6.0), (19, 4.0, 1.41, 45.0, 3.0)]
+    for (n, div, amp, ph, want) in tpCases {
+        var m = stereoMeter()
+        var dd: [Float] = []
+        let frames = 4800
+        let fade = 480
+        for i in 0..frames {
+            var g = 1.0
+            if i < fade {
+                g = Float(i) / Float(fade)
+            } else if i >= frames - fade {
+                g = Float(frames - 1 - i) / Float(fade)
+            }
+            let v = amp * g * sin(2.0 * pi * Float(i) / div + ph * pi / 180.0)
+            dd.append(v)
+            dd.append(v)
+        }
+        m.addData(dd)
+        let tp = m.truePeak
+        t.check(tp <= want + 0.2 && tp >= want - 0.4, "Tech 3341 case {n}: true peak {tp.formatted(decimals: 3)} dBTP, want {want} +0.2/−0.4")
+    }
+    // Cases 20–23 from make_refs.py (mono files fed as stereo).
+    for n in [20, 21, 22, 23] {
+        let x = readF32("tests/fx/fixtures/tp{n}.f32")
+        var dd: [Float] = []
+        for v in x {
+            dd.append(v)
+            dd.append(v)
+        }
+        var m = stereoMeter()
+        m.addData(dd)
+        let tp = m.truePeak
+        t.check(x.count == 4800 && tp <= 0.2 && tp >= -0.4, "Tech 3341 case {n}: true peak {tp.formatted(decimals: 3)} dBTP, want 0 +0.2/−0.4")
+    }
+
+    // Tech 3342 loudness range cases 1–4.
+    let lraCases = [([-20.0, -30.0], 10.0), ([-20.0, -15.0], 5.0), ([-40.0, -20.0], 20.0), ([-50.0, -35.0, -20.0, -35.0, -50.0], 15.0)]
+    var lc = 1
+    for (levels, want) in lraCases {
+        var m = stereoMeter()
+        var f = ToneFeeder()
+        for lv in levels {
+            f.feed(m, seconds: 20.0, level: lv)
+        }
+        t.near(m.loudnessRange(), want, 1.0, "Tech 3342 case {lc}: LRA")
+        t.near(m.loudnessRange(), want, 0.1, "Tech 3342 case {lc}: LRA (tight)")
+        lc += 1
+    }
+
+    // ffmpeg's ebur128 on the noise programmes (fed in uneven blocks).
+    let text = readFile("tests/fx/fixtures/ebur128.txt") ?? ""
+    var oracles = 0
+    for line in text.lines() {
+        if line.hasPrefix("#") || line.trim().isEmpty {
+            continue
+        }
+        let p = line.words()
+        if p.count < 5 {
+            continue
+        }
+        let ch = if p[0] == "surround" { 6 } else { 2 }
+        let levels: [Float] = if ch == 6 { [-24.0, -18.0, -30.0, -20.0, -26.0, -22.0] } else { [-20.0, -26.0, -14.0, -30.0, -18.0, -22.0, -10.0, -40.0, -24.0, -16.0, -28.0, -20.0] }
+        let seed = if ch == 6 { 11 } else { 7 }
+        let all = lcgProgramme(channels: ch, levels: levels, seed: seed)
+        var m = fx.newMeter(rate: 48000, channels: ch, layout: core.defaultLayout(ch))
+        var pos = 0
+        var step = 1000
+        while pos < all.count {
+            let e = min(all.count, pos + step * ch)
+            m.addData(all.slice(from: pos, to: e))
+            pos = e
+            step = if step == 1000 { 4096 } else { 1000 }
+        }
+        let r = m.report()
+        t.near(r.integrated, Float(p[1]) ?? 0.0, 0.15, "{p[0]} noise: integrated vs ffmpeg")
+        t.near(r.range, Float(p[2]) ?? 0.0, 0.3, "{p[0]} noise: LRA vs ffmpeg")
+        t.near(r.truePeak, Float(p[3]) ?? 0.0, 0.5, "{p[0]} noise: true peak vs ffmpeg")
+        t.near(r.samplePeak, Float(p[4]) ?? 0.0, 0.06, "{p[0]} noise: sample peak vs ffmpeg")
+        // The one-shot measure gives the same.
+        let whole = fx.measure(core.Samples(rate: 48000, channels: ch, data: all, layout: core.defaultLayout(ch)))
+        t.near(whole.integrated, r.integrated, 1e-6, "{p[0]} noise: measure() equals streaming")
+        oracles += 1
+    }
+    t.check(oracles == 2, "ffmpeg reference lines read")
+
+    // ReplayGain tags.
+    let tags = ["replaygain_track_gain": "-6.48 dB", "REPLAYGAIN_TRACK_PEAK": "0.988", "----:com.apple.itunes:replaygain_album_gain": "+1.50 dB", "replaygain_album_peak": "1.02"]
+    let rg = fx.replayGain(tags)
+    t.check(rg.trackGain == -6.48 && rg.trackPeak == 0.988 && rg.albumGain == 1.5 && rg.albumPeak == 1.02, "ReplayGain tags are read")
+    let op = fx.replayGain(["r128_track_gain": "-512"])
+    t.check(op.trackGain == 3.0 && op.albumGain == nil, "Opus R128_TRACK_GAIN is turned into ReplayGain terms")
+    t.check(fx.replayGain(["title": "x"]).trackGain == nil, "no ReplayGain tags: nil")
+}

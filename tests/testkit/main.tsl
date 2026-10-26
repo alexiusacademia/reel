@@ -1,0 +1,35 @@
+// Checks that the test helpers read ffmpeg's references correctly.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../../core"
+import "../../testkit"
+
+fn main() {
+    var passed = 0
+    var total = 0
+    fn check(_ ok: Bool, _ what: String) {
+        total += 1
+        if ok { passed += 1 } else { print("FAIL: {what}") }
+    }
+    let ref = testkit.loadRef("h264_baseline.mp4")
+    check(ref.tracks.count == 1 && ref.tracks[0].codec == "h264", "ref track")
+    check(ref.packets.count == 50, "ref packets: {ref.packets.count}")
+    let file = testkit.fixture("h264_baseline.mp4")
+    let m = testkit.mediaFromRef(file, ref)
+    check(m.tracks[0].extra.count == 40 && m.tracks[0].extra[0] == 1, "extradata avcC")
+    check(m.packets.count == 50 && m.packets[0].key, "packets")
+    let first = core.packetBytes(file, m, m.packets[0])
+    check(first.count == m.packets[0].size && first.uint32(at: 0, bigEndian: true) + 4 <= first.count, "first packet is length-prefixed NALs")
+    check(testkit.frameMd5s("h264_baseline.mp4").count == 50, "framemd5 list")
+    let s = testkit.referenceSamples("pcm_s16.wav")
+    check(s.count == 44100 * 2 * 2, "reference samples {s.count}")
+    let yuv = testkit.referenceYuv("mpeg2.mpg", width: 320, height: 240)
+    check(yuv.count == 10, "reference yuv")
+    check(testkit.psnr(yuv[0], yuv[0]) == 99.0 && testkit.psnr(yuv[0], yuv[5]) < 40.0, "psnr")
+    check(testkit.snr(s, s) == 150.0, "snr")
+    let multi = testkit.loadRef("multi.mkv")
+    check(multi.chapters.count == 2 && multi.tracks[2].language == "jpn", "chapters and languages")
+    print("testkit: {passed} of {total} passed")
+}

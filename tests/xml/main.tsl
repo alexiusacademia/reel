@@ -1,0 +1,143 @@
+// Tests for the xml module: parsing (elements, attributes, references,
+// CDATA, comments, DOCTYPE entities, namespaces as prefixes, encodings,
+// errors) and writing (round trips, escaping, indentation).
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+import "../../xml"
+
+fn main() {
+    var passed = 0
+    var total = 0
+    fn check(_ ok: Bool, _ what: String) {
+        total += 1
+        if ok { passed += 1 } else { print("FAIL: {what}") }
+    }
+    fn parsed(_ s: String) -> xml.Node {
+        match xml.parse(s) {
+            .ok(n) -> n
+            .failure(e) -> {
+                print("FAIL: parse: {e.message}")
+                xml.Node(name: "#error")
+            }
+        }
+    }
+
+    // Elements, attributes in order, children, text.
+    let a = parsed("<?xml version=\"1.0\"?>\n<!-- top --><a x=\"1\" y='two' z=\"3\"><b>hi</b><b k=\"v\">yo</b><c/></a>")
+    check(a.name == "a" && a.elements.count == 3, "root and children")
+    check(a.attributes.count == 3 && a.attributes[0].name == "x" && a.attributes[1].name == "y" && a.attributes[2].value == "3", "attributes in order")
+    check(a.attr("y") == "two" && a.attr("nope") == nil && a.attrOr("nope", "d") == "d", "attr")
+    check(a.children("b").count == 2 && a.children("c").count == 1, "children(name)")
+    check((a.child("b")?.text ?? "") == "hi", "child text")
+    check(a.children("b")[1].attr("k") == "v", "second child attr")
+    check(a.childText("b") == "hi" && a.childText("zz") == "", "childText")
+
+    // References (§4.1, §4.6), CDATA, comments and PIs inside content.
+    let r = parsed("<t a=\"&lt;&amp;&gt;&quot;&apos;\">x &lt; y &#233;&#xE9; &#x1F600;<![CDATA[<raw> & stuff]]><!-- c --><?pi data?>end</t>")
+    check(r.attr("a") == "<&>\"'", "attribute entities")
+    check(r.text == "x < y éé 😀<raw> & stuffend", "content references, CDATA, comment and PI skipped")
+
+    // Attribute-value normalisation and line ends.
+    let ln = parsed("<t a=\"one\ntwo\tthree\">l1\r\nl2\rl3</t>")
+    check(ln.attr("a") == "one two three", "attribute whitespace normalised")
+    check(ln.text == "l1\nl2\nl3", "CR LF and CR become LF")
+
+    // Mixed content: text, tail.
+    let m = parsed("<p>Hello <b>big</b> world <i>!</i></p>")
+    check(m.text == "Hello " && m.elements[0].tail == " world " && m.elements[1].tail == "", "text and tails")
+    check(m.innerText == "Hello big world !", "innerText")
+
+    // Namespaces kept as prefixes.
+    let ns = parsed("<rss xmlns:itunes=\"http://www.itunes.com/dtds/podcast-1.0.dtd\"><channel><itunes:image href=\"i.jpg\"/><title>T</title></channel></rss>")
+    let ch = ns.child("channel") ?? xml.Node()
+    check((ch.child("itunes:image")?.attr("href") ?? "") == "i.jpg", "prefixed name")
+    check((ch.child("image", anyPrefix: true)?.name ?? "") == "itunes:image", "anyPrefix match")
+    check(ch.child("image") == nil, "exact match by default")
+    check(ch.elements[0].localName == "image" && ch.elements[0].prefix == "itunes", "localName and prefix")
+    check(ns.attr("xmlns:itunes") != nil, "xmlns kept as an attribute")
+    check((ns.find("title")?.text ?? "") == "T", "find below")
+
+    // DOCTYPE with an internal subset and entity declarations.
+    let dt = parsed("<!DOCTYPE doc [\n<!ENTITY who \"World &amp; co\">\n<!ELEMENT doc (#PCDATA)>\n<!-- x -->\n]>\n<doc>Hello &who;!</doc>")
+    check(dt.text == "Hello World & co!", "internal entity")
+
+    // Lenient vs strict.
+    let le = parsed("<d>Fish & chips &nbsp;&eacute; &unknown;</d>")
+    let nbsp = Data(bytes: [0xc2, 0xa0]).text ?? ""
+    check(le.text == "Fish & chips " + nbsp + "é &unknown;", "lenient & and HTML entities")
+    check(!xml.parse("<d>Fish & chips</d>", strict: true).isOk(), "strict rejects a bare &")
+    check(!xml.parse("<a><b></a>").isOk(), "mismatched end tag")
+    check(!xml.parse("no xml here").isOk(), "not XML")
+    check(!xml.parse("").isOk(), "empty")
+    check(!xml.parse("<a><b>", strict: true).isOk(), "strict: unclosed")
+    check(xml.parse("<a><b>text").isOk(), "lenient: unclosed at the end")
+    match xml.parse("<a>\n<b>\n</c></a>") {
+        .ok(_) -> check(false, "error expected")
+        .failure(e) -> check(e.message.contains("line 3"), "error line number: {e.message}")
+    }
+
+    // Encodings: UTF-8 BOM, UTF-16 LE/BE BOM, Latin-1 declaration.
+    var u8 = Data(bytes: [0xef, 0xbb, 0xbf])
+    u8.append(Data(text: "<a>é</a>"))
+    check((xml.parseData(u8).value()?.text ?? "") == "é", "UTF-8 BOM")
+    var le16 = Data(bytes: [0xff, 0xfe])
+    for c in Data(text: "<a>z</a>").bytes {
+        le16.append(byte: c)
+        le16.append(byte: 0)
+    }
+    le16.append(Data(bytes: [0x3d, 0xd8, 0x00, 0xde]))
+    check((xml.parseData(le16).value()?.text ?? "") == "z", "UTF-16 LE")
+    var be16 = Data(bytes: [0xfe, 0xff])
+    for c in Data(text: "<a>").bytes + [0xe9] + Data(text: "</a>").bytes {
+        be16.append(byte: 0)
+        be16.append(byte: c)
+    }
+    check((xml.parseData(be16).value()?.text ?? "") == "é", "UTF-16 BE")
+    let latin = Data(text: "<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><a>") + Data(bytes: [0x43, 0x61, 0x66, 0xe9]) + Data(text: "</a>")
+    check((xml.parseData(latin).value()?.text ?? "") == "Café", "ISO-8859-1 declared")
+    let badUtf8 = Data(text: "<a>") + Data(bytes: [0xe9]) + Data(text: "</a>")
+    check((xml.parseData(badUtf8).value()?.text ?? "") == "é", "invalid UTF-8 falls back to Latin-1")
+
+    // Writer.
+    let doc = xml.element("playlist", attributes: [xml.Attribute(name: "version", value: "1"), xml.Attribute(name: "xmlns", value: "http://xspf.org/ns/0/")], elements: [
+        xml.element("title", "Rock & <Roll>"),
+        xml.element("trackList", elements: [
+            xml.element("track", elements: [xml.element("location", "file:///a b.mp3")]),
+            xml.element("track", elements: [xml.element("location", "http://x/?a=1&b=2")])
+        ]),
+        xml.element("empty")
+    ])
+    let out = doc.toText(indent: 2, declaration: true)
+    let want = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<playlist version=\"1\" xmlns=\"http://xspf.org/ns/0/\">\n  <title>Rock &amp; &lt;Roll&gt;</title>\n  <trackList>\n    <track>\n      <location>file:///a b.mp3</location>\n    </track>\n    <track>\n      <location>http://x/?a=1&amp;b=2</location>\n    </track>\n  </trackList>\n  <empty/>\n</playlist>\n"
+    check(out == want, "pretty writer")
+    if out != want {
+        print(out)
+    }
+    let back = parsed(out)
+    check(back.childText("title") == "Rock & <Roll>", "round trip text")
+    check(back.child("trackList")?.children("track").count == 2, "round trip structure")
+    check(back.toText(indent: 2, declaration: true) == out, "write, parse, write is stable")
+    check(doc.toText(indent: 0) == "<playlist version=\"1\" xmlns=\"http://xspf.org/ns/0/\"><title>Rock &amp; &lt;Roll&gt;</title><trackList><track><location>file:///a b.mp3</location></track><track><location>http://x/?a=1&amp;b=2</location></track></trackList><empty/></playlist>", "compact writer")
+    check(m.toText(indent: 2) == "<p>Hello <b>big</b> world <i>!</i></p>\n", "mixed content written as it is")
+    let q = xml.element("q").with("a", "x\"y\nz").with("b", "1").with("a", "w\"")
+    check(q.toText(indent: 0) == "<q a=\"w&quot;\" b=\"1\"/>", "with() replaces and escapes")
+    check(parsed(xml.element("q").with("a", "1\n2\t3").toText(indent: 0)).attr("a") == "1\n2\t3", "attribute whitespace survives a round trip")
+    check(xml.unescape("&lt;b&gt; &#233; &amp;amp;") == "<b> é &amp;", "unescape")
+
+    // Speed: a feed-sized document (10,000 items).
+    var big = "<rss><channel>"
+    var items: [String] = []
+    for i in 0..10000 {
+        items.append("<item><title>Episode {i} &amp; more</title><enclosure url=\"http://example.com/e{i}.mp3\" length=\"{i * 1000}\" type=\"audio/mpeg\"/><description><![CDATA[<p>Show notes {i}</p>]]></description></item>")
+    }
+    big += items.joined(separator: "\n") + "</channel></rss>"
+    let t0 = now()
+    let bigDoc = parsed(big)
+    let ms = (now() - t0) * 1000.0
+    check((bigDoc.child("channel")?.children("item").count ?? 0) == 10000, "big document")
+    print("time parse {Data(text: big).count / 1024} KB feed: {Int(ms)} ms")
+
+    print("xml: {passed} of {total} passed")
+}

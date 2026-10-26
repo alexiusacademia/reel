@@ -1,0 +1,319 @@
+// Theora's bit reader and the three header packets (Theora I
+// specification §6): the identification header (§6.2: frame and picture
+// size, frame rate, aspect, colour space, pixel format), the comment
+// header (§6.3, skipped) and the setup header (§6.4: loop filter limits,
+// quantization parameters and the 80 Huffman tables).
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+// MSB-first bits of a packet. Reading past the end gives zero bits;
+// `left()` goes negative then.
+struct ThBits {
+    d: [Int] = []
+    pos: Int = 0
+    end: Int = 0
+    cache: Int = 0
+    held: Int = 0
+
+    fn start(_ data: Data) {
+        d = data.bytes
+        pos = 0
+        end = d.count
+        cache = 0
+        held = 0
+    }
+
+    fn refill() {
+        while held <= 48 {
+            if pos < end {
+                cache = (cache << 8) | d[pos]
+            } else {
+                cache = cache << 8
+            }
+            pos += 1
+            held += 8
+        }
+    }
+
+    // Reads n bits (0 to 32).
+    fn bits(_ n: Int) -> Int {
+        if held < n {
+            refill()
+        }
+        held -= n
+        let v = cache >> held
+        cache = cache & ((1 << held) - 1)
+        v
+    }
+
+    fn bit() -> Int {
+        if held < 1 {
+            refill()
+        }
+        held -= 1
+        let v = cache >> held
+        cache = cache & ((1 << held) - 1)
+        v
+    }
+
+    // The next n bits without moving on (n ≤ 32).
+    fn peek(_ n: Int) -> Int {
+        if held < n {
+            refill()
+        }
+        cache >> (held - n)
+    }
+
+    fn skip(_ n: Int) {
+        if held < n {
+            refill()
+        }
+        held -= n
+        cache = cache & ((1 << held) - 1)
+    }
+
+    // Bits still unread (negative once the reader is past the end).
+    fn left() -> Int {
+        end * 8 - (pos * 8 - held)
+    }
+}
+
+// The identification header's fields.
+struct ThInfo {
+    version: Int = 0
+    // Coded frame size (multiples of 16).
+    width: Int = 0
+    height: Int = 0
+    // The picture region inside it; picY counts from the top (converted
+    // from Theora's bottom-up offset).
+    picW: Int = 0
+    picH: Int = 0
+    picX: Int = 0
+    picY: Int = 0
+    fpsNum: Int = 0
+    fpsDen: Int = 0
+    sarNum: Int = 0
+    sarDen: Int = 0
+    // 0 unspecified, 1 Rec. 470M, 2 Rec. 470BG.
+    colorSpace: Int = 0
+    // 0 4:2:0, 2 4:2:2, 3 4:4:4.
+    pixelFormat: Int = 0
+    keyShift: Int = 6
+}
+
+// The setup header's tables.
+struct ThSetup {
+    ok: Bool = false
+    filterLimit: [Int] = []
+    acScale: [Int] = []
+    dcScale: [Int] = []
+    nMatrices: Int = 0
+    // nMatrices × 64 base matrices (raster order).
+    base: [Int] = []
+    // Quant ranges for [inter 2][plane 3] (index ip = inter * 3 + plane):
+    // count, sizes (64 each) and base matrix numbers (65 each).
+    qrCount: [Int] = []
+    qrSize: [Int] = []
+    qrBase: [Int] = []
+    // Huffman tables: per table the (length, token) leaves in tree order.
+    huffLen: [[Int]] = []
+    huffSym: [[Int]] = []
+}
+
+// Splits Track.extra (each header as a 4-byte big-endian length and its
+// bytes) into the header packets.
+fn thSplitHeaders(_ extra: Data) -> [Data] {
+    var out: [Data] = []
+    var at = 0
+    while at + 4 <= extra.count && out.count < 3 {
+        let n = extra.uint32(at: at, bigEndian: true)
+        at += 4
+        if n < 0 || at + n > extra.count {
+            break
+        }
+        out.append(extra.slice(from: at, to: at + n))
+        at += n
+    }
+    out
+}
+
+// §6.2 identification header (the packet including its 7-byte prefix).
+fn thParseInfo(_ p: Data) -> Result<ThInfo> {
+    if p.count < 42 || p[0] != 0x80 {
+        return .failure(error: Error("theora: not an identification header"))
+    }
+    var r = ThBits()
+    r.start(p)
+    r.skip(32)
+    r.skip(24)
+    var i = ThInfo()
+    i.version = r.bits(24)
+    if i.version < 0x030200 {
+        return .failure(error: Error("theora: bitstream version {i.version >> 16}.{(i.version >> 8) & 255}.{i.version & 255} (before 3.2.0) isn't supported"))
+    }
+    i.width = r.bits(16) << 4
+    i.height = r.bits(16) << 4
+    i.picW = r.bits(24)
+    i.picH = r.bits(24)
+    i.picX = r.bits(8)
+    let offY = r.bits(8)
+    i.fpsNum = r.bits(32)
+    i.fpsDen = r.bits(32)
+    i.sarNum = r.bits(24)
+    i.sarDen = r.bits(24)
+    i.colorSpace = r.bits(8)
+    r.skip(24)
+    r.skip(6)
+    i.keyShift = r.bits(5)
+    i.pixelFormat = r.bits(2)
+    if i.pixelFormat == 1 {
+        return .failure(error: Error("theora: reserved pixel format"))
+    }
+    if i.width < 18 || i.height < 16 || i.picW < 18 || i.picX + i.picW > i.width || offY + i.picH > i.height ||
+        i.picW + 512 < i.width || i.picH + 512 < i.height {
+        return .failure(error: Error("theora: invalid frame size {i.picW}×{i.picH} in {i.width}×{i.height}"))
+    }
+    // Theora's offset is from the bottom; pictures are stored top down.
+    i.picY = i.height - i.picH - offY
+    Result.ok(value: i)
+}
+
+// One Huffman tree (§6.4.4): a 1 bit is a leaf with a 5-bit token, a 0
+// bit two subtrees. Leaves are listed in tree order with their depth.
+fn thReadTree(_ r: ThBits, _ lens: [Int], _ syms: [Int], _ depth: Int) -> (ThBits, [Int], [Int], Bool) {
+    var rr = r
+    var ls = lens
+    var ss = syms
+    if rr.bit() == 1 {
+        if ls.count >= 32 {
+            return (rr, ls, ss, false)
+        }
+        ls.append(depth)
+        ss.append(rr.bits(5))
+        return (rr, ls, ss, true)
+    }
+    if depth >= 31 {
+        return (rr, ls, ss, false)
+    }
+    let (r1, l1, s1, ok1) = thReadTree(rr, ls, ss, depth + 1)
+    if !ok1 {
+        return (r1, l1, s1, false)
+    }
+    thReadTree(r1, l1, s1, depth + 1)
+}
+
+fn thIlog(_ v: Int) -> Int {
+    var n = 0
+    var x = v
+    while x > 0 {
+        n += 1
+        x = x >> 1
+    }
+    n
+}
+
+// §6.4 setup header.
+fn thParseSetup(_ p: Data) -> Result<ThSetup> {
+    if p.count < 7 || p[0] != 0x82 {
+        return .failure(error: Error("theora: not a setup header"))
+    }
+    var r = ThBits()
+    r.start(p)
+    r.skip(32)
+    r.skip(24)
+    var s = ThSetup()
+    // §6.4.1 loop filter limits.
+    let nb = r.bits(3)
+    for _ in 0..64 {
+        s.filterLimit.append(r.bits(nb))
+    }
+    // §6.4.2 quantization parameters.
+    let na = r.bits(4) + 1
+    for _ in 0..64 {
+        s.acScale.append(r.bits(na))
+    }
+    let nd = r.bits(4) + 1
+    for _ in 0..64 {
+        s.dcScale.append(r.bits(nd))
+    }
+    s.nMatrices = r.bits(9) + 1
+    for _ in 0..(s.nMatrices * 64) {
+        s.base.append(r.bits(8))
+    }
+    for _ in 0..6 {
+        s.qrCount.append(0)
+    }
+    for _ in 0..(6 * 64) {
+        s.qrSize.append(0)
+    }
+    for _ in 0..(6 * 65) {
+        s.qrBase.append(0)
+    }
+    // (ffmpeg reads av_log2(n - 1) + 1 bits: at least one.)
+    let mbits = max(1, thIlog(s.nMatrices - 1))
+    for inter in 0..2 {
+        for plane in 0..3 {
+            let ip = inter * 3 + plane
+            var newqr = 1
+            if inter > 0 || plane > 0 {
+                newqr = r.bit()
+            }
+            if newqr == 0 {
+                // Copy an earlier set of ranges.
+                var src = 0
+                if inter == 1 && r.bit() == 1 {
+                    src = plane
+                } else {
+                    let qtj = (3 * inter + plane - 1) / 3
+                    let plj = (plane + 2) % 3
+                    src = qtj * 3 + plj
+                }
+                s.qrCount[ip] = s.qrCount[src]
+                for k in 0..64 {
+                    s.qrSize[ip * 64 + k] = s.qrSize[src * 64 + k]
+                }
+                for k in 0..65 {
+                    s.qrBase[ip * 65 + k] = s.qrBase[src * 65 + k]
+                }
+            } else {
+                var qri = 0
+                var qi = 0
+                while true {
+                    let m = r.bits(mbits)
+                    if m >= s.nMatrices {
+                        return .failure(error: Error("theora: invalid base matrix index"))
+                    }
+                    s.qrBase[ip * 65 + qri] = m
+                    if qi >= 63 || qri >= 63 {
+                        break
+                    }
+                    // (ffmpeg reads av_log2(63 - qi) + 1 bits.)
+                    let sz = r.bits(thIlog(63 - qi)) + 1
+                    s.qrSize[ip * 64 + qri] = sz
+                    qri += 1
+                    qi += sz
+                }
+                if qi > 63 {
+                    return .failure(error: Error("theora: invalid quant range"))
+                }
+                s.qrCount[ip] = qri
+            }
+        }
+    }
+    // §6.4.4 the 80 Huffman tables.
+    for _ in 0..80 {
+        let (r2, ls, ss, ok) = thReadTree(r, [], [], 0)
+        r = r2
+        if !ok {
+            return .failure(error: Error("theora: invalid Huffman table"))
+        }
+        s.huffLen.append(ls)
+        s.huffSym.append(ss)
+    }
+    if r.left() < 0 {
+        return .failure(error: Error("theora: the setup header is cut short"))
+    }
+    s.ok = true
+    Result.ok(value: s)
+}

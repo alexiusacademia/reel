@@ -1,0 +1,195 @@
+// The public face of the HEVC decoder: Decoder (decode, flush, reset),
+// which chains the two stages Parser (parser.tsl) and Reconstructor
+// (reconstruct.tsl) that the player may also run separately; newDecoder
+// for a core.Track; parseHvcC for the hvcC box body
+// (HEVCDecoderConfigurationRecord, ISO/IEC 14496-15 8.3.3.1); and spsInfo
+// for the media info window.
+//
+// Two-stage use (each stage plain data, one background job each):
+//   var parser = try hevc.newParser(track)      // stage 1
+//   var recon = hevc.newReconstructor()          // stage 2
+//   for each packet: for p in parser.parse(bytes, pts:, dts:, key:) {
+//       pictures += recon.reconstruct(p) }       // in the order parsed
+//   at the end: for p in parser.flush() { pictures += recon.reconstruct(p) }
+//   after a seek: parser.reset(); recon.reset()
+// Every ParsedPicture must reach the reconstructor, in order: it also
+// carries the decoded picture buffer's output and removal decisions.
+// skipNonReference is the parser's field (and the Decoder's).
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../core"
+
+// The contents of an hvcC: NAL length size and the parameter set NAL
+// units (VPS, SPS, PPS, SEI), each a whole NAL unit with its header.
+public struct HvcC {
+    valid: Bool = false
+    profile: Int = 0
+    level: Int = 0
+    lengthSize: Int = 4
+    nals: [Data] = []
+}
+
+public fn parseHvcC(_ x: Data) -> HvcC {
+    var c = HvcC()
+    if x.count < 23 {
+        return c
+    }
+    c.profile = x[1] & 31
+    c.level = x[12]
+    c.lengthSize = (x[21] & 3) + 1
+    let arrays = x[22]
+    var p = 23
+    for _ in 0..arrays {
+        if p + 3 > x.count {
+            return c
+        }
+        let n = (x[p + 1] << 8) | x[p + 2]
+        p += 3
+        for _ in 0..n {
+            if p + 2 > x.count {
+                return c
+            }
+            let len = (x[p] << 8) | x[p + 1]
+            p += 2
+            if p + len > x.count {
+                return c
+            }
+            c.nals.append(x.slice(from: p, to: p + len))
+            p += len
+        }
+    }
+    c.valid = true
+    c
+}
+
+public struct Decoder {
+    // When true, sub-layer non-reference pictures of the highest temporal
+    // layer (B-frames nothing refers to) are skipped.
+    skipNonReference: Bool = false
+    warnings: [String] = []
+    parser: Parser = Parser()
+    recon: Reconstructor = Reconstructor()
+    // Development timing of the two stages, seconds.
+    parseTime: Float = 0.0
+    reconTime: Float = 0.0
+    timing: Bool = false
+
+    // Decodes one packet (an access unit); returns the pictures now ready,
+    // in display order.
+    public fn decode(_ packet: Data, pts: Int, dts: Int, key: Bool) -> [core.Picture] {
+        parser.skipNonReference = skipNonReference
+        recon.timing = timing
+        var t = 0.0
+        if timing {
+            t = now()
+        }
+        let parsed = parser.parse(packet, pts: pts, dts: dts, key: key)
+        if timing {
+            let t2 = now()
+            parseTime += t2 - t
+            t = t2
+        }
+        var out: [core.Picture] = []
+        for p in parsed {
+            out += recon.reconstruct(p)
+        }
+        if timing {
+            reconTime += now() - t
+        }
+        collect()
+        out
+    }
+
+    // End of stream: every picture still held.
+    public fn flush() -> [core.Picture] {
+        let parsed = parser.flush()
+        var out: [core.Picture] = []
+        for p in parsed {
+            out += recon.reconstruct(p)
+        }
+        collect()
+        out
+    }
+
+    // After a seek: drops references and held pictures, waits for a
+    // random access point.
+    public fn reset() {
+        parser.reset()
+        recon.reset()
+    }
+
+    // The warnings so far: the reconstructor gets the parser's with each
+    // ParsedPicture and adds its own.
+    fn collect() {
+        for w in recon.warnings {
+            if warnings.count < 200 {
+                warnings.append(w)
+            }
+        }
+        recon.warnings = []
+        parser.warnings = []
+    }
+}
+
+// A decoder for an "hevc" track. track.extra is the hvcC (length-prefixed
+// NAL units follow), or empty / Annex B parameter sets (start codes).
+public fn newDecoder(_ track: core.Track) -> Result<Decoder> {
+    var d = Decoder()
+    d.parser = try newParser(track)
+    d.recon = newReconstructor()
+    Result.ok(value: d)
+}
+
+fn hevcProfileName(_ s: HevcSps) -> String {
+    let p = s.profileIdc
+    let compat = s.profileCompat
+    if p == 1 || (p == 0 && (compat & (1 << 30)) != 0) {
+        return "Main"
+    }
+    if p == 2 || (p == 0 && (compat & (1 << 29)) != 0) {
+        return "Main 10"
+    }
+    if p == 3 {
+        return "Main Still Picture"
+    }
+    if p == 4 {
+        return "Range Extensions"
+    }
+    "Profile {p}"
+}
+
+// "Main 10 @ L4.1, 1920×1080, 4:2:0 10-bit" for a track's first SPS.
+public fn spsInfo(_ track: core.Track) -> String {
+    let x = track.extra
+    var nals: [Data] = []
+    if hevcLooksAnnexB(x) {
+        let at = hevcSplitNals(x, 0)
+        var i = 0
+        while i + 1 < at.count {
+            nals.append(x.slice(from: at[i], to: at[i + 1]))
+            i += 2
+        }
+    } else {
+        nals = parseHvcC(x).nals
+    }
+    for n in nals {
+        if n.count > 2 && ((n[0] >> 1) & 63) == nalSps {
+            let rbsp = hevcUnescape(n, from: 0, to: n.count)
+            var ps = hevcNewPs(rbsp.data, from: 2)
+            let s = ps.parseSps()
+            if s.width == 0 {
+                return "HEVC"
+            }
+            let lv = s.levelIdc / 3
+            let level = if lv % 10 == 0 { "{lv / 10}" } else { "{lv / 10}.{lv % 10}" }
+            let w = s.width - s.confLeft - s.confRight
+            let h = s.height - s.confTop - s.confBottom
+            let chroma = if s.chromaFormatIdc == 0 { "4:0:0" } else if s.chromaFormatIdc == 1 { "4:2:0" } else if s.chromaFormatIdc == 2 { "4:2:2" } else { "4:4:4" }
+            let tier = if s.tierFlag == 1 { " High tier" } else { "" }
+            return "{hevcProfileName(s)} @ L{level}{tier}, {w}×{h}, {chroma} {s.bitDepth}-bit"
+        }
+    }
+    "HEVC"
+}

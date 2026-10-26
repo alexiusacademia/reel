@@ -1,0 +1,280 @@
+// AC-3 and E-AC-3 syncframe headers: finding syncframes in a byte stream
+// and reading what each one is (size, sample rate, channels, blocks).
+//
+// Every syncframe starts with the sync word 0x0B77 (A/52 5.3.1). The
+// bitstream id (bsid, 5 bits after the first 5 bytes' worth of header)
+// says which syntax follows: bsid ≤ 10 is AC-3 (A/52 section 5; 9 and 10
+// are the half- and quarter-rate variants), 11 to 16 is E-AC-3 (A/52
+// Annex E, E.1.2.1): its header carries the frame size directly and can
+// carry 1, 2, 3 or 6 audio blocks instead of AC-3's fixed 6.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../core"
+
+// What a syncframe header says.
+public struct FrameInfo {
+    // A plausible header was found.
+    ok: Bool = false
+    // Bytes in the syncframe.
+    size: Int = 0
+    // 0 to 16; ≥ 11 means E-AC-3.
+    bsid: Int = 0
+    eac3: Bool = false
+    rate: Int = 0
+    // Audio blocks of 256 samples (6 for AC-3).
+    blocks: Int = 6
+    // Audio coding mode (Table 5.8) and the low-frequency effects channel.
+    acmod: Int = 0
+    lfe: Bool = false
+    channels: Int = 0
+    // E-AC-3 stream type: 0 independent, 1 dependent, 2 converted from
+    // AC-3 (AC-3 frames count as 2 here), 3 reserved.
+    frameType: Int = 2
+    substream: Int = 0
+    // Bits per second.
+    bitrate: Int = 0
+}
+
+// The header of the syncframe at `at` (ok is false if there isn't one).
+public fn frameInfo(_ data: Data, at: Int) -> FrameInfo {
+    var info = FrameInfo()
+    if at < 0 || at + 7 > data.count {
+        return info
+    }
+    if data[at] != 0x0b || data[at + 1] != 0x77 {
+        return info
+    }
+    let bsid = data[at + 5] >> 3
+    info.bsid = bsid
+    if bsid <= 10 {
+        // AC-3 syncinfo (5.3.1): crc1, fscod, frmsizecod; bsi: bsid, bsmod,
+        // acmod … lfeon.
+        let fscod = data[at + 4] >> 6
+        let frmsizecod = data[at + 4] & 0x3f
+        if fscod == 3 || frmsizecod > 37 {
+            return info
+        }
+        let shift = max(bsid, 8) - 8
+        info.rate = ac3SampleRates[fscod] >> shift
+        info.size = ac3FrameSizeTab[frmsizecod * 3 + fscod] * 2
+        info.bitrate = (ac3Bitrates[frmsizecod >> 1] * 1000) >> shift
+        var r = core.bitReaderRange(data, from: at + 5, to: min(data.count, at + 16))
+        r.bits(5)
+        r.bits(3)
+        let acmod = r.bits(3)
+        if acmod == 2 {
+            r.bits(2)
+        } else {
+            if (acmod & 1) != 0 && acmod != 1 {
+                r.bits(2)
+            }
+            if (acmod & 4) != 0 {
+                r.bits(2)
+            }
+        }
+        info.acmod = acmod
+        info.lfe = r.flag()
+        info.blocks = 6
+        info.frameType = 2
+        info.eac3 = false
+    } else if bsid <= 16 {
+        // E-AC-3 bsi (E.1.2.2): strmtyp, substreamid, frmsiz, fscod,
+        // fscod2/numblkscod, acmod, lfeon.
+        var r = core.bitReaderRange(data, from: at + 2, to: min(data.count, at + 16))
+        info.frameType = r.bits(2)
+        info.substream = r.bits(3)
+        info.size = (r.bits(11) + 1) * 2
+        let fscod = r.bits(2)
+        if fscod == 3 {
+            let fscod2 = r.bits(2)
+            if fscod2 == 3 {
+                return info
+            }
+            info.rate = ac3SampleRates[fscod2] / 2
+            info.blocks = 6
+        } else {
+            info.rate = ac3SampleRates[fscod]
+            info.blocks = eac3Blocks[r.bits(2)]
+        }
+        info.acmod = r.bits(3)
+        info.lfe = r.flag()
+        info.eac3 = true
+        if info.frameType == 3 || info.size < 7 {
+            return info
+        }
+        info.bitrate = 8 * info.size * info.rate / (info.blocks * 256)
+    } else {
+        return info
+    }
+    info.channels = ac3ChannelsTab[info.acmod] + (if info.lfe { 1 } else { 0 })
+    info.ok = info.size >= 7
+    info
+}
+
+// The position of the next sync word at or after `from` whose header
+// reads as valid, or -1.
+public fn findSync(_ data: Data, from: Int) -> Int {
+    var i = max(from, 0)
+    while i + 6 < data.count {
+        if data[i] == 0x0b && data[i + 1] == 0x77 && frameInfo(data, at: i).ok {
+            return i
+        }
+        i += 1
+    }
+    -1
+}
+
+// The start of every syncframe in a raw .ac3/.eac3 stream, checking that
+// each frame is followed by another sync word (or the end of the data) so
+// that a 0x0B77 inside audio data isn't taken for a frame.
+public fn syncFrames(_ data: Data) -> [Int] {
+    var out: [Int] = []
+    var at = findSync(data, from: 0)
+    while at >= 0 {
+        let info = frameInfo(data, at: at)
+        let next = at + info.size
+        if next == data.count || (next + 1 < data.count && data[next] == 0x0b && data[next + 1] == 0x77) {
+            out.append(at)
+            at = next
+            if next >= data.count {
+                break
+            }
+        } else if next < data.count {
+            at = findSync(data, from: at + 1)
+        } else {
+            // A cut-off last frame.
+            break
+        }
+    }
+    out
+}
+
+// The channel names a frame of this mode decodes to, in WAV order.
+public fn layoutFor(acmod: Int, lfe: Bool) -> [String] {
+    var names = ac3StreamNames(acmod)
+    if lfe {
+        names.append("LFE")
+    }
+    names.sorted(by: { a, b in ac3WavRank(a) < ac3WavRank(b) })
+}
+
+// The CRC-16 (polynomial x^16 + x^15 + x^2 + 1, A/52 7.10.1) of
+// data[from..<to]; over a whole syncframe after the sync word it is 0 when
+// the frame is undamaged.
+public fn crc16(_ data: Data, from: Int, to: Int) -> Int {
+    var crc = 0
+    var i = from
+    while i < to {
+        crc = ((crc << 8) & 0xffff) ^ ac3CrcTab[((crc >> 8) ^ data[i]) & 0xff]
+        i += 1
+    }
+    crc
+}
+
+let ac3CrcTab: [Int] = ac3MakeCrcTab()
+
+fn ac3MakeCrcTab() -> [Int] {
+    var out: [Int] = []
+    for n in 0..256 {
+        var c = n << 8
+        for _ in 0..8 {
+            c = if (c & 0x8000) != 0 { ((c << 1) ^ 0x8005) & 0xffff } else { (c << 1) & 0xffff }
+        }
+        out.append(c)
+    }
+    out
+}
+
+// The dependent substream channel map (chanmap, E.1.2.2) of the E-AC-3
+// frame at `at`, or 0 when it has none.
+public fn eac3ChannelMap(_ data: Data, at: Int) -> Int {
+    let info = frameInfo(data, at: at)
+    if !info.ok || !info.eac3 || info.frameType != 1 {
+        return 0
+    }
+    var r = core.bitReaderRange(data, from: at + 2, to: min(data.count, at + 24))
+    r.skip(2 + 3 + 11 + 2 + 2 + 3 + 1 + 5)
+    let programs = if info.acmod == 0 { 2 } else { 1 }
+    for _ in 0..programs {
+        r.skip(5)
+        if r.flag() {
+            r.skip(8)
+        }
+    }
+    if r.flag() { r.bits(16) } else { 0 }
+}
+
+// A description for the media info window, e.g. "E-AC-3 7.1, 48 kHz,
+// 1152 kb/s". `firstPacket` (any packet of the track) gives what the
+// track doesn't: the channels of a dependent substream and the bit rate.
+public fn streamInfo(_ track: core.Track, firstPacket: Data = Data()) -> String {
+    var kind = if track.codec == "eac3" { "E-AC-3" } else { "AC-3" }
+    var rate = track.sampleRate
+    var channels = track.channels
+    var lfe = channels == 6 || channels == 8
+    var bitrate = track.bitrate
+    if !firstPacket.isEmpty {
+        var at = findSync(firstPacket, from: 0)
+        var first = true
+        var bits = 0
+        var mask = 0
+        while at >= 0 && at + 7 <= firstPacket.count {
+            let info = frameInfo(firstPacket, at: at)
+            if !info.ok {
+                break
+            }
+            if info.eac3 && info.substream != 0 && info.frameType != 1 {
+                // Another program: not what's decoded.
+                break
+            }
+            if first {
+                first = false
+                rate = info.rate
+                lfe = info.lfe
+                for name in layoutFor(acmod: info.acmod, lfe: info.lfe) {
+                    mask = mask | (1 << (ac3BitNames.index(of: name) ?? 0))
+                }
+                if info.eac3 {
+                    kind = "E-AC-3"
+                }
+                bits += info.size * 8 * info.rate / (info.blocks * 256)
+            } else if info.eac3 && info.frameType == 1 {
+                kind = "E-AC-3"
+                let cm = eac3ChannelMap(firstPacket, at: at)
+                for loc in 0..16 {
+                    if (cm & (1 << (15 - loc))) != 0 {
+                        mask = mask | ac3CustomLocations[loc * 2 + 1]
+                    }
+                }
+                bits += info.size * 8 * info.rate / (info.blocks * 256)
+            } else {
+                break
+            }
+            at += info.size
+        }
+        if mask != 0 {
+            channels = ac3PopCount(mask)
+            lfe = (mask & 8) != 0
+        }
+        if bits > 0 {
+            bitrate = bits
+        }
+    }
+    var text = kind
+    if channels == 1 {
+        text += " mono"
+    } else if channels == 2 && !lfe {
+        text += " stereo"
+    } else if channels > 0 {
+        text += if lfe { " {channels - 1}.1" } else { " {channels}.0" }
+    }
+    if rate > 0 {
+        text += if rate % 1000 == 0 { ", {rate / 1000} kHz" } else { ", {rate / 1000}.{(rate % 1000) / 100} kHz" }
+    }
+    if bitrate > 0 {
+        text += ", {bitrate / 1000} kb/s"
+    }
+    text
+}

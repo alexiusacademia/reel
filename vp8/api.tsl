@@ -1,0 +1,143 @@
+// The public face of the VP8 decoder (RFC 6386): Decoder (decode, flush,
+// reset) that chains the two stages, newPipeline for running them side by
+// side in two background jobs (a Parser and a Reconstructor exchanging
+// ParsedFrames), and streamInfo / frameInfo for the media info window.
+//
+// Packets are whole VP8 frames as WebM, MKV, AVI and IVF store them;
+// `track.extra` isn't needed. Output is 8-bit 4:2:0, cropped to the
+// frame's size (the scaling bits of the keyframe header are ignored, as
+// libvpx and ffmpeg do). Frames with show_frame 0 (alt-ref frames)
+// update the references and show nothing.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../core"
+
+// Both stages one after the other.
+public struct Decoder {
+    // When true, frames that update no reference frame aren't decoded.
+    skipNonReference: Bool = false
+    warnings: [String] = []
+    parser: Parser = Parser()
+    reconstructor: Reconstructor = Reconstructor()
+
+    // Decodes one packet; returns the picture it shows (none for a hidden
+    // alt-ref frame).
+    fn decode(_ packet: Data, pts: Int, dts: Int, key: Bool) -> [core.Picture] {
+        parser.skipNonReference = skipNonReference
+        let parsed = parser.parse(packet, pts: pts, dts: dts, key: key)
+        run(parsed)
+    }
+
+    // End of stream: VP8 has no reordering, so nothing is held back.
+    fn flush() -> [core.Picture] {
+        run(parser.flush())
+    }
+
+    // After a seek: drop references, wait for a keyframe.
+    fn reset() {
+        parser.reset()
+        reconstructor.reset()
+    }
+
+    fn run(_ parsed: [ParsedFrame]) -> [core.Picture] {
+        var out: [core.Picture] = []
+        for p in parsed {
+            out += reconstructor.reconstruct(p)
+        }
+        for list in [parser.warnings, reconstructor.warnings] {
+            for w in list {
+                if warnings.count < 200 {
+                    warnings.append(w)
+                }
+            }
+        }
+        if !parser.warnings.isEmpty {
+            parser.warnings = []
+        }
+        if !reconstructor.warnings.isEmpty {
+            reconstructor.warnings = []
+        }
+        out
+    }
+}
+
+// A decoder for a "vp8" track.
+public fn newDecoder(_ track: core.Track) -> Result<Decoder> {
+    let p = try newPipeline(track)
+    Result.ok(value: Decoder(parser: p.parser, reconstructor: p.reconstructor))
+}
+
+// Both stages for one "vp8" track.
+public struct Pipeline {
+    parser: Parser = Parser()
+    reconstructor: Reconstructor = Reconstructor()
+}
+
+public fn newPipeline(_ track: core.Track) -> Result<Pipeline> {
+    if track.codec != "vp8" {
+        return .failure(error: Error("vp8: not a VP8 track ({track.codec})"))
+    }
+    var p = Parser()
+    p.setup()
+    var r = Reconstructor()
+    r.setup()
+    if track.sarNum > 0 && track.sarDen > 0 {
+        r.sarNum = track.sarNum
+        r.sarDen = track.sarDen
+    }
+    r.trackMatrix = track.matrix
+    Result.ok(value: Pipeline(parser: p, reconstructor: r))
+}
+
+// For background jobs, which call top-level functions: one parse step and
+// one reconstruct step, each returning the stage's new state.
+public struct ParseStep {
+    parser: Parser = Parser()
+    frames: [ParsedFrame] = []
+}
+
+public fn parseStep(_ parser: Parser, _ packet: Data, pts: Int, dts: Int, key: Bool) -> ParseStep {
+    var p = parser
+    let f = p.parse(packet, pts: pts, dts: dts, key: key)
+    ParseStep(parser: p, frames: f)
+}
+
+public struct ReconstructStep {
+    reconstructor: Reconstructor = Reconstructor()
+    pictures: [core.Picture] = []
+}
+
+public fn reconstructStep(_ reconstructor: Reconstructor, _ frames: [ParsedFrame]) -> ReconstructStep {
+    var r = reconstructor
+    var out: [core.Picture] = []
+    for f in frames {
+        out += r.reconstruct(f)
+    }
+    ReconstructStep(reconstructor: r, pictures: out)
+}
+
+// "VP8, 1280×720" from the track's size.
+public fn streamInfo(_ track: core.Track) -> String {
+    var info = "VP8"
+    if track.width > 0 && track.height > 0 {
+        info += ", {track.width}×{track.height}"
+    }
+    info
+}
+
+// The version and size from a keyframe's header (9.1), e.g.
+// "VP8 version 0, 176×144"; just "VP8" for an inter frame.
+public fn frameInfo(_ packet: Data) -> String {
+    if packet.count < 10 || (packet[0] & 1) != 0 {
+        return "VP8"
+    }
+    if packet[3] != 0x9d || packet[4] != 0x01 || packet[5] != 0x2a {
+        return "VP8"
+    }
+    let version = (packet[0] >> 1) & 7
+    let w = (packet[6] | (packet[7] << 8)) & 0x3fff
+    let h = (packet[8] | (packet[9] << 8)) & 0x3fff
+    "VP8 version {version}, {w}×{h}"
+}

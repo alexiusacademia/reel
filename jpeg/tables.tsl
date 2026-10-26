@@ -1,0 +1,264 @@
+// JPEG (ITU-T T.81): the zig-zag order, the example Huffman tables of
+// Annex K.3 (which Motion-JPEG frames without a DHT segment use, as
+// AVI1 MJPEG files expect), the Huffman lookup tables built from DHT
+// segments, and the inverse DCT.
+//
+// The IDCT is the integer "simple IDCT" also used by the mpeg12 module
+// (constants cos(k·π/16)·√2·2^14, rows rounded to 11 fractional bits,
+// columns to 20), in the form ffmpeg's ARM NEON code computes it, so
+// pictures can match ffmpeg's bit for bit.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../core"
+
+// Zig-zag order (Figure A.6): position in the coded order → raster index.
+let jpgZigZag = [
+    0, 1, 8, 16, 9, 2, 3, 10, 17, 24, 32, 25, 18, 11, 4, 5,
+    12, 19, 26, 33, 40, 48, 41, 34, 27, 20, 13, 6, 7, 14, 21, 28,
+    35, 42, 49, 56, 57, 50, 43, 36, 29, 22, 15, 23, 30, 37, 44, 51,
+    58, 59, 52, 45, 38, 31, 39, 46, 53, 60, 61, 54, 47, 55, 62, 63,
+]
+
+// Annex K.3, Tables K.3 to K.6: code counts per length (BITS) and the
+// symbols (HUFFVAL).
+let jpgDcLumaBits = [0, 1, 5, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0]
+let jpgDcLumaVals = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+let jpgDcChromaBits = [0, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0]
+let jpgDcChromaVals = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+let jpgAcLumaBits = [0, 2, 1, 3, 3, 2, 4, 3, 5, 5, 4, 4, 0, 0, 1, 0x7d]
+let jpgAcLumaVals = [
+    0x01, 0x02, 0x03, 0x00, 0x04, 0x11, 0x05, 0x12, 0x21, 0x31, 0x41, 0x06, 0x13, 0x51, 0x61, 0x07,
+    0x22, 0x71, 0x14, 0x32, 0x81, 0x91, 0xa1, 0x08, 0x23, 0x42, 0xb1, 0xc1, 0x15, 0x52, 0xd1, 0xf0,
+    0x24, 0x33, 0x62, 0x72, 0x82, 0x09, 0x0a, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x25, 0x26, 0x27, 0x28,
+    0x29, 0x2a, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3a, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49,
+    0x4a, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5a, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69,
+    0x6a, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78, 0x79, 0x7a, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89,
+    0x8a, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98, 0x99, 0x9a, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7,
+    0xa8, 0xa9, 0xaa, 0xb2, 0xb3, 0xb4, 0xb5, 0xb6, 0xb7, 0xb8, 0xb9, 0xba, 0xc2, 0xc3, 0xc4, 0xc5,
+    0xc6, 0xc7, 0xc8, 0xc9, 0xca, 0xd2, 0xd3, 0xd4, 0xd5, 0xd6, 0xd7, 0xd8, 0xd9, 0xda, 0xe1, 0xe2,
+    0xe3, 0xe4, 0xe5, 0xe6, 0xe7, 0xe8, 0xe9, 0xea, 0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8,
+    0xf9, 0xfa,
+]
+let jpgAcChromaBits = [0, 2, 1, 2, 4, 4, 3, 4, 7, 5, 4, 4, 0, 1, 2, 0x77]
+let jpgAcChromaVals = [
+    0x00, 0x01, 0x02, 0x03, 0x11, 0x04, 0x05, 0x21, 0x31, 0x06, 0x12, 0x41, 0x51, 0x07, 0x61, 0x71,
+    0x13, 0x22, 0x32, 0x81, 0x08, 0x14, 0x42, 0x91, 0xa1, 0xb1, 0xc1, 0x09, 0x23, 0x33, 0x52, 0xf0,
+    0x15, 0x62, 0x72, 0xd1, 0x0a, 0x16, 0x24, 0x34, 0xe1, 0x25, 0xf1, 0x17, 0x18, 0x19, 0x1a, 0x26,
+    0x27, 0x28, 0x29, 0x2a, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3a, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48,
+    0x49, 0x4a, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5a, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68,
+    0x69, 0x6a, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78, 0x79, 0x7a, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87,
+    0x88, 0x89, 0x8a, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98, 0x99, 0x9a, 0xa2, 0xa3, 0xa4, 0xa5,
+    0xa6, 0xa7, 0xa8, 0xa9, 0xaa, 0xb2, 0xb3, 0xb4, 0xb5, 0xb6, 0xb7, 0xb8, 0xb9, 0xba, 0xc2, 0xc3,
+    0xc4, 0xc5, 0xc6, 0xc7, 0xc8, 0xc9, 0xca, 0xd2, 0xd3, 0xd4, 0xd5, 0xd6, 0xd7, 0xd8, 0xd9, 0xda,
+    0xe2, 0xe3, 0xe4, 0xe5, 0xe6, 0xe7, 0xe8, 0xe9, 0xea, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8,
+    0xf9, 0xfa,
+]
+
+// The canonical codes of a DHT table (Annex C): (code, length, symbol)
+// triples. Empty when the counts don't make a valid code.
+fn jpgCodes(_ bits: [Int], _ vals: [Int]) -> [Int] {
+    var out: [Int] = []
+    var code = 0
+    var k = 0
+    for len in 1..17 {
+        let n = bits[len - 1]
+        for _ in 0..n {
+            if k >= vals.count || code >= (1 << len) {
+                return []
+            }
+            out.append(code)
+            out.append(len)
+            out.append(vals[k])
+            code += 1
+            k += 1
+        }
+        code = code << 1
+    }
+    out
+}
+
+// A two-level lookup table from (code, length, value) triples: [0] =
+// root bits R, [1] = longest code L, then 2^R root entries and the
+// sub-tables. An entry is value * 32 + length (0 = no such code) or
+// -(index * 32 + extra bits) for a sub-table.
+fn jpgBuild(_ codes: [Int], rootBits: Int) -> [Int] {
+    var maxLen = 1
+    var i = 0
+    while i < codes.count {
+        maxLen = max(maxLen, codes[i + 1])
+        i += 3
+    }
+    let r = min(rootBits, maxLen)
+    var t = [r, maxLen]
+    for _ in 0..(1 << r) {
+        t.append(0)
+    }
+    var extra = core.zeros(1 << r)
+    i = 0
+    while i < codes.count {
+        let len = codes[i + 1]
+        if len > r {
+            let prefix = codes[i] >> (len - r)
+            extra[prefix] = max(extra[prefix], len - r)
+        }
+        i += 3
+    }
+    for p in 0..(1 << r) {
+        if extra[p] > 0 {
+            let at = t.count
+            t[2 + p] = -(at * 32 + extra[p])
+            for _ in 0..(1 << extra[p]) {
+                t.append(0)
+            }
+        }
+    }
+    i = 0
+    while i < codes.count {
+        let code = codes[i]
+        let len = codes[i + 1]
+        let entry = codes[i + 2] * 32 + len
+        if len <= r {
+            let first = code << (r - len)
+            for k in 0..(1 << (r - len)) {
+                t[2 + first + k] = entry
+            }
+        } else {
+            let prefix = code >> (len - r)
+            let e = -t[2 + prefix]
+            let at = e >> 5
+            let k = e & 31
+            let rest = code & ((1 << (len - r)) - 1)
+            let first = rest << (k - (len - r))
+            for j in 0..(1 << (k - (len - r))) {
+                t[at + first + j] = entry
+            }
+        }
+        i += 3
+    }
+    t
+}
+
+let jpgDefaultDcLuma = jpgBuild(jpgCodes(jpgDcLumaBits, jpgDcLumaVals), rootBits: 9)
+let jpgDefaultDcChroma = jpgBuild(jpgCodes(jpgDcChromaBits, jpgDcChromaVals), rootBits: 9)
+let jpgDefaultAcLuma = jpgBuild(jpgCodes(jpgAcLumaBits, jpgAcLumaVals), rootBits: 9)
+let jpgDefaultAcChroma = jpgBuild(jpgCodes(jpgAcChromaBits, jpgAcChromaVals), rootBits: 9)
+
+// ---- Inverse DCT (Annex A.3.3) ----
+
+let jpgW1 = 22725
+let jpgW2 = 21407
+let jpgW3 = 19266
+let jpgW4 = 16383
+let jpgW5 = 12873
+let jpgW6 = 8867
+let jpgW7 = 4520
+
+fn jpgIdctRows(_ b: bind [Int]) {
+    var r = 0
+    while r < 64 {
+        let x0 = b[r]
+        let x1 = b[r + 1]
+        let x2 = b[r + 2]
+        let x3 = b[r + 3]
+        let x4 = b[r + 4]
+        let x5 = b[r + 5]
+        let x6 = b[r + 6]
+        let x7 = b[r + 7]
+        if (x0 | x1 | x2 | x3 | x4 | x5 | x6 | x7) != 0 {
+            var a0 = jpgW4 * x0 + 1024
+            var a1 = a0
+            var a2 = a0
+            var a3 = a0
+            a0 += jpgW2 * x2
+            a1 += jpgW6 * x2
+            a2 -= jpgW6 * x2
+            a3 -= jpgW2 * x2
+            var b0 = jpgW1 * x1 + jpgW3 * x3
+            var b1 = jpgW3 * x1 - jpgW7 * x3
+            var b2 = jpgW5 * x1 - jpgW1 * x3
+            var b3 = jpgW7 * x1 - jpgW5 * x3
+            if (x4 | x5 | x6 | x7) != 0 {
+                a0 += jpgW4 * x4 + jpgW6 * x6
+                a1 += -jpgW4 * x4 - jpgW2 * x6
+                a2 += -jpgW4 * x4 + jpgW2 * x6
+                a3 += jpgW4 * x4 - jpgW6 * x6
+                b0 += jpgW5 * x5 + jpgW7 * x7
+                b1 += -jpgW1 * x5 - jpgW5 * x7
+                b2 += jpgW7 * x5 + jpgW3 * x7
+                b3 += jpgW3 * x5 - jpgW1 * x7
+            }
+            b[r] = (a0 + b0) >> 11
+            b[r + 7] = (a0 - b0) >> 11
+            b[r + 1] = (a1 + b1) >> 11
+            b[r + 6] = (a1 - b1) >> 11
+            b[r + 2] = (a2 + b2) >> 11
+            b[r + 5] = (a2 - b2) >> 11
+            b[r + 3] = (a3 + b3) >> 11
+            b[r + 4] = (a3 - b3) >> 11
+        }
+        r += 8
+    }
+}
+
+fn jpgClip(_ v: Int) -> Int {
+    if v < 0 {
+        return 0
+    }
+    if v > 255 {
+        return 255
+    }
+    v
+}
+
+// Transforms block b (raster order, dequantized, DC including the +1024
+// level shift) and writes it to dst[off …], rows `stride` apart. The
+// block is left zeroed.
+fn jpgIdctPut(_ b: bind [Int], _ dst: bind [Int], _ off: Int, _ stride: Int) {
+    jpgIdctRows(b)
+    for c in 0..8 {
+        let x0 = b[c]
+        let x1 = b[c + 8]
+        let x2 = b[c + 16]
+        let x3 = b[c + 24]
+        let x4 = b[c + 32]
+        let x5 = b[c + 40]
+        let x6 = b[c + 48]
+        let x7 = b[c + 56]
+        var a0 = jpgW4 * (x0 + 32)
+        var a1 = a0
+        var a2 = a0
+        var a3 = a0
+        a0 += jpgW2 * x2
+        a1 += jpgW6 * x2
+        a2 -= jpgW6 * x2
+        a3 -= jpgW2 * x2
+        var b0 = jpgW1 * x1 + jpgW3 * x3
+        var b1 = jpgW3 * x1 - jpgW7 * x3
+        var b2 = jpgW5 * x1 - jpgW1 * x3
+        var b3 = jpgW7 * x1 - jpgW5 * x3
+        if (x4 | x5 | x6 | x7) != 0 {
+            a0 += jpgW4 * x4 + jpgW6 * x6
+            a1 += -jpgW4 * x4 - jpgW2 * x6
+            a2 += -jpgW4 * x4 + jpgW2 * x6
+            a3 += jpgW4 * x4 - jpgW6 * x6
+            b0 += jpgW5 * x5 + jpgW7 * x7
+            b1 += -jpgW1 * x5 - jpgW5 * x7
+            b2 += jpgW7 * x5 + jpgW3 * x7
+            b3 += jpgW3 * x5 - jpgW1 * x7
+        }
+        let s = stride
+        dst[off + c] = jpgClip((a0 + b0) >> 20)
+        dst[off + s + c] = jpgClip((a1 + b1) >> 20)
+        dst[off + 2 * s + c] = jpgClip((a2 + b2) >> 20)
+        dst[off + 3 * s + c] = jpgClip((a3 + b3) >> 20)
+        dst[off + 4 * s + c] = jpgClip((a3 - b3) >> 20)
+        dst[off + 5 * s + c] = jpgClip((a2 - b2) >> 20)
+        dst[off + 6 * s + c] = jpgClip((a1 - b1) >> 20)
+        dst[off + 7 * s + c] = jpgClip((a0 - b0) >> 20)
+    }
+    for i in 0..64 {
+        b[i] = 0
+    }
+}

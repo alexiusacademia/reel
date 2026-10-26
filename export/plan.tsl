@@ -1,0 +1,379 @@
+// Lossless clip planning: which packets of which tracks to copy for a
+// range of a file, with times rebased so the clip starts at 0. Nothing is
+// decoded or re-encoded, so a clip can only start where decoding can
+// start — at a video keyframe:
+//
+//   keyframe start (default): the clip starts at the last video keyframe
+//     at or before `from`; every track is cut from there (so the clip may
+//     start a little early) and that keyframe's time becomes 0.
+//   exact start (exactStart: true): `from` becomes 0; the video still
+//     starts at the keyframe before it, and the pictures before `from` get
+//     negative times. The MP4 writer hides them with an edit list (ISO/IEC
+//     14496-12 §8.6.6) and the Matroska writer marks them invisible
+//     (RFC 9559 §10.2: "the codec SHOULD decode this frame but not display
+//     it"), so players start showing at `from`.
+//
+// Audio is cut to the packets that overlap the range, subtitles to the
+// cues that overlap it (shortened to fit), chapters to those inside it.
+// Pictures that follow the keyframe in decode order but show before it
+// (open-GOP leading B-pictures) need pictures from before the cut and are
+// left out. At the end, video is kept up to the last picture shown before
+// `to` in decode order (so B-pictures keep their references).
+//
+// Packets keep their byte positions in the source file; the writers read
+// them from (file, plan) as they write.
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+import "../core"
+
+public struct ClipPlan {
+    // The output tracks (index = position here), copies of the sources'.
+    tracks: [core.Track] = []
+    // The source track of each output track.
+    sources: [Int] = []
+    // Each source track's stripped prefix (Matroska header stripping),
+    // put back when the bytes are read.
+    prefixes: [Data] = []
+    // Packets to write, in the order to write them (by decode time across
+    // tracks): `track` is the output track, times are rebased (output
+    // track ticks: the source track's timescale), offsets are the source
+    // file's. dts is always set (worked out from pts when the source had
+    // none, as in Matroska).
+    packets: [core.PacketRef] = []
+    chapters: [core.Chapter] = []
+    tags: [String: String] = [:]
+    attachments: [core.Attachment] = []
+    cover: Data = Data()
+    // The range asked for, in source seconds (to = -1: the end).
+    from: Float = 0.0
+    to: Float = -1.0
+    // The source time that becomes 0 in the output.
+    origin: Float = 0.0
+    // Output length in seconds (from 0).
+    duration: Float = 0.0
+    exactStart: Bool = false
+    warnings: [String] = []
+}
+
+// The tracks a clip takes by default: every video, audio and subtitle
+// track.
+public fn defaultTracks(_ media: core.Media) -> [Int] {
+    var out: [Int] = []
+    for t in media.tracks {
+        if t.kind != .other {
+            out.append(t.index)
+        }
+    }
+    out
+}
+
+// Plans a lossless clip of [from, to) seconds (to < 0: to the end) of the
+// chosen source tracks (empty: defaultTracks).
+public fn planClip(_ media: core.Media, tracks: [Int] = [], from: Float = 0.0, to: Float = -1.0, exactStart: Bool = false) -> Result<ClipPlan> {
+    let chosen = if tracks.isEmpty { defaultTracks(media) } else { tracks }
+    if chosen.isEmpty {
+        return Result.failure(error: Error("there are no tracks to export"))
+    }
+    for i in chosen {
+        if i < 0 || i >= media.tracks.count {
+            return Result.failure(error: Error("there is no track {i}"))
+        }
+    }
+    let start = max(0.0, from)
+    let endSec = if to < 0.0 { 1e12 } else { to }
+    if endSec <= start {
+        return Result.failure(error: Error("the end of the range must come after its start"))
+    }
+    var plan = ClipPlan(from: start, to: to, exactStart: exactStart)
+    plan.tags = media.tags
+    plan.attachments = media.attachments
+    plan.cover = media.cover
+    // Each chosen track's packets (indexes into media.packets), stored order.
+    var lists: [[Int]] = []
+    for _ in chosen {
+        lists.append([])
+    }
+    var slot: [Int] = []
+    for _ in media.tracks {
+        slot.append(-1)
+    }
+    for (k, i) in chosen.enumerated() {
+        slot[i] = k
+    }
+    for (j, p) in media.packets.enumerated() {
+        if p.track >= 0 && p.track < slot.count && slot[p.track] >= 0 {
+            lists[slot[p.track]].append(j)
+        }
+    }
+    // The reference video track: the first chosen one with packets.
+    var ref = -1
+    for (k, i) in chosen.enumerated() {
+        if ref < 0 && media.tracks[i].kind == .video && !lists[k].isEmpty {
+            ref = k
+        }
+    }
+    var origin = start
+    var refKeyPos = -1
+    var refKeyPts = 0
+    if ref >= 0 {
+        refKeyPos = exKeyPos(media, lists[ref], exRound(start * Float(media.tracks[chosen[ref]].timescale)))
+        if refKeyPos >= 0 {
+            refKeyPts = media.packets[lists[ref][refKeyPos]].pts
+            if !exactStart {
+                origin = core.seconds(refKeyPts, media.tracks[chosen[ref]].timescale)
+            }
+        }
+    }
+    plan.origin = origin
+    // Keyframe start: everything is cut from the keyframe's time.
+    let cutFrom = if exactStart { start } else { origin }
+    var picked: [core.PacketRef] = []
+    for (k, i) in chosen.enumerated() {
+        let src = media.tracks[i]
+        let ts = max(1, src.timescale)
+        let originTicks = if k == ref && !exactStart && refKeyPos >= 0 { refKeyPts } else { exRound(origin * Float(ts)) }
+        let fromTicks = exRound(cutFrom * Float(ts))
+        let endTicks = if to < 0.0 { core.noTime } else { exRound(endSec * Float(ts)) }
+        let list = lists[k]
+        var out: [core.PacketRef] = []
+        if src.kind == .video {
+            let kp = if k == ref { refKeyPos } else { exKeyPos(media, list, exRound(start * Float(ts))) }
+            if kp >= 0 {
+                let keyPts = media.packets[list[kp]].pts
+                // The last packet (decode order) shown before the end.
+                var last = list.count - 1
+                if endTicks != core.noTime {
+                    last = kp
+                    for j in kp..list.count {
+                        let pts = media.packets[list[j]].pts
+                        if pts != core.noTime && pts < endTicks {
+                            last = j
+                        }
+                    }
+                }
+                for j in kp..(last + 1) {
+                    let p = media.packets[list[j]]
+                    if j > kp && p.pts != core.noTime && keyPts != core.noTime && p.pts < keyPts {
+                        continue
+                    }
+                    out.append(p)
+                }
+            }
+        } else {
+            for (j, idx) in list.enumerated() {
+                var p = media.packets[idx]
+                if p.pts == core.noTime {
+                    p.pts = p.dts
+                }
+                if p.pts == core.noTime {
+                    continue
+                }
+                var dur = p.duration
+                if dur <= 0 && j + 1 < list.count {
+                    let next = media.packets[list[j + 1]].pts
+                    if next != core.noTime && next > p.pts && src.kind == .audio {
+                        dur = next - p.pts
+                    }
+                }
+                if endTicks != core.noTime && p.pts >= endTicks {
+                    continue
+                }
+                if p.pts + max(dur, 0) <= fromTicks && !(dur <= 0 && p.pts >= fromTicks) {
+                    continue
+                }
+                if src.kind == .subtitle {
+                    if p.pts < fromTicks && dur > 0 {
+                        dur -= fromTicks - p.pts
+                        p.pts = fromTicks
+                        p.dts = core.noTime
+                    }
+                    if endTicks != core.noTime && dur > 0 && p.pts + dur > endTicks {
+                        dur = endTicks - p.pts
+                    }
+                    p.duration = dur
+                }
+                out.append(p)
+            }
+        }
+        // Rebase, renumber.
+        for j in 0..out.count {
+            out[j].track = k
+            if out[j].pts != core.noTime {
+                out[j].pts -= originTicks
+            }
+            if out[j].dts != core.noTime {
+                out[j].dts -= originTicks
+            }
+        }
+        exFillTimes(out, src.kind == .video)
+        picked.appendAll(out)
+        var t = src
+        t.index = k
+        t.duration = core.noTime
+        plan.tracks.append(t)
+        plan.sources.append(i)
+        plan.prefixes.append(src.prefix)
+        if out.isEmpty {
+            plan.warnings.append("track {i} ({src.codec}) has nothing in the range")
+        }
+    }
+    plan.packets = exInterleave(picked, plan.tracks)
+    // Length: to the end asked for, or the last packet's end.
+    var last = 0.0
+    for p in plan.packets {
+        let ts = Float(max(1, plan.tracks[p.track].timescale))
+        last = max(last, Float(p.pts + max(0, p.duration)) / ts)
+    }
+    plan.duration = if to < 0.0 { last } else { min(last, endSec - origin) }
+    if plan.duration <= 0.0 {
+        plan.duration = last
+    }
+    // Chapters inside the range.
+    let clipEnd = origin + plan.duration
+    for c in media.chapters {
+        let cEnd = if c.end < 0.0 { clipEnd } else { c.end }
+        if cEnd > cutFrom && c.start < clipEnd {
+            let s = max(c.start, cutFrom) - origin
+            let e = min(cEnd, clipEnd) - origin
+            plan.chapters.append(core.Chapter(start: max(0.0, s), end: e, title: c.title))
+        }
+    }
+    Result.ok(value: plan)
+}
+
+// A plan that copies whole tracks unchanged (a remux): no cutting, no
+// rebasing, every packet kept.
+public fn planAll(_ media: core.Media, tracks: [Int] = []) -> ClipPlan {
+    let chosen = if tracks.isEmpty { defaultTracks(media) } else { tracks }
+    var plan = ClipPlan(from: 0.0, to: -1.0)
+    plan.tags = media.tags
+    plan.attachments = media.attachments
+    plan.cover = media.cover
+    plan.chapters = media.chapters
+    var slot: [Int] = []
+    for _ in media.tracks {
+        slot.append(-1)
+    }
+    for (k, i) in chosen.enumerated() {
+        if i >= 0 && i < media.tracks.count {
+            slot[i] = plan.tracks.count
+            var t = media.tracks[i]
+            t.index = plan.tracks.count
+            t.duration = core.noTime
+            plan.tracks.append(t)
+            plan.sources.append(i)
+            plan.prefixes.append(media.tracks[i].prefix)
+        }
+    }
+    var per: [[core.PacketRef]] = []
+    for _ in plan.tracks {
+        per.append([])
+    }
+    for p in media.packets {
+        if p.track >= 0 && p.track < slot.count && slot[p.track] >= 0 {
+            var q = p
+            q.track = slot[p.track]
+            per[q.track].append(q)
+        }
+    }
+    var all: [core.PacketRef] = []
+    for k in 0..per.count {
+        var list = per[k]
+        exFillTimes(list, plan.tracks[k].kind == .video)
+        all.appendAll(list)
+    }
+    plan.packets = exInterleave(all, plan.tracks)
+    var last = 0.0
+    for p in plan.packets {
+        let ts = Float(max(1, plan.tracks[p.track].timescale))
+        last = max(last, Float(p.pts + max(0, p.duration)) / ts)
+    }
+    plan.duration = if media.duration > 0.0 { media.duration } else { last }
+    plan
+}
+
+fn exRound(_ x: Float) -> Int {
+    Int(floor(x + 0.5))
+}
+
+// The position in `list` of the last keyframe with pts ≤ target, else the
+// first keyframe, else -1.
+fn exKeyPos(_ media: core.Media, _ list: [Int], _ target: Int) -> Int {
+    var best = -1
+    var first = -1
+    for (j, idx) in list.enumerated() {
+        let p = media.packets[idx]
+        if p.key {
+            if first < 0 {
+                first = j
+            }
+            if p.pts != core.noTime && p.pts <= target {
+                best = j
+            }
+        }
+    }
+    if best >= 0 { best } else { first }
+}
+
+// Fills missing times of one track's packets (decode order): pts from the
+// previous packet when missing; dts from pts. For video without decode
+// times (Matroska), dts[i] = (i-th smallest pts) − d, with d the least
+// shift that keeps every dts ≤ its pts; decode times then rise steadily
+// and B-pictures get the composition offsets MP4 needs.
+public fn exFillTimes(_ ps: bind [core.PacketRef], _ isVideo: Bool) {
+    var prev = 0
+    var prevDur = 0
+    for j in 0..ps.count {
+        if ps[j].pts == core.noTime {
+            ps[j].pts = if ps[j].dts != core.noTime { ps[j].dts } else { prev + prevDur }
+        }
+        prev = ps[j].pts
+        prevDur = max(0, ps[j].duration)
+    }
+    var missing = false
+    for p in ps {
+        if p.dts == core.noTime {
+            missing = true
+        }
+    }
+    if !missing {
+        return
+    }
+    if !isVideo {
+        for j in 0..ps.count {
+            ps[j].dts = ps[j].pts
+        }
+        return
+    }
+    var sorted: [Int] = []
+    for p in ps {
+        sorted.append(p.pts)
+    }
+    sorted = sorted.sorted()
+    var d = 0
+    for j in 0..ps.count {
+        d = max(d, sorted[j] - ps[j].pts)
+    }
+    for j in 0..ps.count {
+        ps[j].dts = sorted[j] - d
+    }
+}
+
+// All tracks' packets in one list ordered by decode time (seconds); each
+// track's own order is kept.
+public fn exInterleave(_ ps: [core.PacketRef], _ tracks: [core.Track]) -> [core.PacketRef] {
+    var keyed: [(Float, Int)] = []
+    for (j, p) in ps.enumerated() {
+        let ts = Float(max(1, tracks[p.track].timescale))
+        let t = if p.dts != core.noTime { p.dts } else { p.pts }
+        keyed.append((Float(t) / ts, j))
+    }
+    let order = keyed.sorted(by: { a, b in a.0 < b.0 })
+    var out: [core.PacketRef] = []
+    for (_, j) in order {
+        out.append(ps[j])
+    }
+    out
+}

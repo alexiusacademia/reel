@@ -1,0 +1,381 @@
+// Tests for demux-a's containers (demux/mp4.tsl, wav.tsl, raw.tsl): every
+// MP4/MOV/M4A, WAV/AIFF and raw-stream fixture is opened and compared with
+// ffmpeg's view of it (F.ref.json): tracks, codecs, sizes, rates,
+// languages, tags, cover, chapters, and every packet's size, offset,
+// times and key flag. Then a few hand-made files cover what the fixtures
+// don't (RF64, EXTENSIBLE, AIFC, ID3 unsynchronisation, Annex B video),
+// and a big synthetic MP4 measures speed.
+//
+// Differences from ffmpeg that are by design are allowed here, each with a
+// comment where it's checked: ffmpeg's odd timescales for raw streams are
+// compared after rescaling, the cover picture is Media.cover rather than a
+// track, FLAC/ALAC setup bytes follow core's contract.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../../demux"
+import "../../core"
+import "../../testkit"
+
+struct Counter {
+    passed: Int = 0
+    total: Int = 0
+
+    fn check(_ ok: Bool, _ what: String) {
+        total += 1
+        if ok {
+            passed += 1
+        } else {
+            print("FAIL: {what}")
+        }
+    }
+}
+
+// The format name Reel gives a fixture, from ffmpeg's.
+fn expectedFormat(_ name: String, _ ff: String) -> String {
+    if ff.hasPrefix("mov,") {
+        return if name.hasSuffix(".mov") { "mov" } else { "mp4" }
+    }
+    if ff == "mp3" {
+        return "mp3"
+    }
+    ff
+}
+
+// A time in the ref's clock as ticks of Reel's clock.
+fn toTicks(_ t: Int, from: Int, to: Int) -> Int {
+    if t == core.noTime {
+        return t
+    }
+    if from == to {
+        return t
+    }
+    // Round to nearest (the ref clocks are multiples of the real rates).
+    let whole = t / from
+    let rest = t % from
+    whole * to + (rest * to + (if rest >= 0 { from / 2 } else { -(from / 2) })) / from
+}
+
+fn near(_ a: Int, _ b: Int, _ tol: Int) -> Bool {
+    abs(a - b) <= tol
+}
+
+fn compareFixture(_ dir: String, _ name: String, _ c: bind Counter) {
+    let path = joinPath(dir, name)
+    let file = readData(path) ?? Data()
+    let ref: testkit.Ref = fromJson(readFile(path + ".ref.json") ?? "") ?? testkit.Ref()
+    var media = core.Media()
+    match demux.open(file, name: name) {
+        .ok(m) -> { media = m }
+        .failure(e) -> {
+            c.check(false, "{name}: open failed: {e.message}")
+            return
+        }
+    }
+    c.check(media.format == expectedFormat(name, ref.format), "{name}: format {media.format} (ffmpeg {ref.format})")
+    // ffmpeg gives no duration for raw video streams.
+    if ref.duration >= 0.0 {
+        c.check(abs(media.duration - ref.duration) <= 0.002 + ref.duration * 0.001, "{name}: duration {media.duration}, want {ref.duration}")
+    }
+
+    // Tags: every tag ffmpeg found, with the same text.
+    var tagsOk = true
+    for (k0, v) in ref.tags {
+        // ffmpeg's "album_artist" is core's "albumartist".
+        let k = if k0 == "album_artist" { "albumartist" } else { k0 }
+        let mine = media.tags[k] ?? "(missing)"
+        if mine != v {
+            tagsOk = false
+            print("  {name}: tag {k} = '{mine}', want '{v}'")
+        }
+    }
+    c.check(tagsOk, "{name}: tags")
+
+    // Chapters.
+    var chOk = media.chapters.count == ref.chapters.count
+    for (i, rc) in ref.chapters.enumerated() {
+        if i < media.chapters.count {
+            let mc = media.chapters[i]
+            if abs(mc.start - rc.start) > 0.001 || abs(mc.end - rc.end) > 0.001 || mc.title != rc.title {
+                chOk = false
+                print("  {name}: chapter {i}: {mc.start}-{mc.end} '{mc.title}', want {rc.start}-{rc.end} '{rc.title}'")
+            }
+        }
+    }
+    c.check(chOk, "{name}: chapters ({media.chapters.count}, want {ref.chapters.count})")
+
+    // Cover art: ffmpeg shows it as an attached-picture track; Reel puts
+    // the picture in Media.cover. The fixtures' cover is cover.jpg copied.
+    var refTracks: [testkit.RefTrack] = []
+    var refIndex: [Int: Int] = [:]
+    var hasCover = false
+    for t in ref.tracks {
+        if t.isCover {
+            hasCover = true
+        } else {
+            refIndex[t.index] = refTracks.count
+            refTracks.append(t)
+        }
+    }
+    if hasCover {
+        c.check(media.cover == testkit.fixture("cover.jpg"), "{name}: cover is cover.jpg ({media.cover.count} bytes)")
+    } else {
+        c.check(media.cover.isEmpty, "{name}: no cover")
+    }
+
+    c.check(media.tracks.count == refTracks.count, "{name}: {media.tracks.count} tracks, want {refTracks.count}")
+    if media.tracks.count != refTracks.count {
+        return
+    }
+    for (i, rt) in refTracks.enumerated() {
+        let t = media.tracks[i]
+        let what = "{name} track {i}"
+        c.check(t.kind == testkit.trackKind(rt.kind), "{what}: kind {t.kind}, want {rt.kind}")
+        // ffmpeg calls a QuickTime chapter track "bin_data"; Reel names it
+        // "text" (a track of kind other, so it's never shown as subtitles).
+        let codecOk = t.codec == rt.codec || (rt.codec == "unknown:bin_data" && t.kind == .other && t.codec == "text")
+        c.check(codecOk, "{what}: codec {t.codec}, want {rt.codec}")
+        // Durations: same clock, or ffmpeg's clock rescaled to Reel's.
+        if rt.duration != core.noTime {
+            let want = toTicks(rt.duration, from: rt.timescale, to: t.timescale)
+            let tol = max(1, t.timescale / 1000)
+            c.check(near(t.duration, want, tol), "{what}: duration {t.duration}/{t.timescale}, want {rt.duration}/{rt.timescale}")
+        }
+        if rt.kind == "audio" {
+            c.check(t.sampleRate == rt.sampleRate && t.channels == rt.channels, "{what}: {t.sampleRate} Hz {t.channels} ch, want {rt.sampleRate} {rt.channels}")
+            if rt.codec == "pcm" {
+                let p = t.pcm
+                let r = rt.pcm
+                c.check(p.bits == r.bits && p.float == r.float && p.bigEndian == r.bigEndian && p.signed == r.signed, "{what}: pcm {p.bits} float {p.float} be {p.bigEndian} signed {p.signed}")
+            }
+            if rt.codec == "pcm" || rt.codec == "flac" || rt.codec == "alac" {
+                c.check(t.bitsPerSample == rt.bitsPerSample, "{what}: {t.bitsPerSample} bits, want {rt.bitsPerSample}")
+            }
+        }
+        if rt.kind == "video" {
+            c.check(t.width == rt.width && t.height == rt.height, "{what}: {t.width}x{t.height}, want {rt.width}x{rt.height}")
+            c.check(t.sarNum * rt.sarDen == t.sarDen * rt.sarNum, "{what}: sar {t.sarNum}:{t.sarDen}")
+            c.check(t.rotation == rt.rotation, "{what}: rotation {t.rotation}, want {rt.rotation}")
+            if rt.fpsNum > 0 && rt.fpsDen > 0 {
+                c.check(t.fpsNum * rt.fpsDen == t.fpsDen * rt.fpsNum, "{what}: fps {t.fpsNum}/{t.fpsDen}, want {rt.fpsNum}/{rt.fpsDen}")
+            }
+        }
+        c.check(t.language == rt.language, "{what}: language '{t.language}', want '{rt.language}'")
+        if media.format == "mp4" || media.format == "mov" {
+            c.check(t.isDefault == rt.isDefault, "{what}: default {t.isDefault}, want {rt.isDefault}")
+            c.check(t.title == rt.title || t.kind == .other, "{what}: title '{t.title}', want '{rt.title}'")
+        }
+        // Setup bytes. FLAC: core's form is "fLaC" + the metadata blocks;
+        // ffmpeg's extradata is the bare STREAMINFO. ALAC: core's form is
+        // the ALACSpecificConfig; ffmpeg keeps the whole 'alac' box (12
+        // more bytes in front).
+        let extra = t.extra.hex
+        var extraOk = extra == rt.extraHex
+        if rt.codec == "flac" {
+            extraOk = extra.hasPrefix("664c6143") && extra.substring(from: 16, to: 16 + rt.extraHex.count) == rt.extraHex
+        } else if rt.codec == "alac" {
+            extraOk = rt.extraHex.substring(from: 24, to: rt.extraHex.count) == extra
+        } else if rt.codec == "aac" && rt.extraHex.isEmpty {
+            extraOk = extra.isEmpty && t.adts
+        } else if (rt.codec == "h264" || rt.codec == "hevc") && (rt.extraHex.hasPrefix("000001") || rt.extraHex.hasPrefix("00000001")) {
+            // Annex B streams: ffmpeg's extradata is the stream's first
+            // parameter sets; core's contract is empty extra (they stay in
+            // the packets).
+            extraOk = extra.isEmpty
+        } else if rt.codec == "pcm" && extra.hasPrefix("feff") {
+            // WAVE_FORMAT_EXTENSIBLE: Reel keeps the fmt chunk (for the
+            // channel mask, see demux.wavLayout); ffmpeg keeps nothing.
+            extraOk = rt.extraHex.isEmpty
+        } else if rt.codec == "vp9" && rt.extraHex.isEmpty {
+            // ffmpeg reads the vpcC box into its own fields and keeps no
+            // extradata; Reel passes the box body on.
+            extraOk = extra.hasPrefix("01")
+        }
+        c.check(extraOk, "{what}: extra {extra}, want {rt.extraHex}")
+    }
+
+    // Packets, track by track, in stored order.
+    var mine: [[core.PacketRef]] = []
+    var theirs: [[testkit.RefPacket]] = []
+    for _ in refTracks {
+        mine.append([])
+        theirs.append([])
+    }
+    for p in media.packets {
+        if p.track >= 0 && p.track < mine.count {
+            mine[p.track].append(p)
+        }
+    }
+    for p in ref.packets {
+        if let k = refIndex[p.track] {
+            theirs[k].append(p)
+        }
+    }
+    for k in 0..refTracks.count {
+        let rt = refTracks[k]
+        let scale = media.tracks[k].timescale
+        let a = mine[k]
+        let b = theirs[k]
+        c.check(a.count == b.count, "{name} track {k}: {a.count} packets, want {b.count}")
+        var bad = 0
+        var first = ""
+        // When ffmpeg's clock isn't a multiple of Reel's (AC-3 at 44.1 kHz
+        // counted in 90 kHz ticks), its times carry a rounding error that
+        // grows by up to half a tick per packet.
+        let inexact = rt.timescale % scale != 0
+        // ffmpeg runs its MPEG audio and AC-3 parsers on these tracks in
+        // MP4, which give the last packet a whole frame's duration; Reel
+        // keeps the shorter one the stts table gives.
+        let parsed = rt.codec == "mp3" || rt.codec == "mp2" || rt.codec == "ac3" || rt.codec == "eac3"
+        for j in 0..min(a.count, b.count) {
+            let p = a[j]
+            let q = b[j]
+            let pts = toTicks(q.pts, from: rt.timescale, to: scale)
+            let dts = toTicks(q.dts, from: rt.timescale, to: scale)
+            let dur = toTicks(q.duration, from: rt.timescale, to: scale)
+            // Times within a tick of the rescaled ones; raw streams without
+            // a dts (ffmpeg gives pts = dts) are compared on pts.
+            var ok = p.size == q.size && (q.pos < 0 || p.offset == q.pos) && p.key == q.key
+            // Raw video streams: ffmpeg gives no times (Reel times them by
+            // frame rate), so only bytes and key flags are compared.
+            if q.pts != core.noTime {
+                let tol = if inexact { 1 + (j + 1) * scale / rt.timescale } else { 1 }
+                ok = ok && near(p.pts, pts, tol) && (q.dts == core.noTime || near(p.dts, dts, tol))
+                ok = ok && (near(p.duration, dur, tol) || parsed && j == b.count - 1 && p.duration < dur)
+            }
+            if !ok {
+                if bad == 0 {
+                    first = "#{j}: size {p.size} off {p.offset} pts {p.pts} dts {p.dts} dur {p.duration} key {p.key}; want size {q.size} off {q.pos} pts {pts} dts {dts} dur {dur} key {q.key}"
+                }
+                bad += 1
+            }
+        }
+        c.check(bad == 0, "{name} track {k}: {bad} packets differ, first {first}")
+    }
+    // Packets are in file order.
+    var ordered = true
+    for j in 1..max(1, media.packets.count) {
+        if media.packets[j].offset < media.packets[j - 1].offset {
+            ordered = false
+        }
+    }
+    c.check(ordered, "{name}: packets in file order")
+}
+
+// A damaged copy of a file: `count` bytes changed at pseudo-random places,
+// chosen mostly near the start and end, where the headers are.
+fn damaged(_ file: Data, seed: Int, count: Int) -> Data {
+    var out = file
+    var x = seed
+    let n = file.count
+    if n == 0 {
+        return out
+    }
+    for _ in 0..count {
+        x = (x * 1103515245 + 12345) % 2147483648
+        let r = x % 1000
+        let pos = if r < 450 { x / 1000 % min(n, 4096) } else if r < 900 { n - 1 - x / 1000 % min(n, 8192) } else { x / 1000 % n }
+        x = (x * 1103515245 + 12345) % 2147483648
+        let value = if x % 4 == 0 { 0xff } else if x % 4 == 1 { 0 } else { x / 7 % 256 }
+        out = out.slice(from: 0, to: pos) + Data(bytes: [value]) + out.slice(from: pos + 1, to: n)
+    }
+    out
+}
+
+// Opens damaged and cut-short copies of a file: the program must survive
+// (no stop on a bad index or an overflow, no endless loop), and whatever
+// packets it finds must lie inside the file.
+fn survives(_ dir: String, _ name: String, _ c: bind Counter) {
+    let file = readData(joinPath(dir, name)) ?? Data()
+    var opened = 0
+    var tries = 0
+    var inside = true
+    let n = file.count
+    fn look(_ d: Data, _ what: String) {
+        tries += 1
+        match demux.open(d, name: name) {
+            .ok(m) -> {
+                opened += 1
+                for p in m.packets {
+                    let end = if p.parts.isEmpty { p.offset + p.size } else { p.offset }
+                    if p.offset < 0 || p.size < 0 || end > d.count {
+                        if inside {
+                            print("  {name} {what}: a packet lies outside the file ({p.offset}+{p.size} of {d.count})")
+                        }
+                        inside = false
+                    }
+                }
+            }
+            .failure(_) -> {}
+        }
+    }
+    for k in 1..12 {
+        look(file.slice(from: 0, to: n * k / 12), "cut at {k}/12")
+    }
+    for cut in [0, 3, 8, 12, 20, 40, 100, 1000] {
+        look(file.slice(from: 0, to: cut), "cut at {cut}")
+    }
+    for seed in 1..40 {
+        look(damaged(file, seed: seed * 7919 + n, count: 1 + seed % 9), "damaged {seed}")
+    }
+    c.check(inside, "{name}: damaged and cut copies give packets inside the file")
+    c.check(tries == 58, "{name}: survived {tries} damaged copies ({opened} still opened)")
+}
+
+fn main() {
+    var c = Counter()
+    let fixtures = [
+        "h264_baseline.mp4", "h264_main_bframes.mp4", "h264_cavlc_slices.mp4", "h264_crop.mp4",
+        "h264_weighted.mp4", "h264_intra.mp4", "h264_720p.mp4", "h264_1080p.mp4",
+        "h264_fragmented.mp4", "hevc.mp4", "multi.mp4", "rotated.mp4", "subs_tx3g.mp4",
+        "mov.mov", "aac_lc.m4a", "aac_51.m4a", "he_aac.m4a", "alac.m4a", "cover.m4a",
+        "pcm_s16.wav", "pcm_s24.wav", "pcm_f32.wav", "pcm_u8.wav", "pcm_51.wav", "pcm.aiff",
+        "mp3_cbr.mp3", "mp3_vbr_mono.mp3", "mp2.mp2", "cover.mp3", "aac_mono.aac",
+        "flac.flac", "flac_24.flac", "flac_51.flac", "cover.flac", "ac3.ac3", "eac3.eac3",
+    ]
+    for name in fixtures {
+        compareFixture(testkit.fixtures, name, c)
+    }
+    // demux_a's own small fixtures (made by build/scratch/demux_a/make_extra.sh).
+    let mine = "tests/demux_a/fixtures"
+    let extra = (listFolder(mine) ?? []).filter { f in !f.hasSuffix(".json") }.sorted()
+    c.check(extra.count >= 30, "{extra.count} extra fixtures")
+    for name in extra {
+        compareFixture(mine, name, c)
+    }
+
+    // Channel layouts (WAV channel masks) and colour (MP4 colr).
+    let layouts = [("tests/fixtures/pcm_51.wav", "FL FR FC LFE BL BR"), ("tests/fixtures/pcm_s16.wav", "FL FR"), ("tests/fixtures/pcm_u8.wav", "FC"), ("tests/demux_a/fixtures/quad.wav", "FL FR BL BR")]
+    for (path, want) in layouts {
+        let m = demux.open(readData(path) ?? Data(), name: path).value() ?? core.Media()
+        let got = if m.tracks.isEmpty { "" } else { m.tracks[0].layout.joined(separator: " ") }
+        c.check(got == want, "{path}: layout {got}, want {want}")
+        if !m.tracks.isEmpty {
+            c.check(demux.wavLayout(m.tracks[0]) == m.tracks[0].layout, "{path}: wavLayout")
+        }
+    }
+    let colr = demux.open(readData("tests/demux_a/fixtures/colr.mp4") ?? Data(), name: "colr.mp4").value() ?? core.Media()
+    c.check(!colr.tracks.isEmpty && colr.tracks[0].matrix == .bt709 && colr.tracks[0].fullRange, "colr.mp4: BT.709 full range")
+    let plain = demux.open(testkit.fixture("h264_baseline.mp4"), name: "h264_baseline.mp4").value() ?? core.Media()
+    c.check(!plain.tracks.isEmpty && plain.tracks[0].matrix == .unknown && !plain.tracks[0].fullRange, "h264_baseline.mp4: no colr")
+
+    // Damaged files.
+    let started = now()
+    for name in fixtures {
+        survives(testkit.fixtures, name, c)
+    }
+    for name in extra {
+        survives(mine, name, c)
+    }
+    print("time {(fixtures.count + extra.count) * 58} damaged copies: {Int((now() - started) * 1000.0)} ms")
+    // Speed on a big synthetic MP4 (2 h of 24 fps video and 48 kHz AAC,
+    // 510 301 samples; made by make_extra.sh's comment, not committed).
+    if let big = readData("build/scratch/demux_a/big.mp4") {
+        let t0 = now()
+        let m = demux.open(big, name: "big.mp4").value() ?? core.Media()
+        print("time open 2 h MP4 ({m.packets.count} packets): {Int((now() - t0) * 1000.0)} ms")
+        c.check(m.packets.count == 510301, "big.mp4: 510301 packets, got {m.packets.count}")
+    }
+    print("demux_a: {c.passed} of {c.total} passed")
+}

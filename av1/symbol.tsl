@@ -1,0 +1,244 @@
+// The AV1 symbol (arithmetic) decoder, spec 8.2 (init_symbol,
+// read_symbol with CDF adaptation, read_bool, read_literal, exit_symbol),
+// with the CDF context of the tile being decoded.
+//
+// The spec reads new bits one renormalisation at a time; here the coded
+// bits are kept in a window, already inverted as the spec's
+// "paddedData ^ (((SymbolValue + 1) << bits) - 1)" makes them, so that
+// SymbolValue == dif >> cnt: `dif` holds SymbolValue followed by `cnt`
+// more (inverted) bits of the stream. Comparing SymbolValue with `cur`
+// is then comparing dif with cur << cnt. Bytes past the end of the tile
+// read as zero bits (the spec's padding), i.e. as ones once inverted.
+//
+// The CDFs of the tile (all the spec's Tile…Cdf arrays) live in one flat
+// list `cdf`, laid out as tables.tsl describes (cfX offsets); a CDF of N
+// symbols is N + 1 entries, the last one counting uses.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+struct Av1Sym {
+    data: [Int] = []
+    pos: Int = 0
+    end: Int = 0
+    dif: Int = 0
+    rng: Int = 0
+    cnt: Int = 0
+    // SymbolMaxBits of the spec, for exit_symbol / damage checks.
+    maxBits: Int = 0
+    cdf: [Int] = []
+    disableUpdate: Bool = false
+    // 7 - FloorLog2(i) for i = 1 … 255 (norm[0] unused).
+    norm: [Int] = []
+
+    fn setup() {
+        if norm.isEmpty {
+            var t: [Int] = [8]
+            for i in 1..256 {
+                var v = i
+                var n = 0
+                while v < 128 {
+                    v = v << 1
+                    n += 1
+                }
+                t.append(n)
+            }
+            norm = t
+        }
+    }
+
+    // init_symbol( sz ) over d[start ..< start + size].
+    fn start(_ d: [Int], _ start: Int, _ size: Int) {
+        data = d
+        pos = start
+        end = min(start + size, d.count)
+        dif = 0
+        cnt = -15
+        rng = 32768
+        maxBits = 8 * size - 15
+        fill()
+    }
+
+    // Loads bytes until at least 15 + 25 bits follow SymbolValue.
+    fn fill() {
+        while cnt <= 32 {
+            var b = 255
+            if pos < end {
+                b = 255 ^ data[pos]
+            }
+            pos += 1
+            dif = (dif << 8) | b
+            cnt += 8
+        }
+    }
+
+    // read_symbol for the CDF of n symbols at cdf[off …].
+    fn read(_ off: Int, _ n: Int) -> Int {
+        let c = dif >> cnt
+        let r8 = rng >> 8
+        var sym = -1
+        var cur = rng
+        var prev = rng
+        while true {
+            sym += 1
+            prev = cur
+            cur = ((r8 * ((32768 - cdf[off + sym]) >> 6)) >> 1) + 4 * (n - sym - 1)
+            if c >= cur {
+                break
+            }
+        }
+        var r = prev - cur
+        dif -= cur << cnt
+        // Renormalise: bits = 15 - FloorLog2(r).
+        var bits = 0
+        if r >= 256 {
+            bits = norm[r >> 8]
+        } else {
+            bits = 8 + norm[r]
+        }
+        rng = r << bits
+        cnt -= bits
+        maxBits -= bits
+        if cnt < 0 {
+            fill()
+        }
+        if !disableUpdate {
+            let cntAt = off + n
+            let k = cdf[cntAt]
+            // rate = 3 + (k > 15) + (k > 31) + Min(FloorLog2(N), 2)
+            var rate = if n >= 4 { 5 } else { 4 }
+            if k > 15 {
+                rate += 1
+            }
+            if k > 31 {
+                rate += 1
+            }
+            var i = 0
+            while i < n - 1 {
+                let v = cdf[off + i]
+                if i < sym {
+                    cdf[off + i] = v - (v >> rate)
+                } else {
+                    cdf[off + i] = v + ((32768 - v) >> rate)
+                }
+                i += 1
+            }
+            if k < 32 {
+                cdf[cntAt] = k + 1
+            }
+        }
+        sym
+    }
+
+    // read_bool (8.2.3): an equiprobable bit, no adaptation.
+    fn bool() -> Int {
+        let c = dif >> cnt
+        let cur = ((rng >> 8) << 7) + 4
+        var bit = 0
+        var r = 0
+        if c >= cur {
+            r = rng - cur
+            dif -= cur << cnt
+        } else {
+            r = cur
+            bit = 1
+        }
+        var bits = 0
+        if r >= 256 {
+            bits = norm[r >> 8]
+        } else {
+            bits = 8 + norm[r]
+        }
+        rng = r << bits
+        cnt -= bits
+        maxBits -= bits
+        if cnt < 0 {
+            fill()
+        }
+        bit
+    }
+
+    // read_symbol on a two-symbol CDF built on the spot, {32768 - f,
+    // 32768}, with no adaptation (split_or_horz, split_or_vert).
+    fn readBin(_ f: Int) -> Int {
+        let c = dif >> cnt
+        let cur = (((rng >> 8) * (f >> 6)) >> 1) + 4
+        var bit = 0
+        var r = 0
+        if c >= cur {
+            r = rng - cur
+            dif -= cur << cnt
+        } else {
+            r = cur
+            bit = 1
+        }
+        var bits = 0
+        if r >= 256 {
+            bits = norm[r >> 8]
+        } else {
+            bits = 8 + norm[r]
+        }
+        rng = r << bits
+        cnt -= bits
+        maxBits -= bits
+        if cnt < 0 {
+            fill()
+        }
+        bit
+    }
+
+    // read_literal( n ).
+    fn literal(_ n: Int) -> Int {
+        var x = 0
+        for _ in 0..n {
+            x = 2 * x + bool()
+        }
+        x
+    }
+
+    // NS( n ) read with read_literal (4.10.10 for the symbol decoder: the
+    // "NS" descriptor of palette and subexp syntax).
+    fn ns(_ n: Int) -> Int {
+        var w = 0
+        var x = n
+        while x != 0 {
+            x = x >> 1
+            w += 1
+        }
+        let m = (1 << w) - n
+        let v = literal(w - 1)
+        if v < m {
+            return v
+        }
+        let extra = bool()
+        (v << 1) - m + extra
+    }
+
+    // True when the tile has been read far past its end (damaged data).
+    fn damaged() -> Bool {
+        maxBits < -(1 << 16)
+    }
+}
+
+fn av1FloorLog2(_ x: Int) -> Int {
+    var s = 0
+    var v = x
+    while v > 1 {
+        v = v >> 1
+        s += 1
+    }
+    s
+}
+
+fn av1CeilLog2(_ x: Int) -> Int {
+    if x < 2 {
+        return 0
+    }
+    var i = 1
+    var p = 2
+    while p < x {
+        i += 1
+        p = p << 1
+    }
+    i
+}

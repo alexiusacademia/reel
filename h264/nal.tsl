@@ -1,0 +1,79 @@
+// NAL unit splitting (ITU-T H.264 7.3.1, Annex B byte streams and the
+// length-prefixed NAL units of ISO/IEC 14496-15 avcC streams).
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+// Splits data into NAL units: (start, end) pairs. lengthSize 0 means
+// Annex B start codes, else 1..4 byte big-endian lengths.
+fn h264SplitNals(_ d: Data, _ lengthSize: Int) -> [Int] {
+    var out: [Int] = []
+    let n = d.count
+    if lengthSize > 0 {
+        var p = 0
+        while p + lengthSize <= n {
+            var len = 0
+            for i in 0..lengthSize {
+                len = (len << 8) | d[p + i]
+            }
+            p += lengthSize
+            if len <= 0 {
+                continue
+            }
+            let end = min(n, p + len)
+            out.append(p)
+            out.append(end)
+            p = end
+        }
+        return out
+    }
+    var i = 0
+    var start = -1
+    while i + 2 < n {
+        if d[i] == 0 && d[i + 1] == 0 && d[i + 2] == 1 {
+            if start >= 0 {
+                var end = i
+                while end > start && d[end - 1] == 0 {
+                    end -= 1
+                }
+                if end > start {
+                    out.append(start)
+                    out.append(end)
+                }
+            }
+            i += 3
+            start = i
+        } else {
+            i += 1
+        }
+    }
+    if start >= 0 && start < n {
+        out.append(start)
+        out.append(n)
+    } else if start < 0 && n > 0 {
+        // No start code at all: one NAL unit.
+        out.append(0)
+        out.append(n)
+    }
+    out
+}
+
+// Whether length-prefixed NAL units cover the data exactly.
+fn h264LengthsFit(_ d: Data, _ ls: Int) -> Bool {
+    var p = 0
+    while p + ls <= d.count {
+        var len = 0
+        for i in 0..ls {
+            len = (len << 8) | d[p + i]
+        }
+        p += ls + len
+    }
+    p == d.count
+}
+
+fn h264LooksAnnexB(_ d: Data) -> Bool {
+    if d.count >= 4 && d[0] == 0 && d[1] == 0 && d[2] == 0 && d[3] == 1 {
+        return true
+    }
+    d.count >= 3 && d[0] == 0 && d[1] == 0 && d[2] == 1
+}

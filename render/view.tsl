@@ -1,0 +1,257 @@
+// How the player shows a picture beyond plain colour conversion: picture
+// adjustments (brightness, contrast, saturation, hue, gamma), cropping,
+// an aspect ratio override, zoom and pan, flips and an extra rotation, in
+// one plain settings struct, `render.View`, that the player keeps per file
+// (and saves as JSON). `Renderer.frame` (video.tsl) applies a View.
+//
+// The adjustments follow the definitions of the common "eq" and "hue"
+// video filters as their documentation describes them, so that results
+// can be compared with ffmpeg run as a black box:
+//   * luma, in code values s of the picture's depth (top = 2^depth − 1,
+//     mid = 2^(depth−1)):  x = ((s − mid)·contrast + mid)/top + brightness,
+//     clamped to 0…1, then x^(1/gamma), back to code values;
+//   * chroma: (Cb, Cr) − mid rotated by `hue` degrees
+//     (Cb' = Cb·cos h − Cr·sin h, Cr' = Cb·sin h + Cr·cos h) and scaled by
+//     `saturation`, clamped to the code range.
+// The renderer folds all of it into its conversion tables (luma table and
+// the per-chroma-sample packed contribution), so it costs no extra pass.
+//
+// Geometry: crop edges are in samples of the decoded picture (as
+// vfx.detectCrop reports them); zoom > 1 shows a window 1/zoom of the
+// cropped picture's size, moved by panX/panY (−1…1, 0 = centre); zoom < 1
+// is for the app to draw the frame smaller (the frame itself never has
+// borders). `aspect` overrides the display aspect ratio of the whole
+// (uncropped) picture: 16:9 = 1.777…, 0 = what the stream says. Flips are
+// in screen space (what the viewer sees), applied after rotation.
+// For 4:2:0 and 4:2:2 pictures the window's left edge (and for 4:2:0 its
+// top edge) is rounded down to an even sample, so chroma stays sited.
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+import "../core"
+
+public struct View {
+    // Adjustments (identity values are the defaults).
+    brightness: Float = 0.0
+    contrast: Float = 1.0
+    saturation: Float = 1.0
+    hue: Float = 0.0
+    gamma: Float = 1.0
+    // Crop: samples taken off each edge of the decoded picture.
+    cropLeft: Int = 0
+    cropTop: Int = 0
+    cropRight: Int = 0
+    cropBottom: Int = 0
+    // Display aspect ratio (width / height) of the whole picture; 0 = the
+    // stream's (its size and sample aspect ratio).
+    aspect: Float = 0.0
+    // 1 = the cropped picture fills the frame; 2 = its middle half (by
+    // size) does. Values below 1 are the app's to draw smaller.
+    zoom: Float = 1.0
+    panX: Float = 0.0
+    panY: Float = 0.0
+    // Mirror horizontally / vertically, as seen on screen.
+    flipH: Bool = false
+    flipV: Bool = false
+    // Clockwise degrees (a multiple of 90) on top of the track's rotation.
+    rotation: Int = 0
+
+    // Whether luma needs its own table (brightness, contrast or gamma set).
+    lumaAdjusted: Bool {
+        abs(brightness) > 0.000001 || abs(contrast - 1.0) > 0.000001 || abs(gamma - 1.0) > 0.000001
+    }
+
+    // Whether chroma needs rotating or scaling (hue or saturation set).
+    chromaAdjusted: Bool {
+        abs(saturation - 1.0) > 0.000001 || abs(hue) > 0.000001
+    }
+
+    // Brightness, contrast, saturation, hue and gamma back to normal.
+    fn resetAdjustments() {
+        brightness = 0.0
+        contrast = 1.0
+        saturation = 1.0
+        hue = 0.0
+        gamma = 1.0
+    }
+}
+
+// The plain view: no adjustment, crop, zoom or flip.
+public fn plainView() -> View {
+    View()
+}
+
+// The aspect ratio presets a menu offers: name and value (0 = default).
+public let aspectPresets: [(String, Float)] = [("Default", 0.0), ("16:9", 16.0 / 9.0), ("4:3", 4.0 / 3.0), ("2.35:1", 2.35), ("2.39:1", 2.39), ("1.85:1", 1.85), ("21:9", 64.0 / 27.0), ("16:10", 1.6), ("5:4", 1.25), ("1:1", 1.0), ("9:16", 9.0 / 16.0)]
+
+// An aspect ratio written "16:9", "2.35:1", "2.35" or "Default" (→ 0);
+// 0 for anything unreadable or out of 0.1…10.
+public fn parseAspect(_ text: String) -> Float {
+    let t = text.trim()
+    if t.isEmpty || t.lowercase() == "default" {
+        return 0.0
+    }
+    var value = 0.0
+    let parts = t.split(":")
+    if parts.count == 2 {
+        let a = Float(parts[0].trim()) ?? 0.0
+        let b = Float(parts[1].trim()) ?? 0.0
+        if b > 0.0 {
+            value = a / b
+        }
+    } else if parts.count == 1 {
+        value = Float(t) ?? 0.0
+    }
+    if value < 0.1 || value > 10.0 {
+        return 0.0
+    }
+    value
+}
+
+// The luma code value s after brightness, contrast and gamma (see the top
+// of the file), in code values of `depth`, clamped to the code range.
+public fn adjustedLuma(_ s: Float, _ v: View, depth: Int) -> Float {
+    let top = Float((1 << depth) - 1)
+    let mid = Float(1 << (depth - 1))
+    var x = ((s - mid) * v.contrast + mid) / top + v.brightness
+    x = max(0.0, min(x, 1.0))
+    if abs(v.gamma - 1.0) > 0.000001 && x > 0.0 {
+        x = pow(x, 1.0 / max(v.gamma, 0.01))
+    }
+    x * top
+}
+
+// The sample aspect ratio a view shows a picture with.
+public fn viewSar(_ p: core.Picture, _ v: View) -> Float {
+    if v.aspect > 0.0 && p.width > 0 && p.height > 0 {
+        return v.aspect * Float(p.height) / Float(p.width)
+    }
+    if p.sarNum > 0 && p.sarDen > 0 {
+        return Float(p.sarNum) / Float(p.sarDen)
+    }
+    1.0
+}
+
+// The part of the picture a view shows (crop, then zoom and pan), in
+// samples of the visible picture: (x, y, width, height). Never empty.
+public fn viewWindow(_ p: core.Picture, _ v: View) -> (Int, Int, Int, Int) {
+    let ax = if p.chroma == .yuv420 || p.chroma == .yuv422 { 2 } else { 1 }
+    let ay = if p.chroma == .yuv420 { 2 } else { 1 }
+    var x0 = max(0, v.cropLeft)
+    var y0 = max(0, v.cropTop)
+    var x1 = p.width - max(0, v.cropRight)
+    var y1 = p.height - max(0, v.cropBottom)
+    // A crop that leaves less than 2×2 (or 1/16 of each side) is ignored.
+    if x1 - x0 < max(2, p.width / 16) {
+        x0 = 0
+        x1 = p.width
+    }
+    if y1 - y0 < max(2, p.height / 16) {
+        y0 = 0
+        y1 = p.height
+    }
+    var fx = Float(x0)
+    var fy = Float(y0)
+    var fw = Float(x1 - x0)
+    var fh = Float(y1 - y0)
+    if v.zoom > 1.0 {
+        let z = min(v.zoom, 16.0)
+        let zw = fw / z
+        let zh = fh / z
+        fx += (fw - zw) / 2.0 * (1.0 + max(-1.0, min(v.panX, 1.0)))
+        fy += (fh - zh) / 2.0 * (1.0 + max(-1.0, min(v.panY, 1.0)))
+        fw = zw
+        fh = zh
+    }
+    var x = Int(floor(fx + 0.5))
+    var y = Int(floor(fy + 0.5))
+    var w = max(2, Int(floor(fw + 0.5)))
+    var h = max(2, Int(floor(fh + 0.5)))
+    // Keep chroma sited: even left (and top for 4:2:0) edges.
+    let ex = x - x % ax
+    let ey = y - y % ay
+    w += x - ex
+    h += y - ey
+    x = ex
+    y = ey
+    w = min(w, p.width - x)
+    h = min(h, p.height - y)
+    (x, y, max(1, w), max(1, h))
+}
+
+// The picture limited to a window: same planes, moved offsets. The matrix
+// is fixed first (the guess by size must see the whole picture).
+public fn windowed(_ p: core.Picture, _ x: Int, _ y: Int, _ w: Int, _ h: Int) -> core.Picture {
+    var c = p
+    c.matrix = effectiveMatrix(p)
+    if x == 0 && y == 0 && w == p.width && h == p.height {
+        return c
+    }
+    c.width = w
+    c.height = h
+    c.yOffset = p.yOffset + y * p.yStride + x
+    if p.chroma != .gray {
+        let cx = if p.chroma == .yuv444 { x } else { x / 2 }
+        let cy = if p.chroma == .yuv420 { y / 2 } else { y }
+        c.cOffset = p.cOffset + cy * p.cStride + cx
+    }
+    c
+}
+
+// The total clockwise rotation of a track's pictures under a view.
+public fn viewRotation(_ v: View, trackRotation: Int) -> Int {
+    normalDegrees(trackRotation + v.rotation)
+}
+
+// The flips to apply to the picture before rotating it by `degrees`, so
+// that the screen shows the view's screen-space flips: a horizontal flip
+// after a quarter turn is a vertical flip before it.
+public fn sourceFlips(_ v: View, degrees: Int) -> (Bool, Bool) {
+    let d = normalDegrees(degrees)
+    if d == 90 || d == 270 {
+        return (v.flipV, v.flipH)
+    }
+    (v.flipH, v.flipV)
+}
+
+// The frame size (after rotation) a view shows a picture at inside a box
+// of boxW×boxH device pixels: the window's display shape fitted into the
+// box, never larger than the window's own samples (the screen enlarges
+// for free; converting costs per pixel). A box of 0 gives the natural
+// size.
+public fn frameSize(_ p: core.Picture, _ v: View, boxW: Int, boxH: Int, trackRotation: Int = 0) -> (Int, Int) {
+    let (_, _, ww, wh) = viewWindow(p, v)
+    let sar = viewSar(p, v)
+    let dw = Float(ww) * sar
+    let dh = Float(wh)
+    let d = viewRotation(v, trackRotation: trackRotation)
+    let turned = d == 90 || d == 270
+    var w = ww
+    var h = wh
+    if boxW > 0 && boxH > 0 {
+        let bw = if turned { boxH } else { boxW }
+        let bh = if turned { boxW } else { boxH }
+        let natW = max(Int(floor(dw + 0.5)), ww)
+        let fitW = Float(min(bw, natW))
+        let fitH = Float(min(bh, wh))
+        let s = min(fitW / dw, fitH / dh)
+        w = max(1, Int(floor(dw * s + 0.5)))
+        h = max(1, Int(floor(dh * s + 0.5)))
+    } else if sar >= 1.0 {
+        w = max(1, Int(floor(dw + 0.5)))
+    } else {
+        h = max(1, Int(floor(dh / sar + 0.5)))
+    }
+    if turned {
+        return (h, w)
+    }
+    (w, h)
+}
+
+// A converted frame: packed RGBA pixels, row by row.
+public struct Frame {
+    width: Int = 0
+    height: Int = 0
+    pixels: [Int] = []
+}

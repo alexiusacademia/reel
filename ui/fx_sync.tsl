@@ -1,0 +1,105 @@
+// The Synchronisation tab of the "Effects and Filters" window: the audio
+// delay, the subtitle delay and the secondary (top) subtitle delay, each
+// with a ± milliseconds stepper, a field to type a delay ("−120",
+// "+250 ms", "1.5 s") and Reset; and the playback speed (0.25× … 4×) with
+// a slider, a stepper, common speeds and a field.
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+public let fxSpeedChoices: [Float] = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0]
+
+public view SyncView(sync: bind SyncSettings, onChange: fn()) {
+    state speedDraft = ""
+    state speedError = ""
+
+    fn submitSpeed() {
+        if let s = fxParseSpeed(speedDraft) {
+            sync.speed = s
+            speedDraft = ""
+            speedError = ""
+            onChange()
+        } else {
+            speedError = "Type a speed from 0.25 to 4, like 1.5 or 150%."
+        }
+    }
+
+    fn pickSpeed(_ name: String) {
+        for s in fxSpeedChoices {
+            if fxSpeed(s) == name {
+                sync.speed = s
+            }
+        }
+        onChange()
+    }
+
+    VStack(spacing: 12, alignment: .leading) {
+        FxuSection(title: "Delays") {
+            Text("Positive values make it later, negative earlier.").font(size: 12).color(.secondary)
+            FxuDelayRow(label: "Audio", ms: sync.audioDelayMs, step: 50, onChange: onChange)
+            FxuDelayRow(label: "Subtitles", ms: sync.subtitleDelayMs, step: 100, onChange: onChange)
+            FxuDelayRow(label: "Second subtitles", ms: sync.secondarySubtitleDelayMs, step: 100, onChange: onChange)
+        }
+
+        FxuSection(title: "Playback speed") {
+            FxuSliderRow(label: "Speed", value: sync.speed, from: 0.25, to: 4, step: 0.05, text: fxSpeed(sync.speed), onChange: onChange)
+            FxuSegments(label: "Common", options: fxSpeedChoices.map { s in fxSpeed(s) }, selected: fxSpeed(sync.speed), onPick: pickSpeed)
+            HStack(spacing: 8) {
+                Text("Exact").frame(width: fxuLabelWidth, alignment: .leading)
+                Stepper(value: sync.speed, step: 0.05, from: 0.25, to: 4, decimals: 2) { onChange() }
+                    .accessibilityLabel("Speed")
+                    .frame(width: 150)
+                TextField("Type a speed", text: speedDraft)
+                    .onSubmit { submitSpeed() }
+                    .accessibilityLabel("Speed to set")
+                    .frame(width: 120)
+                Button("Set") { submitSpeed() }
+                Spacer()
+            }
+            if speedError != "" {
+                Text(speedError).font(size: 12).color(.red)
+            }
+        }
+    }
+}
+
+// One delay: label, stepper (ms), a field to type one, Reset.
+view FxuDelayRow(label: String, ms: bind Int, step: Int, onChange: fn()) {
+    state draft = ""
+    state bad = false
+
+    fn submit() {
+        if let v = fxParseMs(draft) {
+            ms = v
+            draft = ""
+            bad = false
+            onChange()
+        } else {
+            bad = draft.trim() != ""
+        }
+    }
+
+    VStack(spacing: 2, alignment: .leading) {
+        HStack(spacing: 8) {
+            Text(label).frame(width: fxuLabelWidth, alignment: .leading)
+            Stepper(value: ms, step: Float(step), from: -600000, to: 600000) { onChange() }
+                .accessibilityLabel("{label} delay in milliseconds")
+                .frame(width: 150)
+            Text("ms").color(.secondary)
+            TextField("Type a delay", text: draft)
+                .onSubmit { submit() }
+                .accessibilityLabel("{label} delay to set")
+                .frame(width: 120)
+            Button("Set") { submit() }
+            Button("Reset") {
+                ms = 0
+                onChange()
+            }
+            .disabled(ms == 0)
+            Spacer()
+        }
+        if bad {
+            Text("Type a delay like −120, +250 ms or 1.5 s.").font(size: 12).color(.red).padding(leading: fxuLabelWidth + 8.0)
+        }
+    }
+}

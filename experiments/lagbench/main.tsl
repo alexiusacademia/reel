@@ -1,0 +1,161 @@
+// Finds where playback of a long movie loses time: runs the player's
+// stages (parse, luma, chroma, convert) on stretches of a real file, batch
+// by batch as the app does, and prints how often each goes over a frame's
+// time; also times a background job's round trip with the movie's media.
+//
+//   tessel run experiments/lagbench -- <file> [boxW boxH]
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../../core"
+import "../../play"
+
+struct Stat {
+    name: String
+    ms: [Float] = []
+
+    fn line(_ budget: Float) -> String {
+        if ms.isEmpty {
+            return "{name}: none"
+        }
+        let s = ms.sorted()
+        var over = 0
+        var sum = 0.0
+        for v in ms {
+            sum += v
+            if v > budget {
+                over += 1
+            }
+        }
+        let p95 = s[min(s.count - 1, s.count * 95 / 100)]
+        "{name}: mean {fmt(sum / Float(ms.count))}  p95 {fmt(p95)}  max {fmt(s[s.count - 1])} ms per frame; over {fmt(budget)} ms: {over} of {ms.count} batches"
+    }
+}
+
+fn fmt(_ v: Float) -> String {
+    "{Int(v * 10.0) / 10}.{Int(v * 10.0) % 10}"
+}
+
+struct Trip {
+    waited: Float
+    work: Float
+}
+
+fn main() {
+    let args = arguments()
+    if args.isEmpty {
+        print("usage: lagbench <file> [boxW boxH]")
+        return
+    }
+    let path = args[0]
+    let boxW = if args.count > 2 { Int(args[1]) ?? 1920 } else { 1920 }
+    let boxH = if args.count > 2 { Int(args[2]) ?? 1080 } else { 1080 }
+    let src = match play.openSource(path) {
+        .ok(s) -> s
+        .failure(e) -> {
+            print("can't open: {e.message}")
+            return
+        }
+    }
+    let media = src.media
+    let file = src.file
+    let vt = media.tracks[src.video]
+    let fps = Float(max(vt.fpsNum, 1)) / Float(max(vt.fpsDen, 1))
+    let budget = 1000.0 / fps
+    print("read {Int(src.readMs)} ms, open {Int(src.openMs)} ms; {media.packets.count} packets; video {vt.codec} {vt.width}×{vt.height} {fmt(fps)} fps → {fmt(budget)} ms per frame")
+
+    trip(file, media, round: 0) {
+        bench(file, media, src.video, boxW, boxH, budget)
+    }
+}
+
+// Background round trips carrying the whole movie, as feed() does.
+fn trip(_ file: Data, _ media: core.Media, round: Int, then: fn()) {
+    let t0 = now()
+    background(work: { tripWork(file, media) }) { r in
+        print("background round trip with the movie's media: {fmt((now() - t0) * 1000.0)} ms (work {fmt(r.work)} ms)")
+        if round < 2 {
+            trip(file, media, round: round + 1, then: then)
+        } else {
+            then()
+        }
+    }
+}
+
+fn bench(_ file: Data, _ media: core.Media, _ video: Int, _ boxW: Int, _ boxH: Int, _ budget: Float) {
+    let vt = media.tracks[video]
+    let starts = [300.0, 1800.0, 3600.0, 6000.0]
+    var parse = Stat(name: "parse")
+    var luma = Stat(name: "luma")
+    var chroma = Stat(name: "chroma")
+    var conv = Stat(name: "convert")
+    var worst = Stat(name: "slowest stage")
+    for start in starts {
+        var st = match play.newStages(media, track: video) {
+            .ok(s) -> s
+            .failure(e) -> {
+                print("no stages: {e.message}")
+                return
+            }
+        }
+        var converter = play.newConverter(rotation: vt.rotation)
+        converter.boxW = boxW
+        converter.boxH = boxH
+        st.parser.seek(media, to: start)
+        var frames = 0
+        var segWorst = 0.0
+        var segWorstAt = 0.0
+        while frames < 300 && !st.parser.done {
+            let t0 = now()
+            let batch = st.parser.run(file, media, count: 3)
+            let t1 = now()
+            let lp = st.luma.run(batch)
+            let t2 = now()
+            let cp = if st.split { st.chroma.run(batch) } else { [] }
+            let t3 = now()
+            let pics = play.mergeStages(vt.codec, lp, cp)
+            var raws: [play.RawPicture] = []
+            for pic in pics {
+                raws.append(play.RawPicture(time: core.seconds(pic.pts, vt.timescale), picture: pic))
+            }
+            let t4 = now()
+            let out = converter.convert(raws)
+            let t5 = now()
+            let n = Float(max(pics.count, 1))
+            if pics.isEmpty {
+                continue
+            }
+            let a = (t1 - t0) * 1000.0 / n
+            let b = (t2 - t1) * 1000.0 / n
+            let c = (t3 - t2) * 1000.0 / n
+            let d = (t5 - t4) * 1000.0 / n
+            parse.ms.append(a)
+            luma.ms.append(b)
+            chroma.ms.append(c)
+            conv.ms.append(d)
+            let w = max(max(a, b), max(c, d))
+            worst.ms.append(w)
+            if w > segWorst {
+                segWorst = w
+                segWorstAt = raws[0].time
+            }
+            frames += out.count
+        }
+        print("from {Int(start / 60.0)}:00 — {frames} frames, slowest batch {fmt(segWorst)} ms per frame at {fmt(segWorstAt)} s")
+    }
+    print(parse.line(budget))
+    print(luma.line(budget))
+    print(chroma.line(budget))
+    print(conv.line(budget))
+    print(worst.line(budget))
+}
+
+fn tripWork(_ file: Data, _ media: core.Media) -> Trip {
+    let t0 = now()
+    var n = 0
+    for i in 0..min(media.packets.count, 1000) {
+        n += media.packets[i].size
+    }
+    Trip(waited: Float(n), work: (now() - t0) * 1000.0)
+}

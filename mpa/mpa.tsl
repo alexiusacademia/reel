@@ -1,0 +1,200 @@
+// MPEG-1/2/2.5 audio decoding, layers I, II and III ("mp1", "mp2", "mp3").
+//
+//   var d = try mpa.newDecoder(track)
+//   let s = d.decode(packetBytes, pts: p.pts)   // core.Samples
+//
+// A packet may hold one frame or several (or a frame and the start of an
+// ID3v1 tag); every whole frame in it is decoded. Layer III keeps its bit
+// reservoir between packets, so packets must come in order (call reset()
+// after a seek). An encoder's Xing/Info/VBRI frame decodes to nothing; its
+// LAME tag sets `delay` (encoder delay + the decoder's 529 samples, the
+// way ffmpeg trims) and `padding` (frames to drop at the very end).
+//
+// Layers I and II decode in fixed point and layer III in floating point,
+// following ffmpeg's default decoders for each, so Reel's output can be
+// compared with ffmpeg's: bit for bit for layers I/II, to rounding for III.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../core"
+
+public struct Decoder {
+    codec: String = "mp3"
+    rate: Int = 0
+    channels: Int = 0
+    layout: [String] = []
+    // Frames (instants) to drop at the start: the encoder's delay plus the
+    // decoder's own 529, when a LAME tag says (0 when unknown).
+    delay: Int = 0
+    // Frames to drop at the end (LAME tag padding minus 529), 0 when
+    // unknown.
+    padding: Int = 0
+    warnings: [String] = []
+    // The tag of the stream's first frame, when it had one.
+    tag: MpaTag = MpaTag()
+    hasTag: Bool = false
+    // Layer of the last frame decoded (0 before the first).
+    layer: Int = 0
+    bitrate: Int = 0
+    // MPEG frames decoded so far.
+    frames: Int = 0
+
+    synth: MpaSynth = MpaSynth()
+    l12: MpaLayer12 = MpaLayer12()
+    l3: MpaLayer3 = MpaLayer3()
+    seenFirst: Bool = false
+    packets: Int = 0
+
+    fn warn(_ s: String) {
+        if warnings.count < 100 {
+            warnings.append(s)
+        }
+    }
+
+    // Decodes the frames in a packet.
+    fn decode(_ packet: Data, pts: Int) -> core.Samples {
+        packets += 1
+        var data: [Float] = []
+        var at = 0
+        var nch = channels
+        let n = packet.count
+        while at + 4 <= n {
+            // Padding zeros, an ID3v1 or APE tag at the end of a stream.
+            if packet[at] == 0 {
+                at += 1
+                continue
+            }
+            if packet[at] == 0x54 && at + 3 <= n && packet.slice(from: at, to: at + 3).latin1 == "TAG" {
+                break
+            }
+            if packet[at] == 0x41 && at + 8 <= n && packet.slice(from: at, to: at + 8).latin1 == "APETAGEX" {
+                break
+            }
+            let hOpt = headerAt(packet, at)
+            if hOpt == nil {
+                // Lost sync: look for the next frame.
+                var next = at + 1
+                while next + 4 <= n && headerAt(packet, next) == nil {
+                    next += 1
+                }
+                if next + 4 > n {
+                    if at == 0 {
+                        warn("packet {packets}: no MPEG audio frame")
+                    }
+                    break
+                }
+                warn("packet {packets}: skipped {next - at} bytes of junk")
+                at = next
+                continue
+            }
+            let h = hOpt ?? MpaHeader()
+            if !seenFirst {
+                seenFirst = true
+                if let t = parseTag(packet.slice(from: at, to: min(at + h.frameSize, n))) {
+                    tag = t
+                    hasTag = true
+                    if t.encoderDelay >= 0 {
+                        delay = t.encoderDelay + 529
+                        padding = max(t.encoderPadding - 529, 0)
+                    }
+                    at += h.frameSize
+                    continue
+                }
+            }
+            if rate != h.rate || channels != h.channels {
+                if frames > 0 {
+                    warn("packet {packets}: stream changed to {h.rate} Hz, {h.channels} channels")
+                }
+                rate = h.rate
+                channels = h.channels
+                layout = core.defaultLayout(h.channels)
+            }
+            if !data.isEmpty && nch != h.channels {
+                // Can't mix channel counts in one Samples: stop here.
+                break
+            }
+            nch = h.channels
+            layer = h.layer
+            bitrate = h.bitrate
+            if at + h.frameSize > n {
+                warn("packet {packets}: frame cut short")
+            }
+            data += decodeFrame(h, packet, at)
+            frames += 1
+            at += h.frameSize
+        }
+        core.Samples(rate: rate, channels: max(nch, 1), data: data, layout: layout, pts: pts)
+    }
+
+    // One frame → its interleaved samples (silence when it's damaged).
+    fn decodeFrame(_ h: MpaHeader, _ d: Data, _ at: Int) -> [Float] {
+        let nch = h.channels
+        synth.prepare(h.samples * nch)
+        if h.layer == 3 {
+            let slots = l3.decode(h, d, at)
+            if l3.problem != "" {
+                warn("packet {packets}: {l3.problem}")
+            }
+            if slots == 0 {
+                return zeros(h.samples * nch)
+            }
+            for ch in 0..nch {
+                for t in 0..slots {
+                    synth.slotFloat(ch, l3.sb, ch * 1152 + t * 32, t * 32 * nch + ch, nch)
+                }
+            }
+        } else {
+            let slots = l12.decode(h, d, at)
+            if slots == 0 {
+                warn("packet {packets}: damaged layer {h.layer} frame")
+                return zeros(h.samples * nch)
+            }
+            for ch in 0..nch {
+                for t in 0..slots {
+                    synth.slotFixed(ch, l12.sb, ch * 1152 + t * 32, t * 32 * nch + ch, nch)
+                }
+            }
+        }
+        synth.out
+    }
+
+    fn zeros(_ n: Int) -> [Float] {
+        var out: [Float] = []
+        for _ in 0..n {
+            out.append(0.0)
+        }
+        out
+    }
+
+    // MPEG audio holds nothing back: there is nothing to flush.
+    fn flush() -> core.Samples {
+        core.Samples(rate: rate, channels: max(channels, 1), layout: layout)
+    }
+
+    // After a seek: forget the reservoir, overlap and filter history.
+    fn reset() {
+        synth.clear()
+        l3.clear()
+        // The first frame after a seek is audio, not a tag.
+        seenFirst = true
+    }
+}
+
+// A decoder for an "mp3", "mp2" or "mp1" track (any layer decodes with
+// any of them; the stream's headers decide).
+public fn newDecoder(_ track: core.Track) -> Result<Decoder> {
+    if track.codec != "mp3" && track.codec != "mp2" && track.codec != "mp1" {
+        return .failure(error: Error("mpa can't decode \"{track.codec}\""))
+    }
+    var d = Decoder(codec: track.codec)
+    d.rate = track.sampleRate
+    d.channels = track.channels
+    if d.channels > 0 {
+        d.layout = core.defaultLayout(d.channels)
+    }
+    d.synth.setup()
+    d.l12.setup()
+    d.l3.setup()
+    Result.ok(value: d)
+}

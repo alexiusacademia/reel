@@ -1,0 +1,283 @@
+// The tempo stretcher of the render module: plays sound faster or slower
+// without changing its pitch, for the player's speed menu (0.25× to 4×).
+//
+// WSOLA (waveform-similarity overlap-add; Verhelst & Roelands, ICASSP
+// 1993): the output is built from frames of N input samples (40 ms),
+// Hann-windowed and overlapped by half (hop H = N/2), so that the windows
+// add up to exactly 1. Output frame k is centred at output time k·H and
+// should show input centred at time Σ H·speed. Instead of taking that
+// input exactly, the frame may start up to ±Δ (12 ms) away, where its
+// first half best matches the "natural continuation" of the previous
+// frame (the input that followed it), by normalised cross-correlation.
+// That keeps the waveform's periods in phase across the joins, so tones
+// keep their pitch with no phasing. When the natural continuation is the
+// nominal frame (speed 1) no search is made and the output equals the input.
+//
+// The search runs on a mono mix, first every 4th lag over every 4th
+// sample, then every lag around the best one over every 2nd sample.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../core"
+
+public struct Stretcher {
+    channels: Int
+    rate: Int
+    speed: Float = 1.0
+    // Frame length N, hop H = N/2, search radius Δ (frames).
+    frameLen: Int = 0
+    hop: Int = 0
+    radius: Int = 0
+    window: [Float] = []
+    // Input not yet used (interleaved); inStart is the input frame index
+    // of its first frame (negative at first: zeros before the start).
+    inBuf: [Float] = []
+    inStart: Int = 0
+    inEnd: Int = 0
+    // Centre of the next frame's nominal input, in input frames.
+    centre: Float = 0.0
+    // Where the previous frame started, once there is one.
+    prevStart: Int = 0
+    hasPrev: Bool = false
+    // The overlap-add accumulator (N frames, interleaved).
+    acc: [Float] = []
+    // Output frames still to drop (the first half frame is before time 0),
+    // frames given out, and (while flushing) how many to give in all.
+    skip: Int = 0
+    target: Int = 0
+    given: Int = 0
+    lastPts: Int = -9223372036854775807
+
+    // Input frames received but not yet shown in the output given out
+    // (about 30–60 ms): the player's audio clock lags by this much input.
+    // A speed change applies to the output made after it, so to these
+    // frames too.
+    latency: Int {
+        if frameLen == 0 {
+            return 0
+        }
+        if hasPrev {
+            return max(0, inEnd - Int(floor(centre - Float(hop) * speed + 0.5)))
+        }
+        inEnd
+    }
+
+    // Sets the tempo: 0.25 to 4.0 (2.0 plays twice as fast).
+    fn setSpeed(_ s: Float) {
+        speed = max(0.25, min(s, 4.0))
+    }
+
+    fn ensureSetup() {
+        if frameLen > 0 {
+            return
+        }
+        hop = max(16, Int(Float(rate) * 0.020))
+        frameLen = 2 * hop
+        radius = max(8, Int(Float(rate) * 0.012))
+        window = []
+        // Periodic Hann: w[n] + w[n + H] = 1.
+        for n in 0..frameLen {
+            window.append(0.5 - 0.5 * cos(2.0 * pi * Float(n) / Float(frameLen)))
+        }
+        // History of zeros before the first input: enough for the first
+        // frame (which starts at −H) and its search.
+        let pad = hop + radius + frameLen
+        inBuf = []
+        for _ in 0..(pad * channels) {
+            inBuf.append(0.0)
+        }
+        inStart = -pad
+        inEnd = 0
+        acc = []
+        for _ in 0..(frameLen * channels) {
+            acc.append(0.0)
+        }
+        centre = 0.0
+        prevStart = 0
+        hasPrev = false
+        skip = hop
+        target = 0
+        given = 0
+    }
+
+    // The block at the current speed (may be shorter or empty: the
+    // stretcher holds about 60 ms back).
+    fn process(_ s: core.Samples) -> core.Samples {
+        ensureSetup()
+        lastPts = s.pts
+        var out = core.Samples(rate: rate, channels: channels, layout: s.layout, pts: s.pts)
+        if s.channels != channels || s.data.isEmpty {
+            return out
+        }
+        inBuf.appendAll(s.data)
+        let frames = s.data.count / channels
+        inEnd += frames
+        out.data = run(false)
+        out
+    }
+
+    // The rest of the output at the end of the stream.
+    fn flush() -> core.Samples {
+        ensureSetup()
+        var out = core.Samples(rate: rate, channels: channels, layout: core.defaultLayout(channels))
+        // The output given so far ends at the centre of the last frame,
+        // which showed input centre − H·speed; the rest of the input, at
+        // the current speed, makes the rest of the output.
+        if hasPrev {
+            let shown = centre - Float(hop) * speed
+            target = given + max(0, Int(floor((Float(inEnd) - shown) / speed + 0.5)))
+        } else {
+            target = Int(floor(Float(inEnd) / speed + 0.5))
+        }
+        // Zeros past the end, so the last frames can be made.
+        for _ in 0..((frameLen * 5 + radius * 2 + 4 * Int(Float(frameLen) * speed)) * channels) {
+            inBuf.append(0.0)
+        }
+        out.data = run(true)
+        out
+    }
+
+    // Forgets everything (after a seek); the speed stays.
+    fn reset() {
+        frameLen = 0
+    }
+
+    // The input sample (frame f, channel c), 0 outside what's held.
+    fn sample(_ f: Int, _ c: Int) -> Float {
+        let i = (f - inStart) * channels + c
+        if i < 0 || i >= inBuf.count {
+            return 0.0
+        }
+        inBuf[i]
+    }
+
+    // Normalised correlation of the candidate frame starting at `start`
+    // with the natural continuation starting at `natural`, over the first
+    // half frame, every `step` samples.
+    fn similarity(_ start: Int, _ natural: Int, _ step: Int) -> Float {
+        let c = channels
+        let a0 = (natural - inStart) * c
+        let b0 = (start - inStart) * c
+        let buf = inBuf
+        var cross = 0.0
+        var energy = 1e-9
+        var n = 0
+        while n < hop {
+            var a = 0.0
+            var b = 0.0
+            let ia = a0 + n * c
+            let ib = b0 + n * c
+            for ch in 0..c {
+                a += buf[ia + ch]
+                b += buf[ib + ch]
+            }
+            cross += a * b
+            energy += b * b
+            n += step
+        }
+        cross / sqrt(energy)
+    }
+
+    // Makes frames while the input they need is here.
+    fn run(_ final: Bool) -> [Float] {
+        let c = channels
+        var out: [Float] = []
+        let available = inStart + inBuf.count / c
+        while true {
+            if final && given >= target {
+                break
+            }
+            let nominal = Int(floor(centre + 0.5)) - hop
+            let natural = if hasPrev { prevStart + hop } else { nominal }
+            let searching = hasPrev && natural != nominal
+            let need = if searching { max(nominal + radius, natural) + frameLen } else { nominal + frameLen }
+            if need > available {
+                break
+            }
+            var chosen = nominal
+            if searching {
+                // Candidates must lie in the held input.
+                let lo = max(nominal - radius, inStart)
+                let hi = nominal + radius
+                var best = nominal
+                var bestScore = -1e300
+                var d = lo
+                while d <= hi {
+                    let sc = similarity(d, natural, 4)
+                    if sc > bestScore {
+                        bestScore = sc
+                        best = d
+                    }
+                    d += 4
+                }
+                let lo2 = max(best - 3, lo)
+                let hi2 = min(best + 3, hi)
+                d = lo2
+                bestScore = -1e300
+                var best2 = best
+                while d <= hi2 {
+                    let sc = similarity(d, natural, 2)
+                    if sc > bestScore {
+                        bestScore = sc
+                        best2 = d
+                    }
+                    d += 1
+                }
+                chosen = best2
+            }
+            // Overlap-add the windowed frame, then give out the first hop
+            // (complete now) and move the accumulator along.
+            let base = (chosen - inStart) * c
+            let buf = inBuf
+            var n = 0
+            while n < frameLen {
+                let wv = window[n]
+                let o = n * c
+                for ch in 0..c {
+                    acc[o + ch] += wv * buf[base + o + ch]
+                }
+                n += 1
+            }
+            var f = 0
+            while f < hop {
+                if skip > 0 {
+                    skip -= 1
+                } else if !final || given < target {
+                    for ch in 0..c {
+                        out.append(acc[f * c + ch])
+                    }
+                    given += 1
+                }
+                f += 1
+            }
+            let keep = (frameLen - hop) * c
+            var i = 0
+            while i < keep {
+                acc[i] = acc[i + hop * c]
+                i += 1
+            }
+            while i < frameLen * c {
+                acc[i] = 0.0
+                i += 1
+            }
+            prevStart = chosen
+            hasPrev = true
+            centre += Float(hop) * speed
+        }
+        // Drop input no later frame needs.
+        let nextNominal = Int(floor(centre + 0.5)) - hop
+        let keepFrom = min(nextNominal - radius, prevStart + hop) - 4
+        let drop = keepFrom - inStart
+        if drop > 8192 && drop * c < inBuf.count {
+            inBuf = inBuf.slice(from: drop * c, to: inBuf.count)
+            inStart = keepFrom
+        }
+        out
+    }
+}
+
+// A stretcher for sound with that many channels at that rate.
+public fn newStretcher(channels: Int, rate: Int) -> Stretcher {
+    Stretcher(channels: max(1, channels), rate: max(1, rate))
+}

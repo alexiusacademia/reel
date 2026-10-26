@@ -1,0 +1,562 @@
+{
+ "format": "mpegts",
+ "duration": 1.010056,
+ "tags": {},
+ "tracks": [
+  {
+   "index": 0,
+   "kind": "video",
+   "codec": "h264",
+   "ffCodec": "h264",
+   "profile": "High",
+   "timescale": 90000,
+   "duration": 90000,
+   "extraHex": "0000016764000aacd94626c044000003000400000300c83c4896580000000168ebe3cb22c0",
+   "width": 96,
+   "height": 64,
+   "sarNum": 1,
+   "sarDen": 1,
+   "fpsNum": 25,
+   "fpsDen": 1,
+   "rotation": 0,
+   "pixFmt": "yuv420p",
+   "sampleRate": 0,
+   "channels": 0,
+   "channelLayout": "",
+   "bitsPerSample": 8,
+   "pcm": {
+    "bits": 16,
+    "float": false,
+    "bigEndian": false,
+    "signed": true
+   },
+   "language": "",
+   "title": "",
+   "isDefault": false,
+   "isCover": false,
+   "frames": -1
+  },
+  {
+   "index": 1,
+   "kind": "audio",
+   "codec": "ac3",
+   "ffCodec": "ac3",
+   "profile": "",
+   "timescale": 90000,
+   "duration": 90905,
+   "extraHex": "",
+   "width": 0,
+   "height": 0,
+   "sarNum": 1,
+   "sarDen": 1,
+   "fpsNum": 0,
+   "fpsDen": 0,
+   "rotation": 0,
+   "pixFmt": "",
+   "sampleRate": 44100,
+   "channels": 1,
+   "channelLayout": "mono",
+   "bitsPerSample": 0,
+   "pcm": {
+    "bits": 16,
+    "float": false,
+    "bigEndian": false,
+    "signed": true
+   },
+   "language": "",
+   "title": "",
+   "isDefault": false,
+   "isCover": false,
+   "frames": -1
+  }
+ ],
+ "packets": [
+  {
+   "track": 0,
+   "pts": 133200,
+   "dts": 126000,
+   "duration": 3600,
+   "key": true,
+   "pos": 576,
+   "size": 2194
+  },
+  {
+   "track": 0,
+   "pts": 147600,
+   "dts": 129600,
+   "duration": 3600,
+   "key": false,
+   "pos": 3072,
+   "size": 613
+  },
+  {
+   "track": 0,
+   "pts": 140400,
+   "dts": 133200,
+   "duration": 3600,
+   "key": false,
+   "pos": 3840,
+   "size": 160
+  },
+  {
+   "track": 0,
+   "pts": 136800,
+   "dts": 136800,
+   "duration": 3600,
+   "key": false,
+   "pos": 4608,
+   "size": 152
+  },
+  {
+   "track": 0,
+   "pts": 144000,
+   "dts": 140400,
+   "duration": 3600,
+   "key": false,
+   "pos": 4800,
+   "size": 129
+  },
+  {
+   "track": 0,
+   "pts": 158400,
+   "dts": 144000,
+   "duration": 3600,
+   "key": false,
+   "pos": 4992,
+   "size": 421
+  },
+  {
+   "track": 1,
+   "pts": 132678,
+   "dts": 132678,
+   "duration": 3134,
+   "key": true,
+   "pos": 6528,
+   "size": 416
+  },
+  {
+   "track": 1,
+   "pts": 135812,
+   "dts": 135812,
+   "duration": 3134,
+   "key": true,
+   "pos": -1,
+   "size": 418
+  },
+  {
+   "track": 1,
+   "pts": 138946,
+   "dts": 138946,
+   "duration": 3134,
+   "key": true,
+   "pos": -1,
+   "size": 418
+  },
+  {
+   "track": 1,
+   "pts": 142080,
+   "dts": 142080,
+   "duration": 3134,
+   "key": true,
+   "pos": -1,
+   "size": 418
+  },
+  {
+   "track": 1,
+   "pts": 145214,
+   "dts": 145214,
+   "duration": 3134,
+   "key": true,
+   "pos": -1,
+   "size": 418
+  },
+  {
+   "track": 1,
+   "pts": 148348,
+   "dts": 148348,
+   "duration": 3134,
+   "key": true,
+   "pos": -1,
+   "size": 418
+  },
+  {
+   "track": 0,
+   "pts": 151200,
+   "dts": 147600,
+   "duration": 3600,
+   "key": false,
+   "pos": 5952,
+   "size": 140
+  },
+  {
+   "track": 0,
+   "pts": 154800,
+   "dts": 151200,
+   "duration": 3600,
+   "key": false,
+   "pos": 6144,
+   "size": 177
+  },
+  {
+   "track": 0,
+   "pts": 169200,
+   "dts": 154800,
+   "duration": 3600,
+   "key": false,
+   "pos": 9600,
+   "size": 638
+  },
+  {
+   "track": 0,
+   "pts": 162000,
+   "dts": 158400,
+   "duration": 3600,
+   "key": false,
+   "pos": 10752,
+   "size": 218
+  },
+  {
+   "track": 0,
+   "pts": 165600,
+   "dts": 162000,
+   "duration": 3600,
+   "key": false,
+   "pos": 11136,
+   "size": 133
+  },
+  {
+   "track": 0,
+   "pts": 180000,
+   "dts": 165600,
+   "duration": 3600,
+   "key": false,
+   "pos": 11328,
+   "size": 370
+  },
+  {
+   "track": 0,
+   "pts": 172800,
+   "dts": 169200,
+   "duration": 3600,
+   "key": false,
+   "pos": 12288,
+   "size": 196
+  },
+  {
+   "track": 1,
+   "pts": 151482,
+   "dts": 151482,
+   "duration": 3134,
+   "key": true,
+   "pos": -1,
+   "size": 418
+  },
+  {
+   "track": 1,
+   "pts": 154620,
+   "dts": 154620,
+   "duration": 3134,
+   "key": true,
+   "pos": 13824,
+   "size": 418
+  },
+  {
+   "track": 1,
+   "pts": 157754,
+   "dts": 157754,
+   "duration": 3134,
+   "key": true,
+   "pos": -1,
+   "size": 418
+  },
+  {
+   "track": 1,
+   "pts": 160888,
+   "dts": 160888,
+   "duration": 3134,
+   "key": true,
+   "pos": -1,
+   "size": 418
+  },
+  {
+   "track": 1,
+   "pts": 164022,
+   "dts": 164022,
+   "duration": 3134,
+   "key": true,
+   "pos": -1,
+   "size": 418
+  },
+  {
+   "track": 1,
+   "pts": 167156,
+   "dts": 167156,
+   "duration": 3134,
+   "key": true,
+   "pos": -1,
+   "size": 418
+  },
+  {
+   "track": 1,
+   "pts": 170290,
+   "dts": 170290,
+   "duration": 3134,
+   "key": true,
+   "pos": -1,
+   "size": 418
+  },
+  {
+   "track": 0,
+   "pts": 176400,
+   "dts": 172800,
+   "duration": 3600,
+   "key": false,
+   "pos": 12864,
+   "size": 101
+  },
+  {
+   "track": 0,
+   "pts": 194400,
+   "dts": 176400,
+   "duration": 3600,
+   "key": false,
+   "pos": 13056,
+   "size": 527
+  },
+  {
+   "track": 0,
+   "pts": 187200,
+   "dts": 180000,
+   "duration": 3600,
+   "key": false,
+   "pos": 17472,
+   "size": 158
+  },
+  {
+   "track": 0,
+   "pts": 183600,
+   "dts": 183600,
+   "duration": 3600,
+   "key": false,
+   "pos": 17664,
+   "size": 163
+  },
+  {
+   "track": 0,
+   "pts": 190800,
+   "dts": 187200,
+   "duration": 3600,
+   "key": false,
+   "pos": 18048,
+   "size": 208
+  },
+  {
+   "track": 0,
+   "pts": 208800,
+   "dts": 190800,
+   "duration": 3600,
+   "key": false,
+   "pos": 18816,
+   "size": 565
+  },
+  {
+   "track": 1,
+   "pts": 173424,
+   "dts": 173424,
+   "duration": 3134,
+   "key": true,
+   "pos": -1,
+   "size": 418
+  },
+  {
+   "track": 1,
+   "pts": 176563,
+   "dts": 176563,
+   "duration": 3134,
+   "key": true,
+   "pos": 20160,
+   "size": 418
+  },
+  {
+   "track": 1,
+   "pts": 179697,
+   "dts": 179697,
+   "duration": 3134,
+   "key": true,
+   "pos": -1,
+   "size": 418
+  },
+  {
+   "track": 1,
+   "pts": 182831,
+   "dts": 182831,
+   "duration": 3134,
+   "key": true,
+   "pos": -1,
+   "size": 418
+  },
+  {
+   "track": 1,
+   "pts": 185965,
+   "dts": 185965,
+   "duration": 3134,
+   "key": true,
+   "pos": -1,
+   "size": 418
+  },
+  {
+   "track": 1,
+   "pts": 189099,
+   "dts": 189099,
+   "duration": 3134,
+   "key": true,
+   "pos": -1,
+   "size": 418
+  },
+  {
+   "track": 1,
+   "pts": 192233,
+   "dts": 192233,
+   "duration": 3134,
+   "key": true,
+   "pos": -1,
+   "size": 418
+  },
+  {
+   "track": 0,
+   "pts": 201600,
+   "dts": 194400,
+   "duration": 3600,
+   "key": false,
+   "pos": 19584,
+   "size": 222
+  },
+  {
+   "track": 0,
+   "pts": 198000,
+   "dts": 198000,
+   "duration": 3600,
+   "key": false,
+   "pos": 19968,
+   "size": 157
+  },
+  {
+   "track": 0,
+   "pts": 205200,
+   "dts": 201600,
+   "duration": 3600,
+   "key": false,
+   "pos": 23808,
+   "size": 203
+  },
+  {
+   "track": 0,
+   "pts": 219600,
+   "dts": 205200,
+   "duration": 3600,
+   "key": false,
+   "pos": 24192,
+   "size": 418
+  },
+  {
+   "track": 1,
+   "pts": 195367,
+   "dts": 195367,
+   "duration": 3134,
+   "key": true,
+   "pos": -1,
+   "size": 418
+  },
+  {
+   "track": 1,
+   "pts": 198506,
+   "dts": 198506,
+   "duration": 3134,
+   "key": true,
+   "pos": 25728,
+   "size": 418
+  },
+  {
+   "track": 1,
+   "pts": 201640,
+   "dts": 201640,
+   "duration": 3134,
+   "key": true,
+   "pos": -1,
+   "size": 418
+  },
+  {
+   "track": 1,
+   "pts": 204774,
+   "dts": 204774,
+   "duration": 3134,
+   "key": true,
+   "pos": -1,
+   "size": 418
+  },
+  {
+   "track": 1,
+   "pts": 207908,
+   "dts": 207908,
+   "duration": 3134,
+   "key": true,
+   "pos": -1,
+   "size": 418
+  },
+  {
+   "track": 1,
+   "pts": 211042,
+   "dts": 211042,
+   "duration": 3134,
+   "key": true,
+   "pos": -1,
+   "size": 418
+  },
+  {
+   "track": 1,
+   "pts": 214176,
+   "dts": 214176,
+   "duration": 3134,
+   "key": true,
+   "pos": -1,
+   "size": 418
+  },
+  {
+   "track": 1,
+   "pts": 217310,
+   "dts": 217310,
+   "duration": 3134,
+   "key": true,
+   "pos": -1,
+   "size": 418
+  },
+  {
+   "track": 0,
+   "pts": 212400,
+   "dts": 208800,
+   "duration": 3600,
+   "key": false,
+   "pos": 24768,
+   "size": 159
+  },
+  {
+   "track": 0,
+   "pts": 216000,
+   "dts": 212400,
+   "duration": 3600,
+   "key": false,
+   "pos": 25344,
+   "size": 169
+  },
+  {
+   "track": 1,
+   "pts": 220449,
+   "dts": 220449,
+   "duration": 3134,
+   "key": true,
+   "pos": 29184,
+   "size": 418
+  }
+ ],
+ "chapters": []
+}

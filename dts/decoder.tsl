@@ -1,0 +1,524 @@
+// The DTS decoder: core (Coherent Acoustics) with its XCh, XXCH, X96 and
+// XBR extensions, and DTS-HD Master Audio lossless (XLL). Packets are one
+// core frame followed by its extension substream (or a substream alone),
+// in any of the four stream forms (header.tsl); a packet may also hold
+// several frames.
+//
+// Which output a frame gives (as FFmpeg's dcadec.c decides):
+// - XLL present: the lossless channel sets, with the core's fixed point
+//   output added to residual coded channels. Bit-exact, 16 or 24 bits.
+// - otherwise the core with its extensions, filtered in floating point
+//   (fixed point when the asset announces XLL that couldn't be used).
+//
+// Output channels are in WAV order (FL FR FC LFE BL BR FLC FRC BC SL SR
+// TC TFL TFC TFR TBL TBC TBR); DTS's surround pair Ls/Rs is SL/SR, its
+// rear pair Lsr/Rsr BL/BR, the rear centre Cs BC.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../core"
+
+let dtsPacketCore = 0x01
+let dtsPacketExss = 0x02
+let dtsPacketXll = 0x04
+let dtsPacketLbr = 0x08
+let dtsPacketRecovery = 0x10
+let dtsPacketResidual = 0x20
+
+// WAV channel (0…17) of each DTS speaker (FFmpeg's dca2wav_norm), and the
+// variant used for the "wide" 7.0/7.1 layouts.
+let dtsToWavNorm: [Int] = [2, 0, 1, 9, 10, 3, 8, 4, 5, 9, 10, 6, 7, 12, 13, 14, 3, 6, 7, 11, 12, 14, 16, 15, 17, 8, 4, 5]
+let dtsToWavWide: [Int] = [2, 0, 1, 4, 5, 3, 8, 4, 5, 9, 10, 6, 7, 12, 13, 14, 3, 9, 10, 11, 12, 14, 16, 15, 17, 8, 4, 5]
+let dtsWavNames: [String] = ["FL", "FR", "FC", "LFE", "BL", "BR", "FLC", "FRC", "BC", "SL", "SR", "TC", "TFL", "TFC", "TFR", "TBL", "TBC", "TBR"]
+
+// The DTS speakers of a speaker mask in WAV order, each WAV channel once
+// (ff_dca_set_channel_layout), and their WAV names.
+public fn dtsWavOrder(_ mask: Int) -> [Int] {
+    let table = if mask == 0x6001f || mask == 0x6003f { dtsToWavWide } else { dtsToWavNorm }
+    var wavMap = core.filled(18, -1)
+    for spkr in 0..28 {
+        if (mask & (1 << spkr)) != 0 {
+            let w = table[spkr]
+            if wavMap[w] < 0 {
+                wavMap[w] = spkr
+            }
+        }
+    }
+    var out: [Int] = []
+    for w in 0..18 {
+        if wavMap[w] >= 0 {
+            out.append(wavMap[w])
+        }
+    }
+    out
+}
+
+public fn dtsWavLayout(_ mask: Int) -> [String] {
+    let table = if mask == 0x6001f || mask == 0x6003f { dtsToWavWide } else { dtsToWavNorm }
+    var names: [String] = []
+    for spkr in dtsWavOrder(mask) {
+        names.append(dtsWavNames[table[spkr]])
+    }
+    names
+}
+
+public struct Decoder {
+    // Output format, from the track when it says, else from each frame.
+    rate: Int = 0
+    channels: Int = 0
+    layout: [String] = []
+    // DTS needs no priming dropped: the first frame's samples are audio.
+    delay: Int = 0
+    warnings: [String] = []
+    // Bits per sample of the source (16 or 24 for lossless output, 0
+    // for the lossy core's float output).
+    bits: Int = 0
+    // "DTS", "DTS-ES", "DTS 96/24", "DTS-HD HRA", "DTS-HD MA" for the
+    // last frame decoded.
+    profile: String = ""
+    // Frames decoded and frames that were damaged.
+    frames: Int = 0
+    damaged: Int = 0
+
+    dcore: DtsCore = DtsCore()
+    xll: DtsXll = DtsXll()
+    packetFlags: Int = 0
+    prevPacket: Int = 0
+    outBuf: [Float] = []
+    warned: [String] = []
+
+    fn warn(_ text: String) {
+        if warnings.count < 100 {
+            warnings.append(text)
+        }
+    }
+
+    fn warnOnce(_ text: String) {
+        if !warned.contains(text) {
+            warned.append(text)
+            warn(text)
+        }
+    }
+
+    // Decodes one packet: one frame normally, or several. A damaged frame
+    // gives silence (when its length is known) and a warning.
+    fn decode(_ packet: Data, pts: Int) -> core.Samples {
+        outBuf = []
+        // A frame cut off at the end of the last packet continues here when
+        // packets don't follow frames (DTS in WAV); a packet that starts
+        // with a sync word starts afresh.
+        var data = packet
+        if !pending.isEmpty {
+            if dtsSyncForm(packet, at: 0) >= 0 {
+                warn("dropped an incomplete frame of {pending.count} bytes")
+            } else {
+                data = pending + packet
+            }
+            pending = Data()
+        }
+        var at = 0
+        var skippedTotal = 0
+        while at + 16 <= data.count {
+            let form = dtsSyncForm(data, at: at)
+            if form < 0 {
+                let next = dtsFindAnySync(data, at + 1)
+                if next < 0 {
+                    skippedTotal += data.count - at
+                    break
+                }
+                skippedTotal += next - at
+                at = next
+                continue
+            }
+            // The frame's extent in the stream's own form.
+            let info = frameInfo(data, at: at)
+            if !info.ok {
+                let next = dtsFindAnySync(data, at + 1)
+                if next < 0 {
+                    skippedTotal += data.count - at
+                    break
+                }
+                skippedTotal += next - at
+                at = next
+                continue
+            }
+            var len = info.size
+            if form == dtsFormBE14 || form == dtsFormLE14 {
+                // The size is an estimate: the next sync word ends the frame.
+                var k = max(at + 2, at + len - 8)
+                var found = -1
+                while k <= at + len + 64 && k + 4 <= data.count {
+                    if dtsSyncForm(data, at: k) == form {
+                        found = k
+                        break
+                    }
+                    k += 2
+                }
+                if found > 0 {
+                    len = found - at
+                } else if data.count - at >= len {
+                    len = data.count - at
+                }
+            }
+            if at + len > data.count {
+                pending = data.slice(from: at, to: data.count)
+                break
+            }
+            if form == dtsFormBE16 || form == dtsFormSubstream {
+                decodeFrame(data, at)
+            } else {
+                warnOnce(if form == dtsFormLE16 { "16-bit little-endian DTS" } else { "14-bit DTS" })
+                decodeFrame(dtsToBigEndian(data, from: at, to: at + len, form: form), 0)
+            }
+            at += max(len, 1)
+        }
+        if skippedTotal > 0 {
+            warn("skipped {skippedTotal} bytes that are not DTS frames")
+        }
+        makeSamples(pts)
+    }
+    pending: Data = Data()
+
+    fn makeSamples(_ pts: Int) -> core.Samples {
+        var s = core.Samples(rate: rate, channels: channels, layout: layout, pts: pts)
+        s.data = outBuf
+        outBuf = []
+        s
+    }
+
+    // Nothing is held back between frames (an incomplete frame left over
+    // from the last packet is dropped).
+    fn flush() -> core.Samples {
+        if !pending.isEmpty {
+            warn("dropped an incomplete frame of {pending.count} bytes at the end")
+            pending = Data()
+        }
+        core.Samples(rate: rate, channels: channels, layout: layout)
+    }
+
+    // After a seek: drop the filter, prediction and smoothing state.
+    fn reset() {
+        pending = Data()
+        dcore.flushState()
+        xll.flushState()
+        prevPacket = prevPacket & 0x0f
+    }
+
+    // One frame at data[at…] (big-endian form): returns the bytes used.
+    fn decodeFrame(_ data: Data, _ at: Int) -> Int {
+        let info = frameInfo(data, at: at)
+        var end = data.count
+        if info.ok && info.size > 0 {
+            end = min(data.count, at + info.size)
+        }
+        packetFlags = 0
+        var exssAt = at
+        var asset = DtsAsset()
+        frames += 1
+        if dtsSyncForm(data, at: at) == dtsFormBE16 {
+            if dcore.parse(data, from: at, to: end) < 0 {
+                warn("damaged core frame: {dcore.error}")
+                damaged += 1
+                if info.ok {
+                    silence(info)
+                    return max(end - at, 1)
+                }
+                return 0
+            }
+            packetFlags = packetFlags | dtsPacketCore
+            let fs = (dcore.frameSize + 3) & ~3
+            if (end - at) - 4 > fs {
+                exssAt = at + fs
+            }
+        }
+        if dtsSyncForm(data, at: exssAt) == dtsFormSubstream {
+            let x = dtsParseExss(data, at: exssAt, end: end)
+            if x.ok {
+                packetFlags = packetFlags | dtsPacketExss
+                asset = x.asset
+                if (packetFlags & dtsPacketCore) == 0 {
+                    end = min(data.count, exssAt + x.size)
+                }
+            } else {
+                warnOnce("extension substream: {x.problem}")
+            }
+        }
+        if asset.ok && (asset.extensionMask & dtsExssXll) != 0 {
+            let r = xll.parse(data, exss: exssAt, asset: asset)
+            if r == dtsErrAgain {
+                if (prevPacket & dtsPacketXll) != 0 && (packetFlags & dtsPacketCore) != 0 {
+                    packetFlags = packetFlags | dtsPacketXll | dtsPacketRecovery
+                }
+            } else if r < 0 {
+                warn("XLL: {xll.error}")
+            } else {
+                packetFlags = packetFlags | dtsPacketXll
+                if xll.bandWarnings > 0 {
+                    warn("XLL: {xll.bandWarnings} damaged band segments")
+                }
+            }
+        }
+        if asset.ok && (asset.extensionMask & dtsExssLbr) != 0 {
+            warnOnce("DTS Express (LBR) audio is not supported")
+        }
+        if (packetFlags & dtsPacketCore) != 0 {
+            let problem = dcore.parseExtensions(data, exss: exssAt, asset: asset, xll: (packetFlags & dtsPacketXll) != 0)
+            if !problem.isEmpty {
+                warn("core extension: {problem}")
+            }
+        }
+        var ok = false
+        if (packetFlags & dtsPacketXll) != 0 {
+            ok = filterXll(asset)
+        } else if (packetFlags & dtsPacketCore) != 0 {
+            ok = filterCore(asset)
+        } else {
+            warn("no decodable DTS substream (core or lossless) in the frame")
+        }
+        if !ok {
+            damaged += 1
+            if info.ok {
+                silence(info)
+            }
+        }
+        prevPacket = packetFlags
+        max(end - at, 1)
+    }
+
+    fn filterXll(_ asset: DtsAsset) -> Bool {
+        let haveCore = (packetFlags & dtsPacketCore) != 0
+        if haveCore {
+            var x96 = -1
+            if xll.freq[0] == 96000 && dcore.sampleRate == 48000 {
+                x96 = 1
+            }
+            if dcore.filterFixed(x96) < 0 {
+                warn("core: {dcore.error}")
+                return false
+            }
+            if (prevPacket & dtsPacketResidual) == 0 && xll.nreschsets > 0 && xll.nchsets > 1 {
+                packetFlags = packetFlags | dtsPacketRecovery
+            }
+            packetFlags = packetFlags | dtsPacketResidual
+        }
+        var coreMap = core.filled(32, -1)
+        if haveCore {
+            for spkr in 0..28 {
+                coreMap[spkr] = dcore.mapSpkr(spkr)
+            }
+        }
+        let r = xll.filterFrame(recovery: (packetFlags & dtsPacketRecovery) != 0, pcm: dcore.syn.pcmX, coreMap: coreMap, coreRate: dcore.outputRate, coreSamples: dcore.npcmsamples, haveCore: haveCore)
+        if r < 0 {
+            warn("XLL: {xll.error}")
+            if !haveCore || r != dtsErrInvalid {
+                return false
+            }
+            // Fall back to the lossy core (already filtered in fixed point).
+            if dcore.finishFixed() < 0 {
+                return false
+            }
+            outputFixedCore()
+            return true
+        }
+        // Lossless output.
+        let mask = xll.outputMask
+        let order = dtsWavOrder(mask)
+        setFormat(xll.outputRate, dtsWavLayout(mask))
+        let ns = xll.outputSamples
+        let nc = order.count
+        let storage = xll.storageBitRes[0]
+        bits = storage
+        profile = if xll.xImaxSyncword { "DTS-HD MA + DTS:X IMAX" } else if xll.xSyncword { "DTS-HD MA + DTS:X" } else { "DTS-HD MA" }
+        var out = dtsFloatList(ns * nc)
+        if storage == 16 {
+            let shift = 16 - xll.pcmBitRes[0]
+            for (i, spkr) in order.enumerated() {
+                for n in 0..ns {
+                    var v = dtsWrap32(xll.sample(spkr, n) << shift)
+                    v = if v < -32768 { -32768 } else if v > 32767 { 32767 } else { v }
+                    out[n * nc + i] = Float(v) / 32768.0
+                }
+            }
+        } else {
+            let shift = 24 - xll.pcmBitRes[0]
+            for (i, spkr) in order.enumerated() {
+                for n in 0..ns {
+                    let v = dtsClip23(dtsWrap32(xll.sample(spkr, n) << shift))
+                    out[n * nc + i] = Float(v) / 8388608.0
+                }
+            }
+        }
+        outBuf += out
+        true
+    }
+
+    fn filterCore(_ asset: DtsAsset) -> Bool {
+        let fixed = (packetFlags & dtsPacketExss) != 0 && asset.ok && (asset.extensionMask & dtsExssXll) != 0
+        if fixed {
+            if dcore.filterFixed(0) < 0 || dcore.finishFixed() < 0 {
+                warn("core: {dcore.error}")
+                return false
+            }
+            outputFixedCore()
+            packetFlags = packetFlags | dtsPacketResidual
+            return true
+        }
+        if dcore.filterFloat() < 0 {
+            warn("core: {dcore.error}")
+            return false
+        }
+        setProfile()
+        bits = 0
+        let mask = dcore.chMask
+        let order = dtsWavOrder(mask)
+        setFormat(dcore.outputRate, dtsWavLayout(mask))
+        let ns = dcore.npcmsamples
+        let nc = order.count
+        var out = dtsFloatList(ns * nc)
+        let m = dtsMaxFrameSamples
+        for (i, spkr) in order.enumerated() {
+            let base = spkr * m
+            for n in 0..ns {
+                out[n * nc + i] = dcore.syn.pcmF[base + n]
+            }
+        }
+        outBuf += out
+        true
+    }
+
+    fn outputFixedCore() {
+        setProfile()
+        bits = 24
+        let mask = dcore.chMask
+        let order = dtsWavOrder(mask)
+        setFormat(dcore.outputRate, dtsWavLayout(mask))
+        let ns = dcore.npcmsamples
+        let nc = order.count
+        var out = dtsFloatList(ns * nc)
+        let m = dtsMaxFrameSamples
+        for (i, spkr) in order.enumerated() {
+            let base = spkr * m
+            for n in 0..ns {
+                out[n * nc + i] = Float(dtsClip23(dcore.syn.pcmX[base + n])) / 8388608.0
+            }
+        }
+        outBuf += out
+    }
+
+    fn setProfile() {
+        let mask = dcore.extAudioMask
+        profile = if (mask & dtsExssMask) != 0 { "DTS-HD HRA" } else if (mask & (dtsCssXxch | dtsCssXch)) != 0 { "DTS-ES" } else if (mask & dtsCssX96) != 0 { "DTS 96/24" } else { "DTS" }
+    }
+
+    fn setFormat(_ r: Int, _ names: [String]) {
+        if rate != r || channels != names.count || layout != names {
+            if !outBuf.isEmpty {
+                warn("format changed inside a packet")
+            }
+            rate = r
+            channels = names.count
+            layout = names
+        }
+    }
+
+    // Silence for a frame that couldn't be decoded, in the current format.
+    fn silence(_ info: FrameInfo) {
+        if channels <= 0 {
+            return
+        }
+        var n = info.samples
+        if info.hdSamples > 0 {
+            n = info.hdSamples
+        } else if rate > 0 && info.rate > 0 && rate == 2 * info.rate {
+            n = 2 * info.samples
+        }
+        outBuf += dtsFloatList(n * channels)
+    }
+}
+
+fn dtsFloatList(_ n: Int) -> [Float] {
+    var out: [Float] = []
+    var i = 0
+    while i < n {
+        out.append(0.0)
+        i += 1
+    }
+    out
+}
+
+// The next sync word of any form at or after `from`, or −1.
+fn dtsFindAnySync(_ data: Data, _ from: Int) -> Int {
+    var i = max(from, 0)
+    while i + 4 <= data.count {
+        if dtsSyncForm(data, at: i) >= 0 {
+            return i
+        }
+        i += 1
+    }
+    -1
+}
+
+public fn newDecoder(_ track: core.Track) -> Result<Decoder> {
+    if track.codec != "dts" {
+        return Result.failure(error: Error("the dts decoder can't decode \"{track.codec}\""))
+    }
+    var d = Decoder()
+    if track.sampleRate > 0 && track.channels > 0 {
+        d.rate = track.sampleRate
+        d.channels = track.channels
+        d.layout = if track.layout.count == track.channels { track.layout } else { core.defaultLayout(track.channels) }
+    }
+    Result.ok(value: d)
+}
+
+// The start of every frame of a raw DTS stream (core frames with their
+// extension substreams, or substreams alone), checking that each is
+// followed by another sync word of the same kind (or the end of the data)
+// so that a sync word inside audio data isn't taken for a frame.
+public fn syncFrames(_ data: Data) -> [Int] {
+    syncFramesIn(data, from: 0, to: data.count)
+}
+
+// The same within data[from…to].
+public fn syncFramesIn(_ data: Data, from: Int, to: Int) -> [Int] {
+    var out: [Int] = []
+    let limit = min(to, data.count)
+    var at = findSync(data, from: from, to: limit)
+    while at >= 0 && at < limit {
+        let info = frameInfo(data, at: at, end: limit)
+        if !info.ok || info.size <= 0 {
+            at = findSync(data, from: at + 1, to: limit)
+            continue
+        }
+        let form = info.form
+        var next = at + info.size
+        if form == dtsFormBE14 || form == dtsFormLE14 {
+            // The 14-bit size is an estimate: look for the next sync near it.
+            var k = max(at + 2, next - 8)
+            var found = -1
+            while k <= next + 64 && k + 4 <= limit {
+                if dtsSyncForm(data, at: k) == form {
+                    found = k
+                    break
+                }
+                k += 2
+            }
+            next = if found > 0 { found } else { limit }
+        }
+        if next >= limit {
+            if next == limit {
+                out.append(at)
+            }
+            break
+        }
+        let nf = dtsSyncForm(data, at: next)
+        if nf == form || (nf >= 0 && form == dtsFormSubstream) {
+            out.append(at)
+            at = next
+        } else {
+            at = findSync(data, from: at + 1, to: limit)
+        }
+    }
+    out
+}

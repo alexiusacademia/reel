@@ -1,0 +1,190 @@
+// The Loudness & dynamics tab of the "Effects and Filters" window:
+// loudness normalisation (mode, target LUFS, most boost and cut), the
+// compressor (threshold, ratio, knee, attack, release, makeup) with its
+// transfer curve drawn on a Canvas, the limiter (ceiling, release), and a
+// live meter readout (momentary, short-term and integrated LUFS, loudness
+// range, true peak, the normalisation gain and the gain reductions) from
+// a MeterReadout the app passes in (ui.meterReadout(chain)).
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+import "../fx"
+
+// The transfer plot's range: input and output from fxuCurveLow to 0 dB.
+let fxuCurveLow = -60.0
+
+public view LoudnessView(audio: bind fx.Settings, meter: MeterReadout, onChange: fn()) {
+    fn pickMode(_ name: String) {
+        audio.normalize = fxNormalizeMode(named: name)
+        onChange()
+    }
+
+    fn compEdited() {
+        audio.compOn = true
+        onChange()
+    }
+
+    fn resetDynamics() {
+        let d = fx.Settings()
+        audio.compThreshold = d.compThreshold
+        audio.compRatio = d.compRatio
+        audio.compKnee = d.compKnee
+        audio.compAttackMs = d.compAttackMs
+        audio.compReleaseMs = d.compReleaseMs
+        audio.compMakeup = d.compMakeup
+        audio.compOn = false
+        onChange()
+    }
+
+    fn resetNormalisation() {
+        let d = fx.Settings()
+        audio.normalize = d.normalize
+        audio.targetLufs = d.targetLufs
+        audio.maxBoost = d.maxBoost
+        audio.maxCut = d.maxCut
+        onChange()
+    }
+
+    fn resetLimiter() {
+        let d = fx.Settings()
+        audio.limiterOn = d.limiterOn
+        audio.limiterCeiling = d.limiterCeiling
+        audio.limiterReleaseMs = d.limiterReleaseMs
+        onChange()
+    }
+
+    VStack(spacing: 12, alignment: .leading) {
+        FxuSection(title: "Loudness normalisation") {
+            FxuSegments(label: "Mode", options: fxNormalizeNames, selected: fxNormalizeName(audio.normalize), onPick: pickMode)
+            Text(fxNormalizeHelp(audio.normalize)).font(size: 12).color(.secondary)
+            VStack(spacing: 8, alignment: .leading) {
+                FxuSliderRow(label: "Target", value: audio.targetLufs, from: -31, to: -5, step: 0.5, text: fxLufs(audio.targetLufs), onChange: onChange)
+                FxuSliderRow(label: "Most boost", value: audio.maxBoost, from: 0, to: 24, step: 0.5, text: fxDb(audio.maxBoost), onChange: onChange)
+                FxuSliderRow(label: "Most cut", value: audio.maxCut, from: 0, to: 48, step: 0.5, text: fxDb(-audio.maxCut), onChange: onChange)
+            }
+            .disabled(audio.normalize == .off)
+            HStack {
+                Spacer()
+                Button("Reset normalisation") { resetNormalisation() }
+            }
+        }
+
+        FxuSection(title: "Meter") {
+            HStack(spacing: 16, alignment: .top) {
+                VStack(spacing: 4, alignment: .leading) {
+                    FxuReadout(label: "Momentary", value: fxLufs(meter.momentary), dim: !meter.active)
+                    FxuReadout(label: "Short-term", value: fxLufs(meter.shortTerm), dim: !meter.active)
+                    FxuReadout(label: "Integrated", value: fxLufs(meter.integrated), dim: !meter.active)
+                    FxuReadout(label: "Range", value: if meter.active { "{meter.range.formatted(decimals: 1)} LU" } else { "—" }, dim: !meter.active)
+                    FxuReadout(label: "True peak", value: fxLufs(meter.truePeak, unit: "dBTP"), dim: !meter.active)
+                }
+                VStack(spacing: 4, alignment: .leading) {
+                    FxuReadout(label: "Gain", value: fxDb(meter.gain), dim: !meter.active)
+                    FxuReadout(label: "Compression", value: fxDb(-meter.compressorReduction), dim: !meter.active)
+                    FxuReadout(label: "Limiting", value: fxDb(-meter.limiterReduction), dim: !meter.active)
+                }
+            }
+            Canvas { g in fxuDrawMeter(g, meter, audio) }
+                .frame(height: 46)
+                .accessibilityLabel("Loudness meter: momentary {fxLufs(meter.momentary)}, short-term {fxLufs(meter.shortTerm)}")
+        }
+
+        FxuSwitchSection(title: "Compressor", isOn: audio.compOn, onChange: onChange, extra: Button("Reset compressor") { resetDynamics() }) {
+            HStack(spacing: 16, alignment: .top) {
+                VStack(spacing: 8, alignment: .leading) {
+                    FxuSliderRow(label: "Threshold", value: audio.compThreshold, from: -60, to: 0, step: 0.5, text: fxDb(audio.compThreshold), onChange: compEdited)
+                    FxuSliderRow(label: "Ratio", value: audio.compRatio, from: 1, to: 20, step: 0.1, text: "{fxPlain(audio.compRatio, decimals: 1)}:1", onChange: compEdited)
+                    FxuSliderRow(label: "Knee", value: audio.compKnee, from: 0, to: 24, step: 0.5, text: "{fxPlain(audio.compKnee, decimals: 1)} dB", onChange: compEdited)
+                    FxuSliderRow(label: "Attack", value: audio.compAttackMs, from: 0.5, to: 200, step: 0.5, text: "{fxPlain(audio.compAttackMs, decimals: 1)} ms", onChange: compEdited)
+                    FxuSliderRow(label: "Release", value: audio.compReleaseMs, from: 10, to: 2000, step: 10, text: "{fxPlain(audio.compReleaseMs, decimals: 0)} ms", onChange: compEdited)
+                    FxuSliderRow(label: "Makeup", value: audio.compMakeup, from: 0, to: 24, step: 0.5, text: fxDb(audio.compMakeup), onChange: compEdited)
+                }
+                Canvas { g in fxuDrawTransfer(g, audio, meter) }
+                    .frame(width: 170, height: 170)
+                    .accessibilityLabel("Compressor transfer curve")
+            }
+            .opacity(if audio.compOn { 1.0 } else { 0.6 })
+        }
+
+        FxuSwitchSection(title: "Limiter", isOn: audio.limiterOn, onChange: onChange, extra: Button("Reset limiter") { resetLimiter() }) {
+            FxuSliderRow(label: "Ceiling", value: audio.limiterCeiling, from: -12, to: 0, step: 0.1, text: "{fxSigned(audio.limiterCeiling, decimals: 1)} dBFS", onChange: onChange)
+            FxuSliderRow(label: "Release", value: audio.limiterReleaseMs, from: 10, to: 500, step: 5, text: "{fxPlain(audio.limiterReleaseMs, decimals: 0)} ms", onChange: onChange)
+            if audio.normalize != .off && !audio.limiterOn {
+                Text("The limiter still runs while normalisation is on.").font(size: 12).color(.secondary)
+            }
+        }
+    }
+}
+
+// The compressor's transfer curve: input level across, output level up,
+// both fxuCurveLow … 0 dB; the 1:1 line dashed, the threshold marked.
+fn fxuDrawTransfer(_ g: Graphics, _ s: fx.Settings, _ meter: MeterReadout) {
+    let pad = 22.0
+    let x0 = pad
+    let y0 = 4.0
+    let side = min(g.width - pad - 4.0, g.height - pad - 4.0)
+    let span = -fxuCurveLow
+    g.fillRect(x: x0, y: y0, width: side, height: side, color: .sidebar, radius: 4)
+    for db in [-48.0, -36.0, -24.0, -12.0] {
+        let p = side * (db - fxuCurveLow) / span
+        g.line(x0 + p, y0, x0 + p, y0 + side, color: .separator)
+        g.line(x0, y0 + side - p, x0 + side, y0 + side - p, color: .separator)
+    }
+    g.text("−60", x: x0, y: y0 + side + 3.0, size: 9, color: .secondary, align: .top)
+    g.text("0", x: x0 + side, y: y0 + side + 3.0, size: 9, color: .secondary, align: .top)
+    g.text("in dB", x: x0 + side / 2.0, y: y0 + side + 3.0, size: 9, color: .secondary, align: .top)
+    g.text("out", x: x0 - 3.0, y: y0 + side / 2.0, size: 9, color: .secondary, align: .trailing)
+    g.text("0", x: x0 - 3.0, y: y0, size: 9, color: .secondary, align: .topTrailing)
+    g.save()
+    g.clip(x: x0, y: y0, width: side, height: side)
+    // 1:1.
+    g.beginPath()
+    g.lines([x0, y0 + side, x0 + side, y0])
+    g.stroke(.gray, width: 1, dash: [4, 3])
+    // Threshold.
+    let tp = side * (s.compThreshold - fxuCurveLow) / span
+    g.line(x0 + tp, y0, x0 + tp, y0 + side, color: .rgba(242, 140, 26, 0.5), width: 1)
+    // The curve.
+    var pts: [Float] = []
+    let n = 90
+    for i in 0..n {
+        let x = fxuCurveLow + span * Float(i) / Float(n - 1)
+        let y = if s.compOn { fxCompressorOutput(x, threshold: s.compThreshold, ratio: s.compRatio, knee: s.compKnee, makeup: s.compMakeup) } else { x }
+        pts.append(x0 + side * (x - fxuCurveLow) / span)
+        pts.append(y0 + side - side * (y - fxuCurveLow) / span)
+    }
+    g.beginPath()
+    g.lines(pts)
+    g.stroke(if s.compOn { fxuAccent } else { .gray }, width: 2)
+    g.restore()
+}
+
+// Bars for momentary and short-term loudness on a −60 … 0 LUFS scale,
+// with the normalisation target marked.
+fn fxuDrawMeter(_ g: Graphics, _ m: MeterReadout, _ s: fx.Settings) {
+    let left = 22.0
+    let w = g.width - left - 4.0
+    let low = -60.0
+    let rows = [("M", m.momentary), ("S", m.shortTerm)]
+    for (i, row) in rows.enumerated() {
+        let (name, v) = row
+        let y = 2.0 + Float(i) * 16.0
+        g.text(name, x: 4.0, y: y + 6.0, size: 10, color: .secondary, align: .leading)
+        g.fillRect(x: left, y: y, width: w, height: 12, color: .lightGray, radius: 3)
+        if m.active && v > low {
+            let f = min(1.0, (v - low) / -low)
+            let over = s.normalize != .off && v > s.targetLufs + 1.0
+            g.fillRect(x: left, y: y, width: w * f, height: 12, color: if over { .red } else { fxuAccent }, radius: 3)
+        }
+    }
+    // Scale and target.
+    for db in [-60.0, -48.0, -36.0, -24.0, -12.0, 0.0] {
+        let x = left + w * (db - low) / -low
+        g.text(fxPlain(db, decimals: 0), x: x, y: 34.0, size: 9, color: .secondary, align: .top)
+    }
+    if s.normalize != .off {
+        let x = left + w * (s.targetLufs - low) / -low
+        g.line(x, 0, x, 32, color: .primary, width: 1.5)
+    }
+}

@@ -1,0 +1,170 @@
+// Media files on disk: which extensions are video and audio, the folder walk
+// a library scan does (names, sizes and dates only — Tessel reads files
+// whole, so a scan never opens big files), and what a played or quickly
+// read file tells the library (`MediaReport`: duration, tags, codecs,
+// picture size), filled from a demuxed `core.Media`.
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+import "../core"
+import "../demux"
+
+public let videoExtensions = ["mp4", "m4v", "mov", "mkv", "webm", "avi", "ts", "m2ts", "mts", "mpg", "mpeg", "vob", "ogv", "ivf", "wmv", "asf", "3gp", "3g2", "divx", "flv", "f4v"]
+public let audioExtensions = ["mp3", "m4a", "m4b", "aac", "flac", "ogg", "oga", "opus", "wav", "aif", "aiff", "aifc", "mka", "ac3", "eac3", "dts", "dtshd", "thd", "mlp", "mp2", "mp1", "wma", "alac", "caf", "w64"]
+
+// "video", "audio", or "" when the extension isn't a media file's.
+public fn mediaKindOf(_ path: String) -> String {
+    let ext = path.fileExtension.lowercase()
+    if videoExtensions.contains(ext) {
+        return "video"
+    }
+    if audioExtensions.contains(ext) {
+        return "audio"
+    }
+    ""
+}
+
+public fn isMediaFile(_ path: String) -> Bool {
+    !mediaKindOf(path).isEmpty
+}
+
+// A media file a folder walk found.
+public struct FoundFile {
+    path: String
+    // The watched folder it was found under.
+    root: String
+    size: Int
+    // Seconds since 1970.
+    modified: Float
+}
+
+// Every media file under the folders (recursively), with sizes and dates.
+// Hidden files and folders (".name") and macOS bundles are skipped. Plain
+// file system work: safe to run in `background`.
+public fn findMediaFiles(_ folders: [String], skipHidden: Bool = true, maxDepth: Int = 24) -> [FoundFile] {
+    var out: [FoundFile] = []
+    for root in folders {
+        var stack: [(String, Int)] = [(root, 0)]
+        while !stack.isEmpty {
+            let (folder, depth) = stack.removeLast()
+            let names = listFolder(folder) ?? []
+            for name in names {
+                if skipHidden && name.hasPrefix(".") {
+                    continue
+                }
+                let p = joinPath(folder, name)
+                if isFolder(p) {
+                    let ext = name.fileExtension.lowercase()
+                    if depth < maxDepth && ext != "app" && ext != "bundle" && ext != "photoslibrary" && ext != "fcpbundle" && ext != "tvlibrary" {
+                        stack.append((p, depth + 1))
+                    }
+                    continue
+                }
+                if isMediaFile(p) {
+                    out.append(FoundFile(path: p, root: root, size: fileSize(p) ?? 0, modified: modifiedTime(p) ?? 0.0))
+                }
+            }
+        }
+    }
+    out
+}
+
+// What is known about a file's content.
+public struct MediaReport {
+    path: String
+    size: Int = 0
+    // "mp4" "mkv" … (the demuxer's format), "" when unknown.
+    container: String = ""
+    // Seconds, −1 unknown.
+    duration: Float = -1.0
+    title: String = ""
+    artist: String = ""
+    album: String = ""
+    albumArtist: String = ""
+    genre: String = ""
+    year: Int = 0
+    track: Int = 0
+    disc: Int = 0
+    // "h264 1920×1080, aac 2ch" style summary, and the main codec names.
+    codecs: String = ""
+    width: Int = 0
+    height: Int = 0
+    hasVideo: Bool = false
+    hasAudio: Bool = false
+}
+
+// The leading number of "3/12", "2026-10-26", "07".
+fn leadingNumber(_ s: String) -> Int {
+    var digits = ""
+    for ch in s.trim().characters {
+        if ch >= "0" && ch <= "9" {
+            digits += ch
+        } else {
+            break
+        }
+    }
+    parseInt(digits).valueOr(0)
+}
+
+// A report from what a demuxer found (the player calls this after
+// opening a file; a scan does it for small audio files).
+public fn reportFromMedia(_ path: String, size: Int, media: core.Media) -> MediaReport {
+    var r = MediaReport(path: path, size: size, container: media.format, duration: media.duration)
+    let tags = media.tags
+    r.title = tags["title"] ?? ""
+    r.artist = tags["artist"] ?? ""
+    r.album = tags["album"] ?? ""
+    r.albumArtist = tags["albumartist"] ?? tags["album_artist"] ?? ""
+    r.genre = tags["genre"] ?? ""
+    r.year = leadingNumber(tags["date"] ?? tags["year"] ?? "")
+    r.track = leadingNumber(tags["track"] ?? "")
+    r.disc = leadingNumber(tags["disc"] ?? "")
+    var parts: [String] = []
+    for t in media.tracks {
+        if t.kind == .video {
+            // Cover art pictures in audio files aren't video.
+            if t.codec == "mjpeg" && media.tracks.count > 1 && (t.duration == core.noTime || t.fpsNum == 0) && !media.cover.isEmpty {
+                continue
+            }
+            if !r.hasVideo {
+                r.width = t.width
+                r.height = t.height
+            }
+            r.hasVideo = true
+            parts.append("{t.codec} {t.width}×{t.height}")
+        } else if t.kind == .audio {
+            r.hasAudio = true
+            parts.append(if t.channels > 0 { "{t.codec} {t.channels}ch" } else { t.codec })
+        }
+    }
+    r.codecs = parts.joined(separator: ", ")
+    r
+}
+
+// Reads a whole (small) file and demuxes it for its report; nil when it is
+// bigger than `maxBytes`, can't be read, or isn't a format Reel knows.
+// Safe to run in `background`.
+public fn readMediaReport(_ path: String, maxBytes: Int = 50_000_000) -> MediaReport? {
+    let size = fileSize(path) ?? -1
+    if size < 0 || size > maxBytes {
+        return nil
+    }
+    if let data = readData(path) {
+        match demux.open(data, name: path) {
+            .ok(m) -> {
+                return reportFromMedia(path, size: data.count, media: m)
+            }
+            .failure(_) -> {
+                return nil
+            }
+        }
+    }
+    nil
+}
+
+// The container a file's first bytes say ("mp4" "mkv" …), for files whose
+// bytes are already in memory (Tessel can't read only the start of a file).
+public fn sniffContainer(_ data: Data, name: String = "") -> String {
+    demux.sniff(data.slice(from: 0, to: 65536), name: name)
+}

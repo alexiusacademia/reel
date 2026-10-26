@@ -1,0 +1,68 @@
+// The public face of the Theora decoder: newDecoder (from a "theora"
+// track whose extra holds the three header packets, each as a 4-byte
+// big-endian length and its bytes) and streamInfo for the media info
+// window. The Decoder itself is in decoder.tsl.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../core"
+
+// A decoder for a "theora" track.
+public fn newDecoder(_ track: core.Track) -> Result<Decoder> {
+    if track.codec != "theora" {
+        return .failure(error: Error("theora: not a Theora track ({track.codec})"))
+    }
+    let hs = thSplitHeaders(track.extra)
+    if hs.count < 3 {
+        return .failure(error: Error("theora: the track's three header packets are missing"))
+    }
+    let info = try thParseInfo(hs[0])
+    let setup = try thParseSetup(hs[2])
+    var d = Decoder()
+    d.configure(info, setup)
+    if info.sarNum > 0 && info.sarDen > 0 {
+        let g = thGcd(info.sarNum, info.sarDen)
+        d.sarNum = info.sarNum / g
+        d.sarDen = info.sarDen / g
+    } else if track.sarNum > 0 && track.sarDen > 0 {
+        d.sarNum = track.sarNum
+        d.sarDen = track.sarDen
+    }
+    d.trackMatrix = track.matrix
+    Result.ok(value: d)
+}
+
+fn thGcd(_ a: Int, _ b: Int) -> Int {
+    var x = a
+    var y = b
+    while y != 0 {
+        let r = x % y
+        x = y
+        y = r
+    }
+    max(x, 1)
+}
+
+// "Theora, 640×480, 4:2:0" (with the colour space when the stream gives
+// one) from the identification header in the track's extra.
+public fn streamInfo(_ track: core.Track) -> String {
+    let hs = thSplitHeaders(track.extra)
+    if hs.count < 1 {
+        if track.width > 0 && track.height > 0 {
+            return "Theora, {track.width}×{track.height}"
+        }
+        return "Theora"
+    }
+    if let i: ThInfo = thParseInfo(hs[0]).value() {
+        let chroma = if i.pixelFormat == 0 { "4:2:0" } else if i.pixelFormat == 2 { "4:2:2" } else { "4:4:4" }
+        var s = "Theora, {i.picW}×{i.picH}, {chroma}"
+        if i.colorSpace == 1 {
+            s += ", Rec. 470M"
+        } else if i.colorSpace == 2 {
+            s += ", Rec. 470BG"
+        }
+        return s
+    }
+    "Theora"
+}

@@ -1,0 +1,882 @@
+// Ogg files (oggOpen): .ogg .oga .ogv .opus.
+//
+// Ogg (RFC 3533) cuts each logical stream's packets into pages of up to
+// 255 segments of up to 255 bytes. A packet ends at the first segment
+// shorter than 255 bytes, so packets can run across pages; such a packet
+// becomes one core.PacketRef with its pieces in `parts`. Each page carries
+// a granule position: a codec-defined time for the last packet that ends
+// on the page. Packets get their times by working back (or on) from
+// those granules with each packet's length, which needs a little of each
+// codec:
+//   Vorbis  packet length = (previous block + this block) / 4 samples,
+//           block sizes from the identification header and each mode's
+//           block flag from the end of the setup header (Vorbis I §4.3).
+//   Opus    48 kHz; length from the TOC byte (RFC 6716 §3.1); time is
+//           granule − pre-skip (RFC 7845 §4).
+//   FLAC    length from each frame header's block size (RFC 9639 §9.1).
+//   Theora  one frame per packet; granule = keyframe number << shift |
+//           frames since it (Theora I §6.4).
+// Several logical streams can be multiplexed (one BOS page each, at the
+// start), and chained: new streams may start after the first ones end
+// (internet radio). Chained streams are listed as more tracks, with a
+// warning, and their times continue after the earlier link's end.
+//
+// This file also has the Xiph helpers mkv.tsl uses (Vorbis modes, Opus
+// TOC, FLAC block sizes, Vorbis comments).
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../core"
+
+// The CRC-32 of Ogg pages (RFC 3533 §6): polynomial 0x04c11db7, most
+// significant bit first, starting at 0, no final xor.
+let oggCrcTable = oggMakeCrcTable()
+
+fn oggMakeCrcTable() -> [Int] {
+    var t: [Int] = []
+    for i in 0..256 {
+        var r = i << 24
+        for _ in 0..8 {
+            if r & 0x80000000 != 0 {
+                r = ((r << 1) ^ 0x04c11db7) & 0xFFFFFFFF
+            } else {
+                r = (r << 1) & 0xFFFFFFFF
+            }
+        }
+        t.append(r)
+    }
+    t
+}
+
+// What one logical stream (one serial number) is, and the state of
+// reading it.
+struct OggStream {
+    serial: Int
+    // Index in Media.tracks, or -1 for streams that aren't media (Skeleton).
+    track: Int = -1
+    codec: String = ""
+    // Header packets still to come before the data packets.
+    headersLeft: Int = 1
+    // FLAC: header count unknown, stop at the first frame.
+    flacOpenHeaders: Bool = false
+    headers: [Data] = []
+    // The packet being put together: offset, size pairs.
+    parts: [Int] = []
+    partsSize: Int = 0
+    // A page continued a packet whose start was lost: skip to its end.
+    skipping: Bool = false
+    // Packets (indexes in Media.packets) that ended on the current page
+    // and still need times.
+    pending: [Int] = []
+    // Where the next packet starts (track ticks), once known.
+    nextPts: Int = -9223372036854775807
+    lastGranule: Int = -1
+    ended: Bool = false
+    sawData: Bool = false
+    // Chained streams: added to every time so the link follows the last.
+    ptsOffset: Int = 0
+    // Opus.
+    preSkip: Int = 0
+    // Vorbis: block sizes, each mode's block flag, the last block.
+    vorbisBlocks: [Int] = [256, 2048]
+    vorbisModes: [Int] = []
+    vorbisPrev: Int = 0
+    // Theora.
+    granuleShift: Int = 0
+    theoraOld: Bool = false
+    frameTicks: Int = 1
+}
+
+struct OggParser {
+    file: Data
+    media: core.Media = core.Media()
+    streams: [OggStream] = []
+    bySerial: [Int: Int] = [:]
+    seenDataPage: Bool = false
+    badCrc: Int = 0
+    chainWarned: Bool = false
+
+    fn parse() -> Error? {
+        let n = file.count
+        if n < 27 || !oggIsCapture(file, 0) {
+            return Error("this isn't an Ogg file (no OggS page at the start)")
+        }
+        media.format = "ogg"
+        var p = 0
+        var lostBytes = 0
+        while p + 27 <= n {
+            if !oggIsCapture(file, p) {
+                // Lost sync: find the next page's capture pattern.
+                var q = p + 1
+                while q + 4 <= n && !oggIsCapture(file, q) {
+                    q += 1
+                }
+                lostBytes += q - p
+                p = q
+                continue
+            }
+            let nseg = file[p + 26]
+            let body = p + 27 + nseg
+            if body > n {
+                media.warnings.append("the last Ogg page is cut short")
+                break
+            }
+            var bodyLen = 0
+            for i in 0..nseg {
+                bodyLen += file[p + 27 + i]
+            }
+            if body + bodyLen > n {
+                media.warnings.append("the last Ogg page is cut short")
+                break
+            }
+            if file[p + 4] != 0 {
+                // An unknown version of the page format: skip the page.
+                p = body + bodyLen
+                continue
+            }
+            if !checkCrc(p, body + bodyLen) {
+                badCrc += 1
+            }
+            page(p, nseg, body)
+            p = body + bodyLen
+        }
+        if lostBytes > 0 {
+            media.warnings.append("skipped {lostBytes} bytes that weren't Ogg pages")
+        }
+        if badCrc > 0 {
+            media.warnings.append("{badCrc} Ogg pages failed their CRC check (read anyway)")
+        }
+        finish()
+        if media.tracks.isEmpty {
+            return Error("this Ogg file has no streams Reel can read")
+        }
+        nil
+    }
+
+    // RFC 3533 §6: the CRC over the whole page with its CRC field as zeros.
+    fn checkCrc(_ from: Int, _ to: Int) -> Bool {
+        let want = file.uint32(at: from + 22)
+        var crc = 0
+        var i = from
+        while i < to {
+            var b = file[i]
+            if i >= from + 22 && i < from + 26 {
+                b = 0
+            }
+            crc = ((crc << 8) & 0xFFFFFFFF) ^ oggCrcTable[((crc >> 24) ^ b) & 0xFF]
+            i += 1
+        }
+        crc == want
+    }
+
+    // One page: header at `at`, `nseg` lacing values, body from `body`.
+    fn page(_ at: Int, _ nseg: Int, _ body: Int) {
+        let flags = file[at + 5]
+        let granule = file.int64(at: at + 6)
+        let serial = file.uint32(at: at + 14)
+        let continued = flags & 1 != 0
+        let bos = flags & 2 != 0
+        let eos = flags & 4 != 0
+        var si = bySerial[serial] ?? -1
+        if si >= 0 && bos && (streams[si].sawData || streams[si].ended) {
+            // A new link that reuses an earlier link's serial number.
+            si = -1
+        }
+        if si < 0 {
+            if !bos {
+                // A page of a stream whose first page is missing.
+                return
+            }
+            si = newStream(serial)
+        }
+        if !bos {
+            seenDataPage = true
+        }
+        if !continued && streams[si].partsSize > 0 {
+            media.warnings.append("an Ogg packet of stream {serial} was cut off (a page is missing)")
+            streams[si].parts = []
+            streams[si].partsSize = 0
+        }
+        if continued && streams[si].partsSize == 0 && streams[si].sawData {
+            streams[si].skipping = true
+        }
+        var off = body
+        for i in 0..nseg {
+            let len = file[at + 27 + i]
+            if !streams[si].skipping && len > 0 {
+                let c = streams[si].parts.count
+                if c >= 2 && streams[si].parts[c - 2] + streams[si].parts[c - 1] == off {
+                    streams[si].parts[c - 1] += len
+                } else {
+                    streams[si].parts.append(off)
+                    streams[si].parts.append(len)
+                }
+                streams[si].partsSize += len
+            }
+            off += len
+            if len < 255 {
+                if streams[si].skipping {
+                    streams[si].skipping = false
+                } else {
+                    packet(si, at)
+                }
+                streams[si].parts = []
+                streams[si].partsSize = 0
+            }
+        }
+        if granule != -1 {
+            assignTimes(si, granule, eos)
+            streams[si].lastGranule = granule
+        }
+        if eos {
+            streams[si].ended = true
+        }
+    }
+
+    fn newStream(_ serial: Int) -> Int {
+        var s = OggStream(serial: serial)
+        if seenDataPage {
+            // Chained Ogg (RFC 3533 §4): a new link after earlier streams.
+            s.ptsOffset = -1
+            if !chainWarned {
+                media.warnings.append("chained Ogg: more streams start after the first ones end (listed as more tracks, from {linkEnd().formatted(decimals: 3)} s on)")
+                chainWarned = true
+            }
+        }
+        streams.append(s)
+        bySerial[serial] = streams.count - 1
+        streams.count - 1
+    }
+
+    // The bytes of the packet being assembled.
+    fn assembled(_ si: Int) -> Data {
+        let parts = streams[si].parts
+        if parts.count == 2 {
+            return file.slice(from: parts[0], to: parts[0] + parts[1])
+        }
+        var out = Data()
+        var i = 0
+        while i + 1 < parts.count {
+            out += file.slice(from: parts[i], to: parts[i] + parts[i + 1])
+            i += 2
+        }
+        out
+    }
+
+    // A whole packet of stream `si` (its pieces in streams[si].parts).
+    fn packet(_ si: Int, _ pageAt: Int) {
+        let size = streams[si].partsSize
+        if streams[si].codec == "" {
+            identify(si, assembled(si))
+            return
+        }
+        if streams[si].headersLeft > 0 || streams[si].flacOpenHeaders {
+            let d = assembled(si)
+            if streams[si].flacOpenHeaders && d.count > 0 && d[0] == 0xFF {
+                streams[si].flacOpenHeaders = false
+                headersDone(si)
+            } else {
+                streams[si].headers.append(d)
+                streams[si].headersLeft -= 1
+                if streams[si].headersLeft <= 0 && !streams[si].flacOpenHeaders {
+                    headersDone(si)
+                }
+                return
+            }
+        }
+        if size == 0 || streams[si].track < 0 {
+            return
+        }
+        streams[si].sawData = true
+        let parts = streams[si].parts
+        let first = parts[0]
+        let ti = streams[si].track
+        var dur = 0
+        var key = true
+        let codec = streams[si].codec
+        if codec == "vorbis" {
+            dur = vorbisSamples(si, first)
+        } else if codec == "opus" {
+            dur = oggOpusSamples(file, first, parts[1])
+        } else if codec == "flac" {
+            dur = oggFlacBlockSize(file, first, parts[1])
+        } else if codec == "theora" {
+            dur = streams[si].frameTicks
+            key = file[first] & 0x40 == 0
+        }
+        var p = core.PacketRef(track: ti, pts: core.noTime, dts: core.noTime, duration: dur, key: key, offset: first, size: size)
+        if parts.count > 2 {
+            p.parts = parts
+        }
+        media.packets.append(p)
+        streams[si].pending.append(media.packets.count - 1)
+    }
+
+    // Vorbis I §4.3.1: an audio packet starts with a 0 bit and the mode
+    // number; its block size comes from the mode's block flag.
+    fn vorbisSamples(_ si: Int, _ at: Int) -> Int {
+        let b0 = file[at]
+        if b0 & 1 != 0 {
+            return 0
+        }
+        let modes = streams[si].vorbisModes
+        let blocks = streams[si].vorbisBlocks
+        var cur = blocks[1]
+        if modes.count > 1 {
+            let bits = oggIlog(modes.count - 1)
+            var v = b0
+            if at + 1 < file.count {
+                v = v | (file[at + 1] << 8)
+            }
+            let mode = (v >> 1) & ((1 << bits) - 1)
+            if mode < modes.count {
+                cur = blocks[modes[mode]]
+            }
+        } else if modes.count == 1 {
+            cur = blocks[modes[0]]
+        }
+        let prev = streams[si].vorbisPrev
+        streams[si].vorbisPrev = cur
+        (prev + cur) / 4
+    }
+
+    // The first packet of a stream says what it is.
+    fn identify(_ si: Int, _ d: Data) {
+        var t = core.Track(index: media.tracks.count, id: streams[si].serial, kind: .audio, codec: "")
+        let n = d.count
+        if n >= 30 && d[0] == 1 && oggText(d, 1, 6) == "vorbis" {
+            // Vorbis I §4.2.2 identification header.
+            streams[si].codec = "vorbis"
+            streams[si].headersLeft = 2
+            t.codec = "vorbis"
+            t.channels = d[11]
+            t.sampleRate = d.uint32(at: 12)
+            t.timescale = max(1, t.sampleRate)
+            t.bitrate = max(0, d.int32(at: 20))
+            let b = d[28]
+            streams[si].vorbisBlocks = [1 << (b & 15), 1 << (b >> 4)]
+            streams[si].vorbisPrev = 1 << (b >> 4)
+        } else if n >= 19 && oggText(d, 0, 8) == "OpusHead" {
+            // RFC 7845 §5.1 identification header.
+            streams[si].codec = "opus"
+            streams[si].headersLeft = 1
+            streams[si].preSkip = d.uint16(at: 10)
+            t.codec = "opus"
+            t.channels = d[9]
+            t.sampleRate = 48000
+            t.timescale = 48000
+            t.extra = d
+        } else if n >= 51 && d[0] == 0x7F && oggText(d, 1, 4) == "FLAC" {
+            // FLAC-in-Ogg mapping: 0x7F "FLAC", version, header count,
+            // then "fLaC" and the STREAMINFO block.
+            streams[si].codec = "flac"
+            let count = d.uint16(at: 7, bigEndian: true)
+            streams[si].headersLeft = count
+            streams[si].flacOpenHeaders = count == 0
+            t.codec = "flac"
+            let si0 = 17
+            t.sampleRate = (d[si0 + 10] << 12) | (d[si0 + 11] << 4) | (d[si0 + 12] >> 4)
+            t.channels = ((d[si0 + 12] >> 1) & 7) + 1
+            t.bitsPerSample = (((d[si0 + 12] & 1) << 4) | (d[si0 + 13] >> 4)) + 1
+            t.timescale = max(1, t.sampleRate)
+            streams[si].headers.append(d.slice(from: 9, to: n))
+        } else if n >= 42 && d[0] == 0x80 && oggText(d, 1, 6) == "theora" {
+            // Theora I §6.2 identification header.
+            streams[si].codec = "theora"
+            streams[si].headersLeft = 2
+            t.kind = .video
+            t.codec = "theora"
+            let version = (d[7] << 16) | (d[8] << 8) | d[9]
+            streams[si].theoraOld = version < 0x030201
+            t.width = (d[14] << 16) | (d[15] << 8) | d[16]
+            t.height = (d[17] << 16) | (d[18] << 8) | d[19]
+            let frn = d.uint32(at: 22, bigEndian: true)
+            let frd = d.uint32(at: 26, bigEndian: true)
+            let parn = (d[30] << 16) | (d[31] << 8) | d[32]
+            let pard = (d[33] << 16) | (d[34] << 8) | d[35]
+            if parn > 0 && pard > 0 {
+                let g = oggGcd(parn, pard)
+                t.sarNum = parn / g
+                t.sarDen = pard / g
+            }
+            if frn > 0 && frd > 0 {
+                t.fpsNum = frn
+                t.fpsDen = frd
+                t.timescale = frn
+                streams[si].frameTicks = frd
+            }
+            streams[si].granuleShift = ((d[40] & 3) << 3) | (d[41] >> 5)
+        } else if n >= 80 && oggText(d, 0, 8) == "Speex   " {
+            streams[si].codec = "speex"
+            streams[si].headersLeft = 1 + d.uint32(at: 68)
+            t.codec = "unknown:speex"
+            t.sampleRate = d.uint32(at: 36)
+            t.channels = d.uint32(at: 48)
+            t.timescale = max(1, t.sampleRate)
+        } else if n >= 8 && (oggText(d, 0, 8) == "fishead" || oggText(d, 0, 8) == "fisbone") {
+            // Ogg Skeleton: an index of the other streams, not media.
+            streams[si].codec = "skeleton"
+            streams[si].headersLeft = 1000000000
+            return
+        } else {
+            streams[si].codec = "unknown"
+            streams[si].headersLeft = 0
+            t.kind = .other
+            t.codec = "unknown:ogg"
+        }
+        streams[si].track = media.tracks.count
+        if streams[si].ptsOffset < 0 {
+            streams[si].ptsOffset = core.ticks(linkEnd(), t.timescale)
+        }
+        media.tracks.append(t)
+        if streams[si].codec != "flac" {
+            streams[si].headers.insert(d, at: 0)
+        }
+        if streams[si].headersLeft == 0 && !streams[si].flacOpenHeaders {
+            headersDone(si)
+        }
+    }
+
+    // All header packets are in: the codec setup and tags.
+    fn headersDone(_ si: Int) {
+        let ti = streams[si].track
+        if ti < 0 {
+            return
+        }
+        let h = streams[si].headers
+        let codec = streams[si].codec
+        if codec == "vorbis" || codec == "theora" {
+            if h.count >= 3 {
+                media.tracks[ti].extra = oggThreeHeaders(h[0], h[1], h[2])
+                if codec == "vorbis" {
+                    streams[si].vorbisModes = oggVorbisModes(h[2])
+                }
+                // After the 7-byte packet header ("\u{3}vorbis", "\u{81}theora").
+                addTags(oggParseComments(h[1], 7, h[1].count))
+            } else {
+                media.warnings.append("a {codec} stream's headers are missing")
+            }
+        } else if codec == "opus" {
+            if h.count >= 2 && oggText(h[1], 0, 8) == "OpusTags" {
+                addTags(oggParseComments(h[1], 8, h[1].count))
+            }
+        } else if codec == "flac" {
+            var extra = Data()
+            for b in h {
+                extra += b
+                // A VORBIS_COMMENT (4) or PICTURE (6) metadata block.
+                if b.count >= 4 && (b[0] & 0x7F) == 4 {
+                    addTags(oggParseComments(b, 4, b.count))
+                } else if b.count >= 4 && (b[0] & 0x7F) == 6 && media.cover.isEmpty {
+                    media.cover = oggPictureData(b.slice(from: 4, to: b.count))
+                }
+            }
+            media.tracks[ti].extra = extra
+        } else if codec == "speex" && h.count >= 2 {
+            addTags(oggParseComments(h[1], 0, h[1].count))
+        }
+        streams[si].headers = []
+    }
+
+    fn addTags(_ c: OggComments) {
+        // ffmpeg also gives a stream its TITLE comment as its title.
+        if let title = c.tags["title"] {
+            let ti = media.tracks.count - 1
+            if ti >= 0 && media.tracks[ti].title.isEmpty {
+                media.tracks[ti].title = title
+            }
+        }
+        for (k, v) in c.tags {
+            if !media.tags.contains(key: k) {
+                media.tags[k] = v
+            }
+        }
+        if media.cover.isEmpty && !c.cover.isEmpty {
+            media.cover = c.cover
+        }
+    }
+
+    // Where the streams read so far end, in seconds (for chained links).
+    fn linkEnd() -> Float {
+        var end = 0.0
+        for (i, s) in streams.enumerated() {
+            if s.track >= 0 && s.lastGranule >= 0 && s.ptsOffset >= 0 {
+                let e = granuleEnd(i, s.lastGranule)
+                if e != core.noTime {
+                    end = max(end, core.seconds(e + s.ptsOffset, media.tracks[s.track].timescale))
+                }
+            }
+        }
+        end
+    }
+
+    // A granule position as the end time of the page's last packet, in
+    // the track's ticks; noTime when the stream has no timing.
+    fn granuleEnd(_ si: Int, _ g: Int) -> Int {
+        let codec = streams[si].codec
+        if codec == "opus" {
+            return g - streams[si].preSkip
+        }
+        if codec == "theora" {
+            let shift = streams[si].granuleShift
+            let frames = (g >> shift) + (g & ((1 << shift) - 1))
+            // From Theora 3.2.1 on, the granule counts frames from 1.
+            let count = if streams[si].theoraOld { frames + 1 } else { frames }
+            return count * streams[si].frameTicks
+        }
+        if codec == "vorbis" || codec == "flac" || codec == "speex" {
+            return g
+        }
+        core.noTime
+    }
+
+    // Gives times to the packets that ended on this page (granule `g`).
+    // The granule is the end of the last one; earlier ones are worked back
+    // from it with their lengths. On the last page (EOS), a granule before
+    // the packets' end means the last packet is cut short (end trimming,
+    // RFC 7845 §4.4; Vorbis I §A.2), as ffmpeg reports it.
+    fn assignTimes(_ si: Int, _ g: Int, _ eos: Bool) {
+        let pend = streams[si].pending
+        if pend.isEmpty {
+            return
+        }
+        streams[si].pending = []
+        let end = granuleEnd(si, g)
+        if end == core.noTime {
+            return
+        }
+        let off = streams[si].ptsOffset
+        var total = 0
+        for k in pend {
+            total += media.packets[k].duration
+        }
+        var start = end - total
+        var trim = false
+        if eos && total > 0 {
+            var known = streams[si].nextPts
+            if known == core.noTime {
+                // A stream whose only data page is also its last: it
+                // starts where the codec starts.
+                let codec = streams[si].codec
+                if codec == "opus" {
+                    known = -streams[si].preSkip
+                } else if codec == "vorbis" {
+                    known = -media.packets[pend[0]].duration
+                } else {
+                    known = 0
+                }
+            }
+            if known + total > end && known <= end {
+                start = known
+                trim = true
+            }
+        }
+        var t = start
+        for k in pend {
+            media.packets[k].pts = t + off
+            media.packets[k].dts = t + off
+            t += media.packets[k].duration
+        }
+        if trim {
+            let last = pend[pend.count - 1]
+            let cut = t - end
+            if cut < media.packets[last].duration {
+                media.packets[last].duration -= cut
+            }
+        }
+        streams[si].nextPts = end
+    }
+
+    fn finish() {
+        var longest = 0.0
+        for s in streams {
+            if s.track < 0 {
+                continue
+            }
+            if !s.pending.isEmpty {
+                media.warnings.append("the last packets of stream {s.serial} have no granule position")
+            }
+            if s.lastGranule >= 0 {
+                // The track's length, as ffmpeg gives it: the last granule
+                // (for Opus that includes the pre-skip; for Theora, frames).
+                var d = s.lastGranule
+                if s.codec == "theora" {
+                    let shift = s.granuleShift
+                    d = ((s.lastGranule >> shift) + (s.lastGranule & ((1 << shift) - 1))) * s.frameTicks
+                } else if s.codec == "skeleton" || s.codec == "unknown" {
+                    d = core.noTime
+                }
+                if d != core.noTime {
+                    media.tracks[s.track].duration = d + s.ptsOffset
+                    longest = max(longest, core.seconds(d + s.ptsOffset, media.tracks[s.track].timescale))
+                }
+            }
+            if s.headersLeft > 0 && s.codec != "skeleton" {
+                media.warnings.append("stream {s.serial} ({s.codec}) ends before its headers do")
+            }
+        }
+        media.duration = if longest > 0.0 { longest } else { -1.0 }
+    }
+}
+
+// Opens an Ogg file.
+public fn oggOpen(_ file: Data) -> Result<core.Media> {
+    var p = OggParser(file: file)
+    let err = p.parse()
+    if let e = err {
+        return Result.failure(error: e)
+    }
+    Result.ok(value: p.media)
+}
+
+fn oggIsCapture(_ d: Data, _ at: Int) -> Bool {
+    at + 4 <= d.count && d[at] == 0x4F && d[at + 1] == 0x67 && d[at + 2] == 0x67 && d[at + 3] == 0x53
+}
+
+// Bytes from..<from+count as Latin-1 text (empty when out of range).
+fn oggText(_ d: Data, _ from: Int, _ count: Int) -> String {
+    if from + count > d.count {
+        return ""
+    }
+    d.slice(from: from, to: from + count).latin1
+}
+
+fn oggGcd(_ a: Int, _ b: Int) -> Int {
+    var x = abs(a)
+    var y = abs(b)
+    while y != 0 {
+        let t = x % y
+        x = y
+        y = t
+    }
+    max(x, 1)
+}
+
+// Vorbis I §9.2.1 ilog: the number of bits needed for v.
+fn oggIlog(_ v: Int) -> Int {
+    var n = 0
+    var x = v
+    while x > 0 {
+        n += 1
+        x = x >> 1
+    }
+    n
+}
+
+// The core's form for Vorbis and Theora setup: each header as a 4-byte
+// big-endian length followed by its bytes.
+fn oggThreeHeaders(_ a: Data, _ b: Data, _ c: Data) -> Data {
+    var out = Data()
+    for h in [a, b, c] {
+        out += Data(bytes: h.count.bytes(count: 4, bigEndian: true))
+        out += h
+    }
+    out
+}
+
+// Each Vorbis mode's block flag (0 short, 1 long), read from the end of
+// the setup header without decoding the codebooks before it.
+//
+// The setup header (Vorbis I §4.2.4) ends with the modes: a 6-bit count−1,
+// then per mode blockflag (1 bit), windowtype (16, must be 0),
+// transformtype (16, must be 0), mapping (8), then the framing bit (1).
+// Bits are packed least significant first. So from the framing bit (the
+// last 1 bit) we step back 41 bits at a time while the mode fields look
+// valid; the right count is the largest one whose 6-bit count field
+// before it agrees. (ffmpeg's vorbis_parser does the same.)
+public fn oggVorbisModes(_ setup: Data) -> [Int] {
+    let n = setup.count
+    var last = n - 1
+    while last >= 0 && setup[last] == 0 {
+        last -= 1
+    }
+    if last < 0 {
+        return []
+    }
+    var top = 7
+    while (setup[last] >> top) & 1 == 0 {
+        top -= 1
+    }
+    let framing = last * 8 + top
+    fn bitsAt(_ pos: Int, _ count: Int) -> Int {
+        var v = 0
+        for j in 0..count {
+            let p = pos + j
+            if p >= 0 {
+                v = v | (((setup[p >> 3] >> (p & 7)) & 1) << j)
+            }
+        }
+        v
+    }
+    var count = 0
+    var best = 0
+    // The first bits after the 7-byte packet header can't be modes.
+    while framing - 41 * (count + 1) - 6 >= 56 {
+        let m = framing - 41 * (count + 1)
+        if bitsAt(m + 1, 16) != 0 || bitsAt(m + 17, 16) != 0 || bitsAt(m + 33, 8) > 63 {
+            break
+        }
+        count += 1
+        if bitsAt(m - 6, 6) + 1 == count {
+            best = count
+        }
+        if count >= 64 {
+            break
+        }
+    }
+    var modes: [Int] = []
+    let first = framing - 41 * best
+    for i in 0..best {
+        modes.append(bitsAt(first + 41 * i, 1))
+    }
+    modes
+}
+
+// RFC 6716 §3.1: the number of 48 kHz samples in an Opus packet, from its
+// TOC byte (configuration → frame size) and frame count code.
+public fn oggOpusSamples(_ d: Data, _ at: Int, _ size: Int) -> Int {
+    if size < 1 {
+        return 0
+    }
+    let toc = d[at]
+    let config = toc >> 3
+    var frame = 0
+    if config < 12 {
+        frame = [480, 960, 1920, 2880][config & 3]
+    } else if config < 16 {
+        frame = [480, 960][config & 1]
+    } else {
+        frame = [120, 240, 480, 960][config & 3]
+    }
+    let code = toc & 3
+    var frames = 1
+    if code == 1 || code == 2 {
+        frames = 2
+    } else if code == 3 {
+        if size < 2 {
+            return 0
+        }
+        frames = d[at + 1] & 0x3F
+    }
+    frame * frames
+}
+
+// RFC 9639 §9.1: a FLAC frame's block size (samples) from its header.
+public fn oggFlacBlockSize(_ d: Data, _ at: Int, _ size: Int) -> Int {
+    if size < 6 || d[at] != 0xFF || (d[at + 1] & 0xFE) != 0xF8 {
+        return 0
+    }
+    let code = d[at + 2] >> 4
+    if code == 1 {
+        return 192
+    }
+    if code >= 2 && code <= 5 {
+        return 576 << (code - 2)
+    }
+    if code >= 8 {
+        return 256 << (code - 8)
+    }
+    if code == 6 || code == 7 {
+        // After the coded frame/sample number (1 to 7 bytes, UTF-8 style).
+        let b = d[at + 4]
+        var len = 1
+        if b >= 0xFE {
+            len = 7
+        } else if b >= 0xFC {
+            len = 6
+        } else if b >= 0xF8 {
+            len = 5
+        } else if b >= 0xF0 {
+            len = 4
+        } else if b >= 0xE0 {
+            len = 3
+        } else if b >= 0xC0 {
+            len = 2
+        }
+        let p = at + 4 + len
+        if code == 6 && p < at + size {
+            return d[p] + 1
+        }
+        if code == 7 && p + 1 < at + size {
+            return ((d[p] << 8) | d[p + 1]) + 1
+        }
+    }
+    0
+}
+
+public struct OggComments {
+    tags: [String: String] = [:]
+    cover: Data = Data()
+}
+
+// Vorbis comments (Vorbis I §5.2.1; also OpusTags, Theora, FLAC's
+// VORBIS_COMMENT): a vendor string, then "KEY=value" strings, all with
+// 32-bit little-endian lengths, starting at `from`. Keys become Reel's
+// lower-case tag names; METADATA_BLOCK_PICTURE (a base64 FLAC picture
+// block) becomes the cover.
+public fn oggParseComments(_ d: Data, _ from: Int, _ to: Int) -> OggComments {
+    var out = OggComments()
+    var r = core.byteReaderRange(d, from: from, to: to)
+    let vendor = r.u32(bigEndian: false)
+    r.skip(vendor)
+    let count = r.u32(bigEndian: false)
+    var i = 0
+    while i < count && !r.overrun && r.left >= 4 {
+        let len = r.u32(bigEndian: false)
+        if len > r.left {
+            break
+        }
+        let raw = r.bytes(len)
+        let text = raw.text ?? raw.latin1
+        i += 1
+        if let eq = text.find("=") {
+            let key = text.substring(from: 0, to: eq).lowercase()
+            let value = text.substring(from: eq + 1, to: text.count)
+            if key == "metadata_block_picture" {
+                if out.cover.isEmpty {
+                    if let pic = decodeBase64(value) {
+                        out.cover = oggPictureData(pic)
+                    }
+                }
+            } else {
+                let name = oggTagName(key)
+                if let old = out.tags[name] {
+                    out.tags[name] = old + "; " + value
+                } else {
+                    out.tags[name] = value
+                }
+            }
+        }
+    }
+    out
+}
+
+fn oggTagName(_ key: String) -> String {
+    match key {
+        "tracknumber" -> "track"
+        "discnumber" -> "disc"
+        "albumartist" -> "albumartist"
+        "album artist" -> "albumartist"
+        "album_artist" -> "albumartist"
+        "description" -> "comment"
+        "year" -> "date"
+        _ -> key
+    }
+}
+
+// The picture bytes of a FLAC PICTURE block body (RFC 9639 §8.8).
+public fn oggPictureData(_ b: Data) -> Data {
+    var r = core.byteReader(b)
+    r.skip(4)
+    let mimeLen = r.u32()
+    r.skip(mimeLen)
+    let descLen = r.u32()
+    r.skip(descLen)
+    r.skip(16)
+    let len = r.u32()
+    if r.overrun || len > r.left {
+        return Data()
+    }
+    r.bytes(len)
+}

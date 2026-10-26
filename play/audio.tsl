@@ -1,0 +1,285 @@
+// The sound side of the player. Tessel plays sound only from files, so
+// an AudioPump decodes one audio track, mixes it to stereo at 48 kHz,
+// changes its tempo when the speed isn't 1 (pitch kept), and writes it as
+// WAV chunks of about a second. Each chunk runs `overlap` seconds past its
+// nominal end, fading out, and the next fades in over the same samples, so
+// the app can start the next chunk when the current one reaches its
+// nominal length and any timing jitter is hidden in the crossfade.
+//
+// Times: a chunk knows the media time of its first sample (`start`) and
+// how much media time one second of it plays (`speed`), so the clock is
+// start + position × speed.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../core"
+import "../demux"
+import "../render"
+import "../fx"
+
+public let outRate = 48000
+public let overlap = 0.04
+
+public struct AudioChunk {
+    path: String
+    // Media time of the first sample, seconds.
+    start: Float
+    // Nominal length in seconds of playing (the overlap comes after it).
+    length: Float
+    // Media seconds per second played.
+    speed: Float = 1.0
+    // The last chunk of the track.
+    last: Bool = false
+    // Levels for a visualiser (0…1), one list for the chunk.
+    levels: [Float] = []
+}
+
+public struct AudioPump {
+    track: Int
+    dec: AudioDecoder
+    mixer: render.Mixer
+    stretcher: render.Stretcher
+    // Audio effects on the 48 kHz stereo output (one item; see fx.Chain).
+    effects: [fx.Chain] = []
+    // The packets are still arriving (a network stream): running out of
+    // them means wait, not the end.
+    growing: Bool = false
+    // The last chunk() stopped because no more packets had arrived yet.
+    starved: Bool = false
+    codec: String = ""
+    timescale: Int = 1000
+    next: Int = 0
+    done: Bool = false
+    speed: Float = 1.0
+    // Mixed (and stretched) stereo samples not yet written, interleaved.
+    pending: [Float] = []
+    // Media time of pending[0].
+    pendingStart: Float = 0.0
+    // Media time where decoded sound starts counting (after a seek, the
+    // target; sound before it is dropped).
+    dropBefore: Float = 0.0
+    // Priming frames still to drop at the start of the stream.
+    primeLeft: Int = 0
+    // Raw MP3: the decoder learns the priming from the first frame's LAME
+    // tag; take it from there once.
+    primeFromDecoder: Bool = false
+    started: Bool = false
+    // Media time of the next mixed sample.
+    clock: Float = 0.0
+    folder: String = ""
+    serial: Int = 0
+    // Numbers the chunk files; unlike serial, never starts again after a
+    // seek, so a file name is never used twice.
+    files: Int = 0
+    warnings: [String] = []
+    decodeMs: Float = 0.0
+
+    // Decodes until `seconds` (of playing time) are ready past what's
+    // already written, then writes one chunk. Gives nil when the track has
+    // ended and nothing is left.
+    fn chunk(_ file: Data, _ media: core.Media, seconds: Float = 1.0) -> AudioChunk? {
+        let wantFrames = Int(seconds * Float(outRate)) + Int(overlap * Float(outRate))
+        starved = false
+        while pending.count / 2 < wantFrames && !done && !starved {
+            step(file, media)
+        }
+        if starved && pending.count / 2 < wantFrames {
+            // Wait for more of the stream.
+            return nil
+        }
+        if pending.isEmpty {
+            return nil
+        }
+        let available = pending.count / 2
+        let fade = Int(overlap * Float(outRate))
+        var nominal = min(Int(seconds * Float(outRate)), available)
+        var total = min(nominal + fade, available)
+        let last = done && total >= available
+        if last {
+            nominal = available
+            total = available
+        }
+        var body = pending.slice(from: 0, to: total * 2)
+        // Fade in (unless it's the first chunk after a start or seek) and
+        // fade out over the overlap.
+        if serial > 0 {
+            for i in 0..min(fade, total) {
+                let g = Float(i) / Float(fade)
+                body[2 * i] = body[2 * i] * g
+                body[2 * i + 1] = body[2 * i + 1] * g
+            }
+        }
+        if !last {
+            for i in 0..min(fade, total) {
+                let k = total - 1 - i
+                let g = Float(i) / Float(fade)
+                if k >= 0 {
+                    body[2 * k] = body[2 * k] * g
+                    body[2 * k + 1] = body[2 * k + 1] * g
+                }
+            }
+        }
+        let s = core.Samples(rate: outRate, channels: 2, data: body, layout: ["FL", "FR"])
+        let path = joinPath(folder, "a{track}-{files}.wav")
+        files += 1
+        writeData(path: path, data: render.wavFile(s))
+        let start = pendingStart
+        let length = Float(nominal) / Float(outRate)
+        let lv = render.levels(core.Samples(rate: outRate, channels: 2, data: body.prefix(min(body.count, 4096)), layout: ["FL", "FR"]), bands: 24)
+        serial += 1
+        pending = pending.dropFirst(nominal * 2)
+        pendingStart += length * speed
+        AudioChunk(path: path, start: start, length: length, speed: speed, last: last, levels: lv)
+    }
+
+    // Decodes the next packet of the track into `pending`.
+    fn step(_ file: Data, _ media: core.Media) {
+        let n = media.packets.count
+        while next < n && media.packets[next].track != track {
+            next += 1
+        }
+        var s = core.Samples(rate: 0, channels: 0)
+        if next >= n && growing {
+            starved = true
+            return
+        }
+        if next >= n {
+            s = dec.flush()
+            done = true
+        } else {
+            let p = media.packets[next]
+            next += 1
+            let t0 = now()
+            s = dec.decode(core.packetBytes(file, media, p), pts: p.pts)
+            decodeMs += (now() - t0) * 1000.0
+        }
+        if s.channels <= 0 || s.data.isEmpty {
+            if done {
+                finish()
+            }
+            return
+        }
+        trimAndMix(s)
+        if done {
+            finish()
+        }
+    }
+
+    fn trimAndMix(_ s0: core.Samples) {
+        var s = s0
+        let frames = s.frames
+        var drop = 0
+        var t = clock
+        if s.pts != core.noTime {
+            t = core.seconds(s.pts, timescale)
+        }
+        // Priming (raw MP3 has none placed before 0 by the container).
+        if primeFromDecoder {
+            primeFromDecoder = false
+            primeLeft = dec.delay()
+        }
+        if primeLeft > 0 {
+            drop = min(primeLeft, frames)
+            primeLeft -= drop
+            t = 0.0
+        }
+        // Sound before the seek target, or before time 0.
+        let rate = Float(s.rate)
+        let before = max(dropBefore, 0.0)
+        if t + Float(drop) / rate < before {
+            let need = Int((before - t) * rate)
+            drop = max(drop, min(need, frames))
+        }
+        if drop >= frames {
+            clock = t + Float(frames) / rate
+            return
+        }
+        if drop > 0 {
+            s.data = s.data.dropFirst(drop * s.channels)
+            t += Float(drop) / rate
+        }
+        if !started {
+            started = true
+            pendingStart = t
+        }
+        clock = t + Float(s.frames) / rate
+        let mixed = mixer.process(s)
+        let played = if speed == 1.0 { mixed } else { stretcher.process(mixed) }
+        pending.appendAll(applyEffects(played))
+    }
+
+    fn applyEffects(_ s: core.Samples) -> [Float] {
+        if effects.isEmpty {
+            return s.data
+        }
+        effects[0].process(s).data
+    }
+
+    fn finish() {
+        let tail = mixer.flush()
+        if speed == 1.0 {
+            pending.appendAll(applyEffects(tail))
+        } else {
+            pending.appendAll(applyEffects(stretcher.process(tail)))
+            pending.appendAll(applyEffects(stretcher.flush()))
+        }
+        if !effects.isEmpty {
+            pending.appendAll(effects[0].flush().data)
+        }
+    }
+
+    // New effect settings: heard from the next decoded sound (call seek
+    // next for at once, as with speed).
+    fn setEffects(_ settings: fx.Settings) {
+        if effects.isEmpty {
+            effects = [fx.newChain(settings)]
+        } else {
+            effects[0].settings = settings
+        }
+    }
+
+    // Starts again from `seconds` (media time).
+    fn seek(_ media: core.Media, to: Float) {
+        dec.reset()
+        mixer.reset()
+        stretcher.reset()
+        if !effects.isEmpty {
+            effects[0].reset()
+        }
+        let i = demux.keyBefore(media, track: track, seconds: max(to - 0.2, 0.0))
+        next = max(i, 0)
+        done = false
+        pending = []
+        started = false
+        dropBefore = to
+        pendingStart = to
+        clock = to
+        primeLeft = 0
+        serial = 0
+    }
+
+    // Changes the speed for the sound not yet written; call seek next so
+    // the change starts right away.
+    fn setSpeed(_ s: Float) {
+        speed = s
+        stretcher.setSpeed(s)
+    }
+}
+
+public fn newAudioPump(_ media: core.Media, track: Int, folder: String) -> Result<AudioPump> {
+    let t = media.tracks[track]
+    let dec = try newAudioDecoder(t)
+    var pump = AudioPump(track: track, dec: dec, mixer: render.newMixer(channels: 2, rate: outRate), stretcher: render.newStretcher(channels: 2, rate: outRate), codec: t.codec, timescale: t.timescale, folder: folder)
+    // Raw MP3 streams start at 0 with the encoder's priming inside; other
+    // containers already place priming before 0.
+    if (t.codec == "mp3" || t.codec == "mp2") && media.format == "mp3" {
+        pump.primeFromDecoder = true
+    }
+    // The effects chain (with default settings it changes nothing).
+    var chain = fx.newChain()
+    chain.newTrack()
+    chain.setTags(media.tags)
+    pump.effects = [chain]
+    Result.ok(value: pump)
+}

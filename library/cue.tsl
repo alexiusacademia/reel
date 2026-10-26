@@ -1,0 +1,342 @@
+// CUE sheets: the text files that describe the tracks of a CD image or of
+// one long audio file (album.flac + album.cue). Reel reads them as tracks
+// (playlist entries with a start and an end inside the file) and as
+// chapters of that file, and writes them back.
+//
+// Followed: the CDRWIN cue sheet syntax as described by Wikipedia's "Cue
+// sheet (computing)" article and the Hydrogenaudio wiki's "Cue sheet" page:
+// commands REM, CATALOG, CDTEXTFILE, FILE "<name>" <type>, FLAGS, INDEX
+// <nn> <mm:ss:ff>, ISRC, PERFORMER, POSTGAP, PREGAP, SONGWRITER, TITLE,
+// TRACK <nn> <datatype>; times count 75 frames a second; INDEX 01 is where
+// a track starts, INDEX 00 where its pregap starts; each INDEX is relative
+// to the start of the FILE it is under.
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+import "../core"
+
+public struct CueTrack {
+    number: Int
+    title: String = ""
+    performer: String = ""
+    songwriter: String = ""
+    isrc: String = ""
+    // The file the track is in (resolved path), and its type ("WAVE"
+    // "MP3" "AIFF" "BINARY" "MOTOROLA").
+    file: String = ""
+    fileType: String = ""
+    // "AUDIO", "MODE1/2352" …
+    dataType: String = "AUDIO"
+    // Seconds into `file`: INDEX 01, and INDEX 00 (−1 when there's none).
+    start: Float = 0.0
+    pregap: Float = -1.0
+    // Other indexes (02 …) as seconds, in order.
+    more: [Float] = []
+}
+
+public struct CueSheet {
+    title: String = ""
+    performer: String = ""
+    songwriter: String = ""
+    catalog: String = ""
+    // REM lines: "GENRE" "DATE" "COMMENT" "DISCID" "REPLAYGAIN_ALBUM_GAIN" …
+    // (upper-case keys).
+    rems: [String: String] = [:]
+    // Every FILE named, resolved, in order.
+    files: [String] = []
+    tracks: [CueTrack] = []
+    warnings: [String] = []
+}
+
+// mm:ss:ff (75 frames a second) as seconds; −1 when it isn't one.
+public fn cueTime(_ s: String) -> Float {
+    let parts = s.trim().split(":")
+    if parts.count != 3 {
+        return -1.0
+    }
+    let m = parseInt(parts[0]).valueOr(-1)
+    let sec = parseInt(parts[1]).valueOr(-1)
+    let f = parseInt(parts[2]).valueOr(-1)
+    if m < 0 || sec < 0 || f < 0 || f >= 75 || sec >= 60 {
+        return -1.0
+    }
+    Float(m) * 60.0 + Float(sec) + Float(f) / 75.0
+}
+
+// Seconds as mm:ss:ff, rounded to the nearest frame.
+public fn formatCueTime(_ t: Float) -> String {
+    let frames = Int(max(t, 0.0) * 75.0 + 0.5)
+    let m = frames / (75 * 60)
+    let s = (frames / 75) % 60
+    let f = frames % 75
+    "{"{m}".padStart(2, with: "0")}:{"{s}".padStart(2, with: "0")}:{"{f}".padStart(2, with: "0")}"
+}
+
+// The words of a cue line; a "quoted string" is one word (without quotes).
+fn cueWords(_ line: String) -> [String] {
+    var out: [String] = []
+    var cur = ""
+    var inQuote = false
+    var had = false
+    for ch in line.characters {
+        if ch == "\"" {
+            inQuote = !inQuote
+            had = true
+        } else if (ch == " " || ch == "\t") && !inQuote {
+            if had || !cur.isEmpty {
+                out.append(cur)
+            }
+            cur = ""
+            had = false
+        } else {
+            cur += ch
+        }
+    }
+    if had || !cur.isEmpty {
+        out.append(cur)
+    }
+    out
+}
+
+// The rest of a line after its first `n` words, unquoted.
+fn cueRest(_ words: [String], _ n: Int) -> String {
+    words.dropFirst(n).joined(separator: " ")
+}
+
+// Reads a cue sheet; FILE names are resolved against `base`.
+public fn parseCue(_ text: String, base: String = "") -> Result<CueSheet> {
+    var sheet = CueSheet()
+    var file = ""
+    var fileType = ""
+    var inTrack = false
+    var cur = CueTrack(number: 0)
+    var lineNo = 0
+    for raw in text.lines() {
+        lineNo += 1
+        let w = cueWords(raw.trim())
+        if w.isEmpty {
+            continue
+        }
+        let cmd = w[0].uppercase()
+        if cmd == "REM" {
+            if w.count >= 2 {
+                sheet.rems[w[1].uppercase()] = cueRest(w, 2)
+            }
+        } else if cmd == "FILE" {
+            if w.count < 2 {
+                sheet.warnings.append("line {lineNo}: FILE without a name")
+                continue
+            }
+            // The type is the last word; a name with spaces may be unquoted.
+            if w.count >= 3 {
+                file = resolveLocation(w.slice(from: 1, to: w.count - 1).joined(separator: " "), base: base)
+                fileType = w[w.count - 1].uppercase()
+            } else {
+                file = resolveLocation(w[1], base: base)
+                fileType = ""
+            }
+            sheet.files.append(file)
+        } else if cmd == "TRACK" {
+            if inTrack {
+                sheet.tracks.append(cur)
+            }
+            let n = if w.count >= 2 { parseInt(w[1]).valueOr(sheet.tracks.count + 1) } else { sheet.tracks.count + 1 }
+            cur = CueTrack(number: n, file: file, fileType: fileType, dataType: if w.count >= 3 { w[2].uppercase() } else { "AUDIO" })
+            inTrack = true
+        } else if cmd == "INDEX" {
+            if !inTrack || w.count < 3 {
+                sheet.warnings.append("line {lineNo}: INDEX outside a track")
+                continue
+            }
+            let n = parseInt(w[1]).valueOr(-1)
+            let t = cueTime(w[2])
+            if t < 0.0 {
+                sheet.warnings.append("line {lineNo}: bad time {w[2]}")
+                continue
+            }
+            if n == 0 {
+                cur.pregap = t
+            } else if n == 1 {
+                cur.start = t
+            } else {
+                cur.more.append(t)
+            }
+        } else if cmd == "TITLE" {
+            if inTrack { cur.title = cueRest(w, 1) } else { sheet.title = cueRest(w, 1) }
+        } else if cmd == "PERFORMER" {
+            if inTrack { cur.performer = cueRest(w, 1) } else { sheet.performer = cueRest(w, 1) }
+        } else if cmd == "SONGWRITER" {
+            if inTrack { cur.songwriter = cueRest(w, 1) } else { sheet.songwriter = cueRest(w, 1) }
+        } else if cmd == "ISRC" {
+            if inTrack { cur.isrc = cueRest(w, 1) }
+        } else if cmd == "CATALOG" {
+            sheet.catalog = cueRest(w, 1)
+        } else if cmd == "FLAGS" || cmd == "PREGAP" || cmd == "POSTGAP" || cmd == "CDTEXTFILE" {
+            // Burning details: not needed to play.
+        } else {
+            sheet.warnings.append("line {lineNo}: unknown command {w[0]}")
+        }
+    }
+    if inTrack {
+        sheet.tracks.append(cur)
+    }
+    if sheet.tracks.isEmpty {
+        return Result.failure(error: Error("the cue sheet has no tracks"))
+    }
+    Result.ok(value: sheet)
+}
+
+// Where track `i` ends in its file: the next track's pregap (or start) when
+// it's in the same file, else −1 (the end of the file).
+fn cueTrackEnd(_ sheet: CueSheet, _ i: Int, chapters: Bool) -> Float {
+    if i + 1 < sheet.tracks.count && sheet.tracks[i + 1].file == sheet.tracks[i].file {
+        let next = sheet.tracks[i + 1]
+        if !chapters && next.pregap >= 0.0 {
+            return next.pregap
+        }
+        return next.start
+    }
+    -1.0
+}
+
+// The tracks as playlist entries (one per track, with start and end in the
+// file); titles and performers fall back to the sheet's.
+public fn cuePlaylist(_ sheet: CueSheet) -> Playlist {
+    var pl = Playlist(title: sheet.title, format: "cue", warnings: sheet.warnings)
+    for (i, t) in sheet.tracks.enumerated() {
+        if t.dataType != "AUDIO" && !t.dataType.isEmpty {
+            continue
+        }
+        let end = cueTrackEnd(sheet, i, chapters: false)
+        let d = if end >= 0.0 { end - t.start } else { -1.0 }
+        pl.entries.append(PlaylistEntry(location: t.file, title: if t.title.isEmpty { "Track {t.number}" } else { t.title }, duration: d, artist: if t.performer.isEmpty { sheet.performer } else { t.performer }, album: sheet.title, start: t.start, end: end, trackNumber: t.number))
+    }
+    pl
+}
+
+// The tracks inside `file` as chapters (all tracks when `file` is "" and
+// the sheet names one file). `duration` (seconds, when known) ends the
+// last chapter.
+public fn cueChapters(_ sheet: CueSheet, file: String = "", duration: Float = -1.0) -> [core.Chapter] {
+    var out: [core.Chapter] = []
+    let want = if file.isEmpty && !sheet.files.isEmpty { sheet.files[0] } else { file }
+    for (i, t) in sheet.tracks.enumerated() {
+        if !want.isEmpty && t.file != want && !(t.file.fileName == want.fileName) {
+            continue
+        }
+        var end = cueTrackEnd(sheet, i, chapters: true)
+        if end < 0.0 {
+            end = duration
+        }
+        let title = if t.title.isEmpty { "Track {t.number}" } else { t.title }
+        out.append(core.Chapter(start: t.start, end: end, title: title))
+    }
+    out
+}
+
+// The cue sheet that goes with a media file: "<name>.cue" or
+// "<name>.<ext>.cue" beside it, or the only .cue in the folder that names
+// this file. `listing` is the folder's file names (from listFolder).
+public fn findCueSheet(_ mediaPath: String, listing: [String]) -> String {
+    let name = mediaPath.fileName
+    let stem = if let dot = name.findLast(".") { name.substring(from: 0, to: dot) } else { name }
+    let lower: [String] = listing.map { n in n.lowercase() }
+    for cand in [stem + ".cue", name + ".cue"] {
+        if let i = lower.index(of: cand.lowercase()) {
+            return joinPath(mediaPath.folder, listing[i])
+        }
+    }
+    for n in listing {
+        if n.lowercase().hasSuffix(".cue") {
+            let p = joinPath(mediaPath.folder, n)
+            if let d = readData(p) {
+                if decodeText(d).contains(name) {
+                    return p
+                }
+            }
+        }
+    }
+    ""
+}
+
+// A cue sheet made from a playlist whose entries have starts (one FILE line
+// for each run of entries in the same file).
+public fn cueFromPlaylist(_ pl: Playlist) -> CueSheet {
+    var sheet = CueSheet(title: pl.title)
+    var n = 1
+    for e in pl.entries {
+        if !sheet.files.contains(e.location) {
+            sheet.files.append(e.location)
+        }
+        let type = cueFileType(e.location)
+        sheet.tracks.append(CueTrack(number: n, title: e.title, performer: e.artist, file: e.location, fileType: type, start: e.start))
+        if sheet.performer.isEmpty && !e.artist.isEmpty {
+            sheet.performer = e.artist
+        }
+        n += 1
+    }
+    sheet
+}
+
+fn cueFileType(_ path: String) -> String {
+    let ext = path.fileExtension.lowercase()
+    if ext == "mp3" {
+        return "MP3"
+    }
+    if ext == "aif" || ext == "aiff" {
+        return "AIFF"
+    }
+    "WAVE"
+}
+
+// Writes a cue sheet; files inside `base` are written relative to it.
+public fn writeCue(_ sheet: CueSheet, base: String = "") -> String {
+    var out = ""
+    for (k, v) in sheet.rems {
+        out += "REM {k} {cueQuoteIfNeeded(v)}\n"
+    }
+    if !sheet.catalog.isEmpty {
+        out += "CATALOG {sheet.catalog}\n"
+    }
+    if !sheet.performer.isEmpty {
+        out += "PERFORMER \"{cueText(sheet.performer)}\"\n"
+    }
+    if !sheet.title.isEmpty {
+        out += "TITLE \"{cueText(sheet.title)}\"\n"
+    }
+    var file = ""
+    var first = true
+    for t in sheet.tracks {
+        if t.file != file || first {
+            first = false
+            file = t.file
+            let type = if t.fileType.isEmpty { cueFileType(t.file) } else { t.fileType }
+            out += "FILE \"{cueText(relativeLocation(t.file, base: base))}\" {type}\n"
+        }
+        out += "  TRACK {"{t.number}".padStart(2, with: "0")} {if t.dataType.isEmpty { "AUDIO" } else { t.dataType }}\n"
+        if !t.title.isEmpty {
+            out += "    TITLE \"{cueText(t.title)}\"\n"
+        }
+        if !t.performer.isEmpty {
+            out += "    PERFORMER \"{cueText(t.performer)}\"\n"
+        }
+        if !t.isrc.isEmpty {
+            out += "    ISRC {t.isrc}\n"
+        }
+        if t.pregap >= 0.0 {
+            out += "    INDEX 00 {formatCueTime(t.pregap)}\n"
+        }
+        out += "    INDEX 01 {formatCueTime(t.start)}\n"
+    }
+    out
+}
+
+// Cue strings can't hold a double quote: it becomes a single one.
+fn cueText(_ s: String) -> String {
+    oneLine(s).replace("\"", with: "'")
+}
+
+fn cueQuoteIfNeeded(_ s: String) -> String {
+    if s.contains(" ") { "\"{cueText(s)}\"" } else { s }
+}

@@ -1,0 +1,124 @@
+// Where each probability and symbol count of a VP9 frame context lives in
+// the parser's flat lists (VP9 spec 7.3 "frame context", 8.4 probability
+// adaptation), plus the small coding trees of the spec (9.3) as lists.
+//
+// Probabilities (vp9DefaultProbs order, 311 entries):
+//   yMode [4][9]  uvMode [10][9]  filter [4][2]  mvMode [7][3]  intra [4]
+//   comp [5]  singleRef [5][2]  compRef [5]  tx32 [2][3]  tx16 [2][2]
+//   tx8 [2]  skip [3]  mvJoint [3]  mvComp [2][33]  partition [4][4][3]
+// mvComp per component: sign, classes[10], class0, bits[10],
+//   class0Fp[2][3], fp[3], class0Hp, hp.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+let pYMode = 0
+let pUvMode = 36
+let pFilter = 126
+let pMvMode = 134
+let pIntra = 155
+let pComp = 159
+let pSingleRef = 164
+let pCompRef = 174
+let pTx32 = 179
+let pTx16 = 185
+let pTx8 = 189
+let pSkip = 191
+let pMvJoint = 194
+let pMvComp = 197
+let pPartition = 263
+let pCount = 311
+
+// Offsets inside one mv component's 33 probabilities.
+let mvcSign = 0
+let mvcClasses = 1
+let mvcClass0 = 11
+let mvcBits = 12
+let mvcClass0Fp = 22
+let mvcFp = 28
+let mvcClass0Hp = 31
+let mvcHp = 32
+
+// Symbol counts for backward adaptation (8.4.2), 422 entries:
+//   yMode [4][10]  uvMode [10][10]  filter [4][3]  mvMode [7][4]
+//   intra [4][2]  comp [5][2]  singleRef [5][2][2]  compRef [5][2]
+//   tx32 [2][4]  tx16 [2][3]  tx8 [2][2]  skip [3][2]  mvJoint [4]
+//   mvComp [2][51]  partition [4][4][4]
+let cYMode = 0
+let cUvMode = 40
+let cFilter = 140
+let cMvMode = 152
+let cIntra = 180
+let cComp = 188
+let cSingleRef = 198
+let cCompRef = 218
+let cTx32 = 228
+let cTx16 = 236
+let cTx8 = 242
+let cSkip = 246
+let cMvJoint = 252
+let cMvComp = 256
+let cPartition = 358
+let cCount = 422
+
+// Offsets inside one mv component's 51 counts.
+let mvkSign = 0
+let mvkClasses = 2
+let mvkClass0 = 13
+let mvkBits = 15
+let mvkClass0Fp = 35
+let mvkFp = 43
+let mvkClass0Hp = 47
+let mvkHp = 49
+
+// Intra modes (FFmpeg's numbering, used by every table here).
+let modeV = 0
+let modeH = 1
+let modeDc = 2
+let modeD45 = 3
+let modeD135 = 4
+let modeD117 = 5
+let modeD153 = 6
+let modeD63 = 7
+let modeD207 = 8
+let modeTm = 9
+let modeLeftDc = 10
+let modeTopDc = 11
+let modeDc128 = 12
+let modeDc127 = 13
+let modeDc129 = 14
+// Inter modes.
+let modeNearest = 10
+let modeNear = 11
+let modeZero = 12
+let modeNew = 13
+
+// Block sizes (bs): 64x64 64x32 32x64 32x32 32x16 16x32 16x16 16x8 8x16
+// 8x8 8x4 4x8 4x4 = 0 … 12; bs = level * 3 + partition.
+let bs8x8 = 9
+let bs8x4 = 10
+let bs4x8 = 11
+let bs4x4 = 12
+
+// Interpolation filters: smooth, regular, sharp, bilinear, switchable.
+let filterSwitchable = 4
+
+// Width and height of each block size in 4x4 units, then in 8x8 units
+// (at least 1): [bs * 2], [bs * 2 + 1].
+let vp9Bwh4: [Int] = [16, 16, 16, 8, 8, 16, 8, 8, 8, 4, 4, 8, 4, 4, 4, 2, 2, 4, 2, 2, 2, 1, 1, 2, 1, 1]
+let vp9Bwh8: [Int] = [8, 8, 8, 4, 4, 8, 4, 4, 4, 2, 2, 4, 2, 2, 2, 1, 1, 2, 1, 1, 1, 1, 1, 1, 1, 1]
+
+// Trees (9.3.1), as FFmpeg writes them: tree[2 * node + bit] is the next
+// node, or a leaf -symbol when it is <= 0; node n is read with probs[n].
+let treePartition: [Int] = [0, 1, -1, 2, -2, -3]
+let treeSegment: [Int] = [1, 2, 3, 4, 5, 6, 0, -1, -2, -3, -4, -5, -6, -7]
+let treeIntraMode: [Int] = [-2, 1, -9, 2, 0, 3, 4, 6, -1, 5, -4, -5, -3, 7, -7, 8, -6, -8]
+let treeInterMode: [Int] = [-12, 1, -10, 2, -11, -13]
+let treeFilter: [Int] = [0, 1, -1, -2]
+let treeMvJoint: [Int] = [0, 1, -1, 2, -2, -3]
+let treeMvClass: [Int] = [0, 1, -1, 2, 3, 4, -2, -3, 5, 6, -4, -5, -6, 7, 8, 9, -7, -8, -9, -10]
+let treeMvFp: [Int] = [0, 1, -1, 2, -2, -3]
+
+// The transform type of each intra mode (and DCT for the inter modes
+// 10…13): 0 DCT_DCT, 1 DCT_ADST, 2 ADST_DCT, 3 ADST_ADST.
+let vp9IntraTxType: [Int] = [2, 1, 0, 0, 3, 2, 1, 2, 1, 3, 0, 0, 0, 0]

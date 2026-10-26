@@ -1,0 +1,1776 @@
+// MPEG transport streams (.ts, .m2ts, .mts), and the elementary stream
+// helpers the program stream reader (ps.tsl) shares: frame cutting for
+// audio, header probes for track details, keyframe tests.
+//
+// A transport stream (ISO/IEC 13818-1 §2.4) is a run of 188-byte packets,
+// each starting with the sync byte 0x47 and naming a 13-bit PID. Blu-ray
+// M2TS puts a 4-byte timestamp before each packet (192 bytes); DVB-ASI
+// captures may add 16 Reed-Solomon bytes after it (204 bytes). PID 0
+// carries the Program Association Table (PAT, §2.4.4.3), which names the
+// PID of each program's Program Map Table (PMT, §2.4.4.8), which lists
+// the program's elementary streams with their stream types and
+// descriptors. Each elementary stream is cut into PES packets (§2.4.3.6)
+// that start in a TS packet with payload_unit_start_indicator set and
+// continue in the next packets of that PID.
+//
+// One PES packet of a video stream is one packet here (muxers put one
+// access unit in each), its bytes as `parts` (the TS payload pieces, PES
+// header left out). Audio PES packets often hold several frames, so audio
+// is cut into frames by their headers (ADTS, AC-3/E-AC-3, MPEG audio, DTS
+// with its DTS-HD substream; private streams found to be DTS by their
+// first bytes) the way ffmpeg's parsers do: a PES's PTS goes to the
+// first frame that starts in it, later frames count on by their sample
+// counts.
+//
+// Times are the PES PTS/DTS at 90 kHz, with the 33-bit wraparound
+// unwrapped; the first timestamp isn't moved to zero (ffmpeg keeps them
+// too).
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../core"
+import "../dts"
+
+// Frame cutter kinds.
+let tsCutNone = 0
+let tsCutAdts = 1
+let tsCutAc3 = 2
+let tsCutMpa = 3
+let tsCutSpu = 4
+let tsCutDts = 5
+
+let tsWrap = 8589934592
+let tsHalfWrap = 4294967296
+
+// Cuts one elementary stream's bytes, which arrive as pieces of the file,
+// into frames by their own headers. Pieces are offset, size pairs; the
+// stream position counts bytes from the stream's start.
+struct TsFramer {
+    kind: Int = 0
+    q: [Int] = []
+    qHead: Int = 0
+    qUsed: Int = 0
+    avail: Int = 0
+    pos: Int = 0
+    // Timestamps waiting for a frame: stream position, pts, dts triples.
+    marks: [Int] = []
+    mHead: Int = 0
+    // Timing of the frames after the last timestamp.
+    basePts: Int = -9223372036854775807
+    baseDts: Int = -9223372036854775807
+    samplesSince: Int = 0
+    stepSum: Int = 0
+    lost: Int = 0
+    frames: Int = 0
+    // DTS: samples and rate of the last core frame (for substream-only
+    // frames, which don't say).
+    dtsSamples: Int = 512
+    dtsRate: Int = 48000
+
+    fn push(_ parts: [Int], pts: Int, dts: Int) {
+        if pts != core.noTime {
+            marks.append(pos + avail)
+            marks.append(pts)
+            marks.append(if dts == core.noTime { pts } else { dts })
+        }
+        var i = 0
+        while i + 1 < parts.count {
+            if parts[i + 1] > 0 {
+                q.append(parts[i])
+                q.append(parts[i + 1])
+                avail += parts[i + 1]
+            }
+            i += 2
+        }
+    }
+
+    // The k-th byte not yet framed.
+    fn byteAt(_ file: Data, _ k: Int) -> Int {
+        var i = qHead
+        var off = qUsed + k
+        while off >= q[i + 1] {
+            off -= q[i + 1]
+            i += 2
+        }
+        file[q[i] + off]
+    }
+
+    // A DTS frame (ETSI TS 102 114 5.3.1 core header; the DTS-HD
+    // extension substream after it, padded to 4 bytes, belongs to the same
+    // frame): length, samples, rate; length 0 when no frame starts here,
+    // −1 when more bytes are needed to tell.
+    fn dtsFrameLength(_ file: Data, _ final: Bool) -> (Int, Int, Int) {
+        let b0 = byteAt(file, 0)
+        let b1 = byteAt(file, 1)
+        let b2 = byteAt(file, 2)
+        let b3 = byteAt(file, 3)
+        if b0 == 0x64 && b1 == 0x58 && b2 == 0x20 && b3 == 0x25 {
+            let n = dtsSubstreamSize(file, 0)
+            return (n, dtsSamples, dtsRate)
+        }
+        if b0 != 0x7F || b1 != 0xFE || b2 != 0x80 || b3 != 0x01 {
+            return (0, 0, 0)
+        }
+        let b4 = byteAt(file, 4)
+        let b5 = byteAt(file, 5)
+        let b6 = byteAt(file, 6)
+        let b7 = byteAt(file, 7)
+        let b8 = byteAt(file, 8)
+        let npcm = (((b4 & 1) << 6) | (b5 >> 2)) + 1
+        let fsize = (((b5 & 3) << 12) | (b6 << 4) | (b7 >> 4)) + 1
+        let rates = [0, 8000, 16000, 32000, 0, 0, 11025, 22050, 44100, 0, 0, 12000, 24000, 48000, 96000, 192000]
+        let rate = rates[(b8 >> 2) & 15]
+        if fsize < 96 || (npcm & 7) != 0 || rate == 0 {
+            return (0, 0, 0)
+        }
+        dtsSamples = npcm * 32
+        dtsRate = rate
+        let aligned = (fsize + 3) & ~3
+        if avail < aligned + 12 {
+            if final || avail >= aligned + 4 && !(byteAt(file, aligned) == 0x64) {
+                return (fsize, npcm * 32, rate)
+            }
+            return (-1, 0, 0)
+        }
+        if byteAt(file, aligned) == 0x64 && byteAt(file, aligned + 1) == 0x58 && byteAt(file, aligned + 2) == 0x20 && byteAt(file, aligned + 3) == 0x25 {
+            let n = dtsSubstreamSize(file, aligned)
+            if n > 0 {
+                return (aligned + n, npcm * 32, rate)
+            }
+        }
+        (fsize, npcm * 32, rate)
+    }
+
+    // The size of the extension substream at byte k (its header's
+    // nuExtSSFsize), 0 when it can't be read.
+    fn dtsSubstreamSize(_ file: Data, _ k: Int) -> Int {
+        if avail < k + 10 {
+            return 0
+        }
+        var x = 0
+        for i in 4..10 {
+            x = (x << 8) | byteAt(file, k + i)
+        }
+        // user bits (8), substream index (2), wide header flag (1), header
+        // size (8 or 12), substream size (16 or 20), then +1.
+        let wide = (x >> 37) & 1
+        if wide == 1 {
+            return ((x >> 5) & 0xFFFFF) + 1
+        }
+        ((x >> 13) & 0xFFFF) + 1
+    }
+
+    // Takes n bytes off the front, as offset, size pairs.
+    fn take(_ n: Int) -> [Int] {
+        var out: [Int] = []
+        var left = n
+        while left > 0 && qHead < q.count {
+            let have = q[qHead + 1] - qUsed
+            let use = min(have, left)
+            if !out.isEmpty && out[out.count - 2] + out[out.count - 1] == q[qHead] + qUsed {
+                out[out.count - 1] += use
+            } else {
+                out.append(q[qHead] + qUsed)
+                out.append(use)
+            }
+            left -= use
+            qUsed += use
+            if qUsed == q[qHead + 1] {
+                qHead += 2
+                qUsed = 0
+            }
+        }
+        avail -= n
+        pos += n
+        compact()
+        out
+    }
+
+    fn drop(_ n: Int) {
+        var left = n
+        while left > 0 && qHead < q.count {
+            let have = q[qHead + 1] - qUsed
+            let use = min(have, left)
+            left -= use
+            qUsed += use
+            if qUsed == q[qHead + 1] {
+                qHead += 2
+                qUsed = 0
+            }
+        }
+        avail -= n
+        pos += n
+        compact()
+    }
+
+    fn compact() {
+        if qHead >= 256 {
+            q = q.slice(from: qHead, to: q.count)
+            qHead = 0
+        }
+        if mHead >= 96 {
+            marks = marks.slice(from: mHead, to: marks.count)
+            mHead = 0
+        }
+    }
+
+    // Cuts the frames that are complete. At the end of the file (`final`)
+    // what's left is dropped.
+    fn drain(_ file: Data, _ track: Int, final: Bool) -> [core.PacketRef] {
+        var out: [core.PacketRef] = []
+        let need = if kind == tsCutAdts { 7 } else if kind == tsCutAc3 { 8 } else if kind == tsCutMpa { 4 } else if kind == tsCutDts { 16 } else { 2 }
+        while avail >= need {
+            var info = (0, 0, 0)
+            if kind == tsCutDts {
+                let r = dtsFrameLength(file, final)
+                if r.0 < 0 {
+                    break
+                }
+                info = r
+            } else {
+                var h: [Int] = []
+                for k in 0..need {
+                    h.append(byteAt(file, k))
+                }
+                info = tsFrameHeader(kind, h)
+            }
+            let len = info.0
+            if len <= 0 {
+                drop(1)
+                lost += 1
+                continue
+            }
+            if len > avail {
+                break
+            }
+            let start = pos
+            let parts = take(len)
+            // The newest timestamp that came at or before this frame's
+            // start (and after the previous frame's) is this frame's.
+            var found = false
+            var mp = core.noTime
+            var md = core.noTime
+            while mHead + 2 < marks.count && marks[mHead] <= start {
+                mp = marks[mHead + 1]
+                md = marks[mHead + 2]
+                found = true
+                mHead += 3
+            }
+            // Frames without a timestamp follow the previous one. ffmpeg's
+            // parsers count AC-3 and MPEG audio on by each frame's
+            // duration in whole ticks, and ADTS AAC by the exact sample
+            // count rounded to ticks; the same here.
+            let samples = info.1
+            let rate = info.2
+            if found {
+                basePts = mp
+                baseDts = md
+                samplesSince = 0
+                stepSum = 0
+            }
+            var pts = core.noTime
+            var dts = core.noTime
+            var dur = 0
+            if rate > 0 {
+                dur = samples * 90000 / rate
+            }
+            if basePts != core.noTime {
+                var since = stepSum
+                if kind == tsCutAdts && rate > 0 {
+                    since = (samplesSince * 180000 + rate) / (2 * rate)
+                }
+                pts = basePts + since
+                dts = baseDts + since
+            }
+            samplesSince += samples
+            stepSum += dur
+            var p = core.PacketRef(track: track, pts: pts, dts: dts, duration: dur, key: true, offset: parts[0], size: len)
+            if parts.count > 2 {
+                p.parts = parts
+            }
+            out.append(p)
+            frames += 1
+        }
+        if final && avail > 0 {
+            lost += avail
+            drop(avail)
+        }
+        out
+    }
+}
+
+// Frame length, samples and sample rate from the first bytes of a frame
+// (0 length: not a frame header here).
+fn tsFrameHeader(_ kind: Int, _ h: [Int]) -> (Int, Int, Int) {
+    if kind == tsCutAdts {
+        // ISO/IEC 14496-3 §1.A.2.2 adts_fixed_header and adts_variable_header.
+        if h[0] != 0xFF || (h[1] & 0xF6) != 0xF0 {
+            return (0, 0, 0)
+        }
+        let sfi = (h[2] >> 2) & 15
+        let rate = tsAacRate(sfi)
+        let len = ((h[3] & 3) << 11) | (h[4] << 3) | (h[5] >> 5)
+        let blocks = (h[6] & 3) + 1
+        if rate == 0 || len < 7 {
+            return (0, 0, 0)
+        }
+        return (len, 1024 * blocks, rate)
+    }
+    if kind == tsCutAc3 {
+        let a = tsAc3Header(h)
+        return (a.0, a.1, a.2)
+    }
+    if kind == tsCutMpa {
+        let m = tsMpaHeader(h)
+        return (m.0, m.1, m.2)
+    }
+    if kind == tsCutSpu {
+        // DVD sub-picture unit: SPU_SIZE (16 bits) covers the whole unit.
+        let len = (h[0] << 8) | h[1]
+        if len < 4 {
+            return (0, 0, 0)
+        }
+        return (len, 0, 0)
+    }
+    (0, 0, 0)
+}
+
+fn tsAacRate(_ i: Int) -> Int {
+    let rates = [96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350]
+    if i < 0 || i >= rates.count {
+        return 0
+    }
+    rates[i]
+}
+
+// AC-3 (ATSC A/52 §5.4.1 syncinfo, bsi) or E-AC-3 (A/52 Annex E §E.1.2):
+// frame length, samples, rate, channels, codec.
+fn tsAc3Header(_ h: [Int]) -> (Int, Int, Int, Int, String) {
+    if h.count < 8 || h[0] != 0x0B || h[1] != 0x77 {
+        return (0, 0, 0, 0, "")
+    }
+    let bsid = h[5] >> 3
+    let chans = [2, 1, 2, 3, 3, 4, 4, 5]
+    if bsid <= 10 {
+        let fscod = h[4] >> 6
+        let code = h[4] & 63
+        if fscod == 3 || code >= 38 {
+            return (0, 0, 0, 0, "")
+        }
+        let kbps = [32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384, 448, 512, 576, 640]
+        let br = kbps[code >> 1]
+        var bytes = 0
+        var rate = 48000
+        if fscod == 0 {
+            bytes = br * 4
+        } else if fscod == 1 {
+            rate = 44100
+            bytes = (br * 96000 / 44100 + (code & 1)) * 2
+        } else {
+            rate = 32000
+            bytes = br * 6
+        }
+        // bsi: bsid(5) bsmod(3) acmod(3), then cmixlev, surmixlev,
+        // dsurmod when present, then lfeon.
+        var r = core.bitReader(Data(bytes: h))
+        r.skip(48)
+        let acmod = r.bits(3)
+        if (acmod & 1) != 0 && acmod != 1 {
+            r.skip(2)
+        }
+        if (acmod & 4) != 0 {
+            r.skip(2)
+        }
+        if acmod == 2 {
+            r.skip(2)
+        }
+        let lfe = r.bits(1)
+        return (bytes, 1536, rate, chans[acmod] + lfe, "ac3")
+    }
+    if bsid > 16 {
+        return (0, 0, 0, 0, "")
+    }
+    // E-AC-3: strmtyp(2) substreamid(3) frmsiz(11) fscod(2)
+    // numblkscod/fscod2(2) acmod(3) lfeon(1).
+    let frmsiz = ((h[2] & 7) << 8) | h[3]
+    let fscod = h[4] >> 6
+    let x = (h[4] >> 4) & 3
+    var rate = 0
+    var blocks = 6
+    if fscod == 3 {
+        let half = [24000, 22050, 16000, 0]
+        rate = half[x]
+    } else {
+        let full = [48000, 44100, 32000]
+        rate = full[fscod]
+        let nb = [1, 2, 3, 6]
+        blocks = nb[x]
+    }
+    let acmod = (h[4] >> 1) & 7
+    let lfe = h[4] & 1
+    if rate == 0 {
+        return (0, 0, 0, 0, "")
+    }
+    // Dependent substreams (strmtyp 1) add channels to the independent
+    // frame before them; they're kept as their own packets.
+    let strmtyp = h[2] >> 6
+    let samples = if strmtyp == 1 { 0 } else { blocks * 256 }
+    ((frmsiz + 1) * 2, samples, rate, chans[acmod] + lfe, "eac3")
+}
+
+// MPEG-1/2/2.5 audio frame header (ISO/IEC 11172-3 §2.4.2.3): frame
+// length, samples, rate, channels, codec.
+fn tsMpaHeader(_ h: [Int]) -> (Int, Int, Int, Int, String) {
+    if h.count < 4 || h[0] != 0xFF || (h[1] & 0xE0) != 0xE0 {
+        return (0, 0, 0, 0, "")
+    }
+    let version = (h[1] >> 3) & 3
+    let layer = (h[1] >> 1) & 3
+    let bri = h[2] >> 4
+    let sri = (h[2] >> 2) & 3
+    let pad = (h[2] >> 1) & 1
+    if version == 1 || layer == 0 || bri == 0 || bri == 15 || sri == 3 {
+        return (0, 0, 0, 0, "")
+    }
+    let v1 = version == 3
+    var rate = [44100, 48000, 32000][sri]
+    if version == 2 {
+        rate = rate / 2
+    } else if version == 0 {
+        rate = rate / 4
+    }
+    var kbps = 0
+    if v1 {
+        if layer == 3 {
+            kbps = [0, 32, 64, 96, 128, 160, 192, 224, 256, 288, 320, 352, 384, 416, 448][bri]
+        } else if layer == 2 {
+            kbps = [0, 32, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384][bri]
+        } else {
+            kbps = [0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320][bri]
+        }
+    } else {
+        if layer == 3 {
+            kbps = [0, 32, 48, 56, 64, 80, 96, 112, 128, 144, 160, 176, 192, 224, 256][bri]
+        } else {
+            kbps = [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160][bri]
+        }
+    }
+    let channels = if (h[3] >> 6) == 3 { 1 } else { 2 }
+    if layer == 3 {
+        return ((12 * kbps * 1000 / rate + pad) * 4, 384, rate, channels, "mp1")
+    }
+    if layer == 2 {
+        return (144 * kbps * 1000 / rate + pad, 1152, rate, channels, "mp2")
+    }
+    if v1 {
+        return (144 * kbps * 1000 / rate + pad, 1152, rate, channels, "mp3")
+    }
+    (72 * kbps * 1000 / rate + pad, 576, rate, channels, "mp3")
+}
+
+// --- Track details from the first bytes of a stream ---
+
+// Fills in what the elementary stream's headers say (size, rate,
+// channels); true when it found them. `d` is the start of a packet.
+fn tsProbe(_ t: core.Track, _ d: Data) -> (Bool, core.Track) {
+    var out = t
+    if t.codec == "h264" {
+        return tsProbeH264(out, d)
+    }
+    if t.codec == "mpeg1" || t.codec == "mpeg2" {
+        return tsProbeMpegVideo(out, d)
+    }
+    if t.codec == "hevc" {
+        return tsProbeHevc(out, d)
+    }
+    if t.codec == "mpeg4" {
+        return tsProbeMpeg4(out, d)
+    }
+    if t.codec == "aac" && t.adts {
+        let n = min(d.count, 4096)
+        var i = 0
+        while i + 7 <= n {
+            if d[i] == 0xFF && (d[i + 1] & 0xF6) == 0xF0 {
+                let rate = tsAacRate((d[i + 2] >> 2) & 15)
+                if rate > 0 {
+                    out.sampleRate = rate
+                    var ch = ((d[i + 2] & 1) << 2) | (d[i + 3] >> 6)
+                    if ch == 7 {
+                        ch = 8
+                    }
+                    out.channels = ch
+                    return (true, out)
+                }
+            }
+            i += 1
+        }
+        return (false, out)
+    }
+    if t.codec == "ac3" || t.codec == "eac3" {
+        let n = min(d.count, 4096)
+        var i = 0
+        while i + 8 <= n {
+            if d[i] == 0x0B && d[i + 1] == 0x77 {
+                let a = tsAc3Header(d.slice(from: i, to: i + 8).bytes)
+                if a.0 > 0 {
+                    out.sampleRate = a.2
+                    out.channels = a.3
+                    out.codec = a.4
+                    return (true, out)
+                }
+            }
+            i += 1
+        }
+        return (false, out)
+    }
+    if t.codec == "dts" || t.codec == "unknown:0x06" {
+        // DTS: the first frame's header (dts.frameInfo); a private stream
+        // (type 0x06) without descriptors is DTS when it starts with a DTS
+        // sync word, as FFmpeg finds it.
+        let n = min(d.count, 4096)
+        var i = 0
+        while i + 16 <= n {
+            if (d[i] == 0x7F || d[i] == 0x64) && dts.dtsSyncForm(d, at: i) >= 0 {
+                let fi = dts.frameInfo(d, at: i)
+                if fi.ok {
+                    out.codec = "dts"
+                    out.kind = core.TrackKind.audio
+                    out.sampleRate = if fi.hdRate > 0 { fi.hdRate } else { fi.rate }
+                    out.channels = if fi.hdChannels > 0 { fi.hdChannels } else { fi.channels }
+                    if fi.hdBits > 0 {
+                        out.bitsPerSample = fi.hdBits
+                    }
+                    return (true, out)
+                }
+            }
+            if t.codec != "dts" {
+                // Only a stream that starts with a frame is taken for DTS.
+                break
+            }
+            i += 1
+        }
+        return (false, out)
+    }
+    if t.codec == "mp1" || t.codec == "mp2" || t.codec == "mp3" {
+        let n = min(d.count, 4096)
+        var i = 0
+        while i + 4 <= n {
+            if d[i] == 0xFF && (d[i + 1] & 0xE0) == 0xE0 {
+                let m = tsMpaHeader(d.slice(from: i, to: i + 4).bytes)
+                if m.0 > 0 {
+                    out.sampleRate = m.2
+                    out.channels = m.3
+                    out.codec = m.4
+                    return (true, out)
+                }
+            }
+            i += 1
+        }
+        return (false, out)
+    }
+    (true, out)
+}
+
+// The position of the next 00 00 01 start code prefix in d[from..<to],
+// or -1.
+fn tsNextStartCode(_ d: Data, _ from: Int, _ to: Int) -> Int {
+    var i = from
+    while i + 2 < to {
+        let c = d[i + 2]
+        if c > 1 {
+            i += 3
+        } else if c == 1 && d[i] == 0 && d[i + 1] == 0 {
+            return i
+        } else {
+            i += 1
+        }
+    }
+    -1
+}
+
+// H.264 sequence parameter set (ITU-T H.264 §7.3.2.1.1): size after
+// cropping, sample aspect ratio (§E.1.1) and frame rate from the timing
+// info when there is one.
+fn tsProbeH264(_ t: core.Track, _ d: Data) -> (Bool, core.Track) {
+    var out = t
+    var at = tsNextStartCode(d, 0, d.count)
+    while at >= 0 {
+        let nal = at + 3
+        if nal >= d.count {
+            break
+        }
+        let next = tsNextStartCode(d, nal, d.count)
+        let end = if next < 0 { d.count } else { next }
+        if (d[nal] & 31) == 7 {
+            let rbsp = core.unescapeRbsp(d, from: nal + 1, to: end)
+            var r = core.bitReader(rbsp)
+            let profile = r.bits(8)
+            r.skip(16)
+            r.ue()
+            var chromaFormat = 1
+            var separate = false
+            if profile == 100 || profile == 110 || profile == 122 || profile == 244 || profile == 44 || profile == 83 || profile == 86 || profile == 118 || profile == 128 || profile == 138 || profile == 139 || profile == 134 || profile == 135 {
+                chromaFormat = r.ue()
+                if chromaFormat == 3 {
+                    separate = r.flag()
+                }
+                r.ue()
+                r.ue()
+                r.skip(1)
+                if r.flag() {
+                    let lists = if chromaFormat == 3 { 12 } else { 8 }
+                    for i in 0..lists {
+                        if r.flag() {
+                            let size = if i < 6 { 16 } else { 64 }
+                            var last = 8
+                            var next8 = 8
+                            for _ in 0..size {
+                                if next8 != 0 {
+                                    let delta = r.se()
+                                    next8 = (last + delta + 256) % 256
+                                }
+                                if next8 != 0 {
+                                    last = next8
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            r.ue()
+            let pocType = r.ue()
+            if pocType == 0 {
+                r.ue()
+            } else if pocType == 1 {
+                r.skip(1)
+                r.se()
+                r.se()
+                let n = r.ue()
+                for _ in 0..min(n, 255) {
+                    r.se()
+                }
+            }
+            r.ue()
+            r.skip(1)
+            let wMbs = r.ue() + 1
+            let hMap = r.ue() + 1
+            let frameMbsOnly = r.flag()
+            if !frameMbsOnly {
+                r.skip(1)
+            }
+            r.skip(1)
+            var cropL = 0
+            var cropR = 0
+            var cropT = 0
+            var cropB = 0
+            if r.flag() {
+                cropL = r.ue()
+                cropR = r.ue()
+                cropT = r.ue()
+                cropB = r.ue()
+            }
+            let arrayType = if separate { 0 } else { chromaFormat }
+            let cx = if arrayType == 0 { 1 } else if arrayType == 3 { 1 } else { 2 }
+            var cy = if arrayType == 1 { 2 } else { 1 }
+            if !frameMbsOnly {
+                cy = cy * 2
+            }
+            let frameH = (if frameMbsOnly { 1 } else { 2 }) * hMap * 16
+            out.width = wMbs * 16 - cx * (cropL + cropR)
+            out.height = frameH - cy * (cropT + cropB)
+            if r.flag() {
+                // VUI: aspect_ratio_info.
+                if r.flag() {
+                    let idc = r.bits(8)
+                    let sars = [[1, 1], [1, 1], [12, 11], [10, 11], [16, 11], [40, 33], [24, 11], [20, 11], [32, 11], [80, 33], [18, 11], [15, 11], [64, 33], [160, 99], [4, 3], [3, 2], [2, 1]]
+                    if idc == 255 {
+                        let n = r.bits(16)
+                        let dd = r.bits(16)
+                        if n > 0 && dd > 0 {
+                            out.sarNum = n
+                            out.sarDen = dd
+                        }
+                    } else if idc > 0 && idc < sars.count {
+                        out.sarNum = sars[idc][0]
+                        out.sarDen = sars[idc][1]
+                    }
+                }
+                if r.flag() {
+                    r.skip(1)
+                }
+                if r.flag() {
+                    // video_signal_type: video_format, full range, and the
+                    // colour description (§E.2.1, table E-5 matrices).
+                    r.skip(3)
+                    out.fullRange = r.flag()
+                    if r.flag() {
+                        r.skip(16)
+                        out.matrix = tsMatrix(r.bits(8))
+                    }
+                }
+                if r.flag() {
+                    r.ue()
+                    r.ue()
+                }
+                if r.flag() {
+                    let units = r.bits(32)
+                    let scale = r.bits(32)
+                    if units > 0 && scale > 0 && !r.overrun {
+                        let g = tsGcd(scale, units * 2)
+                        out.fpsNum = scale / g
+                        out.fpsDen = units * 2 / g
+                    }
+                }
+            }
+            return (!r.overrun || out.width > 0, out)
+        }
+        at = next
+    }
+    (false, out)
+}
+
+// HEVC sequence parameter set (ITU-T H.265 §7.3.2.2.1): the picture
+// size after the conformance window. (The VUI's aspect ratio comes after
+// many variable fields and is left at 1:1.)
+fn tsProbeHevc(_ t: core.Track, _ d: Data) -> (Bool, core.Track) {
+    var out = t
+    var at = tsNextStartCode(d, 0, d.count)
+    while at >= 0 {
+        let nal = at + 3
+        if nal + 1 >= d.count {
+            break
+        }
+        let next = tsNextStartCode(d, nal, d.count)
+        let end = if next < 0 { d.count } else { next }
+        if ((d[nal] >> 1) & 63) == 33 {
+            let rbsp = core.unescapeRbsp(d, from: nal + 2, to: end)
+            var r = core.bitReader(rbsp)
+            r.skip(4)
+            let subLayers = r.bits(3)
+            r.skip(1)
+            // profile_tier_level(1, sps_max_sub_layers_minus1) §7.3.3.
+            r.skip(88)
+            r.skip(8)
+            var profilePresent: [Bool] = []
+            var levelPresent: [Bool] = []
+            for _ in 0..subLayers {
+                profilePresent.append(r.flag())
+                levelPresent.append(r.flag())
+            }
+            if subLayers > 0 {
+                for _ in subLayers..8 {
+                    r.skip(2)
+                }
+            }
+            for i in 0..subLayers {
+                if profilePresent[i] {
+                    r.skip(88)
+                }
+                if levelPresent[i] {
+                    r.skip(8)
+                }
+            }
+            r.ue()
+            let chroma = r.ue()
+            if chroma == 3 {
+                r.skip(1)
+            }
+            let w = r.ue()
+            let h = r.ue()
+            var cl = 0
+            var cr = 0
+            var ct = 0
+            var cb = 0
+            if r.flag() {
+                cl = r.ue()
+                cr = r.ue()
+                ct = r.ue()
+                cb = r.ue()
+            }
+            let sx = if chroma == 1 || chroma == 2 { 2 } else { 1 }
+            let sy = if chroma == 1 { 2 } else { 1 }
+            out.width = w - sx * (cl + cr)
+            out.height = h - sy * (ct + cb)
+            return (!r.overrun, out)
+        }
+        at = next
+    }
+    (false, out)
+}
+
+// MPEG-4 Part 2 video object layer header (ISO/IEC 14496-2 §6.2.3): the
+// size and pixel aspect ratio.
+fn tsProbeMpeg4(_ t: core.Track, _ d: Data) -> (Bool, core.Track) {
+    var out = t
+    var at = tsNextStartCode(d, 0, d.count)
+    while at >= 0 && at + 4 < d.count {
+        let code = d[at + 3]
+        if code >= 0x20 && code <= 0x2F {
+            var r = core.bitReaderRange(d, from: at + 4, to: d.count)
+            r.skip(1)
+            r.skip(8)
+            var verid = 1
+            if r.flag() {
+                verid = r.bits(4)
+                r.skip(3)
+            }
+            let ar = r.bits(4)
+            let pars = [[1, 1], [1, 1], [12, 11], [10, 11], [16, 11], [40, 33]]
+            if ar == 15 {
+                let pw = r.bits(8)
+                let ph = r.bits(8)
+                if pw > 0 && ph > 0 {
+                    out.sarNum = pw
+                    out.sarDen = ph
+                }
+            } else if ar > 0 && ar < pars.count {
+                out.sarNum = pars[ar][0]
+                out.sarDen = pars[ar][1]
+            }
+            if r.flag() {
+                r.skip(3)
+                if r.flag() {
+                    r.skip(79)
+                }
+            }
+            let shape = r.bits(2)
+            if shape == 3 && verid != 1 {
+                r.skip(4)
+            }
+            r.skip(1)
+            let resolution = r.bits(16)
+            r.skip(1)
+            if r.flag() {
+                var bits = 1
+                while (1 << bits) < resolution {
+                    bits += 1
+                }
+                r.skip(bits)
+            }
+            if shape == 0 {
+                r.skip(1)
+                out.width = r.bits(13)
+                r.skip(1)
+                out.height = r.bits(13)
+            }
+            return (!r.overrun, out)
+        }
+        at = tsNextStartCode(d, at + 3, d.count)
+    }
+    (false, out)
+}
+
+// MPEG-1/2 video sequence header (ISO/IEC 13818-2 §6.2.2.1) and sequence
+// extension (§6.2.2.3): size, aspect, frame rate, and MPEG-1 or -2.
+fn tsProbeMpegVideo(_ t: core.Track, _ d: Data) -> (Bool, core.Track) {
+    var out = t
+    var at = tsNextStartCode(d, 0, d.count)
+    var found = false
+    var aspect = 0
+    while at >= 0 && at + 12 <= d.count {
+        let code = d[at + 3]
+        if code == 0xB3 && !found {
+            out.width = (d[at + 4] << 4) | (d[at + 5] >> 4)
+            out.height = ((d[at + 5] & 15) << 8) | d[at + 6]
+            aspect = d[at + 7] >> 4
+            let frc = d[at + 7] & 15
+            let nums = [0, 24000, 24, 25, 30000, 30, 50, 60000, 60]
+            let dens = [1, 1001, 1, 1, 1001, 1, 1, 1001, 1]
+            if frc > 0 && frc < 9 {
+                out.fpsNum = nums[frc]
+                out.fpsDen = dens[frc]
+            }
+            found = true
+            if out.codec == "mpeg1" || out.codec == "mpeg2" {
+                // Decided below by the extension.
+                out.codec = "mpeg1"
+            }
+        } else if code == 0xB5 && found && (d[at + 4] >> 4) == 2 {
+            // Sequence display extension (§6.2.2.4): video_format(3),
+            // colour_description(1), then primaries, transfer, matrix.
+            if (d[at + 4] & 1) != 0 && at + 8 <= d.count {
+                out.matrix = tsMatrix(d[at + 7])
+            }
+        } else if code == 0xB5 && found && (d[at + 4] >> 4) == 1 {
+            out.codec = "mpeg2"
+            let hx = ((d[at + 5] & 1) << 1) | (d[at + 6] >> 7)
+            let vx = (d[at + 6] >> 5) & 3
+            out.width += hx << 12
+            out.height += vx << 12
+            let fn2 = (d[at + 9] >> 5) & 3
+            let fd2 = d[at + 9] & 31
+            if out.fpsNum > 0 {
+                out.fpsNum = out.fpsNum * (fn2 + 1)
+                out.fpsDen = out.fpsDen * (fd2 + 1)
+            }
+        } else if code == 0x00 && found {
+            break
+        }
+        at = tsNextStartCode(d, at + 3, d.count)
+    }
+    if !found {
+        return (false, out)
+    }
+    // Aspect: MPEG-2 aspect_ratio_information is the display shape;
+    // MPEG-1's is the pixel shape (height/width, ISO/IEC 11172-2 §2.4.3.2).
+    if out.codec == "mpeg2" && out.width > 0 && out.height > 0 {
+        var n = 1
+        var dd = 1
+        if aspect == 2 {
+            n = 4 * out.height
+            dd = 3 * out.width
+        } else if aspect == 3 {
+            n = 16 * out.height
+            dd = 9 * out.width
+        } else if aspect == 4 {
+            n = 221 * out.height
+            dd = 100 * out.width
+        }
+        let g = tsGcd(n, dd)
+        out.sarNum = n / g
+        out.sarDen = dd / g
+    } else if out.codec == "mpeg1" {
+        let ratios = [10000, 10000, 6735, 7031, 7615, 8055, 8437, 8935, 9157, 9815, 10255, 10695, 10950, 11575, 12015]
+        if aspect > 0 && aspect < ratios.count {
+            let g = tsGcd(10000, ratios[aspect])
+            out.sarNum = 10000 / g
+            out.sarDen = ratios[aspect] / g
+        }
+    }
+    (true, out)
+}
+
+// --- Keyframe tests on the start of a video packet ---
+// Each says 1 (a keyframe), 0 (not one) or -1 (the bytes end before it
+// can tell).
+
+// H.264: an IDR slice (NAL type 5), or a recovery point SEI (§D.2.8)
+// before the first slice.
+fn tsH264KeyRange(_ d: Data, _ from: Int, _ to: Int) -> Int {
+    var at = tsNextStartCode(d, from, to)
+    while at >= 0 && at + 3 < to {
+        let t = d[at + 3] & 31
+        if t == 5 {
+            return 1
+        }
+        if t == 1 {
+            return 0
+        }
+        if t == 6 && at + 4 < to && d[at + 4] == 6 {
+            return 1
+        }
+        at = tsNextStartCode(d, at + 3, to)
+    }
+    -1
+}
+
+// HEVC: an IRAP picture (NAL types 16 to 23, §7.4.2.2) before any other
+// slice.
+fn tsHevcKeyRange(_ d: Data, _ from: Int, _ to: Int) -> Int {
+    var at = tsNextStartCode(d, from, to)
+    while at >= 0 && at + 3 < to {
+        let t = (d[at + 3] >> 1) & 63
+        if t >= 16 && t <= 23 {
+            return 1
+        }
+        if t < 16 {
+            return 0
+        }
+        at = tsNextStartCode(d, at + 3, to)
+    }
+    -1
+}
+
+// MPEG-1/2 video: the first picture header's picture_coding_type is 1 (I).
+fn tsMpegVideoKeyRange(_ d: Data, _ from: Int, _ to: Int) -> Int {
+    var at = tsNextStartCode(d, from, to)
+    while at >= 0 && at + 5 < to {
+        if d[at + 3] == 0 {
+            return if ((d[at + 5] >> 3) & 7) == 1 { 1 } else { 0 }
+        }
+        at = tsNextStartCode(d, at + 3, to)
+    }
+    -1
+}
+
+// MPEG-4 Part 2: the first VOP's vop_coding_type is 0 (I).
+fn tsMpeg4KeyRange(_ d: Data, _ from: Int, _ to: Int) -> Int {
+    var at = tsNextStartCode(d, from, to)
+    while at >= 0 && at + 4 < to {
+        if d[at + 3] == 0xB6 {
+            return if (d[at + 4] >> 6) == 0 { 1 } else { 0 }
+        }
+        at = tsNextStartCode(d, at + 3, to)
+    }
+    -1
+}
+
+fn tsVideoKey(_ codec: String, _ d: Data) -> Int {
+    match codec {
+        "h264" -> tsH264KeyRange(d, 0, d.count)
+        "hevc" -> tsHevcKeyRange(d, 0, d.count)
+        "mpeg1" -> tsMpegVideoKeyRange(d, 0, d.count)
+        "mpeg2" -> tsMpegVideoKeyRange(d, 0, d.count)
+        "mpeg4" -> tsMpeg4KeyRange(d, 0, d.count)
+        _ -> 1
+    }
+}
+
+// The bytes of the first pieces of a split packet, up to about `limit`.
+fn tsGather(_ file: Data, _ parts: [Int], _ limit: Int) -> Data {
+    var out = Data()
+    var i = 0
+    while i + 1 < parts.count && out.count < limit {
+        out += file.slice(from: parts[i], to: parts[i] + parts[i + 1])
+        i += 2
+    }
+    out
+}
+
+// matrix_coefficients (H.264 table E-5, ISO/IEC 13818-2 table 6-9).
+fn tsMatrix(_ m: Int) -> core.ColorMatrix {
+    match m {
+        1 -> core.ColorMatrix.bt709
+        5 -> core.ColorMatrix.bt601
+        6 -> core.ColorMatrix.bt601
+        9 -> core.ColorMatrix.bt2020
+        10 -> core.ColorMatrix.bt2020
+        _ -> core.ColorMatrix.unknown
+    }
+}
+
+fn tsGcd(_ a: Int, _ b: Int) -> Int {
+    var x = abs(a)
+    var y = abs(b)
+    while y != 0 {
+        let t = x % y
+        x = y
+        y = t
+    }
+    if x == 0 { 1 } else { x }
+}
+
+// A 33-bit timestamp unwrapped to be near the previous one.
+fn tsUnwrap(_ raw: Int, _ last: Int) -> Int {
+    if last == core.noTime {
+        return raw
+    }
+    var c = last - (last & (tsWrap - 1)) + raw
+    if c < last - tsHalfWrap {
+        c += tsWrap
+    } else if c > last + tsHalfWrap && c >= tsWrap {
+        c -= tsWrap
+    }
+    c
+}
+
+// A 33-bit PTS or DTS in a PES header (§2.4.3.7): 4 bits marker, 3 bits,
+// marker, 15 bits, marker, 15 bits, marker.
+fn tsTimestamp(_ d: Data, _ at: Int) -> Int {
+    let a = (d[at] >> 1) & 7
+    let b = (d[at + 1] << 7) | (d[at + 2] >> 1)
+    let c = (d[at + 3] << 7) | (d[at + 4] >> 1)
+    (a << 30) | (b << 15) | c
+}
+
+// Codec and kind for a PMT stream type and its descriptors (§2.4.4.9
+// table 2-34, ATSC A/52 and DVB EN 300 468 descriptors, Blu-ray types).
+fn tsStreamCodec(_ type: Int, _ descriptors: Data, m2ts: Bool) -> (String, core.TrackKind) {
+    var reg = ""
+    var dtag = -1
+    var i = 0
+    while i + 2 <= descriptors.count {
+        let tag = descriptors[i]
+        let len = descriptors[i + 1]
+        if tag == 0x05 && len >= 4 && i + 6 <= descriptors.count {
+            reg = descriptors.slice(from: i + 2, to: i + 6).latin1
+        } else if tag == 0x6A || tag == 0x7A || tag == 0x7B || tag == 0x73 || tag == 0x59 || tag == 0x56 || tag == 0x46 {
+            if dtag < 0 {
+                dtag = tag
+            }
+        }
+        i += 2 + len
+    }
+    let v = core.TrackKind.video
+    let a = core.TrackKind.audio
+    let s = core.TrackKind.subtitle
+    let o = core.TrackKind.other
+    match type {
+        0x01 -> ("mpeg1", v)
+        0x02 -> ("mpeg2", v)
+        0x10 -> ("mpeg4", v)
+        0x1B -> ("h264", v)
+        0x24 -> ("hevc", v)
+        0xEA -> ("vc1", v)
+        0x42 -> ("unknown:cavs", v)
+        0x03 -> ("mp2", a)
+        0x04 -> ("mp2", a)
+        0x0F -> ("aac", a)
+        0x11 -> ("unknown:latm", a)
+        0x81 -> ("ac3", a)
+        0x87 -> ("eac3", a)
+        0x84 -> ("eac3", a)
+        0xA1 -> ("eac3", a)
+        0x82 -> ("dts", a)
+        0x85 -> ("dts", a)
+        0x86 -> if m2ts { ("dts", a) } else { ("", o) }
+        0xA2 -> ("dts", a)
+        0x83 -> ("truehd", a)
+        0x80 -> if m2ts { ("unknown:bdlpcm", a) } else { ("mpeg2", v) }
+        0x90 -> ("pgs", s)
+        0x92 -> ("unknown:bdtext", s)
+        0x06 -> {
+            if dtag == 0x6A || reg == "AC-3" {
+                return ("ac3", a)
+            }
+            if dtag == 0x7A || reg == "EAC3" {
+                return ("eac3", a)
+            }
+            if dtag == 0x7B || dtag == 0x73 || reg == "DTS1" || reg == "DTS2" || reg == "DTS3" {
+                return ("dts", a)
+            }
+            if dtag == 0x59 {
+                return ("dvbsub", s)
+            }
+            if dtag == 0x56 || dtag == 0x46 {
+                return ("unknown:teletext", o)
+            }
+            if reg == "Opus" {
+                return ("unknown:opus", a)
+            }
+            if reg == "HEVC" {
+                return ("hevc", v)
+            }
+            ("unknown:0x06", o)
+        }
+        // Sections, not PES: DSM-CC, private sections.
+        0x05 -> ("", o)
+        0x0B -> ("", o)
+        0x0C -> ("", o)
+        0x0D -> ("", o)
+        _ -> ("unknown:0x{tsHex2(type)}", o)
+    }
+}
+
+fn tsHex2(_ v: Int) -> String {
+    let digits = "0123456789abcdef"
+    digits.substring(from: (v >> 4) & 15, to: ((v >> 4) & 15) + 1) + digits.substring(from: v & 15, to: (v & 15) + 1)
+}
+
+// The ISO 639 language descriptor (tag 0x0A), "" when there is none or
+// it's "und".
+fn tsLanguage(_ descriptors: Data) -> String {
+    var i = 0
+    while i + 2 <= descriptors.count {
+        let tag = descriptors[i]
+        let len = descriptors[i + 1]
+        if (tag == 0x0A || tag == 0x59 || tag == 0x56) && len >= 3 && i + 5 <= descriptors.count {
+            let lang = descriptors.slice(from: i + 2, to: i + 5).latin1.lowercase()
+            if lang == "und" {
+                return ""
+            }
+            return lang
+        }
+        i += 2 + len
+    }
+    ""
+}
+
+// --- The transport stream reader ---
+
+// One elementary stream of the program, with the PES packet being put
+// together.
+struct TsStream {
+    pid: Int
+    track: Int
+    codec: String
+    kind: core.TrackKind
+    cut: Int = 0
+    active: Bool = false
+    parts: [Int] = []
+    total: Int = 0
+    // Payload bytes the PES header promises, or -1 (unbounded video).
+    limit: Int = -1
+    pts: Int = -9223372036854775807
+    dts: Int = -9223372036854775807
+    rai: Bool = false
+    // A PES header split across TS packets, gathered until complete.
+    hdr: Data = Data()
+    hdrPending: Bool = false
+    lastCC: Int = -1
+    lastTs: Int = -9223372036854775807
+    probed: Bool = false
+    probeTries: Int = 0
+    framer: TsFramer = TsFramer()
+}
+
+struct TsReader {
+    file: Data
+    psize: Int = 188
+    m2ts: Bool = false
+    // PID → stream slot (≥ 0), -1 nothing, -2 PAT, -3 the PMT.
+    pidSlot: [Int] = []
+    streams: [TsStream] = []
+    tracks: [core.Track] = []
+    packets: [core.PacketRef] = []
+    warnings: [String] = []
+    program: Int = -1
+    pmtPid: Int = -1
+    pmtVersion: Int = -1
+    section: Data = Data()
+    sectionPid: Int = -1
+    resyncs: Int = 0
+    errors: Int = 0
+    firstPcr: Int = -1
+    lastPcr: Int = -1
+    // The end of the TS packet being read (where a gathered PES header's
+    // leftover payload bytes end).
+    curEnd: Int = 0
+
+    fn run(_ start: Int) {
+        pidSlot = core.filled(8192, -1)
+        pidSlot[0] = -2
+        let n = file.count
+        var at = start
+        while at + 188 <= n {
+            if file[at] != 0x47 {
+                at = resync(at)
+                continue
+            }
+            let b1 = file[at + 1]
+            let pid = ((b1 & 31) << 8) | file[at + 2]
+            let slot = pidSlot[pid]
+            if slot == -1 {
+                at += psize
+                continue
+            }
+            let b3 = file[at + 3]
+            let afc = (b3 >> 4) & 3
+            var payload = at + 4
+            var rai = false
+            if (afc & 2) != 0 {
+                let alen = file[at + 4]
+                if alen > 0 {
+                    let flags = file[at + 5]
+                    rai = (flags & 0x40) != 0
+                    if (flags & 0x10) != 0 && alen >= 7 {
+                        // PCR (§2.4.3.5): 33-bit base at 90 kHz.
+                        let pcr = (file[at + 6] << 25) | (file[at + 7] << 17) | (file[at + 8] << 9) | (file[at + 9] << 1) | (file[at + 10] >> 7)
+                        if firstPcr < 0 {
+                            firstPcr = pcr
+                        }
+                        lastPcr = pcr
+                    }
+                }
+                payload = at + 5 + alen
+            }
+            if (afc & 1) == 0 || payload >= at + 188 {
+                at += psize
+                continue
+            }
+            if (b1 & 0x80) != 0 {
+                // transport_error_indicator: the packet is damaged.
+                errors += 1
+                at += psize
+                continue
+            }
+            let pusi = (b1 & 0x40) != 0
+            if slot < 0 {
+                sectionData(pid, slot, pusi, payload, at + 188)
+                at += psize
+                continue
+            }
+            // A repeated continuity_counter is a duplicate packet (§2.4.3.3).
+            let cc = b3 & 15
+            if cc == streams[slot].lastCC && !rai {
+                at += psize
+                continue
+            }
+            streams[slot].lastCC = cc
+            curEnd = at + 188
+            if pusi {
+                if streams[slot].active || streams[slot].hdrPending {
+                    finish(slot, final: false)
+                }
+                streams[slot].hdr = file.slice(from: payload, to: at + 188)
+                streams[slot].hdrPending = true
+                streams[slot].rai = rai
+                startPes(slot)
+            } else if streams[slot].hdrPending {
+                streams[slot].hdr += file.slice(from: payload, to: at + 188)
+                startPes(slot)
+            } else if streams[slot].active {
+                streams[slot].parts.append(payload)
+                streams[slot].parts.append(at + 188 - payload)
+                streams[slot].total += at + 188 - payload
+            }
+            at += psize
+        }
+        for s in 0..streams.count {
+            if streams[s].active {
+                finish(s, final: true)
+            }
+            if streams[s].cut != tsCutNone {
+                let more = streams[s].framer.drain(file, streams[s].track, final: true)
+                packets += more
+            }
+        }
+    }
+
+    // Finds the next place where packets line up again after a lost sync.
+    fn resync(_ at: Int) -> Int {
+        resyncs += 1
+        var q = at + 1
+        let n = file.count
+        while q + 188 <= n {
+            if file[q] == 0x47 && (q + psize >= n || file[q + psize] == 0x47) && (q + 2 * psize >= n || file[q + 2 * psize] == 0x47) {
+                return q
+            }
+            q += 1
+        }
+        n
+    }
+
+    // Parses the PES header gathered in `hdr` once it's all there
+    // (§2.4.3.6–7). The bytes after the header start the payload.
+    fn startPes(_ slot: Int) {
+        let h = streams[slot].hdr
+        if h.count < 6 {
+            return
+        }
+        if h[0] != 0 || h[1] != 0 || h[2] != 1 {
+            // Not a PES start: drop the packet's data.
+            streams[slot].hdrPending = false
+            streams[slot].active = false
+            streams[slot].hdr = Data()
+            warnings.append("TS: PID {streams[slot].pid} has a payload start that isn't a PES header")
+            return
+        }
+        let sid = h[3]
+        let plen = (h[4] << 8) | h[5]
+        var hlen = 6
+        var pts = core.noTime
+        var dts = core.noTime
+        let plain = sid == 0xBC || sid == 0xBE || sid == 0xBF || sid == 0xF0 || sid == 0xF1 || sid == 0xFF || sid == 0xF2 || sid == 0xF8
+        if !plain {
+            if h.count < 9 {
+                return
+            }
+            hlen = 9 + h[8]
+            if h.count < hlen {
+                return
+            }
+            let flags = h[7] >> 6
+            if (flags & 2) != 0 && hlen >= 14 {
+                pts = tsTimestamp(h, 9)
+                if flags == 3 && hlen >= 19 {
+                    dts = tsTimestamp(h, 14)
+                }
+            }
+        }
+        // The header is complete: the rest of the gathered bytes are the
+        // first payload piece. They sit at the end of the last TS packet
+        // read, so their file offset is found from there.
+        var s = streams[slot]
+        s.hdrPending = false
+        s.active = true
+        s.parts = []
+        s.total = 0
+        s.limit = if plen > 0 { plen + 6 - hlen } else { -1 }
+        let last = lastTs(slot, pts, dts)
+        s.pts = last.0
+        s.dts = last.1
+        if s.pts != core.noTime {
+            s.lastTs = if s.dts != core.noTime { s.dts } else { s.pts }
+        }
+        let rest = h.count - hlen
+        s.hdr = Data()
+        streams[slot] = s
+        if rest > 0 {
+            // The gathered header ends where the current TS packet ends.
+            let end = curEnd
+            streams[slot].parts.append(end - rest)
+            streams[slot].parts.append(rest)
+            streams[slot].total = rest
+        }
+    }
+
+
+    fn lastTs(_ slot: Int, _ pts: Int, _ dts: Int) -> (Int, Int) {
+        let ref = streams[slot].lastTs
+        var p = pts
+        var d = dts
+        if p != core.noTime {
+            p = tsUnwrap(p, ref)
+        }
+        if d != core.noTime {
+            d = tsUnwrap(d, if ref == core.noTime { p } else { ref })
+        }
+        (p, d)
+    }
+
+    // A PES packet is complete: make it a packet (video, subtitles) or
+    // pass it to the frame cutter (audio).
+    fn finish(_ slot: Int, final: Bool) {
+        var s = streams[slot]
+        streams[slot].active = false
+        streams[slot].hdrPending = false
+        streams[slot].parts = []
+        if !s.active || s.total == 0 {
+            return
+        }
+        var parts = s.parts
+        var total = s.total
+        if s.limit >= 0 && total > s.limit {
+            // Bytes past PES_packet_length: stuffing, cut them off.
+            var keep = s.limit
+            var cut: [Int] = []
+            var i = 0
+            while i + 1 < parts.count && keep > 0 {
+                let use = min(parts[i + 1], keep)
+                cut.append(parts[i])
+                cut.append(use)
+                keep -= use
+                i += 2
+            }
+            parts = cut
+            total = s.limit
+        }
+        if total <= 0 {
+            return
+        }
+        let ti = s.track
+        if !s.probed && s.probeTries < 64 {
+            let head = tsGather(file, parts, 65536)
+            let pr = tsProbe(tracks[ti], head)
+            tracks[ti] = pr.1
+            streams[slot].probeTries += 1
+            if pr.0 {
+                streams[slot].probed = true
+                if s.cut == tsCutAc3 || s.cut == tsCutMpa {
+                    streams[slot].codec = pr.1.codec
+                }
+                if pr.1.codec == "dts" && s.cut == tsCutNone {
+                    // A private stream found to be DTS by its first bytes.
+                    streams[slot].codec = "dts"
+                    streams[slot].kind = core.TrackKind.audio
+                    streams[slot].cut = tsCutDts
+                    streams[slot].framer = TsFramer(kind: tsCutDts)
+                    s.cut = tsCutDts
+                }
+            }
+        }
+        if s.cut != tsCutNone {
+            streams[slot].framer.push(parts, pts: s.pts, dts: s.dts)
+            let more = streams[slot].framer.drain(file, ti, final: false)
+            packets += more
+            return
+        }
+        var key = s.rai
+        if s.kind == core.TrackKind.video {
+            // Usually decided in the first TS packets; long headers (an
+            // encoder's SEI) push the first slice further.
+            var k = tsVideoKey(tracks[ti].codec, tsGather(file, parts, 2048))
+            if k < 0 && total > 2048 {
+                k = tsVideoKey(tracks[ti].codec, tsGather(file, parts, 65536))
+            }
+            key = k == 1 || (k < 0 && s.rai)
+        } else {
+            key = true
+        }
+        var dts = s.dts
+        if dts == core.noTime {
+            dts = s.pts
+        }
+        var p = core.PacketRef(track: ti, pts: s.pts, dts: dts, key: key, offset: parts[0], size: total)
+        if parts.count > 2 {
+            p.parts = parts
+        }
+        packets.append(p)
+    }
+
+    // PAT and PMT sections (§2.4.4): gathered across packets, then parsed.
+    fn sectionData(_ pid: Int, _ slot: Int, _ pusi: Bool, _ from: Int, _ to: Int) {
+        var start = from
+        if pusi {
+            let pointer = file[from]
+            if sectionPid == pid && section.count > 0 && pointer > 0 {
+                // The end of the previous section comes first.
+                section += file.slice(from: from + 1, to: min(from + 1 + pointer, to))
+                trySection(pid, slot)
+            }
+            start = from + 1 + pointer
+            section = Data()
+            sectionPid = pid
+        } else if sectionPid != pid || section.isEmpty {
+            return
+        }
+        if start < to {
+            section += file.slice(from: start, to: to)
+        }
+        trySection(pid, slot)
+    }
+
+    fn trySection(_ pid: Int, _ slot: Int) {
+        if section.count < 3 {
+            return
+        }
+        let len = ((section[1] & 15) << 8) | section[2]
+        if section.count < 3 + len {
+            return
+        }
+        let sec = section.slice(from: 0, to: 3 + len)
+        section = Data()
+        sectionPid = -1
+        if slot == -2 && sec[0] == 0x00 {
+            parsePat(sec)
+        } else if slot == -3 && sec[0] == 0x02 {
+            parsePmt(sec)
+        }
+    }
+
+    // Program association section (§2.4.4.3): program 1, or the first.
+    fn parsePat(_ sec: Data) {
+        if pmtPid >= 0 {
+            return
+        }
+        let len = ((sec[1] & 15) << 8) | sec[2]
+        let end = 3 + len - 4
+        var i = 8
+        var chosen = -1
+        var chosenProgram = -1
+        while i + 4 <= end {
+            let prog = (sec[i] << 8) | sec[i + 1]
+            let pid = ((sec[i + 2] & 31) << 8) | sec[i + 3]
+            if prog != 0 && (chosen < 0 || prog == 1) {
+                if chosen < 0 || prog == 1 {
+                    chosen = pid
+                    chosenProgram = prog
+                }
+            }
+            i += 4
+        }
+        if chosen >= 0 {
+            pmtPid = chosen
+            program = chosenProgram
+            pidSlot[chosen] = -3
+        }
+    }
+
+    // Program map section (§2.4.4.8): one track per elementary stream.
+    // A new version may add streams; known PIDs keep their tracks.
+    fn parsePmt(_ sec: Data) {
+        let version = (sec[5] >> 1) & 31
+        let prog = (sec[3] << 8) | sec[4]
+        if program >= 0 && prog != program {
+            return
+        }
+        if version == pmtVersion {
+            return
+        }
+        pmtVersion = version
+        let len = ((sec[1] & 15) << 8) | sec[2]
+        let end = min(3 + len - 4, sec.count)
+        let infoLen = ((sec[10] & 15) << 8) | sec[11]
+        let progDesc = sec.slice(from: 12, to: 12 + infoLen)
+        if tsHasRegistration(progDesc, "HDMV") {
+            m2ts = true
+        }
+        var i = 12 + infoLen
+        while i + 5 <= end {
+            let type = sec[i]
+            let pid = ((sec[i + 1] & 31) << 8) | sec[i + 2]
+            let esLen = ((sec[i + 3] & 15) << 8) | sec[i + 4]
+            let desc = sec.slice(from: i + 5, to: min(i + 5 + esLen, end))
+            i += 5 + esLen
+            if pidSlot[pid] >= 0 || pid == 0 || pid == pmtPid || pid >= 0x1FFF {
+                continue
+            }
+            let ck = tsStreamCodec(type, desc, m2ts: m2ts)
+            if ck.0.isEmpty {
+                continue
+            }
+            let index = tracks.count
+            var t = core.Track(index: index, id: pid, kind: ck.1, codec: ck.0)
+            t.timescale = 90000
+            t.language = tsLanguage(desc)
+            if t.codec == "aac" {
+                t.adts = true
+            }
+            tracks.append(t)
+            var cut = tsCutNone
+            if t.codec == "aac" {
+                cut = tsCutAdts
+            } else if t.codec == "ac3" || t.codec == "eac3" {
+                cut = tsCutAc3
+            } else if t.codec == "mp2" {
+                cut = tsCutMpa
+            } else if t.codec == "dts" {
+                cut = tsCutDts
+            }
+            var st = TsStream(pid: pid, track: index, codec: t.codec, kind: t.kind)
+            st.cut = cut
+            st.framer = TsFramer(kind: cut)
+            streams.append(st)
+            pidSlot[pid] = streams.count - 1
+        }
+    }
+}
+
+fn tsHasRegistration(_ d: Data, _ what: String) -> Bool {
+    var i = 0
+    while i + 2 <= d.count {
+        if d[i] == 0x05 && d[i + 1] >= 4 && i + 6 <= d.count && d.slice(from: i + 2, to: i + 6).latin1 == what {
+            return true
+        }
+        i += 2 + d[i + 1]
+    }
+    false
+}
+
+// Finds the packet size and the first sync byte: 188 (plain), 192 (M2TS:
+// a 4-byte header before each packet) or 204 (Reed-Solomon bytes after).
+fn tsFindLayout(_ file: Data) -> (Int, Int) {
+    let n = file.count
+    for size in [188, 192, 204] {
+        var start = 0
+        while start < min(n, size * 4) {
+            var ok = true
+            for k in 0..5 {
+                let p = start + k * size
+                // A short stream (an HLS audio tail) may end after fewer
+                // than five whole packets.
+                if p == n && k > 0 {
+                    break
+                }
+                if p >= n || file[p] != 0x47 {
+                    ok = false
+                    break
+                }
+            }
+            if ok {
+                return (size, start)
+            }
+            start += 1
+        }
+    }
+    (0, 0)
+}
+
+// Opens an MPEG transport stream.
+public fn tsOpen(_ file: Data) -> Result<core.Media> {
+    let layout = tsFindLayout(file)
+    if layout.0 == 0 {
+        return Result.failure(error: Error("this isn't an MPEG transport stream (no packet sync)"))
+    }
+    var r = TsReader(file: file, psize: layout.0, m2ts: layout.0 == 192)
+    r.run(layout.1)
+    if r.tracks.isEmpty {
+        return Result.failure(error: Error("this transport stream has no program (no PAT/PMT found)"))
+    }
+    var media = core.Media(format: "ts")
+    // Stored order: by where each packet's first byte is.
+    media.packets = r.packets.sorted(by: { a, b in a.offset < b.offset })
+    media.tracks = r.tracks
+    tsFinishTiming(media)
+    if r.resyncs > 0 {
+        r.warnings.append("TS: lost packet sync {r.resyncs} times")
+    }
+    if r.errors > 0 {
+        r.warnings.append("TS: skipped {r.errors} packets marked as damaged")
+    }
+    for s in r.streams {
+        if s.framer.lost > 0 {
+            r.warnings.append("TS: PID {s.pid}: skipped {s.framer.lost} bytes that weren't whole {s.codec} frames")
+        }
+        if !s.probed && s.kind != core.TrackKind.other {
+            r.warnings.append("TS: PID {s.pid}: couldn't read the {s.codec} stream's headers")
+        }
+    }
+    media.warnings = r.warnings
+    Result.ok(value: media)
+}
+
+// Video packet durations (from the frame rate, else the spacing of the
+// decode times), track durations (last end − first start) and the file's
+// duration. Shared with ps.tsl.
+fn tsFinishTiming(_ media: bind core.Media) {
+    let nt = media.tracks.count
+    var firstStart = core.filled(nt, core.noTime)
+    var lastEnd = core.filled(nt, core.noTime)
+    var step = core.filled(nt, 0)
+    var lastDts = core.filled(nt, core.noTime)
+    // The smallest positive dts step of each video track.
+    for p in media.packets {
+        let t = p.track
+        if media.tracks[t].kind == core.TrackKind.video && p.dts != core.noTime {
+            if lastDts[t] != core.noTime && p.dts > lastDts[t] {
+                let d = p.dts - lastDts[t]
+                if step[t] == 0 || d < step[t] {
+                    step[t] = d
+                }
+            }
+            lastDts[t] = p.dts
+        }
+    }
+    for t in 0..nt {
+        let tr = media.tracks[t]
+        if tr.kind == core.TrackKind.video {
+            if tr.fpsNum > 0 && tr.fpsDen > 0 {
+                step[t] = core.rescale(tr.fpsDen, from: tr.fpsNum, to: tr.timescale)
+            } else if step[t] > 0 {
+                let g = tsGcd(tr.timescale, step[t])
+                media.tracks[t].fpsNum = tr.timescale / g
+                media.tracks[t].fpsDen = step[t] / g
+            }
+        }
+    }
+    for i in 0..media.packets.count {
+        let t = media.packets[i].track
+        if media.packets[i].duration == 0 && step[t] > 0 {
+            media.packets[i].duration = step[t]
+        }
+        let p = media.packets[i]
+        if p.pts == core.noTime {
+            continue
+        }
+        if firstStart[t] == core.noTime || p.pts < firstStart[t] {
+            firstStart[t] = p.pts
+        }
+        let e = p.pts + p.duration
+        if lastEnd[t] == core.noTime || e > lastEnd[t] {
+            lastEnd[t] = e
+        }
+    }
+    var start = core.noTime
+    var end = core.noTime
+    for t in 0..nt {
+        if firstStart[t] == core.noTime {
+            continue
+        }
+        media.tracks[t].duration = lastEnd[t] - firstStart[t]
+        let k = media.tracks[t].kind
+        if k == core.TrackKind.video || k == core.TrackKind.audio {
+            if start == core.noTime || firstStart[t] < start {
+                start = firstStart[t]
+            }
+            if end == core.noTime || lastEnd[t] > end {
+                end = lastEnd[t]
+            }
+        }
+        let secs = core.seconds(media.tracks[t].duration, media.tracks[t].timescale)
+        if secs > 0.0 {
+            var bytes = 0
+            for p in media.packets {
+                if p.track == t {
+                    bytes += p.size
+                }
+            }
+            media.tracks[t].bitrate = Int(Float(bytes) * 8.0 / secs)
+        }
+    }
+    if start != core.noTime {
+        media.duration = Float(end - start) / 90000.0
+    }
+}

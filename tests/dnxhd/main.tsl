@@ -1,0 +1,255 @@
+// Tests for the DNxHD/DNxHR decoder: clips made by ffmpeg's encoder
+// (tests/dnxhd/fixtures from tests/prores/make_fixtures.sh: DNxHR LB, SQ,
+// HQ, HQX, 444 in Y'CbCr and RGB, an odd size, DNxHD 1080p 36 Mb/s; and
+// in build/scratch/pro/big every DNxHD CID ffmpeg can make, progressive
+// and interlaced, plus 1080p/4K timing clips) and FATE samples
+// (build/conformance/pro: CID 1260 with adaptive macroblock interlacing,
+// DNxHR 444 and 12-bit HQX in MOV, raw .dnxhr streams) against ffmpeg's
+// framemd5, opened through demux.open; damaged packets.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../../core"
+import "../../testkit"
+import "../../demux"
+import "../../dnxhd"
+
+struct Run {
+    ok: Bool = false
+    pictures: Int = 0
+    same: Int = 0
+    refs: Int = 0
+    ms: Float = 0.0
+    warnings: Int = 0
+    width: Int = 0
+    height: Int = 0
+    depth: Int = 0
+    chroma: core.Chroma = .yuv420
+    firstBad: Int = -1
+    info: String = ""
+}
+
+// The md5 column of an ffmpeg framemd5 file.
+fn md5sAt(_ path: String) -> [String] {
+    let text = readFile(path) ?? ""
+    var out: [String] = []
+    for line in text.lines() {
+        if line.hasPrefix("#") || line.trim().isEmpty {
+            continue
+        }
+        let parts = line.split(",")
+        if parts.count >= 6 {
+            out.append(parts[5].trim())
+        }
+    }
+    out
+}
+
+// Opens a MOV through demux.open, decodes its video track and compares
+// every picture with ffmpeg's md5 (path + ".framemd5").
+fn runFile(_ path: String, _ timeOnly: Bool = false) -> Run {
+    var r = Run()
+    let file = readData(path) ?? Data()
+    if file.isEmpty {
+        return r
+    }
+    let media = demux.open(file, name: path).value() ?? core.Media(format: "", duration: -1.0)
+    var vt = -1
+    for t in media.tracks {
+        if t.kind == .video && t.codec == "dnxhd" {
+            vt = t.index
+            break
+        }
+    }
+    if vt < 0 {
+        return r
+    }
+    let track = media.tracks[vt]
+    r.info = dnxhd.streamInfo(track)
+    var dec = dnxhd.newDecoder(track).value() ?? dnxhd.Decoder()
+    let md5s = md5sAt(path + ".framemd5")
+    r.refs = md5s.count
+    var t = 0.0
+    var pts: [Int] = []
+    for p in media.packets {
+        if p.track != vt {
+            continue
+        }
+        let bytes = core.packetBytes(file, media, p)
+        let t0 = now()
+        let pics = dec.decode(bytes, pts: p.pts, dts: p.dts, key: p.key)
+        t += now() - t0
+        for pic in pics {
+            if r.pictures < md5s.count && !timeOnly {
+                if testkit.pictureMd5(pic) == md5s[r.pictures] {
+                    r.same += 1
+                } else if r.firstBad < 0 {
+                    r.firstBad = r.pictures
+                }
+            }
+            pts.append(pic.pts)
+            r.width = pic.width
+            r.height = pic.height
+            r.depth = pic.depth
+            r.chroma = pic.chroma
+            r.pictures += 1
+        }
+    }
+    r.ms = t * 1000.0
+    r.warnings = dec.warnings.count
+    for w in dec.warnings {
+        print("  warning: {w}")
+        break
+    }
+    r.ok = true
+    r.info = r.info + " " + dnxhd.profileName(dec.cid) + (if dec.rgb { " RGB" } else { "" })
+    r
+}
+
+
+// A raw .dnxhr stream: frames start at multiples of 4096 bytes with the
+// first frame's 5-byte prefix.
+fn runRaw(_ path: String) -> Run {
+    var r = Run()
+    let file = readData(path) ?? Data()
+    if file.count < 0x280 {
+        return r
+    }
+    var starts: [Int] = []
+    var at = 0
+    while at + 5 <= file.count {
+        var same = true
+        for k in 0..5 {
+            if file[at + k] != file[k] {
+                same = false
+            }
+        }
+        if same {
+            starts.append(at)
+        }
+        at += 4096
+    }
+    starts.append(file.count)
+    var dec = dnxhd.newDecoder(core.Track(index: 0, kind: .video, codec: "dnxhd")).value() ?? dnxhd.Decoder()
+    let md5s = md5sAt(path + ".framemd5")
+    r.refs = md5s.count
+    let t0 = now()
+    for k in 0..starts.count - 1 {
+        let pics = dec.decode(file.slice(from: starts[k], to: starts[k + 1]), pts: k, dts: k, key: true)
+        for pic in pics {
+            if r.pictures < md5s.count && testkit.pictureMd5(pic) == md5s[r.pictures] {
+                r.same += 1
+            } else if r.firstBad < 0 {
+                r.firstBad = r.pictures
+            }
+            r.width = pic.width
+            r.height = pic.height
+            r.depth = pic.depth
+            r.pictures += 1
+        }
+    }
+    r.ms = (now() - t0) * 1000.0
+    r.warnings = dec.warnings.count
+    r.info = dnxhd.profileName(dec.cid)
+    r.ok = true
+    r
+}
+
+fn fmt(_ x: Float) -> String {
+    x.formatted(decimals: 2)
+}
+
+fn main() {
+    var passed = 0
+    var total = 0
+    fn check(_ ok: Bool, _ what: String) {
+        total += 1
+        if ok { passed += 1 } else { print("FAIL: {what}") }
+    }
+
+    // ---- ffmpeg-made clips ----
+    let dir = "tests/dnxhd/fixtures/"
+    for name in ["dnxhr_lb.mov", "dnxhr_sq.mov", "dnxhr_hq.mov", "dnxhr_hqx.mov", "dnxhr_444.mov", "dnxhr_444rgb.mov", "dnxhr_odd.mov", "dnxhd36.mov"] {
+        let r = runFile(dir + name)
+        print("{name}: {r.pictures} pictures {r.width}×{r.height} {r.depth}-bit, md5 same {r.same} of {r.refs} ({r.info})")
+        check(r.ok && r.refs > 0 && r.pictures == r.refs && r.same == r.refs && r.warnings == 0, "{name}: bit-exact with ffmpeg (first different picture {r.firstBad})")
+    }
+    let big = "build/scratch/pro/big/"
+    for cid in ["1235", "1237", "1238", "1241", "1242", "1243", "1244", "1250", "1251", "1252", "1258", "1259"] {
+        let name = "cid" + cid + ".mov"
+        let r = runFile(big + name)
+        if !r.ok {
+            continue
+        }
+        print("{name}: {r.pictures} pictures {r.width}×{r.height} {r.depth}-bit, md5 same {r.same} of {r.refs} ({r.info}); {fmt(r.ms / Float(max(1, r.pictures)))} ms each")
+        check(r.refs > 0 && r.pictures == r.refs && r.same == r.refs && r.warnings == 0, "{name}: bit-exact with ffmpeg (first different picture {r.firstBad})")
+    }
+
+    // ---- FATE samples ----
+    let conf = "build/conformance/pro/"
+    for name in ["dnxhd100_cid1260.mov", "dnxhr444_cid1270.mov", "dnxhr_cid1271_12bit.mov"] {
+        let r = runFile(conf + name)
+        if !r.ok {
+            print("{name}: not there (skipped)")
+            continue
+        }
+        print("{name}: {r.pictures} pictures {r.width}×{r.height} {r.depth}-bit, md5 same {r.same} of {r.refs} ({r.info})")
+        check(r.refs > 0 && r.pictures == r.refs && r.same == r.refs, "{name}: bit-exact with ffmpeg (first different picture {r.firstBad})")
+    }
+    for name in ["dnxhr_cid1274.dnxhr", "prefix-256x1536.dnxhr", "prefix-256x1716.dnxhr", "prefix-256x2048.dnxhr", "prefix-256x2160.dnxhr", "prefix-256x3212.dnxhr"] {
+        let r = runRaw(conf + name)
+        if !r.ok {
+            print("{name}: not there (skipped)")
+            continue
+        }
+        print("{name}: {r.pictures} pictures {r.width}×{r.height} {r.depth}-bit, md5 same {r.same} of {r.refs} ({r.info})")
+        check(r.refs > 0 && r.pictures == r.refs && r.same == r.refs, "{name}: bit-exact with ffmpeg (first different picture {r.firstBad})")
+    }
+
+    // ---- Picture facts, damage ----
+    let f0 = readData(dir + "dnxhr_sq.mov") ?? Data()
+    let m0 = demux.open(f0, name: "dnxhr_sq.mov").value() ?? core.Media(format: "", duration: -1.0)
+    if m0.tracks.count > 0 && m0.packets.count > 1 {
+        var dec = dnxhd.newDecoder(m0.tracks[0]).value() ?? dnxhd.Decoder()
+        let whole = core.packetBytes(f0, m0, m0.packets[0])
+        let pics = dec.decode(whole, pts: m0.packets[0].pts, dts: 0, key: true)
+        check(pics.count == 1, "one picture per packet")
+        if let p = pics.first {
+            check(p.key && p.pts == m0.packets[0].pts && p.chroma == .yuv422 && p.depth == 8 && p.width == 256 && p.height == 144, "key, pts, 4:2:2 8-bit, size")
+            check(p.matrix == .bt709, "matrix {p.matrix}")
+            check(p.duration > 0, "duration {p.duration}")
+        }
+        check(dec.cid == 1273, "CID {dec.cid}")
+        let cut = whole.slice(from: 0, to: whole.count / 2)
+        var junk = whole.slice(from: 0, to: 0x300)
+        for i in 0..3000 {
+            junk.append(byte: (i * 7919) & 255)
+        }
+        junk = junk + whole.slice(from: junk.count, to: whole.count)
+        let w0 = dec.warnings.count
+        let a = dec.decode(cut, pts: 5, dts: 5, key: true)
+        let b = dec.decode(junk, pts: 6, dts: 6, key: true)
+        let c = dec.decode(Data(), pts: 7, dts: 7, key: true)
+        check(a.count == 1 && b.count == 1 && c.count == 1 && dec.warnings.count >= w0 + 2, "damaged packets: concealed with warnings ({dec.warnings.count - w0})")
+        let again = dec.decode(whole, pts: 8, dts: 8, key: true)
+        let md5s = md5sAt(dir + "dnxhr_sq.mov.framemd5")
+        check(again.count == 1 && testkit.pictureMd5(again[0]) == md5s[0], "after damage the next frame is right again")
+        dec.reset()
+        check(dec.flush().isEmpty, "flush gives nothing (intra only)")
+    }
+    check(dnxhd.newDecoder(core.Track(index: 0, kind: .video, codec: "prores")).value() == nil, "refuses other codecs")
+    check(dnxhd.profileName(1272) == "DNxHR HQ", "profile names")
+
+    // ---- Speed ----
+    for name in ["dnxhr_hq_1080.mov", "dnxhr_hqx_1080.mov", "dnxhr_hq_2160.mov", "dnxhr_444_2160.mov"] {
+        let r = runFile(big + name)
+        if !r.ok {
+            continue
+        }
+        check(r.same == r.refs && r.pictures == r.refs, "{name}: bit-exact")
+        print("time dnxhd {name} per {r.width}×{r.height} picture: {fmt(r.ms / Float(max(1, r.pictures)))} ms")
+    }
+
+    print("dnxhd: {passed} of {total} passed")
+}

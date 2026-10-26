@@ -1,0 +1,229 @@
+// The public face of the VP9 decoder: Decoder (decode, flush, reset) that
+// chains the two stages, newPipeline for running them side by side in two
+// background jobs (a Parser and a Reconstructor exchanging ParsedFrames),
+// and streamInfo for the media info window.
+//
+// Packets are whole VP9 frames or superframes (Annex B) as WebM, MKV, MP4
+// and IVF store them; `track.extra` (the vpcC/CodecPrivate) isn't needed.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../core"
+
+// Both stages one after the other.
+public struct Decoder {
+    // When true, frames that no later frame refers to
+    // (refresh_frame_flags == 0) aren't reconstructed.
+    skipNonReference: Bool = false
+    warnings: [String] = []
+    parser: Parser = Parser()
+    reconstructor: Reconstructor = Reconstructor()
+
+    // Decodes one packet; returns the pictures it shows (none for a
+    // hidden alt-ref frame, one normally), in display order.
+    fn decode(_ packet: Data, pts: Int, dts: Int, key: Bool) -> [core.Picture] {
+        parser.skipNonReference = skipNonReference
+        let parsed = parser.parse(packet, pts: pts, dts: dts, key: key)
+        run(parsed)
+    }
+
+    // End of stream: VP9 has no reordering, so nothing is held back.
+    fn flush() -> [core.Picture] {
+        run(parser.flush())
+    }
+
+    // After a seek: drop references, wait for a keyframe.
+    fn reset() {
+        parser.reset()
+        reconstructor.reset()
+    }
+
+    fn run(_ parsed: [ParsedFrame]) -> [core.Picture] {
+        var out: [core.Picture] = []
+        for p in parsed {
+            out += reconstructor.reconstruct(p)
+        }
+        out = vp9LastOnly(out)
+        for list in [parser.warnings, reconstructor.warnings] {
+            for w in list {
+                if warnings.count < 200 {
+                    warnings.append(w)
+                }
+            }
+        }
+        parser.warnings = []
+        reconstructor.warnings = []
+        out
+    }
+}
+
+// A decoder for a "vp9" track.
+public fn newDecoder(_ track: core.Track) -> Result<Decoder> {
+    let p = try newPipeline(track)
+    Result.ok(value: Decoder(parser: p.parser, reconstructor: p.reconstructor))
+}
+
+// Both stages for one "vp9" track.
+public struct Pipeline {
+    parser: Parser = Parser()
+    reconstructor: Reconstructor = Reconstructor()
+}
+
+public fn newPipeline(_ track: core.Track) -> Result<Pipeline> {
+    if track.codec != "vp9" {
+        return .failure(error: Error("vp9: not a VP9 track ({track.codec})"))
+    }
+    var p = Parser()
+    p.setup()
+    var r = Reconstructor()
+    r.setup()
+    if track.sarNum > 0 && track.sarDen > 0 {
+        r.sarNum = track.sarNum
+        r.sarDen = track.sarDen
+    }
+    r.trackMatrix = track.matrix
+    Result.ok(value: Pipeline(parser: p, reconstructor: r))
+}
+
+// For background jobs, which call top-level functions: one parse step and
+// one reconstruct step, each returning the stage's new state.
+public struct ParseStep {
+    parser: Parser = Parser()
+    frames: [ParsedFrame] = []
+}
+
+public fn parseStep(_ parser: Parser, _ packet: Data, pts: Int, dts: Int, key: Bool) -> ParseStep {
+    var p = parser
+    let f = p.parse(packet, pts: pts, dts: dts, key: key)
+    ParseStep(parser: p, frames: f)
+}
+
+public struct ReconstructStep {
+    reconstructor: Reconstructor = Reconstructor()
+    pictures: [core.Picture] = []
+}
+
+public fn reconstructStep(_ reconstructor: Reconstructor, _ frames: [ParsedFrame]) -> ReconstructStep {
+    var r = reconstructor
+    var out: [core.Picture] = []
+    for f in frames {
+        out += r.reconstruct(f)
+    }
+    ReconstructStep(reconstructor: r, pictures: vp9LastOnly(out))
+}
+
+// A packet shows at most one picture, the last its frames show (as libvpx
+// returns them; spatial layers of an SVC superframe all have show_frame).
+fn vp9LastOnly(_ pics: [core.Picture]) -> [core.Picture] {
+    if pics.count <= 1 {
+        return pics
+    }
+    [pics[pics.count - 1]]
+}
+
+// "VP9 Profile 2, 1920×1080, 10-bit" from the track: its size, and the
+// profile, bit depth and chroma format when the container's setup bytes
+// (MP4 vpcC, Matroska CodecPrivate) give them. frameInfo reads the same
+// from a keyframe's header when they don't.
+public fn streamInfo(_ track: core.Track) -> String {
+    var info = "VP9"
+    var profile = -1
+    var depth = 0
+    var chroma = ""
+    let x = track.extra
+    if x.count >= 3 && x[1] == 1 && x[0] >= 1 && x[0] <= 4 {
+        // Matroska CodecPrivate: (id, length, value) features: 1 profile,
+        // 2 level, 3 bit depth, 4 chroma subsampling.
+        var i = 0
+        while i + 2 <= x.count && i + 2 + x[i + 1] <= x.count {
+            let id = x[i]
+            let len = x[i + 1]
+            if len >= 1 {
+                let v = x[i + 2]
+                if id == 1 {
+                    profile = v
+                } else if id == 3 {
+                    depth = v
+                } else if id == 4 {
+                    chroma = if v <= 1 { "4:2:0" } else if v == 2 { "4:2:2" } else { "4:4:4" }
+                }
+            }
+            i += 2 + len
+        }
+    } else if x.count >= 7 && x[1] == 0 {
+        // vpcC box body (version, flags, then profile, level, bitDepth << 4
+        // | chromaSubsampling << 1 | fullRange).
+        profile = x[4]
+        depth = x[6] >> 4
+        let cs = (x[6] >> 1) & 7
+        chroma = if cs <= 1 { "4:2:0" } else if cs == 2 { "4:2:2" } else { "4:4:4" }
+    }
+    if profile >= 0 && profile <= 3 {
+        info += " Profile {profile}"
+    }
+    if track.width > 0 && track.height > 0 {
+        info += ", {track.width}×{track.height}"
+    }
+    if depth > 0 {
+        info += ", {depth}-bit"
+    }
+    if !chroma.isEmpty && chroma != "4:2:0" {
+        info += " {chroma}"
+    }
+    info
+}
+
+// The profile, size and bit depth from a frame's uncompressed header
+// (6.2), for streamInfo when the container says nothing.
+public fn frameInfo(_ packet: Data) -> String {
+    if packet.count < 4 {
+        return "VP9"
+    }
+    var r = core.bitReader(packet)
+    if r.bits(2) != 2 {
+        return "VP9"
+    }
+    var profile = r.bit()
+    profile = profile | (r.bit() << 1)
+    if profile == 3 {
+        profile += r.bit()
+    }
+    if r.bit() == 1 {
+        return "VP9 Profile {profile}"
+    }
+    let key = r.bit() == 0
+    r.bit()
+    r.bit()
+    if !key {
+        return "VP9 Profile {profile}"
+    }
+    r.bits(24)
+    var depth = 8
+    if profile >= 2 {
+        depth = if r.bit() == 1 { 12 } else { 10 }
+    }
+    let cs = r.bits(3)
+    var chroma = "4:2:0"
+    if cs == 7 {
+        chroma = "4:4:4 RGB"
+        if (profile & 1) == 1 {
+            r.bit()
+        }
+    } else {
+        r.bit()
+        if (profile & 1) == 1 {
+            let sx = r.bit()
+            let sy = r.bit()
+            chroma = if sx == 1 && sy == 0 { "4:2:2" } else if sx == 0 && sy == 1 { "4:4:0" } else { "4:4:4" }
+            r.bit()
+        }
+    }
+    let w = r.bits(16) + 1
+    let h = r.bits(16) + 1
+    var s = "VP9 Profile {profile}, {w}×{h}, {depth}-bit"
+    if chroma != "4:2:0" {
+        s += " {chroma}"
+    }
+    s
+}

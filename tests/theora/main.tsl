@@ -1,0 +1,363 @@
+// Tests of the Theora decoder (module theora): every picture of every
+// sample must have the md5 ffmpeg's decoder gives it (framemd5 made with
+// `ffmpeg -threads 1 -i X -map 0:v:0 -fps_mode passthrough -f framemd5`).
+// Packets come through demux.open (Ogg and Matroska).
+//
+//   tests/theora/fixtures/*.ogg, .mkv  small cuts kept with the tests
+//                                      (4:2:0, 4:2:2, 4:4:4, odd size,
+//                                      Matroska)
+//   build/conformance/vp8theora/theora the FATE samples (vp3/, ogg/), the
+//                                      Xiph Theora test suite and a 1080p
+//                                      cut, fetched with their references
+//                                      by tests/theora/fixtures/fetch.sh
+// plus chained Ogg (one track per link), the Decoder API (pts, key flags,
+// SAR, matrix, streamInfo), reset after a seek, headers in the stream,
+// damaged and random packets, and timings at 720p and 1080p.
+// THEORA_ONLY=a.ogg,b.ogg decodes only those conformance samples.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../../theora"
+import "../../core"
+import "../../demux"
+
+struct T {
+    passed: Int = 0
+    total: Int = 0
+
+    fn check(_ ok: Bool, _ what: String) {
+        total += 1
+        if ok {
+            passed += 1
+        } else {
+            print("FAIL: {what}")
+        }
+    }
+}
+
+fn framemd5(_ path: String) -> [String] {
+    var out: [String] = []
+    for line in (readFile(path) ?? "").lines() {
+        if line.hasPrefix("#") {
+            continue
+        }
+        let parts = line.split(",")
+        if parts.count >= 6 {
+            out.append(parts[5].trim())
+        }
+    }
+    out
+}
+
+fn md5(_ p: core.Picture) -> String {
+    core.pictureBytes(p).hash("md5").hex
+}
+
+// A file's media and its packets' bytes for one track.
+struct Clip {
+    media: core.Media = core.Media()
+    track: core.Track = core.Track(index: 0, kind: .video, codec: "")
+    packets: [Data] = []
+    pts: [Int] = []
+    keys: [Bool] = []
+    error: String = ""
+}
+
+// The n-th Theora track of a file (n counts Theora tracks only).
+fn openClip(_ path: String, nth: Int = 0) -> Clip {
+    var c = Clip()
+    let file = readData(path) ?? Data()
+    let opened = demux.open(file, name: path)
+    let mo: core.Media? = opened.value()
+    if mo == nil {
+        c.error = "can't open"
+        return c
+    }
+    c.media = mo ?? core.Media()
+    var vt = -1
+    var seen = 0
+    for tr in c.media.tracks {
+        if tr.codec == "theora" {
+            if seen == nth && vt < 0 {
+                vt = tr.index
+            }
+            seen += 1
+        }
+    }
+    if vt < 0 {
+        c.error = "no theora track {nth}"
+        return c
+    }
+    c.track = c.media.tracks[vt]
+    for pk in c.media.packets {
+        if pk.track == vt {
+            c.packets.append(core.packetBytes(file, c.media, pk))
+            c.pts.append(pk.pts)
+            c.keys.append(pk.key)
+        }
+    }
+    c
+}
+
+struct Run {
+    pictures: Int = 0
+    mismatches: Int = 0
+    firstBad: Int = -1
+    ptsOk: Bool = true
+    ms: Float = 0.0
+    width: Int = 0
+    height: Int = 0
+    chroma: core.Chroma = .yuv420
+    firstKey: Bool = false
+    sarNum: Int = 0
+    sarDen: Int = 0
+    matrix: core.ColorMatrix = .unknown
+    error: String = ""
+    warnings: Int = 0
+}
+
+fn decodeClip(_ c: Clip, _ want: [String]) -> Run {
+    var run = Run()
+    if !c.error.isEmpty {
+        run.error = c.error
+        return run
+    }
+    let made = theora.newDecoder(c.track)
+    let dm: theora.Decoder? = made.value()
+    if dm == nil {
+        run.error = "newDecoder failed"
+        return run
+    }
+    var d = dm ?? theora.Decoder()
+    var spent = 0.0
+    for (i, pk) in c.packets.enumerated() {
+        let t0 = now()
+        let pics = d.decode(pk, pts: c.pts[i], dts: c.pts[i], key: c.keys[i])
+        spent += now() - t0
+        for p in pics {
+            if run.pictures == 0 {
+                run.firstKey = p.key
+                run.sarNum = p.sarNum
+                run.sarDen = p.sarDen
+                run.matrix = p.matrix
+                run.chroma = p.chroma
+            }
+            run.width = p.width
+            run.height = p.height
+            if p.pts != c.pts[i] {
+                run.ptsOk = false
+            }
+            let got = md5(p)
+            if run.pictures >= want.count || got != want[run.pictures] {
+                run.mismatches += 1
+                if run.firstBad < 0 {
+                    run.firstBad = run.pictures
+                }
+            }
+            run.pictures += 1
+        }
+    }
+    run.ms = spent * 1000.0
+    run.warnings = d.warnings.count
+    run
+}
+
+fn same(_ r: Run, _ want: [String]) -> Bool {
+    r.error.isEmpty && want.count > 0 && r.pictures == want.count && r.mismatches == 0
+}
+
+fn describe(_ name: String, _ r: Run, _ want: [String]) -> String {
+    "{name}: {r.pictures} pictures, {r.mismatches} md5 mismatches (first {r.firstBad}) of {want.count} {r.error}"
+}
+
+fn main() {
+    var t = T()
+
+    // ---- the committed fixtures ----
+    let fx = "tests/theora/fixtures"
+    for name in ["t420.ogg", "t420.mkv", "t422.ogg", "t444.ogg", "todd.ogg"] {
+        let path = joinPath(fx, name)
+        let want = framemd5(path + ".framemd5")
+        let r = decodeClip(openClip(path), want)
+        t.check(same(r, want), describe(name, r, want))
+        t.check(r.ptsOk && r.firstKey, "{name}: pts kept and the first picture is a keyframe")
+        if name == "t422.ogg" {
+            t.check(r.chroma == .yuv422, "{name} is 4:2:2")
+        }
+        if name == "t444.ogg" {
+            t.check(r.chroma == .yuv444 && r.width == 1280 && r.height == 720, "{name} is 4:4:4 1280×720")
+        }
+        if name == "todd.ogg" {
+            t.check(r.width == 322 && r.height == 242, "{name} is 322×242 ({r.width}×{r.height})")
+        }
+    }
+    let base = openClip(joinPath(fx, "t420.ogg"))
+    let baseWant = framemd5(joinPath(fx, "t420.ogg.framemd5"))
+    let info = theora.streamInfo(base.track)
+    t.check(info == "Theora, 320×240, 4:2:0", "streamInfo: \"{info}\"")
+    let mk = openClip(joinPath(fx, "t420.mkv"))
+    t.check(mk.track.codec == "theora" && theora.streamInfo(mk.track) == info, "Matroska track gives the same headers")
+
+    // ---- the API around decoding ----
+    var bad = base.track
+    bad.extra = Data(bytes: [0, 0, 0, 3, 1, 2, 3])
+    let r1: theora.Decoder? = theora.newDecoder(bad).value()
+    t.check(r1 == nil, "newDecoder refuses broken headers")
+    var other = base.track
+    other.codec = "vp8"
+    let r2: theora.Decoder? = theora.newDecoder(other).value()
+    t.check(r2 == nil, "newDecoder refuses a non-Theora track")
+    var d = theora.newDecoder(base.track).value() ?? theora.Decoder()
+    // Seeking: reset, then packets from the middle without a keyframe show
+    // nothing; from the start again, everything is right.
+    var shown = 0
+    for (i, pk) in base.packets.enumerated() {
+        if i < 3 {
+            d.decode(pk, pts: i, dts: i, key: base.keys[i])
+        }
+    }
+    d.reset()
+    for (i, pk) in base.packets.enumerated() {
+        if i >= 5 && !base.keys[i] {
+            shown += d.decode(pk, pts: i, dts: i, key: false).count
+        }
+    }
+    t.check(shown == 0, "after reset nothing is shown before a keyframe ({shown})")
+    d.reset()
+    var right = 0
+    var n = 0
+    for (i, pk) in base.packets.enumerated() {
+        for p in d.decode(pk, pts: i, dts: i, key: base.keys[i]) {
+            if n < baseWant.count && md5(p) == baseWant[n] {
+                right += 1
+            }
+            n += 1
+        }
+    }
+    t.check(right == baseWant.count && n == baseWant.count, "after reset, from the keyframe: {right} of {baseWant.count} right")
+    t.check(d.flush().isEmpty, "flush has nothing held back")
+    // The headers again in the stream (as a re-sent stream would have
+    // them): the decoder reconfigures and goes on from the next keyframe.
+    var hdrs: [Data] = []
+    var at = 0
+    let x = base.track.extra
+    while at + 4 <= x.count {
+        let len = x.uint32(at: at, bigEndian: true)
+        hdrs.append(x.slice(from: at + 4, to: at + 4 + len))
+        at += 4 + len
+    }
+    var e = theora.newDecoder(base.track).value() ?? theora.Decoder()
+    for h in hdrs {
+        e.decode(h, pts: 0, dts: 0, key: false)
+    }
+    var hn = 0
+    var hr = 0
+    for (i, pk) in base.packets.enumerated() {
+        for p in e.decode(pk, pts: i, dts: i, key: base.keys[i]) {
+            if hn < baseWant.count && md5(p) == baseWant[hn] {
+                hr += 1
+            }
+            hn += 1
+        }
+    }
+    t.check(hdrs.count == 3 && hr == baseWant.count, "header packets in the stream: {hr} of {baseWant.count} right after them")
+    // An empty packet (a dropped frame) shows nothing, as ffmpeg.
+    t.check(e.decode(Data(), pts: 99, dts: 99, key: false).isEmpty, "an empty packet shows nothing")
+
+    // ---- damage never stops the program ----
+    var g = theora.newDecoder(base.track).value() ?? theora.Decoder()
+    var seed = 12345
+    var dshown = 0
+    for (i, pk) in base.packets.enumerated() {
+        var bytes = pk.bytes
+        if i % 3 == 1 {
+            for _ in 0..8 {
+                seed = (seed * 1103515245 + 12345) & 0x7fffffff
+                let at2 = 1 + seed % max(1, bytes.count - 1)
+                if at2 < bytes.count {
+                    bytes[at2] = (bytes[at2] ^ (seed >> 8)) & 255
+                }
+            }
+        }
+        if i % 5 == 2 {
+            bytes = bytes.prefix(bytes.count / 3)
+        }
+        dshown += g.decode(Data(bytes: bytes), pts: i, dts: i, key: base.keys[i]).count
+    }
+    t.check(dshown > 0 && !g.warnings.isEmpty, "damaged packets: decoding went on ({dshown} pictures, {g.warnings.count} warnings)")
+    var rnd = theora.newDecoder(base.track).value() ?? theora.Decoder()
+    rnd.decode(base.packets[0], pts: 0, dts: 0, key: true)
+    for k in 0..300 {
+        var b: [Int] = []
+        for _ in 0..(k * 7 % 500) {
+            seed = (seed * 1103515245 + 12345) & 0x7fffffff
+            b.append((seed >> 7) & 255)
+        }
+        if b.count > 0 {
+            b[0] = b[0] & 0x7f
+        }
+        rnd.decode(Data(bytes: b), pts: k, dts: k, key: false)
+    }
+    t.check(true, "random packets: no crash")
+    var nh = theora.Decoder()
+    t.check(nh.decode(base.packets[0], pts: 0, dts: 0, key: true).isEmpty, "a decoder without headers shows nothing")
+
+    // ---- the conformance samples ----
+    let conf = "build/conformance/vp8theora/theora"
+    if !fileExists(joinPath(conf, "320x240.ogg")) {
+        print("note: {conf} is missing; run tests/theora/fixtures/fetch.sh for the conformance samples")
+    } else {
+        var names: [String] = []
+        let only = environment("THEORA_ONLY") ?? ""
+        if !only.isEmpty {
+            names = only.split(",")
+        } else {
+            names = ["320x240.ogg", "bear.ogv", "offset_test.ogv", "empty_theora_packets.ogv",
+                     "322x242_not-divisible-by-sixteen-framesize.ogg", "pixel_aspect_ratio.ogg",
+                     "videotestsrc-720x576-16-15.ogg", "sign_irene_cif-3qi-b.ogg", "multi2.ogg",
+                     "mobile_itu601_i_422.ogg", "ducks_take_off_444_720p25.ogg", "stockholm-vfr.ogg",
+                     "coeff_level64.mkv", "bbb_1080p_cut.ogg"]
+        }
+        for name in names {
+            let path = joinPath(conf, name)
+            if !fileExists(path) {
+                t.check(false, "{name} is missing: run tests/theora/fixtures/fetch.sh")
+                continue
+            }
+            let want = framemd5(path + ".framemd5")
+            let r = decodeClip(openClip(path), want)
+            t.check(same(r, want), describe(name, r, want))
+            if name == "pixel_aspect_ratio.ogg" {
+                t.check(r.sarNum == 640 && r.sarDen == 429 && r.matrix == .bt601, "{name}: SAR 640:429 ({r.sarNum}:{r.sarDen}), BT.601 from the colour space")
+            }
+            if name == "offset_test.ogv" {
+                t.check(r.width == 512 && r.height == 512, "{name}: the 512×512 picture region of the 768×784 frame")
+            }
+            if r.pictures > 0 {
+                let per = (r.ms / Float(r.pictures)).formatted(decimals: 2)
+                if name == "stockholm-vfr.ogg" {
+                    print("time theora 720p: {per} ms per picture")
+                } else if name == "bbb_1080p_cut.ogg" {
+                    print("time theora 1080p: {per} ms per picture")
+                } else if name == "ducks_take_off_444_720p25.ogg" {
+                    print("time theora 720p 4:4:4: {per} ms per picture")
+                } else if name == "coeff_level64.mkv" {
+                    print("time theora 2960x1040: {per} ms per picture")
+                }
+            }
+        }
+        // Chained Ogg: each link is its own track; each must match ffmpeg
+        // on that link alone.
+        if only.isEmpty {
+            let chain = joinPath(conf, "chained_streams.ogg")
+            for k in 0..3 {
+                let want = framemd5(chain + ".link{k}.framemd5")
+                let r = decodeClip(openClip(chain, nth: k), want)
+                t.check(same(r, want), describe("chained_streams.ogg link {k}", r, want))
+            }
+        }
+    }
+
+    print("theora: {t.passed} of {t.total} passed")
+}

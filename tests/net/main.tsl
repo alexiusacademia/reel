@@ -1,0 +1,676 @@
+// Tests for the net module: URLs (RFC 3986 examples), AES-128-CBC
+// (FIPS-197 and SP 800-38A vectors, openssl-made segments), HLS and DASH
+// parsing (ffmpeg-made fixtures and hand-written cases for the spec's
+// corners), sessions loading every fixture through file:// into a
+// StreamBuffer and comparing the packets with ffprobe's (sizes, md5 of
+// the bytes, relative times), discontinuities, live reloads, ABR, seeks,
+// variant switches, trimming, radio (ICY metadata, status pages, chunking
+// a growing MP3), podcasts (RSS + iTunes, Atom) and the Remote block
+// cache. Runs without a network: tests/net/http_check.sh covers real HTTP
+// against a local server.
+//
+// Fixtures: tests/net/make_fixtures.sh.
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+import "../../core"
+import "../../net"
+import "../../testkit"
+
+struct Tally {
+    passed: Int = 0
+    total: Int = 0
+
+    fn check(_ ok: Bool, _ what: String) {
+        total += 1
+        if ok {
+            passed += 1
+        } else {
+            print("FAIL: {what}")
+        }
+    }
+}
+
+struct RefPacket {
+    kind: String
+    pts: Float
+    size: Int
+    md5: String
+}
+
+let fx = "tests/net/fixtures"
+
+fn fixtureUrl(_ name: String) -> String {
+    net.asUrl(joinPath(currentFolder(), joinPath(fx, name)))
+}
+
+fn loadPackets(_ name: String) -> [RefPacket] {
+    var out: [RefPacket] = []
+    let text = readFile(joinPath(fx, name)) ?? ""
+    for line in text.lines() {
+        let w = line.words()
+        if w.count >= 4 {
+            out.append(RefPacket(kind: w[0], pts: parseFloat(w[1]).valueOr(0.0), size: parseInt(w[2]).valueOr(0), md5: w[3]))
+        }
+    }
+    out
+}
+
+// Compares the packets of the buffer's first track of `kind` (of
+// `stream`) with ffprobe's: count, sizes, md5s and times relative to the
+// first. Gives "" when equal, else what differs.
+fn comparePackets(_ b: net.StreamBuffer, _ refs: [RefPacket], _ kind: String, stream: Int = 0, from: Int = 0, tolerance: Float = 0.0011) -> String {
+    var track = -1
+    for i in b.tracksOf(stream: stream) {
+        let k = b.media.tracks[i].kind
+        if track < 0 && ((kind == "video" && k == core.TrackKind.video) || (kind == "audio" && k == core.TrackKind.audio)) {
+            track = i
+        }
+    }
+    if track < 0 {
+        return "no {kind} track"
+    }
+    let want = refs.filter { r in r.kind == kind }
+    let got = core.packetsOf(b.media, track)
+    if got.count != want.count - from {
+        return "{kind}: {got.count} packets, ffprobe {want.count - from}"
+    }
+    let ts = b.media.tracks[track].timescale
+    let g0 = core.seconds(got[0].pts, ts)
+    let w0 = want[from].pts
+    for (i, p) in got.enumerated() {
+        let w = want[i + from]
+        if p.size != w.size {
+            return "{kind} packet {i}: size {p.size}, ffprobe {w.size}"
+        }
+        let md5 = core.packetBytes(b.file, b.media, p).hash("md5").hex
+        if md5 != w.md5 {
+            return "{kind} packet {i}: md5 differs"
+        }
+        let dt = (core.seconds(p.pts, ts) - g0) - (w.pts - w0)
+        if abs(dt) > tolerance {
+            return "{kind} packet {i}: time {core.seconds(p.pts, ts) - g0}, ffprobe {w.pts - w0}"
+        }
+    }
+    ""
+}
+
+// Runs a session until nothing is left to load.
+async fn runSession(_ start: net.Session, limit: Int = 200) -> net.Session {
+    var s = start
+    s.bufferAhead = 1000.0
+    var n = 0
+    while n < limit {
+        let (next, worked) = await net.step(s)
+        s = next
+        if !worked {
+            break
+        }
+        n += 1
+    }
+    s
+}
+
+async fn open(_ name: String) -> net.Session {
+    match await net.openSession(fixtureUrl(name)) {
+        .ok(s) -> s
+        .failure(e) -> {
+            print("FAIL: open {name}: {e.message}")
+            net.Session(presentation: net.Presentation())
+        }
+    }
+}
+
+fn hexData(_ h: String) -> Data {
+    testkit.hexToData(h)
+}
+
+async fn main() {
+    var t = Tally()
+
+    // ---------------------------------------------------------------
+    // URLs: RFC 3986 §5.4.1 normal and §5.4.2 abnormal examples.
+    let base = "http://a/b/c/d;p?q"
+    let cases = [
+        ("g:h", "g:h"), ("g", "http://a/b/c/g"), ("./g", "http://a/b/c/g"), ("g/", "http://a/b/c/g/"),
+        ("/g", "http://a/g"), ("//g", "http://g"), ("?y", "http://a/b/c/d;p?y"), ("g?y", "http://a/b/c/g?y"),
+        ("#s", "http://a/b/c/d;p?q#s"), ("g#s", "http://a/b/c/g#s"), ("g?y#s", "http://a/b/c/g?y#s"),
+        (";x", "http://a/b/c/;x"), ("g;x", "http://a/b/c/g;x"), ("", "http://a/b/c/d;p?q"), (".", "http://a/b/c/"),
+        ("./", "http://a/b/c/"), ("..", "http://a/b/"), ("../", "http://a/b/"), ("../g", "http://a/b/g"),
+        ("../..", "http://a/"), ("../../", "http://a/"), ("../../g", "http://a/g"),
+        ("../../../g", "http://a/g"), ("../../../../g", "http://a/g"), ("/./g", "http://a/g"), ("/../g", "http://a/g"),
+        ("g.", "http://a/b/c/g."), (".g", "http://a/b/c/.g"), ("g..", "http://a/b/c/g.."), ("..g", "http://a/b/c/..g"),
+        ("./../g", "http://a/b/g"), ("./g/.", "http://a/b/c/g/"), ("g/./h", "http://a/b/c/g/h"), ("g/../h", "http://a/b/c/h"),
+        ("g;x=1/./y", "http://a/b/c/g;x=1/y"), ("g;x=1/../y", "http://a/b/c/y"), ("g?y/./x", "http://a/b/c/g?y/./x"),
+        ("g#s/../x", "http://a/b/c/g#s/../x")
+    ]
+    var urlBad = 0
+    for (r, want) in cases {
+        let got = net.resolveUrl(base, r)
+        if got != want {
+            urlBad += 1
+            print("FAIL: resolve {r}: {got}, want {want}")
+        }
+    }
+    t.check(urlBad == 0, "RFC 3986 §5.4 resolution examples ({cases.count})")
+    let u = net.parseUrl("https://user@example.com:8443/live/a.m3u8?token=x#frag")
+    t.check(u.scheme == "https" && u.host == "example.com" && u.port == 8443 && u.path == "/live/a.m3u8" && u.query == "token=x" && u.fragment == "frag", "parseUrl parts")
+    t.check(net.resolveUrl("https://cdn.example.com/hls/master.m3u8?sig=1", "720p/index.m3u8") == "https://cdn.example.com/hls/720p/index.m3u8", "playlist-relative URI drops the base query")
+    t.check(net.filePath(net.asUrl("/tmp/a b+c.m3u8")) == "/tmp/a b+c.m3u8", "local path round trip through file://")
+    t.check(net.resolveUrl("/Users/x/media/index.m3u8", "seg 1.ts") == "file:///Users/x/media/seg 1.ts", "local base path")
+    t.check(net.urlFileName("http://h/a/b/seg-7.ts?x=1") == "seg-7.ts", "urlFileName")
+
+    // ---------------------------------------------------------------
+    // AES-128: FIPS-197 appendix C.1, SP 800-38A F.2.1 / F.2.2 (CBC).
+    let zero = hexData("00000000000000000000000000000000")
+    let k1 = net.newAes(hexData("000102030405060708090a0b0c0d0e0f"))
+    let c1 = k1.encryptCbc(hexData("00112233445566778899aabbccddeeff"), iv: zero, padded: false)
+    t.check(c1.hex == "69c4e0d86a7b0430d8cdb78070b4c55a", "FIPS-197 C.1 encrypt")
+    t.check((k1.decryptCbc(c1, iv: zero, padded: false) ?? Data()).hex == "00112233445566778899aabbccddeeff", "FIPS-197 C.1 decrypt")
+    let spKey = net.newAes(hexData("2b7e151628aed2a6abf7158809cf4f3c"))
+    let spIv = hexData("000102030405060708090a0b0c0d0e0f")
+    let spPlain = hexData("6bc1bee22e409f96e93d7e117393172aae2d8a571e03ac9c9eb76fac45af8e5130c81c46a35ce411e5fbc1191a0a52eff69f2445df4f9b17ad2b417be66c3710")
+    let spCipher = "7649abac8119b246cee98e9b12e9197d5086cb9b507219ee95db113a917678b273bed6b8e3c1743b7116e69e222295163ff1caa1681fac09120eca307586e1a7"
+    t.check(spKey.encryptCbc(spPlain, iv: spIv, padded: false).hex == spCipher, "SP 800-38A F.2.1 CBC encrypt")
+    t.check((spKey.decryptCbc(hexData(spCipher), iv: spIv, padded: false) ?? Data()) == spPlain, "SP 800-38A F.2.2 CBC decrypt")
+    var odd = Data()
+    for i in 0..1000 {
+        odd.append(byte: i * 7)
+    }
+    let enc = spKey.encryptCbc(odd, iv: spIv)
+    t.check(enc.count == 1008 && (spKey.decryptCbc(enc, iv: spIv) ?? Data()) == odd, "PKCS#7 round trip")
+    t.check(spKey.decryptCbc(enc.slice(from: 0, to: 1000), iv: spIv) == nil, "not whole blocks is an error")
+    t.check(net.newAes(hexData("0011")).decryptCbc(enc, iv: spIv) == nil, "bad key size is an error")
+    t.check(net.sequenceIv(7).hex == "00000000000000000000000000000007" && net.hexIv("0x0A").hex == "0000000000000000000000000000000a", "IVs")
+    // Segments encrypted by openssl with the sequence number as IV.
+    let key = readData(joinPath(fx, "key.bin")) ?? Data()
+    let plainSeg = readData(joinPath(fx, "hls_ts/v0_1.ts")) ?? Data()
+    let cipherSeg = readData(joinPath(fx, "hls_aes_seq/s8.ts")) ?? Data()
+    let tAes = now()
+    let dec = net.aes128CbcDecrypt(cipherSeg, key: key, iv: net.sequenceIv(8)) ?? Data()
+    let aesMs = (now() - tAes) * 1000.0
+    t.check(dec == plainSeg && !dec.isEmpty, "openssl-encrypted segment decrypts to the original")
+    var mb = Data()
+    for i in 0..65536 {
+        mb.append(Data(bytes: [i & 255, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, i >> 8]))
+    }
+    let mbEnc = spKey.encryptCbc(mb, iv: spIv)
+    let tMb = now()
+    let mbDec = spKey.decryptCbc(mbEnc, iv: spIv) ?? Data()
+    let mbMs = (now() - tMb) * 1000.0
+    t.check(mbDec == mb, "1 MB round trip")
+    print("time AES-128-CBC decrypt 1 MB: {mbMs.formatted(decimals: 1)} ms (a {cipherSeg.count / 1024} KB segment: {aesMs.formatted(decimals: 2)} ms)")
+
+    // ---------------------------------------------------------------
+    // HLS parsing.
+    let masterText = readFile(joinPath(fx, "hls_ts/master.m3u8")) ?? ""
+    t.check(net.isHlsPlaylist(masterText), "isHlsPlaylist")
+    let master = net.parseHls(masterText, url: fixtureUrl("hls_ts/master.m3u8")).valueOr(net.HlsPlaylist())
+    t.check(master.isMaster && master.variants.count == 2, "master: two variants")
+    let mv = master.variants
+    t.check(mv[0].bandwidth < mv[1].bandwidth && masterText.contains("BANDWIDTH={mv[0].bandwidth},") && masterText.contains("BANDWIDTH={mv[1].bandwidth},"), "variants sorted by bandwidth")
+    t.check(mv[1].width == 160 && mv[1].height == 90 && mv[1].codecs.hasPrefix("avc1.") && mv[1].codecs.hasSuffix(",mp4a.40.2") && masterText.contains("AVERAGE-BANDWIDTH={mv[1].averageBandwidth},RESOLUTION=160x90"), "variant attributes")
+    t.check(master.variants[1].uri == fixtureUrl("hls_ts/v0.m3u8"), "variant URI resolved")
+    let singleText = readFile(joinPath(fx, "hls_single/index.m3u8")) ?? ""
+    let media = net.parseHls(singleText, url: "http://h/x/index.m3u8").valueOr(net.HlsPlaylist())
+    t.check(!media.isMaster && media.segments.count == 3 && media.endList && !media.isLive && media.targetDuration == 2.0, "media playlist")
+    t.check(media.segments[0].offset == 0 && media.segments[1].offset == media.segments[0].length && singleText.contains("#EXT-X-BYTERANGE:{media.segments[1].length}@{media.segments[1].offset}") && media.segments[1].uri == "http://h/x/index.ts" && abs(media.segments[2].start - 4.0) < 0.0001 && abs(media.duration - 6.0) < 0.0001, "byte ranges and starts")
+    let spec = "#EXTM3U\n#EXT-X-VERSION:9\n#EXT-X-DEFINE:NAME=\"cdn\",VALUE=\"http://cdn.example.com\"\n#EXT-X-TARGETDURATION:6\n#EXT-X-MEDIA-SEQUENCE:100\n#EXT-X-DISCONTINUITY-SEQUENCE:4\n#EXT-X-START:TIME-OFFSET=-12.5,PRECISE=YES\n#EXT-X-KEY:METHOD=AES-128,URI=\"keys/k1\",IV=0x00000000000000000000000000000abc\n#EXT-X-MAP:URI=\"init.mp4\",BYTERANGE=\"700@0\"\n#EXT-X-PROGRAM-DATE-TIME:2026-10-26T10:00:00.000Z\n#EXTINF:6.0,First one\n#EXT-X-BITRATE:800\n\{$cdn}/s100.m4s\n#EXTINF:6,\n#EXT-X-BYTERANGE:1000@5000\nall.m4s\n#EXTINF:6,\n#EXT-X-BYTERANGE:2000\nall.m4s\n#EXT-X-DISCONTINUITY\n#EXT-X-KEY:METHOD=NONE\n#EXT-X-GAP\n#EXTINF:5.5,\ns103.m4s\n#EXT-X-DATERANGE:ID=\"ad1\",START-DATE=\"2026-10-26T10:00:20Z\",DURATION=10\n#EXT-X-PART-INF:PART-TARGET=1.0\n#EXTINF:6,\ns104.m4s\n"
+    let sp = net.parseHls(spec, url: "https://example.com/live/index.m3u8").valueOr(net.HlsPlaylist())
+    t.check(sp.segments.count == 5 && sp.isLive && sp.version == 9, "spec playlist: segments, live")
+    t.check(sp.segments[0].uri == "http://cdn.example.com/s100.m4s" && sp.segments[0].title == "First one" && sp.segments[0].sequence == 100 && sp.segments[0].bitrate == 800, "EXT-X-DEFINE substitution, title, sequence, bitrate")
+    t.check(sp.segments[0].key.method == "AES-128" && sp.segments[0].key.uri == "https://example.com/live/keys/k1" && sp.segments[0].key.iv.hex == "00000000000000000000000000000abc", "EXT-X-KEY")
+    t.check(sp.segments[1].map.uri == "https://example.com/live/init.mp4" && sp.segments[1].map.length == 700 && sp.segments[1].map.offset == 0, "EXT-X-MAP with byte range")
+    t.check(sp.segments[1].offset == 5000 && sp.segments[2].offset == 6000 && sp.segments[2].length == 2000, "byte range without offset continues")
+    t.check(sp.segments[0].discontinuitySequence == 4 && sp.segments[3].discontinuity && sp.segments[3].discontinuitySequence == 5 && sp.segments[4].discontinuitySequence == 5, "discontinuity sequence")
+    t.check(sp.segments[3].key.method == "NONE" && sp.segments[3].gap && !sp.segments[4].gap, "key reset and EXT-X-GAP")
+    let pdt0 = net.hlsParseDate("2026-10-26T10:00:00.000Z")
+    t.check(pdt0 > 0.0 && abs(sp.segments[2].programDateTime - (pdt0 + 12.0)) < 0.001 && sp.segments[0].dateText == "2026-10-26T10:00:00.000Z", "program date-time carried forward")
+    t.check(sp.hasStart && sp.startOffset == -12.5 && sp.startPrecise && sp.dateRanges.count == 1, "EXT-X-START, EXT-X-DATERANGE")
+    t.check(abs(sp.segments[4].start - 23.5) < 0.0001 && sp.segmentAt(20.0) == 3 && sp.indexOf(sequence: 102) == 2, "starts, segmentAt, indexOf")
+    t.check(net.hlsLiveStart(sp) == 2, "EXT-X-START -12.5 s from the end → segment 2")
+    let mtext = "#EXTM3U\n#EXT-X-INDEPENDENT-SEGMENTS\n#EXT-X-SESSION-DATA:DATA-ID=\"com.apple.hls.title\",VALUE=\"Big Show\"\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aac\",NAME=\"English\",LANGUAGE=\"en\",DEFAULT=YES,AUTOSELECT=YES,CHANNELS=\"2\",URI=\"a/en.m3u8\"\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aac\",NAME=\"Français\",LANGUAGE=\"fr\",URI=\"a/fr.m3u8\"\n#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"subs\",NAME=\"English\",LANGUAGE=\"en\",FORCED=NO,URI=\"s/en.m3u8\"\n#EXT-X-MEDIA:TYPE=CLOSED-CAPTIONS,GROUP-ID=\"cc\",NAME=\"CC1\",INSTREAM-ID=\"CC1\"\n#EXT-X-STREAM-INF:BANDWIDTH=2000000,RESOLUTION=1280x720,FRAME-RATE=29.970,CODECS=\"avc1.64001f,mp4a.40.2\",AUDIO=\"aac\",SUBTITLES=\"subs\",CLOSED-CAPTIONS=\"cc\",VIDEO-RANGE=SDR\nv720.m3u8\n#EXT-X-STREAM-INF:BANDWIDTH=500000,RESOLUTION=640x360,AUDIO=\"aac\"\nv360.m3u8\n#EXT-X-I-FRAME-STREAM-INF:BANDWIDTH=90000,URI=\"iframe.m3u8\"\n"
+    let mp = net.parseHls(mtext, url: "http://h/m.m3u8").valueOr(net.HlsPlaylist())
+    t.check(mp.isMaster && mp.independentSegments && mp.variants.count == 2 && mp.variants[1].frameRate == 29.97 && mp.variants[1].subtitles == "subs" && mp.variants[1].videoRange == "SDR", "master with renditions")
+    t.check(mp.renditions.count == 4 && mp.renditionsOf("AUDIO", group: "aac").count == 2 && mp.renditions[1].name == "Français" && mp.renditions[0].isDefault && mp.renditions[0].channels == "2", "EXT-X-MEDIA")
+    t.check(mp.iFrameVariants.count == 1 && mp.iFrameVariants[0].uri == "http://h/iframe.m3u8" && mp.sessionData[0].value == "Big Show", "I-frame variant, session data")
+    let pres = net.hlsPresentation(mp)
+    t.check(pres.variants.count == 2 && pres.audios.count == 2 && pres.subtitles.count == 1 && pres.title == "Big Show" && pres.variants[1].name == "720p", "HLS presentation")
+    t.check(!net.parseHls("not a playlist").isOk() && !net.parseHls("").isOk(), "not HLS")
+
+    // Live: merging reloads, reload timing, live start.
+    let l1 = net.parseHls(readFile(joinPath(fx, "live1.m3u8")) ?? "", url: fixtureUrl("live1.m3u8")).valueOr(net.HlsPlaylist())
+    let l2 = net.parseHls(readFile(joinPath(fx, "live2.m3u8")) ?? "", url: fixtureUrl("live2.m3u8")).valueOr(net.HlsPlaylist())
+    let (m12, ch12) = net.hlsMerge(l1, l2)
+    t.check(ch12 && m12.segments.count == 2 && abs(m12.segments[0].start - 2.0) < 0.0001 && abs(m12.segments[1].start - 4.0) < 0.0001, "live merge keeps times by sequence")
+    let (m22, ch22) = net.hlsMerge(m12, l2)
+    t.check(!ch22 && abs(m22.segments[0].start - 2.0) < 0.0001, "unchanged reload")
+    t.check(net.hlsReloadDelay(l2, changed: true) == 2.0 && net.hlsReloadDelay(l2, changed: false) == 1.0, "reload delays (§6.3.4)")
+    t.check(l1.isLive && net.hlsLiveStart(l1) == 0, "live start: three target durations from the end")
+    var longLive = "#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXT-X-MEDIA-SEQUENCE:50\n"
+    for _ in 0..10 {
+        longLive += "#EXTINF:4,\nx.ts\n"
+    }
+    t.check(net.hlsLiveStart(net.parseHls(longLive).valueOr(net.HlsPlaylist())) == 7, "live start of a 10-segment window")
+
+    // ---------------------------------------------------------------
+    // DASH parsing.
+    let tlText = readFile(joinPath(fx, "dash_tl/manifest.mpd")) ?? ""
+    t.check(net.isDashManifest(tlText), "isDashManifest")
+    let tl = net.parseDash(tlText, url: fixtureUrl("dash_tl/manifest.mpd")).valueOr(net.DashManifest())
+    t.check(!tl.isLive && tl.duration == 6.0 && tl.minBufferTime == 4.0 && tl.periods.count == 1 && tl.periods[0].adaptationSets.count == 2, "MPD basics")
+    let tv = tl.periods[0].adaptationSets[0].representations[0]
+    t.check(tv.kind == "video" && tv.width == 160 && tv.frameRate == 25.0 && tv.codecs == "avc1.4d400b" && tv.segments.count == 3, "video representation")
+    t.check(tv.initialization.url == fixtureUrl("dash_tl/init-stream0.m4s") && tv.segments[2].url == fixtureUrl("dash_tl/chunk-stream0-00003.m4s") && abs(tv.segments[2].start - 4.0) < 0.0001, "template URLs with %05d")
+    let ta = tl.periods[0].adaptationSets[1].representations[0]
+    t.check(ta.kind == "audio" && ta.channels == 2 && ta.sampleRate == 48000 && ta.segments.count == 4 && abs(ta.segments[3].start - (92160.0 + 2.0 * 96256.0) / 48000.0) < 0.0001, "timeline with t, r and a last short S")
+    let num = net.parseDash(readFile(joinPath(fx, "dash_num/manifest.mpd")) ?? "", url: fixtureUrl("dash_num/manifest.mpd")).valueOr(net.DashManifest())
+    t.check(num.periods[0].adaptationSets[0].representations[0].segments.count == 3 && num.periods[0].adaptationSets[1].representations[0].segments[2].number == 3, "template with duration: 6 s / 2 s")
+    let singleMpd = readFile(joinPath(fx, "dash_single/manifest.mpd")) ?? ""
+    let single = net.parseDash(singleMpd, url: fixtureUrl("dash_single/manifest.mpd")).valueOr(net.DashManifest())
+    let sv = single.periods[0].adaptationSets[0].representations[0]
+    let sv1 = sv.segments[1]
+    t.check(sv.segments.count == 3 && singleMpd.contains("mediaRange=\"{sv1.offset}-{sv1.offset + sv1.length - 1}\"") && sv.initialization.offset == 0 && singleMpd.contains("range=\"0-{sv.initialization.length - 1}\"") && sv.segments[0].url == fixtureUrl("dash_single/manifest-stream0.mp4"), "SegmentList with media ranges")
+    let mpd = "<?xml version=\"1.0\"?>\n<MPD xmlns=\"urn:mpeg:dash:schema:mpd:2011\" type=\"static\" mediaPresentationDuration=\"PT1M0.5S\" minBufferTime=\"PT1.5S\">\n<BaseURL>http://cdn.example.com/content/</BaseURL>\n<Period id=\"p1\" duration=\"PT30S\">\n<BaseURL>p1/</BaseURL>\n<SegmentTemplate timescale=\"1000\" media=\"$RepresentationID$/$Bandwidth$/t$Time$.m4s\" initialization=\"$RepresentationID$/init.mp4\" presentationTimeOffset=\"1000\">\n<SegmentTimeline><S t=\"1000\" d=\"4000\" r=\"-1\"/></SegmentTimeline>\n</SegmentTemplate>\n<AdaptationSet mimeType=\"video/mp4\" lang=\"en\"><Role schemeIdUri=\"urn:mpeg:dash:role:2011\" value=\"main\"/>\n<BaseURL>../video/</BaseURL>\n<Representation id=\"hi\" bandwidth=\"3000000\" width=\"1920\" height=\"1080\" frameRate=\"30000/1001\"/>\n<Representation id=\"lo\" bandwidth=\"800000\" width=\"640\" height=\"360\"><BaseURL>http://other.example.com/lo/</BaseURL></Representation>\n</AdaptationSet>\n</Period>\n<Period id=\"p2\">\n<AdaptationSet contentType=\"audio\" mimeType=\"audio/mp4\">\n<SegmentTemplate timescale=\"48000\" duration=\"96000\" startNumber=\"10\" media=\"a_$Number%03d$_$$.m4s\"/>\n<Representation id=\"a\" bandwidth=\"128000\"/>\n</AdaptationSet>\n</Period>\n</MPD>"
+    let hm = net.parseDash(mpd, url: "http://origin.example.com/x/manifest.mpd").valueOr(net.DashManifest())
+    t.check(hm.periods.count == 2 && hm.duration == 60.5 && hm.periods[1].start == 30.0 && abs(hm.periods[1].duration - 30.5) < 0.0001, "periods, start and duration")
+    let reps = hm.periods[0].adaptationSets[0].representations
+    t.check(reps[0].id == "lo" && reps[1].id == "hi" && abs(reps[1].frameRate - 29.97) < 0.01 && reps[0].language == "en" && hm.periods[0].adaptationSets[0].roles == ["main"], "representations sorted, attributes inherited")
+    t.check(reps[1].baseUrl == "http://cdn.example.com/content/video/" && reps[0].baseUrl == "http://other.example.com/lo/", "BaseURL resolution at four levels")
+    t.check(reps[1].segments.count == 8 && reps[1].segments[1].url == "http://cdn.example.com/content/video/hi/3000000/t5000.m4s" && reps[1].segments[0].start == 0.0 && reps[1].segments[7].start == 28.0, "r=-1 to the period end, $Time$, $Bandwidth$, presentationTimeOffset")
+    t.check(reps[1].initialization.url == "http://cdn.example.com/content/video/hi/init.mp4", "inherited template initialization")
+    let ar = hm.periods[1].adaptationSets[0].representations[0]
+    t.check(ar.segments.count == 16 && ar.segments[0].url == "http://cdn.example.com/content/a_010_$.m4s" && ar.segments[15].number == 25 && abs(ar.segments[0].start - 30.0) < 0.0001 && abs(ar.segments[15].duration - 0.5) < 0.0001, "$Number%03d$, $$, startNumber, last segment cut at the period end")
+    t.check(net.dashTemplate("$RepresentationID$-$Number%05d$-$Time%x$.m4s", "v1", 0, 42, 255) == "v1-00042-ff.m4s", "template widths")
+    t.check(net.dashDuration("PT1H2M3.5S") == 3723.5 && net.dashDuration("P1DT1S") == 86401.0 && net.dashDuration("PT0S") == 0.0 && net.dashDuration("") == -1.0, "ISO 8601 durations")
+    // Dynamic: segments available at a given wall-clock time.
+    let live = "<MPD xmlns=\"urn:mpeg:dash:schema:mpd:2011\" type=\"dynamic\" availabilityStartTime=\"2026-10-26T10:00:00Z\" minimumUpdatePeriod=\"PT2S\" timeShiftBufferDepth=\"PT20S\" suggestedPresentationDelay=\"PT6S\" minBufferTime=\"PT2S\"><Period id=\"1\" start=\"PT0S\"><AdaptationSet mimeType=\"video/mp4\"><SegmentTemplate timescale=\"1\" duration=\"2\" startNumber=\"1\" media=\"s$Number$.m4s\" initialization=\"i.mp4\"/><Representation id=\"v\" bandwidth=\"100000\"/></AdaptationSet></Period></MPD>"
+    let ast = net.hlsParseDate("2026-10-26T10:00:00Z")
+    let dl = net.parseDash(live, url: "http://h/l.mpd", now: ast + 61.0).valueOr(net.DashManifest())
+    let dr = dl.periods[0].adaptationSets[0].representations[0]
+    t.check(dl.isLive && dr.segments.count == 10 && dr.segments[0].number == 21 && dr.segments[9].number == 30 && dr.segments[9].start == 58.0, "dynamic: available window at now")
+    t.check(net.dashLiveStart(dl, dr) == 54.0, "dynamic: start suggestedPresentationDelay before the live edge")
+    t.check(net.dashLiveSegments(dl, dl.periods[0], dr, now: ast + 1.0).isEmpty, "dynamic: nothing before the first segment ends")
+    // sidx (14496-12 §8.16.3) of the SegmentBase fixture.
+    let baseMpd = net.parseDash(readFile(joinPath(fx, "dash_base/manifest.mpd")) ?? "", url: fixtureUrl("dash_base/manifest.mpd")).valueOr(net.DashManifest())
+    let br = baseMpd.periods[0].adaptationSets[0].representations[0]
+    t.check(br.needsIndex && br.indexOffset > 0 && br.indexLength > 24 && br.initialization.offset == 0 && br.initialization.length == br.indexOffset, "SegmentBase index and init ranges")
+    let vfile = readData(joinPath(fx, "dash_base/video.mp4")) ?? Data()
+    match net.dashApplySidx(br, vfile.slice(from: br.indexOffset, to: br.indexOffset + br.indexLength)) {
+        .ok(rr) -> {
+            var covered = 0
+            for s in rr.segments {
+                covered += s.length
+            }
+            // The references run to the mfra box at the end; times start at the
+            // earliest presentation time (0.08 s: the B-frame delay).
+            let mfra = vfile.slice(from: rr.segments[0].offset + covered + 4, to: rr.segments[0].offset + covered + 8).latin1
+            t.check(rr.segments.count == 3 && rr.segments[0].offset == br.indexOffset + br.indexLength && mfra == "mfra" && abs(rr.segments[0].start - 0.08) < 0.0001 && abs(rr.segments[1].start - 2.08) < 0.0001, "sidx references cover the fragments")
+        }
+        .failure(e) -> t.check(false, "sidx: {e.message}")
+    }
+    t.check(!net.parseSidx(Data(bytes: [0, 0, 0, 8, 0x66, 0x72, 0x65, 0x65])).isOk(), "no sidx is an error")
+    t.check(!net.parseDash("<html/>").isOk() && !net.parseDash("MPD").isOk(), "not an MPD")
+
+    // ---------------------------------------------------------------
+    // Sessions over file:// fixtures → StreamBuffer packets vs ffprobe.
+    let t0 = now()
+    var s1 = await runSession(await open("hls_ts/master.m3u8"))
+    let loadMs = (now() - t0) * 1000.0
+    t.check(s1.presentation.kind == "hls" && s1.variant == 1 && s1.buffer.segments.count == 3 && s1.finished, "HLS TS: all three segments of the top variant")
+    let v0 = loadPackets("hls_ts/v0.packets")
+    let cmpV = comparePackets(s1.buffer, v0, "video")
+    t.check(cmpV.isEmpty, "HLS TS video packets = ffprobe ({cmpV})")
+    let cmpA = comparePackets(s1.buffer, v0, "audio")
+    t.check(cmpA.isEmpty, "HLS TS audio packets = ffprobe ({cmpA})")
+    let firstPts = core.seconds(core.packetsOf(s1.buffer.media, 0)[0].pts, s1.buffer.media.tracks[0].timescale)
+    t.check(abs(firstPts - 0.04) < 0.05 && s1.buffer.media.duration == 6.0, "timeline starts at the playlist's 0 (first pts {firstPts})")
+    t.check(abs(s1.buffer.bufferedSeconds(at: 1.0) - 5.0) < 0.001 && s1.buffer.bufferedEnd(stream: 0) == 6.0, "buffered seconds")
+    print("time load 3 HLS segments (file://), whole session: {loadMs.formatted(decimals: 1)} ms")
+    // Speed of the buffer with bigger segments: a 1.1 MB TS appended 8 times.
+    let bigTs = testkit.fixture("h264_interlaced.ts")
+    var bb = net.StreamBuffer()
+    let tApp = now()
+    for k in 0..8 {
+        let _e = bb.append(bigTs, start: Float(k), duration: 1.0, sequence: k, name: "x.ts")
+    }
+    let appMs = (now() - tApp) * 1000.0
+    let tDrop = now()
+    let dropped = bb.dropBefore(4.0)
+    let dropMs = (now() - tDrop) * 1000.0
+    t.check(bb.segments.count == 4 && dropped > 0 && bb.size == bigTs.count * 4, "8 big segments in, 4 dropped")
+    print("time StreamBuffer append 1.1 MB TS segment: {(appMs / 8.0).formatted(decimals: 1)} ms each; drop 4 of 8 (compaction): {dropMs.formatted(decimals: 1)} ms")
+
+    let s2 = await runSession(await open("hls_aes/index.m3u8"))
+    let aesRef = loadPackets("hls_aes/index.packets")
+    let cmpAes = comparePackets(s2.buffer, aesRef, "video") + comparePackets(s2.buffer, aesRef, "audio")
+    t.check(s2.keyUrls.count == 1 && cmpAes.isEmpty, "HLS AES-128 (IV attribute) = ffprobe ({cmpAes})")
+    let s3 = await runSession(await open("hls_aes_seq/index.m3u8"))
+    let cmpSeq = comparePackets(s3.buffer, v0, "video") + comparePackets(s3.buffer, v0, "audio")
+    t.check(cmpSeq.isEmpty && s3.buffer.segments[0].sequence == 7, "HLS AES-128 (sequence-number IV) = the clear segments ({cmpSeq})")
+    let s4 = await runSession(await open("hls_fmp4/index.m3u8"))
+    let fmRef = loadPackets("hls_fmp4/index.packets")
+    let cmpFm = comparePackets(s4.buffer, fmRef, "video") + comparePackets(s4.buffer, fmRef, "audio")
+    t.check(s4.initKeys.count == 1 && s4.buffer.media.format == "mp4" && cmpFm.isEmpty, "HLS fMP4 with EXT-X-MAP = ffprobe ({cmpFm})")
+    t.check(s4.buffer.size < (fileSize(joinPath(fx, "hls_fmp4/s0.m4s")) ?? 0) * 4, "init segment not copied into the store")
+    let s5 = await runSession(await open("hls_single/index.m3u8"))
+    let sgRef = loadPackets("hls_single/index.packets")
+    let cmpSg = comparePackets(s5.buffer, sgRef, "video") + comparePackets(s5.buffer, sgRef, "audio")
+    t.check(s5.buffer.segments.count == 3 && cmpSg.isEmpty, "HLS byte ranges of one file = ffprobe ({cmpSg})")
+    let s6 = await runSession(await open("hls_alt/master.m3u8"))
+    let cmpAltV = comparePackets(s6.buffer, loadPackets("hls_alt/p0.packets"), "video", stream: 0)
+    // ffmpeg's TS demuxer gives the first two AAC frames of an audio-only
+    // PES the same time; Reel's demux spaces them by a frame: allow 2 frames.
+    let cmpAltA = comparePackets(s6.buffer, loadPackets("hls_alt/pEnglish.packets"), "audio", stream: 1, tolerance: 0.043)
+    t.check(s6.presentation.audios.count == 1 && s6.audioIndex() == 0 && cmpAltV.isEmpty && cmpAltA.isEmpty, "HLS separate audio rendition: both streams = ffprobe ({cmpAltV}{cmpAltA})")
+    let altV = core.packetsOf(s6.buffer.media, s6.buffer.tracksOf(stream: 0)[0])
+    let altA = core.packetsOf(s6.buffer.media, s6.buffer.tracksOf(stream: 1)[0])
+    let avGap = core.seconds(altA[0].pts, s6.buffer.media.tracks[s6.buffer.tracksOf(stream: 1)[0]].timescale) - core.seconds(altV[0].pts, s6.buffer.media.tracks[s6.buffer.tracksOf(stream: 0)[0]].timescale)
+    let refGap = loadPackets("hls_alt/pEnglish.packets")[0].pts - loadPackets("hls_alt/p0.packets")[0].pts
+    t.check(abs(avGap - refGap) < 0.002, "audio rendition stays in sync with video ({avGap} vs {refGap})")
+
+    // Discontinuity: the second encode's timestamps restart, Reel's go on.
+    let s7 = await runSession(await open("disc.m3u8"))
+    var after = -1.0
+    var before = -1.0
+    let vt = s7.buffer.media.tracks[0].timescale
+    for sg in s7.buffer.segments {
+        if sg.sequence == 2 {
+            for k in sg.firstPacket..sg.firstPacket + sg.packetCount {
+                let p = s7.buffer.media.packets[k]
+                if p.track == 0 && (after < 0.0 || core.seconds(p.pts, vt) < after) {
+                    after = core.seconds(p.pts, vt)
+                }
+            }
+        }
+        if sg.sequence == 1 {
+            for k in sg.firstPacket..sg.firstPacket + sg.packetCount {
+                let p = s7.buffer.media.packets[k]
+                if p.track == 0 && core.seconds(p.pts, vt) > before {
+                    before = core.seconds(p.pts, vt)
+                }
+            }
+        }
+    }
+    t.check(s7.buffer.segments.count == 4 && abs(after - 4.0) < 0.05 && before < after && before > 3.8, "discontinuity: timeline continues ({before} → {after})")
+    t.check(s7.buffer.timelineIds.count == 2 && s7.buffer.segments[2].timeline == 1, "two timelines")
+
+    // DASH sessions.
+    let d1 = await runSession(await open("dash_tl/manifest.mpd"))
+    let cmpD1 = comparePackets(d1.buffer, loadPackets("dash_tl/stream0.packets"), "video", stream: 0) + comparePackets(d1.buffer, loadPackets("dash_tl/stream1.packets"), "audio", stream: 1)
+    t.check(d1.presentation.kind == "dash" && d1.presentation.audios.count == 1 && cmpD1.isEmpty && d1.finished, "DASH SegmentTimeline: video + audio = ffprobe ({cmpD1})")
+    let d2 = await runSession(await open("dash_num/manifest.mpd"))
+    // The MPD says 6 s of 2 s segments: three, so ffmpeg's fourth audio
+    // chunk (one 21 ms frame past the presentation's end) isn't loaded.
+    let numAudio = loadPackets("dash_num/stream1.packets")
+    let cmpD2 = comparePackets(d2.buffer, loadPackets("dash_num/stream0.packets"), "video", stream: 0) + comparePackets(d2.buffer, numAudio.prefix(numAudio.count - 1), "audio", stream: 1)
+    t.check(cmpD2.isEmpty, "DASH $Number$ template = ffprobe ({cmpD2})")
+    let d3 = await runSession(await open("dash_base/manifest.mpd"))
+    let cmpD3 = comparePackets(d3.buffer, loadPackets("dash_base/video.packets"), "video")
+    t.check(!d3.presentation.variants[0].needsIndex && d3.buffer.segments.count == 3 && cmpD3.isEmpty, "DASH SegmentBase + sidx = ffprobe ({cmpD3})")
+    let d4 = await runSession(await open("dash_single/manifest.mpd"))
+    t.check(d4.buffer.segments.count == 7 && core.packetsOf(d4.buffer.media, 0).count == 150, "DASH SegmentList with ranges")
+
+    // Seek: from the segment holding the time.
+    var sk = await open("hls_ts/master.m3u8")
+    sk.bufferAhead = 1000.0
+    let (sk1, _) = await net.step(sk)
+    sk = sk1
+    let (sk2, _) = await net.step(sk)
+    sk = sk2
+    sk.seek(3.0)
+    t.check(sk.nextMain == 2.0 && sk.buffer.media.packets.isEmpty && sk.position == 2.0, "seek goes to the segment start")
+    sk = await runSession(sk)
+    t.check(sk.buffer.segments.count == 2 && sk.buffer.segments[0].sequence == 1 && sk.finished, "after a seek: segments 1 and 2")
+
+    // ABR: a fixed low variant, then automatic again: switch at a
+    // segment boundary, the track change is reported.
+    var sw = await open("hls_ts/master.m3u8")
+    sw.bufferAhead = 1000.0
+    sw.abr.fixed = 0
+    var guard = 0
+    while sw.buffer.segments.isEmpty && guard < 10 {
+        let (n1, _) = await net.step(sw)
+        sw = n1
+        guard += 1
+    }
+    sw.abr.fixed = 1
+    sw = await runSession(sw)
+    t.check(sw.buffer.segments.count == 3 && sw.variant == 1 && sw.buffer.changes.count >= 1 && sw.buffer.media.tracks[0].width == 160, "variant switch after segment 0 (changes {sw.buffer.changes.count})")
+    var swOk = true
+    let swv = core.packetsOf(sw.buffer.media, 0)
+    var lastDts = core.noTime
+    for p in swv {
+        if p.dts <= lastDts {
+            swOk = false
+        }
+        lastDts = p.dts
+    }
+    t.check(swOk && swv.count == v0.filter({ r in r.kind == "video" }).count, "switched video: one rising decode timeline")
+
+    var abr = net.Abr()
+    let ladder = [100000, 300000, 800000, 2000000]
+    t.check(abr.choose(ladder, current: -1, buffered: 0.0) == 2, "ABR start: highest ≤ 1.5 Mbit/s")
+    abr.addSample(bytes: 500000, seconds: 1.0, mediaSeconds: 4.0)
+    t.check(abs(abr.estimate - 4000000.0) < 1.0, "ABR estimate after one sample")
+    t.check(abr.choose(ladder, current: 2, buffered: 4.0) == 2, "ABR: no up-switch with a small buffer")
+    t.check(abr.choose(ladder, current: 2, buffered: 12.0) == 3, "ABR: up one step with 12 s buffered")
+    for _ in 0..4 {
+        abr.addSample(bytes: 25000, seconds: 1.0, mediaSeconds: 4.0)
+    }
+    t.check(abr.estimate < 400000.0 && abr.choose(ladder, current: 3, buffered: 6.0) <= 1, "ABR: down at once when throughput falls ({Int(abr.estimate)})")
+    t.check(abr.choose(ladder, current: 3, buffered: 1.0) == 0, "ABR: panic to the lowest")
+    abr.fixed = 2
+    t.check(abr.choose(ladder, current: 0, buffered: 0.0) == 2, "ABR: fixed variant")
+
+    // Trim: dropping old segments rebases offsets and indexes.
+    var tb = s1.buffer
+    let before0 = tb.media.packets.count
+    let lastBytes = core.packetBytes(tb.file, tb.media, tb.media.packets[before0 - 1])
+    let gone = tb.dropBefore(2.0)
+    t.check(gone > 0 && tb.segments.count == 2 && tb.media.packets.count == before0 - gone && tb.rebase(before0 - 1) == before0 - 1 - gone && tb.rebase(0) == 0, "dropBefore and rebase")
+    t.check(core.packetBytes(tb.file, tb.media, tb.media.packets[tb.media.packets.count - 1]) == lastBytes && tb.segments[0].from == 0 && tb.size < s1.buffer.size, "bytes still found after compaction")
+
+    // Live session driven by hand: reload timing and the sliding window.
+    var lv = await open("live1.m3u8")
+    lv.bufferAhead = 1000.0
+    t.check(lv.presentation.live && lv.presentation.duration == -1.0 && lv.nextMain == 0.0, "live session opens at the live start")
+    var clock = now()
+    var fetched = 0
+    var plan = lv.nextFetch(now: clock)
+    while plan != nil && fetched < 5 {
+        if let f = plan {
+            lv.deliver(f, await net.fetch(f), now: clock)
+        }
+        fetched += 1
+        plan = lv.nextFetch(now: clock)
+    }
+    t.check(lv.buffer.segments.count == 2 && lv.nextFetch(now: clock) == nil, "live: both listed segments, then wait")
+    let reload = lv.nextFetch(now: clock + 2.5)
+    t.check(reload?.kind == "playlist", "live: reload after the target duration")
+    if let f = reload {
+        lv.deliver(f, Result.ok(value: net.Fetched(data: readData(joinPath(fx, "live2.m3u8")) ?? Data(), status: 200)), now: clock + 2.5)
+    }
+    if let f = lv.nextFetch(now: clock + 2.5) {
+        t.check(f.kind == "segment" && f.url.hasSuffix("v0_2.ts"), "live: the new segment is next")
+        lv.deliver(f, await net.fetch(f), now: clock + 2.5)
+    }
+    if let f = lv.nextFetch(now: clock + 5.0) {
+        lv.deliver(f, Result.ok(value: net.Fetched(data: readData(joinPath(fx, "live3.m3u8")) ?? Data(), status: 200)), now: clock + 5.0)
+    }
+    let lcmp = comparePackets(lv.buffer, v0, "video")
+    t.check(lv.buffer.segments.count == 3 && !lv.presentation.variants[0].live && lcmp.isEmpty, "live: window slid, ENDLIST ends it; packets = VOD's ({lcmp})")
+    t.check(lv.presentation.variants[0].segments[0].start == 4.0, "live: times kept by sequence across reloads")
+
+    // Failures: a missing segment is retried, then skipped.
+    var bad = net.Session(presentation: net.hlsPresentation(net.parseHls("#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXTINF:2,\nmissing.ts\n#EXTINF:2,\nv0_1.ts\n#EXT-X-ENDLIST\n", url: fixtureUrl("hls_ts/x.m3u8")).valueOr(net.HlsPlaylist())))
+    bad.bufferAhead = 1000.0
+    var errors = 0
+    for k in 0..6 {
+        if let f = bad.nextFetch(now: clock + Float(k) * 10.0) {
+            if bad.deliver(f, await net.fetch(f), now: clock + Float(k) * 10.0) != nil {
+                errors += 1
+            }
+        }
+    }
+    t.check(errors == 3 && bad.buffer.segments.count == 1 && bad.warnings.count == 1, "a failing segment: 3 tries, then skipped ({errors} errors)")
+
+    // ---------------------------------------------------------------
+    // Packed audio's ID3 timestamp (RFC 8216 §3.4).
+    var id3 = Data(text: "ID3")
+    id3.append(Data(bytes: [4, 0, 0, 0, 0, 0, 63]))
+    id3.append(Data(text: "PRIV"))
+    id3.append(Data(bytes: [0, 0, 0, 53, 0, 0]))
+    id3.append(Data(text: "com.apple.streaming.transportStreamTimestamp"))
+    id3.append(Data(bytes: [0, 0, 0, 0, 1, 0, 0, 0, 0]))
+    t.check(net.id3TransportTimestamp(id3) == 4294967296, "ID3 PRIV transport stream timestamp")
+
+    // ---------------------------------------------------------------
+    // Radio: ICY metadata, status pages, a growing MP3 download.
+    let md = net.parseIcyMetadata("StreamTitle='Guns N' Roses - Don't Cry';StreamUrl='http://x/';")
+    t.check((md["StreamTitle"] ?? "") == "Guns N' Roses - Don't Cry" && (md["StreamUrl"] ?? "") == "http://x/", "ICY metadata with quotes inside")
+    let (artist, song) = net.splitArtistTitle("Guns N' Roses - Don't Cry")
+    t.check(artist == "Guns N' Roses" && song == "Don't Cry", "artist and title")
+    let info = net.icyHeaders(["icy-name": "Reel FM", "icy-br": "128,128", "icy-metaint": "16000", "content-type": "audio/mpeg; charset=x"])
+    t.check(info.name == "Reel FM" && info.bitrate == 128 && info.metaint == 16000 && info.contentType == "audio/mpeg", "ICY headers")
+    // A stream with metaint 100 and two metadata blocks, fed in odd pieces.
+    var icy = Data()
+    var audioWant = Data()
+    for blk in 0..3 {
+        for i in 0..100 {
+            icy.append(byte: (blk * 100 + i) & 255)
+            audioWant.append(byte: (blk * 100 + i) & 255)
+        }
+        if blk == 0 {
+            let txt = Data(text: "StreamTitle='One';")
+            icy.append(byte: 2)
+            icy.append(txt)
+            for _ in 0..32 - txt.count {
+                icy.append(byte: 0)
+            }
+        } else if blk == 1 {
+            icy.append(byte: 0)
+        } else {
+            let txt = Data(text: "StreamTitle='Two';")
+            icy.append(byte: 2)
+            icy.append(txt)
+            for _ in 0..32 - txt.count {
+                icy.append(byte: 0)
+            }
+        }
+    }
+    var reader = net.IcyReader(metaint: 100)
+    var audioGot = Data()
+    var at = 0
+    for size in [7, 93, 1, 5, 40, 113, 300] {
+        audioGot.append(reader.feed(icy.slice(from: at, to: at + size)))
+        at += size
+    }
+    t.check(audioGot == audioWant && reader.titles == ["One", "Two"] && reader.title == "Two", "IcyReader strips split metadata blocks")
+    let ice = "\{\"icestats\":\{\"admin\":\"x\",\"source\":[\{\"listenurl\":\"http://h:8000/other\",\"title\":\"Wrong\"},\{\"artist\":\"Band\",\"listenurl\":\"http://h:8000/live\",\"title\":\"Song \\u00e9\"}]}}"
+    t.check(net.radioStatusTitle(ice, streamUrl: "http://h:8000/live") == "Band - Song é", "Icecast status-json title for the mount")
+    t.check(net.radioStatusTitle("<html><body>12,1,40,100,10,128,Artist - Title, with comma</body></html>") == "Artist - Title, with comma", "SHOUTcast 7.html")
+    t.check(net.radioStatusTitle("\{\"currentlisteners\":1,\"songtitle\":\"V2 Song\"}") == "V2 Song", "SHOUTcast 2 stats")
+    t.check(net.radioStatusUrls("http://h:8000/live").count == 4 && net.radioStatusUrls("http://h:8000/live")[0] == "http://h:8000/status-json.xsl", "status URLs")
+    // A growing MP3 download, read whole every time as the .part would be.
+    let mp3 = testkit.fixture("mp3_cbr.mp3")
+    var radio = net.Radio(url: "http://h/stream")
+    var secs = 0.0
+    var grow = 4000
+    let tRadio = now()
+    while grow < mp3.count + 4000 {
+        secs += radio.take(mp3.slice(from: 0, to: min(grow, mp3.count)))
+        grow += 4000
+    }
+    secs += radio.finish()
+    let radioMs = (now() - tRadio) * 1000.0
+    let whole = net.StreamBuffer()
+    var all = whole
+    let allErr = all.append(mp3, start: 0.0, duration: 0.0, name: "a.mp3")
+    let wholeCount = all.media.packets.count
+    t.check(allErr == nil, "whole mp3 into a buffer")
+    let rp = radio.buffer.media.packets
+    var rising = true
+    for i in 1..rp.count {
+        if rp[i].pts <= rp[i - 1].pts {
+            rising = false
+        }
+    }
+    t.check(radio.format == "mp3" && rp.count >= wholeCount - 1 && rp.count <= wholeCount && rising && radio.chunks >= 2, "radio chunks: {rp.count} of {wholeCount} frames in {radio.chunks} chunks, times rising")
+    var same = true
+    for (i, p) in rp.enumerated() {
+        if i < wholeCount && core.packetBytes(radio.buffer.file, radio.buffer.media, p) != core.packetBytes(all.file, all.media, all.media.packets[i]) {
+            same = false
+        }
+    }
+    t.check(same && abs(secs - radio.time) < 0.0001, "radio frames are the file's frames")
+    print("time radio: {mp3.count / 1024} KB in 4 KB arrivals: {radioMs.formatted(decimals: 1)} ms")
+    let tail = mp3.slice(from: 0, to: 30000)
+    let reconnect = mp3.slice(from: 20000, to: 40000)
+    t.check(net.spliceOffset(old: tail, new: reconnect) == 10000, "splice a reconnect's burst onto the old stream")
+    t.check(net.spliceOffset(old: tail, new: mp3.slice(from: 35000, to: 45000)) == -1, "no overlap")
+
+    // ---------------------------------------------------------------
+    // Podcasts.
+    let rss = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<rss version=\"2.0\" xmlns:itunes=\"http://www.itunes.com/dtds/podcast-1.0.dtd\" xmlns:content=\"http://purl.org/rss/1.0/modules/content/\">\n<channel>\n<title>Reel Talk &amp; Friends</title>\n<link>https://reel.example.com/</link>\n<language>en-us</language>\n<itunes:author>Alexius</itunes:author>\n<description>All about &lt;b&gt;players&lt;/b&gt;.</description>\n<itunes:image href=\"https://reel.example.com/cover.jpg\"/>\n<itunes:category text=\"Technology\"><itunes:category text=\"Software\"/></itunes:category>\n<itunes:explicit>false</itunes:explicit>\n<lastBuildDate>Mon, 26 Oct 2026 08:00:00 +0800</lastBuildDate>\n<item>\n<title>Episode 2: Streams</title>\n<guid isPermaLink=\"false\">ep2</guid>\n<pubDate>Sun, 25 Oct 2026 10:30:00 GMT</pubDate>\n<enclosure url=\"media/ep2.mp3\" length=\"12345678\" type=\"audio/mpeg\"/>\n<itunes:duration>1:02:03</itunes:duration>\n<itunes:season>1</itunes:season><itunes:episode>2</itunes:episode><itunes:episodeType>full</itunes:episodeType>\n<content:encoded><![CDATA[<p>We talk about <b>HLS</b> &amp; DASH.</p><ul><li>One</li><li>Two</li></ul>]]></content:encoded>\n<itunes:image href=\"https://reel.example.com/ep2.jpg\"/>\n</item>\n<item>\n<title>Episode 1</title>\n<pubDate>Sat, 24 Oct 26 22:00 EST</pubDate>\n<enclosure url=\"https://cdn.example.com/ep1.m4a\" length=\"999\" type=\"audio/x-m4a\"/>\n<itunes:duration>1834</itunes:duration>\n<description>Plain notes</description>\n<itunes:explicit>yes</itunes:explicit>\n</item>\n</channel>\n</rss>"
+    match net.parsePodcast(rss, url: "https://reel.example.com/feed.xml") {
+        .ok(p) -> {
+            t.check(p.format == "rss" && p.title == "Reel Talk & Friends" && p.description == "All about players." && p.author == "Alexius" && p.language == "en-us", "RSS channel")
+            t.check(p.image == "https://reel.example.com/cover.jpg" && p.categories == ["Technology", "Software"] && !p.explicit, "RSS image, categories")
+            t.check(p.updated == net.hlsParseDate("2026-10-26T00:00:00Z"), "RSS lastBuildDate with +0800")
+            t.check(p.episodes.count == 2, "two episodes")
+            let e = p.episodes[0]
+            t.check(e.title == "Episode 2: Streams" && e.guid == "ep2" && e.enclosureUrl == "https://reel.example.com/media/ep2.mp3" && e.enclosureLength == 12345678 && e.enclosureType == "audio/mpeg", "enclosure")
+            t.check(e.duration == 3723.0 && e.season == 1 && e.episode == 2 && e.episodeType == "full" && e.image == "https://reel.example.com/ep2.jpg", "iTunes episode tags")
+            t.check(e.published == net.hlsParseDate("2026-10-25T10:30:00Z"), "RFC 822 date")
+            t.check(e.description == "We talk about HLS & DASH.\n\n• One\n• Two", "HTML notes to text: {e.description}")
+            let e1 = p.episodes[1]
+            t.check(e1.duration == 1834.0 && e1.explicit && e1.description == "Plain notes" && e1.published == net.hlsParseDate("2026-10-25T03:00:00Z"), "seconds duration, 2-digit year, EST, no seconds")
+        }
+        .failure(err) -> t.check(false, "RSS: {err.message}")
+    }
+    let atom = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<feed xmlns=\"http://www.w3.org/2005/Atom\" xml:lang=\"fr\">\n<title type=\"text\">Atom Cast</title>\n<subtitle>Short &amp; sweet</subtitle>\n<link href=\"https://atom.example.com/\"/>\n<link rel=\"self\" href=\"https://atom.example.com/feed\"/>\n<logo>/logo.png</logo>\n<updated>2026-10-26T12:00:00+02:00</updated>\n<author><name>Ada</name></author>\n<entry>\n<title>Première</title>\n<id>urn:uuid:1</id>\n<published>2026-10-20T08:00:00Z</published>\n<updated>2026-10-21T08:00:00Z</updated>\n<link rel=\"alternate\" href=\"https://atom.example.com/1\"/>\n<link rel=\"enclosure\" type=\"audio/mpeg\" length=\"4242\" href=\"https://atom.example.com/1.mp3\"/>\n<content type=\"xhtml\"><div xmlns=\"http://www.w3.org/1999/xhtml\"><p>Hello <em>world</em></p></div></content>\n</entry>\n</feed>"
+    match net.parsePodcast(atom, url: "https://atom.example.com/feed") {
+        .ok(p) -> {
+            t.check(p.format == "atom" && p.title == "Atom Cast" && p.description == "Short & sweet" && p.author == "Ada" && p.language == "fr" && p.link == "https://atom.example.com/" && p.image == "https://atom.example.com/logo.png", "Atom feed")
+            t.check(p.updated == net.hlsParseDate("2026-10-26T10:00:00Z"), "Atom updated")
+            let e = p.episodes[0]
+            t.check(p.episodes.count == 1 && e.title == "Première" && e.enclosureUrl == "https://atom.example.com/1.mp3" && e.enclosureLength == 4242 && e.link == "https://atom.example.com/1", "Atom entry")
+            t.check(e.published == net.hlsParseDate("2026-10-20T08:00:00Z") && e.description == "Hello world", "Atom date and xhtml content")
+        }
+        .failure(err) -> t.check(false, "Atom: {err.message}")
+    }
+    t.check(!net.parsePodcast("<html><body/></html>").isOk(), "not a feed")
+    t.check(net.parseItunesDuration("62:03") == 3723.0 && net.parseItunesDuration("") == -1.0 && net.parseItunesDuration("abc") == -1.0, "iTunes durations")
+    t.check(net.htmlToText("a<br/>b&nbsp;c <script>x()</script>d") == "a\nb c d", "htmlToText: {net.htmlToText("a<br/>b&nbsp;c <script>x()</script>d")}")
+
+    // ---------------------------------------------------------------
+    // Remote over file:// (ranges cut locally) with a small block cache.
+    let rurl = fixtureUrl("hls_single/index.ts")
+    let whole2 = readData(joinPath(fx, "hls_single/index.ts")) ?? Data()
+    match await net.openRemote(rurl, blockSize: 4096, maxBlocks: 4) {
+        .ok(r0) -> {
+            t.check(r0.size == whole2.count && r0.acceptsRanges && r0.mime == "video/mp2t", "probe of a local file")
+            var r = r0
+            let (r1, a1) = await net.readRemote(r, from: 5000, to: 9000)
+            r = r1
+            t.check((a1.value() ?? Data()) == whole2.slice(from: 5000, to: 9000) && r.blocks.count == 2 && r.misses == 1, "ranged read through the cache")
+            let (r2, a2) = await net.readRemote(r, from: 4100, to: 8000)
+            r = r2
+            t.check((a2.value() ?? Data()) == whole2.slice(from: 4100, to: 8000) && r.hits == 1, "cache hit")
+            let (r3, a3) = await net.readRemote(r, from: 0, to: 20000)
+            r = r3
+            t.check((a3.value() ?? Data()) == whole2.slice(from: 0, to: 20000) && r.blocks.count == 4, "a read bigger than the cache")
+            let (r4, a4) = await net.readRemote(r, from: whole2.count - 10, to: whole2.count + 100)
+            r = r4
+            t.check((a4.value() ?? Data()) == whole2.slice(from: whole2.count - 10, to: whole2.count), "read past the end is cut")
+        }
+        .failure(e) -> t.check(false, "openRemote: {e.message}")
+    }
+    t.check(!(await net.probe(fixtureUrl("nope.ts"))).isOk(), "probe of a missing file fails")
+    t.check(net.httpRangeTotal("bytes 0-0/12345") == 12345 && net.httpRangeTotal("bytes 0-0/*") == -1, "Content-Range total")
+    t.check(net.mimeForName("http://h/a/index.m3u8?x") == "application/vnd.apple.mpegurl" && net.mimeForName("x.mpd") == "application/dash+xml", "MIME from names")
+
+    print("net: {t.passed} of {t.total} passed")
+}

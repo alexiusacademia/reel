@@ -1,0 +1,306 @@
+// Test helpers shared by every module's tests: ffmpeg's reference answers
+// for the fixtures in tests/fixtures (made by tools/make_fixtures.sh),
+// read into Tessel values, and ways to compare decoded output with them.
+//
+//   loadRef(name)            F.ref.json: tracks, packets, tags, chapters
+//   mediaFromRef(file, ref)  a core.Media whose packets come from ffprobe's
+//                            byte positions (only packets stored in one
+//                            piece; for testing decoders without a demuxer)
+//   frameMd5s(name)          F.v.framemd5: each picture's md5, in order
+//   referenceYuv(name)       F.v.yuv: the first pictures' raw planes
+//   referenceSamples(name)   F.a.f32: ffmpeg's decoded samples
+//   psnr, snr                how close two signals are, in dB
+//
+// Paths are relative to the Reel folder; run tests from there.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../core"
+
+public let fixtures = "tests/fixtures"
+
+public struct RefPcm {
+    bits: Int = 16
+    float: Bool = false
+    bigEndian: Bool = false
+    signed: Bool = true
+}
+
+public struct RefTrack {
+    index: Int = 0
+    kind: String = "other"
+    codec: String = ""
+    ffCodec: String = ""
+    profile: String = ""
+    timescale: Int = 1000
+    duration: Int = -9223372036854775807
+    extraHex: String = ""
+    width: Int = 0
+    height: Int = 0
+    sarNum: Int = 1
+    sarDen: Int = 1
+    fpsNum: Int = 0
+    fpsDen: Int = 1
+    rotation: Int = 0
+    pixFmt: String = ""
+    sampleRate: Int = 0
+    channels: Int = 0
+    channelLayout: String = ""
+    bitsPerSample: Int = 0
+    pcm: RefPcm = RefPcm()
+    language: String = ""
+    title: String = ""
+    isDefault: Bool = false
+    isCover: Bool = false
+    frames: Int = -1
+}
+
+public struct RefPacket {
+    track: Int = 0
+    pts: Int = -9223372036854775807
+    dts: Int = -9223372036854775807
+    duration: Int = 0
+    key: Bool = false
+    pos: Int = -1
+    size: Int = 0
+}
+
+public struct RefChapter {
+    start: Float = 0.0
+    end: Float = -1.0
+    title: String = ""
+}
+
+public struct Ref {
+    format: String = ""
+    duration: Float = -1.0
+    tags: [String: String] = [:]
+    tracks: [RefTrack] = []
+    packets: [RefPacket] = []
+    chapters: [RefChapter] = []
+}
+
+public fn fixturePath(_ name: String) -> String {
+    joinPath(fixtures, name)
+}
+
+// The fixture file's bytes (empty when it's missing).
+public fn fixture(_ name: String) -> Data {
+    readData(fixturePath(name)) ?? Data()
+}
+
+// ffmpeg's reference for a fixture, e.g. loadRef("h264_baseline.mp4").
+public fn loadRef(_ name: String) -> Ref {
+    let text = readFile(fixturePath(name + ".ref.json")) ?? ""
+    let ref: Ref = fromJson(text) ?? Ref()
+    ref
+}
+
+public fn hexToData(_ hex: String) -> Data {
+    var out = Data()
+    let digits = hex.characters
+    var i = 0
+    while i + 1 < digits.count {
+        out.append(byte: hexDigit(digits[i]) * 16 + hexDigit(digits[i + 1]))
+        i += 2
+    }
+    out
+}
+
+fn hexDigit(_ c: String) -> Int {
+    let all = "0123456789abcdef"
+    all.find(c.lowercase()) ?? 0
+}
+
+public fn trackKind(_ s: String) -> core.TrackKind {
+    match s {
+        "video" -> core.TrackKind.video
+        "audio" -> core.TrackKind.audio
+        "subtitle" -> core.TrackKind.subtitle
+        _ -> core.TrackKind.other
+    }
+}
+
+// A core.Track made from the reference.
+public fn trackFromRef(_ t: RefTrack) -> core.Track {
+    var out = core.Track(index: t.index, kind: trackKind(t.kind), codec: t.codec)
+    out.timescale = t.timescale
+    out.duration = t.duration
+    out.extra = hexToData(t.extraHex)
+    out.width = t.width
+    out.height = t.height
+    out.sarNum = t.sarNum
+    out.sarDen = t.sarDen
+    out.fpsNum = t.fpsNum
+    out.fpsDen = t.fpsDen
+    out.rotation = t.rotation
+    out.sampleRate = t.sampleRate
+    out.channels = t.channels
+    out.bitsPerSample = t.bitsPerSample
+    out.pcm = core.PcmFormat(bits: t.pcm.bits, float: t.pcm.float, bigEndian: t.pcm.bigEndian, signed: t.pcm.signed)
+    out.language = t.language
+    out.title = t.title
+    out.isDefault = t.isDefault
+    out
+}
+
+// A Media built from ffmpeg's view of the file. Packets without a byte
+// position are left out. AAC tracks whose extra is empty are marked adts.
+//
+// For Matroska, ffprobe's `pos` is the start of the Block body (track
+// number vint, 2-byte timecode, flags), not of the frame. By default the
+// packets keep ffprobe's offsets (tests written early in round 1 skip the
+// header themselves); `skipBlockHeaders: true` moves each packet past it.
+// Laced blocks aren't handled.
+public fn mediaFromRef(_ file: Data, _ ref: Ref, skipBlockHeaders: Bool = false) -> core.Media {
+    var m = mediaFromRefAsIs(file, ref)
+    if skipBlockHeaders && ref.format.hasPrefix("matroska") {
+        for p in m.packets {
+            if p.offset < file.count {
+                let first = file[p.offset]
+                var len = 1
+                while len < 8 && (first & (0x80 >> (len - 1))) == 0 {
+                    len += 1
+                }
+                // ffprobe's size is already the frame's own size.
+                p.offset += len + 3
+            }
+        }
+    }
+    m
+}
+
+fn mediaFromRefAsIs(_ file: Data, _ ref: Ref) -> core.Media {
+    var m = core.Media(format: ref.format, duration: ref.duration)
+    for t in ref.tracks {
+        var tr = trackFromRef(t)
+        if tr.codec == "aac" && tr.extra.isEmpty {
+            tr.adts = true
+        }
+        m.tracks.append(tr)
+    }
+    for p in ref.packets {
+        if p.pos >= 0 && p.pos + p.size <= file.count {
+            m.packets.append(core.PacketRef(track: p.track, pts: p.pts, dts: p.dts, duration: p.duration, key: p.key, offset: p.pos, size: p.size))
+        }
+    }
+    m.tags = ref.tags
+    for c in ref.chapters {
+        m.chapters.append(core.Chapter(start: c.start, end: c.end, title: c.title))
+    }
+    m
+}
+
+// Each decoded picture's md5 (lower-case hex) from F.v.framemd5.
+public fn frameMd5s(_ name: String) -> [String] {
+    let text = readFile(fixturePath(name + ".v.framemd5")) ?? ""
+    var out: [String] = []
+    for line in text.lines() {
+        if line.hasPrefix("#") || line.trim().isEmpty {
+            continue
+        }
+        let parts = line.split(",")
+        if parts.count >= 6 {
+            out.append(parts[5].trim())
+        }
+    }
+    out
+}
+
+// ffmpeg's first decoded pictures (F.v.yuv), 8-bit planar, as
+// core.Pictures of the given size and chroma.
+public fn referenceYuv(_ name: String, width: Int, height: Int, chroma: core.Chroma = .yuv420) -> [core.Picture] {
+    let data = readData(fixturePath(name + ".v.yuv")) ?? Data()
+    var p = core.Picture(width: width, height: height, chroma: chroma)
+    let cw = p.chromaWidth
+    let ch = p.chromaHeight
+    let frameSize = width * height + 2 * cw * ch
+    var out: [core.Picture] = []
+    let bytes = data.bytes
+    var at = 0
+    while at + frameSize <= bytes.count {
+        var pic = core.Picture(width: width, height: height, chroma: chroma)
+        pic.yStride = width
+        pic.cStride = cw
+        pic.y = bytes.slice(from: at, to: at + width * height)
+        pic.u = bytes.slice(from: at + width * height, to: at + width * height + cw * ch)
+        pic.v = bytes.slice(from: at + width * height + cw * ch, to: at + frameSize)
+        out.append(pic)
+        at += frameSize
+    }
+    out
+}
+
+// ffmpeg's decoded samples (F.a.f32), interleaved.
+public fn referenceSamples(_ name: String) -> [Float] {
+    let data = readData(fixturePath(name + ".a.f32")) ?? Data()
+    var out: [Float] = []
+    var i = 0
+    while i + 4 <= data.count {
+        out.append(data.float32(at: i))
+        i += 4
+    }
+    out
+}
+
+// The md5 of a picture's visible samples, as ffmpeg's framemd5 has it.
+public fn pictureMd5(_ p: core.Picture) -> String {
+    core.pictureBytes(p).hash("md5").hex
+}
+
+// Peak signal-to-noise ratio of two pictures' luma (and chroma), in dB;
+// 99 when they're the same.
+public fn psnr(_ a: core.Picture, _ b: core.Picture) -> Float {
+    var sum = 0
+    var n = 0
+    for y in 0..min(a.height, b.height) {
+        for x in 0..min(a.width, b.width) {
+            let d = a.luma(x, y) - b.luma(x, y)
+            sum += d * d
+            n += 1
+        }
+    }
+    if a.chroma != .gray && b.chroma != .gray {
+        for y in 0..min(a.chromaHeight, b.chromaHeight) {
+            for x in 0..min(a.chromaWidth, b.chromaWidth) {
+                let d = a.cb(x, y) - b.cb(x, y)
+                let e = a.cr(x, y) - b.cr(x, y)
+                sum += d * d + e * e
+                n += 2
+            }
+        }
+    }
+    if n == 0 {
+        return 0.0
+    }
+    if sum == 0 {
+        return 99.0
+    }
+    let mse = Float(sum) / Float(n)
+    let peak = Float((1 << a.depth) - 1)
+    10.0 * log10(peak * peak / mse)
+}
+
+// Signal-to-noise ratio of decoded samples against a reference, in dB,
+// over the frames both have (from `offset` frames into the reference);
+// 150 when they're the same.
+public fn snr(_ got: [Float], _ want: [Float], offset: Int = 0) -> Float {
+    var signal = 0.0
+    var noise = 0.0
+    var i = 0
+    while i < got.count && i + offset < want.count {
+        let w = want[i + offset]
+        let d = got[i] - w
+        signal += w * w
+        noise += d * d
+        i += 1
+    }
+    if noise == 0.0 {
+        return 150.0
+    }
+    if signal == 0.0 {
+        return 0.0
+    }
+    10.0 * log10(signal / noise)
+}

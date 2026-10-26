@@ -1,0 +1,477 @@
+// Keyboard shortcuts as data: actions (ids like "play-pause") bound to key
+// combinations ("space", "cmd+shift+s", "alt+left"), with Reel's current
+// keys as the defaults, the user's changes kept as overrides, conflict
+// detection, parsing what people type ("Ctrl+Shift+S", "⇧⌘S") and
+// formatting for menus and the preferences window (⌃⌥⇧⌘ on macOS,
+// "Ctrl+Shift+S" elsewhere).
+//
+// Key names are those of Tessel's KeyEvent: a single character (the key
+// without Shift: "=" for Shift+=) or "space" "enter" "escape" "tab"
+// "backspace" "delete" "left" "right" "up" "down" "home" "end" "pageup"
+// "pagedown" "insert" "f1"…"f12". "cmd" is Cmd on macOS and Ctrl on
+// Windows (KeyEvent.command); "ctrl" is the Control key itself.
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+public struct KeyCombo {
+    key: String
+    command: Bool = false
+    control: Bool = false
+    alt: Bool = false
+    shift: Bool = false
+
+    // The canonical text: modifiers in the order cmd, ctrl, alt, shift,
+    // then the key ("cmd+shift+s").
+    text: String {
+        var s = ""
+        if command {
+            s += "cmd+"
+        }
+        if control {
+            s += "ctrl+"
+        }
+        if alt {
+            s += "alt+"
+        }
+        if shift {
+            s += "shift+"
+        }
+        s + key
+    }
+}
+
+// An action the keys can run.
+public struct KeyAction {
+    id: String
+    title: String
+    // For grouping in the preferences window: "Playback" "Audio" "Video"
+    // "Subtitles" "Media" "View".
+    group: String
+}
+
+// Two or more actions on one combination, or a combination the system
+// keeps for itself.
+public struct KeyConflict {
+    combo: String
+    actions: [String]
+    // Taken by the system (cmd+q, cmd+h, cmd+tab …).
+    reserved: Bool = false
+}
+
+public struct KeyBinding {
+    action: String
+    combos: [String]
+}
+
+// The bindings, in the order of `keyActions`.
+public struct Keymap {
+    bindings: [KeyBinding] = []
+
+    // The combinations of an action (canonical texts).
+    fn combos(_ action: String) -> [String] {
+        bindings.first(where: { b in b.action == action })?.combos ?? []
+    }
+
+    // The action a combination runs, or "".
+    fn action(_ combo: String) -> String {
+        let c = canonicalCombo(combo)
+        if c.isEmpty {
+            return ""
+        }
+        for b in bindings {
+            if b.combos.contains(c) {
+                return b.action
+            }
+        }
+        ""
+    }
+
+    // The action for a key press (KeyEvent's fields), or "".
+    fn actionFor(key: String, command: Bool = false, control: Bool = false, alt: Bool = false, shift: Bool = false) -> String {
+        let k = canonicalKey(key)
+        if k.isEmpty {
+            return ""
+        }
+        action(KeyCombo(key: k, command: command, control: control, alt: alt, shift: shift).text)
+    }
+
+    // Binds an action to these combinations (replacing its own; other
+    // actions keep theirs: use `conflicts` to show clashes).
+    fn set(_ action: String, combos: [String]) {
+        var cs: [String] = []
+        for c in combos {
+            let t = canonicalCombo(c)
+            if !t.isEmpty && !cs.contains(t) {
+                cs.append(t)
+            }
+        }
+        if let i = bindings.firstIndex(where: { b in b.action == action }) {
+            bindings[i].combos = cs
+        } else {
+            bindings.append(KeyBinding(action: action, combos: cs))
+        }
+    }
+
+    // Binds one more combination, taking it away from any other action
+    // (the usual "press a key to assign" behaviour).
+    fn assign(_ action: String, combo: String) {
+        let t = canonicalCombo(combo)
+        if t.isEmpty {
+            return
+        }
+        for i in 0..bindings.count {
+            bindings[i].combos.removeAll(where: { c in c == t })
+        }
+        set(action, combos: combos(action) + [t])
+    }
+
+    // Combinations bound to several actions, and reserved ones in use.
+    fn conflicts() -> [KeyConflict] {
+        var byCombo: [String: [String]] = [:]
+        var order: [String] = []
+        for b in bindings {
+            for c in b.combos {
+                if byCombo[c] == nil {
+                    byCombo[c] = []
+                    order.append(c)
+                }
+                var list = byCombo[c] ?? []
+                if !list.contains(b.action) {
+                    list.append(b.action)
+                }
+                byCombo[c] = list
+            }
+        }
+        var out: [KeyConflict] = []
+        for c in order {
+            let acts = byCombo[c] ?? []
+            let reserved = reservedCombos.contains(c)
+            if acts.count > 1 || reserved {
+                out.append(KeyConflict(combo: c, actions: acts, reserved: reserved))
+            }
+        }
+        out
+    }
+
+    // The combination to show on a menu item (`MenuItem(shortcut:)`): the
+    // action's first one with cmd, as canonical text; "" when it has none.
+    fn menuShortcut(_ action: String) -> String {
+        for c in combos(action) {
+            if c.hasPrefix("cmd+") {
+                return c
+            }
+        }
+        ""
+    }
+
+    // The user's changes against the defaults, for the preferences file:
+    // action → combinations, only for actions that differ.
+    fn overrides() -> [String: [String]] {
+        let d = defaultKeymap()
+        var out: [String: [String]] = [:]
+        for b in bindings {
+            if d.combos(b.action) != b.combos {
+                out[b.action] = b.combos
+            }
+        }
+        out
+    }
+}
+
+// Every action, in menu order.
+public let keyActions: [KeyAction] = [
+    KeyAction(id: "play-pause", title: "Play/Pause", group: "Playback"),
+    KeyAction(id: "stop", title: "Stop", group: "Playback"),
+    KeyAction(id: "next", title: "Next", group: "Playback"),
+    KeyAction(id: "previous", title: "Previous", group: "Playback"),
+    KeyAction(id: "next-episode", title: "Next Episode", group: "Playback"),
+    KeyAction(id: "jump-forward", title: "Jump Forward 10 s", group: "Playback"),
+    KeyAction(id: "jump-back", title: "Jump Back 10 s", group: "Playback"),
+    KeyAction(id: "jump-forward-short", title: "Jump Forward 3 s", group: "Playback"),
+    KeyAction(id: "jump-back-short", title: "Jump Back 3 s", group: "Playback"),
+    KeyAction(id: "jump-forward-long", title: "Jump Forward 1 min", group: "Playback"),
+    KeyAction(id: "jump-back-long", title: "Jump Back 1 min", group: "Playback"),
+    KeyAction(id: "frame-step", title: "Next Frame", group: "Playback"),
+    KeyAction(id: "frame-back", title: "Previous Frame", group: "Playback"),
+    KeyAction(id: "jump-to-time", title: "Jump to Time…", group: "Playback"),
+    KeyAction(id: "next-chapter", title: "Next Chapter", group: "Playback"),
+    KeyAction(id: "previous-chapter", title: "Previous Chapter", group: "Playback"),
+    KeyAction(id: "sleep-timer", title: "Sleep Timer…", group: "Playback"),
+    KeyAction(id: "faster", title: "Faster", group: "Playback"),
+    KeyAction(id: "slower", title: "Slower", group: "Playback"),
+    KeyAction(id: "normal-speed", title: "Normal Speed", group: "Playback"),
+    KeyAction(id: "ab-loop", title: "A-B Loop", group: "Playback"),
+    KeyAction(id: "bookmark-add", title: "Add Bookmark", group: "Playback"),
+    KeyAction(id: "bookmark-next", title: "Next Bookmark", group: "Playback"),
+    KeyAction(id: "bookmark-previous", title: "Previous Bookmark", group: "Playback"),
+    KeyAction(id: "volume-up", title: "Volume Up", group: "Audio"),
+    KeyAction(id: "volume-down", title: "Volume Down", group: "Audio"),
+    KeyAction(id: "mute", title: "Mute", group: "Audio"),
+    KeyAction(id: "cycle-audio", title: "Next Audio Track", group: "Audio"),
+    KeyAction(id: "audio-delay-later", title: "Audio Delay +50 ms", group: "Audio"),
+    KeyAction(id: "audio-delay-earlier", title: "Audio Delay −50 ms", group: "Audio"),
+    KeyAction(id: "fullscreen", title: "Full Screen", group: "Video"),
+    KeyAction(id: "exit-fullscreen", title: "Leave Full Screen", group: "Video"),
+    KeyAction(id: "snapshot", title: "Snapshot", group: "Video"),
+    KeyAction(id: "cycle-subtitle", title: "Next Subtitle Track", group: "Subtitles"),
+    KeyAction(id: "subtitle-delay-later", title: "Subtitle Delay +0.1 s", group: "Subtitles"),
+    KeyAction(id: "subtitle-delay-earlier", title: "Subtitle Delay −0.1 s", group: "Subtitles"),
+    KeyAction(id: "cycle-secondary-subtitle", title: "Next Secondary Subtitle Track", group: "Subtitles"),
+    KeyAction(id: "find-dialogue", title: "Find in Dialogue…", group: "Subtitles"),
+    KeyAction(id: "transcript", title: "Transcript", group: "Subtitles"),
+    KeyAction(id: "open-file", title: "Open File…", group: "Media"),
+    KeyAction(id: "open-folder", title: "Open Folder…", group: "Media"),
+    KeyAction(id: "close", title: "Close", group: "Media"),
+    KeyAction(id: "media-info", title: "Media Information", group: "View"),
+    KeyAction(id: "playlist", title: "Playlist", group: "View"),
+    KeyAction(id: "library", title: "Library", group: "View"),
+    KeyAction(id: "preferences", title: "Preferences…", group: "View"),
+    KeyAction(id: "effects", title: "Effects and Filters", group: "View"),
+    KeyAction(id: "mini-player", title: "Mini Player", group: "View"),
+    KeyAction(id: "export-clip", title: "Export Clip…", group: "Media"),
+]
+
+// Reel's keys (main.tsl's `key()` and menu shortcuts as of round 4),
+// plus defaults for the new actions on keys that were free.
+let defaultBindings: [(String, [String])] = [
+    ("play-pause", ["space"]),
+    ("stop", ["s"]),
+    ("next", ["n"]),
+    ("previous", ["p"]),
+    ("next-episode", ["shift+n"]),
+    ("jump-forward", ["right", "cmd+right"]),
+    ("jump-back", ["left", "cmd+left"]),
+    ("jump-forward-short", ["shift+right"]),
+    ("jump-back-short", ["shift+left"]),
+    ("jump-forward-long", ["alt+right"]),
+    ("jump-back-long", ["alt+left"]),
+    ("frame-step", ["e", "."]),
+    ("frame-back", ["shift+e", ","]),
+    ("jump-to-time", ["cmd+t"]),
+    ("next-chapter", ["shift+cmd+right"]),
+    ("previous-chapter", ["shift+cmd+left"]),
+    ("sleep-timer", ["alt+s"]),
+    ("faster", ["]", "cmd+="]),
+    ("slower", ["[", "cmd+-"]),
+    ("normal-speed", ["=", "cmd+0"]),
+    ("ab-loop", ["l"]),
+    ("bookmark-add", ["cmd+b"]),
+    ("bookmark-next", ["shift+."]),
+    ("bookmark-previous", ["shift+,"]),
+    ("volume-up", ["up", "cmd+up"]),
+    ("volume-down", ["down", "cmd+down"]),
+    ("mute", ["m"]),
+    ("cycle-audio", ["b"]),
+    ("audio-delay-later", ["k"]),
+    ("audio-delay-earlier", ["j"]),
+    ("fullscreen", ["f", "cmd+ctrl+f"]),
+    ("exit-fullscreen", ["escape"]),
+    ("snapshot", ["cmd+shift+s"]),
+    ("cycle-subtitle", ["v"]),
+    ("subtitle-delay-later", ["h"]),
+    ("subtitle-delay-earlier", ["g"]),
+    ("cycle-secondary-subtitle", ["shift+v"]),
+    ("find-dialogue", ["cmd+f"]),
+    ("transcript", ["cmd+shift+t"]),
+    ("open-file", ["cmd+o"]),
+    ("open-folder", ["cmd+shift+o"]),
+    ("close", ["cmd+w"]),
+    ("media-info", ["i", "cmd+i"]),
+    ("playlist", ["cmd+l"]),
+    ("library", ["cmd+shift+l"]),
+    ("preferences", ["cmd+,"]),
+    ("effects", ["cmd+e"]),
+    ("mini-player", ["cmd+shift+m"]),
+    ("export-clip", ["cmd+shift+e"]),
+]
+
+// Combinations the system keeps (macOS and Windows), warned about when
+// bound.
+let reservedCombos: [String] = ["cmd+q", "cmd+h", "cmd+m", "cmd+tab", "cmd+space", "cmd+alt+escape", "cmd+c", "cmd+v", "cmd+x", "cmd+a", "cmd+z", "cmd+shift+z", "alt+f4", "cmd+`"]
+
+// The default keymap.
+public fn defaultKeymap() -> Keymap {
+    var m = Keymap()
+    for (a, cs) in defaultBindings {
+        m.bindings.append(KeyBinding(action: a, combos: cs))
+    }
+    m
+}
+
+// The defaults with the user's overrides (action → combinations) on top;
+// unknown actions are kept too (a newer Reel may know them).
+public fn keymapWith(overrides: [String: [String]]) -> Keymap {
+    var m = defaultKeymap()
+    // First the actions' own lists, then each combination is taken away
+    // from the default actions that had it (the user moved it).
+    for (a, _) in overrides {
+        m.set(a, combos: [])
+    }
+    for (a, cs) in overrides {
+        for combo in cs {
+            m.assign(a, combo: combo)
+        }
+    }
+    m
+}
+
+let keyNames: [String] = ["space", "enter", "escape", "tab", "backspace", "delete", "left", "right", "up", "down", "home", "end", "pageup", "pagedown", "insert", "f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8", "f9", "f10", "f11", "f12"]
+
+// A key name as KeyEvent gives it ("Esc" → "escape", " " → "space", "A" →
+// "a", "←" → "left"), or "" when it isn't a key.
+public fn canonicalKey(_ k0: String) -> String {
+    if k0 == " " {
+        return "space"
+    }
+    let k = k0.trim().lowercase()
+    if k.isEmpty {
+        return ""
+    }
+    let aliases: [String: String] = ["esc": "escape", "return": "enter", "del": "delete", "forwarddelete": "delete", "pgup": "pageup", "pgdn": "pagedown", "pageup": "pageup", "page up": "pageup", "page down": "pagedown", "spacebar": "space", "arrowleft": "left", "arrowright": "right", "arrowup": "up", "arrowdown": "down", "←": "left", "→": "right", "↑": "up", "↓": "down", "⎋": "escape", "↩": "enter", "⌫": "backspace", "⌦": "delete", "⇥": "tab", "ins": "insert", "plus": "+", "minus": "-", "comma": ",", "period": "."]
+    if let a = aliases[k] {
+        return a
+    }
+    if keyNames.contains(k) {
+        return k
+    }
+    if k.count == 1 {
+        return k
+    }
+    ""
+}
+
+// Parses a combination as people write it: "cmd+shift+s", "Ctrl+Alt+Left",
+// "⇧⌘S", "Shift + Right", "cmd++" (the plus key). nil when it isn't one.
+public fn parseCombo(_ text: String) -> KeyCombo? {
+    var t = text.trim()
+    if t.isEmpty {
+        return nil
+    }
+    var c = KeyCombo(key: "")
+    // macOS symbols in front of the key.
+    var changed = true
+    while changed && t.count > 1 {
+        changed = false
+        let first = t.character(at: 0) ?? ""
+        if first == "⌘" {
+            c.command = true
+        } else if first == "⌃" {
+            c.control = true
+        } else if first == "⌥" {
+            c.alt = true
+        } else if first == "⇧" {
+            c.shift = true
+        } else {
+            break
+        }
+        t = t.substring(from: 1, to: t.count)
+        changed = true
+    }
+    var parts: [String] = []
+    if t.hasSuffix("++") {
+        parts = t.substring(from: 0, to: t.count - 2).split("+")
+        parts.append("+")
+    } else if t == "+" {
+        parts = ["+"]
+    } else {
+        parts = t.split("+")
+    }
+    if parts.isEmpty {
+        return nil
+    }
+    for (i, p0) in parts.enumerated() {
+        let p = p0.trim().lowercase()
+        if i == parts.count - 1 {
+            c.key = canonicalKey(if p0.trim().isEmpty { p0 } else { p0.trim() })
+            continue
+        }
+        if p == "cmd" || p == "command" || p == "meta" || p == "super" || p == "win" || p == "⌘" || p == "mod" {
+            c.command = true
+        } else if p == "ctrl" || p == "control" || p == "⌃" {
+            c.control = true
+        } else if p == "alt" || p == "option" || p == "opt" || p == "⌥" {
+            c.alt = true
+        } else if p == "shift" || p == "⇧" {
+            c.shift = true
+        } else if p.isEmpty {
+            continue
+        } else {
+            return nil
+        }
+    }
+    if c.key.isEmpty {
+        return nil
+    }
+    c
+}
+
+// A combination's canonical text, or "" when it doesn't parse.
+public fn canonicalCombo(_ text: String) -> String {
+    parseCombo(text)?.text ?? ""
+}
+
+// A combination for people to read: "⇧⌘S", "⌥←" on macOS; "Ctrl+Shift+S",
+// "Alt+Left" elsewhere. `os` is "macos" or "windows" ("" = this system).
+public fn displayCombo(_ text: String, os: String = "") -> String {
+    if let c = parseCombo(text) {
+        let mac = (if os.isEmpty { platform() } else { os }) == "macos"
+        let key = displayKey(c.key, mac: mac)
+        if mac {
+            var s = ""
+            if c.control {
+                s += "⌃"
+            }
+            if c.alt {
+                s += "⌥"
+            }
+            if c.shift {
+                s += "⇧"
+            }
+            if c.command {
+                s += "⌘"
+            }
+            return s + key
+        }
+        var parts: [String] = []
+        if c.command || c.control {
+            parts.append("Ctrl")
+        }
+        if c.alt {
+            parts.append("Alt")
+        }
+        if c.shift {
+            parts.append("Shift")
+        }
+        parts.append(key)
+        return parts.joined(separator: "+")
+    }
+    text
+}
+
+fn displayKey(_ k: String, mac: Bool) -> String {
+    if mac {
+        let symbols: [String: String] = ["left": "←", "right": "→", "up": "↑", "down": "↓", "enter": "↩", "escape": "⎋", "tab": "⇥", "backspace": "⌫", "delete": "⌦", "pageup": "⇞", "pagedown": "⇟", "home": "↖", "end": "↘", "space": "Space"]
+        if let s = symbols[k] {
+            return s
+        }
+    }
+    if k.count == 1 {
+        return k.uppercase()
+    }
+    if k.hasPrefix("f") && k.count <= 3 {
+        return k.uppercase()
+    }
+    let names: [String: String] = ["pageup": "Page Up", "pagedown": "Page Down", "backspace": "Backspace", "escape": "Esc"]
+    names[k] ?? k.capitalized()
+}
+
+// The title of an action id, or the id.
+public fn actionTitle(_ id: String) -> String {
+    keyActions.first(where: { a in a.id == id })?.title ?? id
+}
+
+// The action for a key event from `.onKeyEvent`, or "".
+public fn keyAction(_ m: Keymap, _ e: KeyEvent) -> String {
+    m.actionFor(key: e.key, command: e.command, control: e.control, alt: e.alt, shift: e.shift)
+}

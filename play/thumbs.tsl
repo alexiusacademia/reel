@@ -1,0 +1,245 @@
+// Pictures away from the playing position: a thumbnail of the keyframe
+// before any time (seek-bar previews), and a scan of a video's keyframes
+// for scene changes (the scene strip and automatic chapters for files
+// without chapters). Both decode with fresh decoders of their own, so they
+// can run in background work beside playback; any codec Reel plays works
+// (staged ones through play.Stages, the others through VideoDecoder).
+//
+// The scan looks at keyframes only: encoders put one at nearly every scene
+// cut, and a two-hour film has a few thousand of them, against ~170,000
+// pictures, so it finishes in a minute or two in the background.
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+import "../core"
+import "../demux"
+import "../vfx"
+import "../render"
+
+public struct Thumb {
+    // Seconds on the media's clock.
+    time: Float = 0.0
+    width: Int = 0
+    height: Int = 0
+    // RGBA pixels for g.image(pixels:…).
+    pixels: [Int] = []
+}
+
+// The first picture decoded from packet `from` on (a keyframe), with a
+// decoder of its own; nil when none comes within `maxPackets` packets.
+public fn firstPictureFrom(_ file: Data, _ media: core.Media, track: Int, from: Int, maxPackets: Int = 48) -> core.Picture? {
+    let codec = media.tracks[track].codec
+    if canStage(codec) {
+        match newStages(media, track: track) {
+            .ok(st0) -> {
+                var st = st0
+                st.parser.next = max(from, 0)
+                var tries = 0
+                while tries < maxPackets && !st.parser.done {
+                    let batch = st.parser.run(file, media, count: 1)
+                    let luma = st.luma.run(batch)
+                    let pics = if st.split { mergeStages(codec, luma, st.chroma.run(batch)) } else { luma }
+                    if !pics.isEmpty {
+                        return pics[0]
+                    }
+                    tries += 1
+                }
+            }
+            .failure(_) -> {}
+        }
+        return nil
+    }
+    match newVideoDecoder(media.tracks[track]) {
+        .ok(d0) -> {
+            var d = d0
+            var i = max(from, 0)
+            var fed = 0
+            let n = media.packets.count
+            while i < n && fed < maxPackets {
+                let p = media.packets[i]
+                i += 1
+                if p.track != track {
+                    continue
+                }
+                fed += 1
+                let pics = d.decode(core.packetBytes(file, media, p), pts: p.pts, dts: p.dts, key: p.key)
+                if !pics.isEmpty {
+                    return pics[0]
+                }
+            }
+            let rest = d.flush()
+            if !rest.isEmpty {
+                return rest[0]
+            }
+        }
+        .failure(_) -> {}
+    }
+    nil
+}
+
+// A thumbnail `width` pixels wide of the keyframe at or before `seconds`.
+public fn thumbnailAt(_ file: Data, _ media: core.Media, track: Int, seconds: Float, width: Int = 160) -> Thumb? {
+    let k = demux.keyBefore(media, track: track, seconds: seconds)
+    if k < 0 {
+        return nil
+    }
+    if let pic = firstPictureFrom(file, media, track: track, from: k) {
+        let scale = media.tracks[track].timescale
+        let t = if pic.pts != core.noTime { core.seconds(pic.pts, scale) } else { seconds }
+        return Thumb(time: t, width: width, height: vfx.thumbnailHeight(pic, width: width), pixels: vfx.thumbnail(pic, width: width))
+    }
+    nil
+}
+
+// The key of the thumbnail cache for a time: the keyframe packet before it.
+public fn thumbnailKey(_ media: core.Media, track: Int, seconds: Float) -> Int {
+    demux.keyBefore(media, track: track, seconds: seconds)
+}
+
+// A scan of the keyframes for scene changes, done a few keyframes per
+// background job (step), so it can be stopped and shows progress.
+public struct SceneScan {
+    track: Int
+    // Packet indexes of the track's keyframes, and the next one to look at.
+    keys: [Int] = []
+    next: Int = 0
+    // The previous keyframe's small luma picture.
+    prev: [Int] = []
+    // Times of the cuts found, and a thumbnail per scene (its first
+    // keyframe), for the scene strip.
+    cuts: [Float] = []
+    scenes: [Thumb] = []
+    thumbWidth: Int = 160
+    threshold: Float = 0.35
+    // Keyframes too close to the last cut aren't cuts (seconds).
+    minGap: Float = 2.0
+    done: Bool = false
+
+    // Looks at up to `count` more keyframes.
+    fn step(_ file: Data, _ media: core.Media, count: Int) {
+        var looked = 0
+        let scale = media.tracks[track].timescale
+        while looked < count && next < keys.count {
+            let k = keys[next]
+            next += 1
+            looked += 1
+            if let pic = firstPictureFrom(file, media, track: track, from: k, maxPackets: 8) {
+                let t = if pic.pts != core.noTime { core.seconds(pic.pts, scale) } else { core.seconds(media.packets[k].pts, scale) }
+                let (_, _, luma) = vfx.lumaThumb(pic)
+                let first = prev.isEmpty
+                let score = if first { 1.0 } else { vfx.sceneScore(prev, luma) }
+                prev = luma
+                let lastCut = if cuts.isEmpty { -1000.0 } else { cuts[cuts.count - 1] }
+                if first || (score >= threshold && t - lastCut >= minGap) {
+                    cuts.append(t)
+                    scenes.append(Thumb(time: t, width: thumbWidth, height: vfx.thumbnailHeight(pic, width: thumbWidth), pixels: vfx.thumbnail(pic, width: thumbWidth)))
+                }
+            }
+        }
+        if next >= keys.count {
+            done = true
+        }
+    }
+
+    // How far the scan is, 0…1.
+    progress: Float {
+        if keys.isEmpty { 1.0 } else { Float(next) / Float(keys.count) }
+    }
+
+    // Chapters from the cuts (for files without chapters of their own):
+    // films cut every few seconds, so chapters keep at least
+    // max(duration / 24, 120 s) apart, each starting at a cut.
+    fn chapters(duration: Float) -> [core.Chapter] {
+        let gap = if duration > 0.0 { max(duration / 24.0, 120.0) } else { 120.0 }
+        var kept: [Float] = []
+        for c in cuts {
+            if kept.isEmpty || c - kept[kept.count - 1] >= gap {
+                kept.append(c)
+            }
+        }
+        if duration > 0.0 && duration < 2.0 * gap {
+            // Short clips: every cut is a chapter.
+            kept = cuts
+        }
+        vfx.sceneChapters(kept, duration: duration)
+    }
+}
+
+public fn newSceneScan(_ media: core.Media, track: Int, thumbWidth: Int = 160) -> SceneScan {
+    var s = SceneScan(track: track, thumbWidth: thumbWidth)
+    for (i, p) in media.packets.enumerated() {
+        if p.track == track && p.key {
+            s.keys.append(i)
+        }
+    }
+    s
+}
+
+// Pictures of a range as RGBA frames `width` × `height`, one every 1/fps
+// seconds (the latest picture at or before each step), for GIF export.
+// Decodes from the keyframe before `from`.
+public fn rangeFrames(_ file: Data, _ media: core.Media, track: Int, from: Float, to: Float, fps: Int, width: Int, height: Int) -> [[Int]] {
+    var out: [[Int]] = []
+    let codec = media.tracks[track].codec
+    let scale = media.tracks[track].timescale
+    let step = 1.0 / Float(max(fps, 1))
+    var next = from
+    var last: [core.Picture] = []
+    fn take(_ pics: [core.Picture]) -> Bool {
+        for pic in pics {
+            let t = if pic.pts != core.noTime { core.seconds(pic.pts, scale) } else { next }
+            while t > next + 0.0005 && next <= to && !last.isEmpty {
+                out.append(render.toRgba(last[0], width: width, height: height))
+                next += step
+            }
+            if t <= next + 0.0005 {
+                last = [pic]
+            }
+            if next > to {
+                return true
+            }
+        }
+        false
+    }
+    let k = max(demux.keyBefore(media, track: track, seconds: from), 0)
+    var finished = false
+    if canStage(codec) {
+        match newStages(media, track: track) {
+            .ok(st0) -> {
+                var st = st0
+                st.parser.next = k
+                while !finished && !st.parser.done {
+                    let batch = st.parser.run(file, media, count: 4)
+                    let luma = st.luma.run(batch)
+                    let pics = if st.split { mergeStages(codec, luma, st.chroma.run(batch)) } else { luma }
+                    finished = take(pics)
+                }
+            }
+            .failure(_) -> {}
+        }
+    } else {
+        match newVideoDecoder(media.tracks[track]) {
+            .ok(d0) -> {
+                var d = d0
+                var i = k
+                while !finished && i < media.packets.count {
+                    let p = media.packets[i]
+                    i += 1
+                    if p.track == track {
+                        finished = take(d.decode(core.packetBytes(file, media, p), pts: p.pts, dts: p.dts, key: p.key))
+                    }
+                }
+                if !finished {
+                    take(d.flush())
+                }
+            }
+            .failure(_) -> {}
+        }
+    }
+    while next <= to && !last.isEmpty {
+        out.append(render.toRgba(last[0], width: width, height: height))
+        next += step
+    }
+    out
+}

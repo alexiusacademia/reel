@@ -1,0 +1,63 @@
+{
+ "format": "wav",
+ "duration": 0.15,
+ "tags": {
+  "encoder": "Lavf62.12.102"
+ },
+ "tracks": [
+  {
+   "index": 0,
+   "kind": "audio",
+   "codec": "pcm",
+   "ffCodec": "pcm_f64le",
+   "profile": "",
+   "timescale": 44100,
+   "duration": 6615,
+   "extraHex": "",
+   "width": 0,
+   "height": 0,
+   "sarNum": 1,
+   "sarDen": 1,
+   "fpsNum": 0,
+   "fpsDen": 0,
+   "rotation": 0,
+   "pixFmt": "",
+   "sampleRate": 44100,
+   "channels": 1,
+   "channelLayout": "",
+   "bitsPerSample": 64,
+   "pcm": {
+    "bits": 64,
+    "float": true,
+    "bigEndian": false,
+    "signed": true
+   },
+   "language": "",
+   "title": "",
+   "isDefault": false,
+   "isCover": false,
+   "frames": -1
+  }
+ ],
+ "packets": [
+  {
+   "track": 0,
+   "pts": 0,
+   "dts": 0,
+   "duration": 4096,
+   "key": true,
+   "pos": 92,
+   "size": 32768
+  },
+  {
+   "track": 0,
+   "pts": 4096,
+   "dts": 4096,
+   "duration": 2519,
+   "key": true,
+   "pos": 32860,
+   "size": 20152
+  }
+ ],
+ "chapters": []
+}

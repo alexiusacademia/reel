@@ -1,0 +1,329 @@
+// One Opus stream's decoder (RFC 6716 sections 4 and 4.5): a SILK and a
+// CELT decoder side by side, run per frame as the TOC's mode says (SILK
+// only, hybrid with SILK below 8 kHz and CELT above, or CELT only), with
+// the redundant CELT frames that smooth mode switches (4.5.1), the
+// cross-fades of transitions (4.5.2) and concealment of lost frames.
+// Follows libopus opus_decoder.c (opus_decode_frame, opus_decode_native),
+// float build, output at 48 kHz.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+// prevMode values (0 means no frame decoded yet).
+let opusModeNone = 0
+let opusModeSilk = 1
+let opusModeHybrid = 2
+let opusModeCelt = 3
+
+fn opusModeCode(_ m: OpusMode) -> Int {
+    match m {
+        .silk -> opusModeSilk
+        .hybrid -> opusModeHybrid
+        .celt -> opusModeCelt
+    }
+}
+
+public struct OpusStream {
+    // Output channels (1 or 2).
+    channels: Int = 2
+    silk: SilkDecoder = newSilkDecoder(apiChannels: 2)
+    celt: CeltDecoder = CeltDecoder()
+    // The current packet's TOC values.
+    streamChannels: Int = 2
+    bandwidth: Int = 0
+    mode: Int = 0
+    frameSize: Int = 120
+    prevMode: Int = 0
+    prevRedundancy: Bool = false
+    lastPacketDuration: Int = 0
+    // The range coder's final state of the last frame (for conformance
+    // tests: it must equal the encoder's).
+    rangeFinal: Int = 0
+    // Damaged data found.
+    errors: Int = 0
+
+    // OPUS_RESET_STATE.
+    fn reset() {
+        celt.reset()
+        silk.reset()
+        streamChannels = channels
+        bandwidth = 0
+        mode = 0
+        prevMode = 0
+        prevRedundancy = false
+        frameSize = 120
+        lastPacketDuration = 0
+        rangeFinal = 0
+    }
+
+    // smooth_fade: out = w^2 * in2 + (1 - w^2) * in1 over 120 samples.
+    fn smoothFade(_ in1: [Float], _ off1: Int, _ in2: [Float], _ off2: Int, _ out: bind [Float], _ offOut: Int) {
+        let c = channels
+        for ch in 0..c {
+            for i in 0..120 {
+                let w = celtWindow[i] * celtWindow[i]
+                out[offOut + i * c + ch] = w * in2[off2 + i * c + ch] + (1.0 - w) * in1[off1 + i * c + ch]
+            }
+        }
+    }
+
+    // opus_decode_frame: one frame from d[from ..< from + lenIn], or a
+    // concealed one when hasData is false (or the frame has 0 or 1 bytes).
+    // Returns the samples (interleaved, `channels` per frame).
+    fn decodeFrame(_ d: Data, from: Int, lenIn: Int, hasData: Bool, frameSizeIn: Int) -> [Float] {
+        let f20 = 960
+        let f10 = 480
+        let f5 = 240
+        let f25 = 120
+        var len = lenIn
+        var frameSizeOut = min(frameSizeIn, 2880)
+        var data = hasData
+        if len <= 1 {
+            data = false
+            // Don't conceal more than the TOC says.
+            frameSizeOut = min(frameSizeOut, frameSize)
+        }
+        var audiosize = 0
+        var md = 0
+        var bw = 0
+        var rc = if data { opusRange(d, from: from, size: len) } else { opusRange(Data(), from: 0, size: 0) }
+        if data {
+            audiosize = frameSize
+            md = mode
+            bw = bandwidth
+        } else {
+            audiosize = frameSizeOut
+            // Conceal with the last mode (CELT if we ended with CELT
+            // redundancy).
+            md = if prevRedundancy { opusModeCelt } else { prevMode }
+            bw = 0
+            if md == opusModeNone {
+                return celtZerosF(audiosize * channels)
+            }
+            // The PLC works on 2.5, 5, 10 or 20 ms.
+            if audiosize > f20 {
+                var out: [Float] = []
+                var left = audiosize
+                while left > 0 {
+                    let part = decodeFrame(d, from: 0, lenIn: 0, hasData: false, frameSizeIn: min(left, f20))
+                    out += part
+                    left -= part.count / channels
+                    if part.isEmpty {
+                        break
+                    }
+                }
+                return out
+            } else if audiosize < f20 {
+                if audiosize > f10 {
+                    audiosize = f10
+                } else if md != opusModeSilk && audiosize > f5 && audiosize < f10 {
+                    audiosize = f5
+                }
+            }
+        }
+        var transition = false
+        var pcmTransition: [Float] = []
+        if data && prevMode > 0 && ((md == opusModeCelt && prevMode != opusModeCelt && !prevRedundancy) || (md != opusModeCelt && prevMode == opusModeCelt)) {
+            transition = true
+            if md == opusModeCelt {
+                pcmTransition = decodeFrame(d, from: 0, lenIn: 0, hasData: false, frameSizeIn: min(f5, audiosize))
+            }
+        }
+        if audiosize > frameSizeOut {
+            errors += 1
+            return celtZerosF(frameSizeOut * channels)
+        }
+        let fsz = audiosize
+        // The SILK layer.
+        var pcmSilk: [Int] = []
+        if md != opusModeCelt {
+            if prevMode == opusModeCelt {
+                silk.reset()
+            }
+            // The SILK PLC can't make less than 10 ms.
+            let payloadMs = max(10, 1000 * audiosize / 48000)
+            var internalRate = 16000
+            if md == opusModeSilk {
+                if bw == opusNarrowband {
+                    internalRate = 8000
+                } else if bw == opusMediumband {
+                    internalRate = 12000
+                }
+            }
+            pcmSilk = silk.decode(rc: rc, internalRate: internalRate, streamChannels: streamChannels, frameMs: payloadMs, lost: !data)
+        }
+        var startBand = 0
+        var redundancy = false
+        var redundancyBytes = 0
+        var celtToSilk = false
+        let hybridExtra = if md == opusModeHybrid { 20 } else { 0 }
+        if data && md != opusModeCelt && rc.tell() + 17 + hybridExtra <= 8 * len {
+            // Is there a redundant 0-8 kHz CELT frame (section 4.5.1)?
+            redundancy = if md == opusModeHybrid { rc.bitLogp(12) } else { true }
+            if redundancy {
+                celtToSilk = rc.bitLogp(1)
+                redundancyBytes = if md == opusModeHybrid { rc.uint(256) + 2 } else { len - ((rc.tell() + 7) >> 3) }
+                len -= redundancyBytes
+                if len * 8 < rc.tell() {
+                    len = 0
+                    redundancyBytes = 0
+                    redundancy = false
+                }
+                // The raw bits come from the end of what's left.
+                rc.shrink(redundancyBytes)
+            }
+        }
+        if md != opusModeCelt {
+            startBand = 17
+        }
+        if redundancy {
+            transition = false
+        }
+        if transition && md != opusModeCelt {
+            pcmTransition = decodeFrame(d, from: 0, lenIn: 0, hasData: false, frameSizeIn: min(f5, audiosize))
+        }
+        if bw != 0 {
+            var endBand = 21
+            if bw == opusNarrowband {
+                endBand = 13
+            } else if bw == opusMediumband || bw == opusWideband {
+                endBand = 17
+            } else if bw == opusSuperwideband {
+                endBand = 19
+            }
+            celt.end = endBand
+        }
+        celt.streamChannels = streamChannels
+        var redundantAudio: [Float] = []
+        var redundantRng = 0
+        let redFrom = from + len
+        if redundancy && celtToSilk {
+            // 5 ms redundant frame for CELT -> SILK.
+            celt.start = 0
+            var rrc = opusRange(d, from: redFrom, size: redundancyBytes)
+            redundantAudio = celt.decodeFrame(rc: rrc, len: redundancyBytes, frameSize: f5)
+            redundantRng = celt.rng
+        }
+        celt.start = startBand
+        var pcm: [Float] = []
+        if md != opusModeSilk {
+            let celtFrameSize = min(f20, fsz)
+            // Discard any previous CELT state.
+            if md != prevMode && prevMode > 0 && !prevRedundancy {
+                celt.reset()
+            }
+            if data {
+                pcm = celt.decodeFrame(rc: rc, len: len, frameSize: celtFrameSize)
+            } else {
+                var none = opusRange(Data(), from: 0, size: 0)
+                pcm = celt.decodeFrame(rc: none, len: 0, frameSize: celtFrameSize)
+            }
+        } else {
+            pcm = celtZerosF(fsz * channels)
+            // Hybrid -> SILK: let the CELT MDCT fade out by decoding a
+            // silence frame.
+            if prevMode == opusModeHybrid && !(redundancy && celtToSilk && prevRedundancy) {
+                celt.start = 0
+                let silence = Data(bytes: [0xFF, 0xFF])
+                var src = opusRange(silence, from: 0, size: 2)
+                let fade = celt.decodeFrame(rc: src, len: 2, frameSize: f25)
+                for i in 0..fade.count {
+                    pcm[i] = fade[i]
+                }
+            }
+        }
+        if md != opusModeCelt {
+            for i in 0..(fsz * channels) {
+                pcm[i] = pcm[i] + (1.0 / 32768.0) * Float(pcmSilk[i])
+            }
+        }
+        if redundancy && !celtToSilk {
+            // 5 ms redundant frame for SILK -> CELT.
+            celt.reset()
+            celt.start = 0
+            var rrc = opusRange(d, from: redFrom, size: redundancyBytes)
+            redundantAudio = celt.decodeFrame(rc: rrc, len: redundancyBytes, frameSize: f5)
+            redundantRng = celt.rng
+            let at = channels * (fsz - f25)
+            let copy = pcm
+            smoothFade(copy, at, redundantAudio, channels * f25, pcm, at)
+        }
+        if redundancy && celtToSilk && (prevMode != opusModeSilk || prevRedundancy) {
+            for i in 0..(channels * f25) {
+                pcm[i] = redundantAudio[i]
+            }
+            let copy = pcm
+            smoothFade(redundantAudio, channels * f25, copy, channels * f25, pcm, channels * f25)
+        }
+        if transition {
+            if audiosize >= f5 {
+                for i in 0..(channels * f25) {
+                    pcm[i] = pcmTransition[i]
+                }
+                let copy = pcm
+                smoothFade(pcmTransition, channels * f25, copy, channels * f25, pcm, channels * f25)
+            } else {
+                // Not enough time for a clean transition.
+                let copy = pcm
+                smoothFade(pcmTransition, 0, copy, 0, pcm, 0)
+            }
+        }
+        if len <= 1 {
+            rangeFinal = 0
+        } else {
+            rangeFinal = rc.rng ^ redundantRng
+        }
+        if celt.error {
+            errors += 1
+            celt.error = false
+        }
+        prevMode = md
+        prevRedundancy = redundancy && !celtToSilk
+        pcm
+    }
+
+    // opus_decode_native: a whole packet d[from ..< to] (self-delimited
+    // inside multistream packets). Returns the samples and where the
+    // packet ended. An empty range conceals `lostFrames` samples.
+    fn decodePacket(_ d: Data, from: Int, to: Int, selfDelimited: Bool = false, lostFrames: Int = 960) -> ([Float], Int) {
+        if to <= from {
+            // Lost: conceal, in steps the PLC can do.
+            var out: [Float] = []
+            var count = 0
+            while count < lostFrames {
+                let part = decodeFrame(d, from: 0, lenIn: 0, hasData: false, frameSizeIn: lostFrames - count)
+                if part.isEmpty {
+                    break
+                }
+                out += part
+                count += part.count / channels
+            }
+            lastPacketDuration = count
+            return (out, from)
+        }
+        if let p = opusParsePacket(d, from: from, to: to, selfDelimited: selfDelimited) {
+            mode = opusModeCode(p.mode)
+            bandwidth = p.bandwidth
+            frameSize = p.frameSize
+            streamChannels = if p.stereo { 2 } else { 1 }
+            var out: [Float] = []
+            for i in 0..p.offsets.count {
+                out += decodeFrame(d, from: p.offsets[i], lenIn: p.sizes[i], hasData: true, frameSizeIn: 5760)
+            }
+            lastPacketDuration = out.count / channels
+            return (out, p.end)
+        }
+        errors += 1
+        (celtZerosF(0), to)
+    }
+}
+
+// A decoder for one stream with 1 or 2 output channels.
+public fn newOpusStream(channels: Int) -> OpusStream {
+    var s = OpusStream(channels: channels)
+    s.silk = newSilkDecoder(apiChannels: channels)
+    s.celt = CeltDecoder(channels: channels, streamChannels: channels)
+    s.celt.disableInv = channels == 1
+    s.streamChannels = channels
+    s
+}

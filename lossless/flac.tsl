@@ -1,0 +1,602 @@
+// FLAC decoding (Free Lossless Audio Codec, the format described at
+// xiph.org/flac/format.html and in RFC 9639). A FLAC packet is one frame:
+// a frame header, one subframe per channel, padding to a byte, and a
+// CRC-16. Each subframe predicts its samples (constant, verbatim, fixed
+// polynomial or LPC) and codes the prediction error with Rice codes.
+//
+// Also here: reading STREAMINFO from the setup bytes ("fLaC" + metadata
+// blocks), and finding frames in a raw .flac file by their sync code and
+// header CRC-8 (for tests and anyone without a demuxer).
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../core"
+
+// STREAMINFO (RFC 9639 section 8.2).
+public struct FlacInfo {
+    minBlock: Int = 0
+    maxBlock: Int = 0
+    minFrame: Int = 0
+    maxFrame: Int = 0
+    rate: Int = 0
+    channels: Int = 0
+    bits: Int = 0
+    // Total frames (instants) in the stream, 0 when unknown.
+    totalFrames: Int = 0
+    md5: Data = Data()
+}
+
+// Reads STREAMINFO from "fLaC" + metadata blocks (or from metadata blocks
+// without the marker, or a bare 34-byte STREAMINFO body).
+public fn parseFlacInfo(_ extra: Data) -> FlacInfo? {
+    var at = 0
+    if extra.count >= 4 && extra.slice(from: 0, to: 4).latin1 == "fLaC" {
+        at = 4
+    }
+    var body = 0
+    if extra.count - at == 34 {
+        body = at
+    } else {
+        // Walk the metadata blocks: 1 bit last-flag, 7 bits type, 24 bits size.
+        var found = -1
+        while at + 4 <= extra.count {
+            let kind = extra[at] & 0x7f
+            let size = (extra[at + 1] << 16) | (extra[at + 2] << 8) | extra[at + 3]
+            if kind == 0 && size >= 34 && at + 4 + 34 <= extra.count {
+                found = at + 4
+                break
+            }
+            if extra[at] & 0x80 != 0 {
+                break
+            }
+            at += 4 + size
+        }
+        if found < 0 {
+            return nil
+        }
+        body = found
+    }
+    if body + 34 > extra.count {
+        return nil
+    }
+    var r = core.bitReaderRange(extra, from: body, to: body + 34)
+    var info = FlacInfo()
+    info.minBlock = r.bits(16)
+    info.maxBlock = r.bits(16)
+    info.minFrame = r.bits(24)
+    info.maxFrame = r.bits(24)
+    info.rate = r.bits(20)
+    info.channels = r.bits(3) + 1
+    info.bits = r.bits(5) + 1
+    info.totalFrames = r.long(36)
+    info.md5 = extra.slice(from: body + 18, to: body + 34)
+    info
+}
+
+// CRC-8 with polynomial x^8 + x^2 + x + 1 (0x07), for frame headers.
+fn flacMakeCrc8() -> [Int] {
+    var t: [Int] = []
+    for i in 0..256 {
+        var c = i
+        for _ in 0..8 {
+            c = if c & 0x80 != 0 { ((c << 1) ^ 0x07) & 0xff } else { (c << 1) & 0xff }
+        }
+        t.append(c)
+    }
+    t
+}
+
+// CRC-16 with polynomial x^16 + x^15 + x^2 + 1 (0x8005), for whole frames.
+fn flacMakeCrc16() -> [Int] {
+    var t: [Int] = []
+    for i in 0..256 {
+        var c = i << 8
+        for _ in 0..8 {
+            c = if c & 0x8000 != 0 { ((c << 1) ^ 0x8005) & 0xffff } else { (c << 1) & 0xffff }
+        }
+        t.append(c)
+    }
+    t
+}
+
+let flacCrc8Table = flacMakeCrc8()
+let flacCrc16Table = flacMakeCrc16()
+
+public fn flacCrc8(_ d: Data, from: Int, to: Int) -> Int {
+    var c = 0
+    var i = from
+    while i < to {
+        c = flacCrc8Table[c ^ d[i]]
+        i += 1
+    }
+    c
+}
+
+public fn flacCrc16(_ d: Data, from: Int, to: Int) -> Int {
+    var c = 0
+    var i = from
+    while i < to {
+        c = ((c << 8) & 0xffff) ^ flacCrc16Table[(c >> 8) ^ d[i]]
+        i += 1
+    }
+    c
+}
+
+// Leading zero bits of a byte (8 for 0), for fast unary codes.
+fn flacMakeClz8() -> [Int] {
+    var t: [Int] = [8]
+    for i in 1..256 {
+        var n = 0
+        var v = i
+        while v & 0x80 == 0 {
+            n += 1
+            v = v << 1
+        }
+        t.append(n)
+    }
+    t
+}
+
+let flacClz8 = flacMakeClz8()
+
+// A parsed frame header (RFC 9639 section 9.1).
+public struct FlacHeader {
+    blockSize: Int = 0
+    rate: Int = 0
+    // 0–7: independent channels (assignment + 1 of them); 8 left/side,
+    // 9 side/right, 10 mid/side.
+    assignment: Int = 0
+    channels: Int = 0
+    bits: Int = 0
+    // Frame number (fixed block size) or first sample number (variable).
+    number: Int = 0
+    variable: Bool = false
+    // Bytes in the header, CRC-8 included.
+    size: Int = 0
+}
+
+// Parses the frame header at `at`, checking its CRC-8. `info` fills in what
+// the header leaves to STREAMINFO (rate and bits codes 0).
+public fn parseFlacHeader(_ d: Data, at: Int, info: FlacInfo) -> FlacHeader? {
+    if at + 6 > d.count {
+        return nil
+    }
+    if d[at] != 0xff || (d[at + 1] & 0xfe) != 0xf8 {
+        return nil
+    }
+    var h = FlacHeader()
+    h.variable = d[at + 1] & 1 == 1
+    let bsCode = d[at + 2] >> 4
+    let rateCode = d[at + 2] & 15
+    h.assignment = d[at + 3] >> 4
+    let bitsCode = (d[at + 3] >> 1) & 7
+    if d[at + 3] & 1 != 0 || h.assignment > 10 || bitsCode == 3 || rateCode == 15 || bsCode == 0 {
+        return nil
+    }
+    // The coded number: UTF-8-like, 1 to 7 bytes.
+    var p = at + 4
+    let first = d[p]
+    p += 1
+    var extraBytes = 0
+    var value = 0
+    if first < 0x80 {
+        value = first
+    } else if first & 0xe0 == 0xc0 {
+        value = first & 0x1f
+        extraBytes = 1
+    } else if first & 0xf0 == 0xe0 {
+        value = first & 0x0f
+        extraBytes = 2
+    } else if first & 0xf8 == 0xf0 {
+        value = first & 0x07
+        extraBytes = 3
+    } else if first & 0xfc == 0xf8 {
+        value = first & 0x03
+        extraBytes = 4
+    } else if first & 0xfe == 0xfc {
+        value = first & 0x01
+        extraBytes = 5
+    } else if first == 0xfe {
+        value = 0
+        extraBytes = 6
+    } else {
+        return nil
+    }
+    if p + extraBytes + 3 > d.count {
+        return nil
+    }
+    for _ in 0..extraBytes {
+        let b = d[p]
+        if b & 0xc0 != 0x80 {
+            return nil
+        }
+        value = (value << 6) | (b & 0x3f)
+        p += 1
+    }
+    h.number = value
+    // At most four more header bytes follow; a real frame always has
+    // room for them (its subframes and CRC-16 come after).
+    if p + 4 > d.count {
+        return nil
+    }
+    // Block size.
+    if bsCode == 1 {
+        h.blockSize = 192
+    } else if bsCode <= 5 {
+        h.blockSize = 576 << (bsCode - 2)
+    } else if bsCode == 6 {
+        h.blockSize = d[p] + 1
+        p += 1
+    } else if bsCode == 7 {
+        h.blockSize = ((d[p] << 8) | d[p + 1]) + 1
+        p += 2
+    } else {
+        h.blockSize = 256 << (bsCode - 8)
+    }
+    // Sample rate.
+    let rates = [0, 88200, 176400, 192000, 8000, 16000, 22050, 24000, 32000, 44100, 48000, 96000]
+    if rateCode == 0 {
+        h.rate = info.rate
+    } else if rateCode < 12 {
+        h.rate = rates[rateCode]
+    } else if rateCode == 12 {
+        h.rate = d[p] * 1000
+        p += 1
+    } else if rateCode == 13 {
+        h.rate = (d[p] << 8) | d[p + 1]
+        p += 2
+    } else {
+        h.rate = ((d[p] << 8) | d[p + 1]) * 10
+        p += 2
+    }
+    let sizes = [0, 8, 12, 0, 16, 20, 24, 32]
+    h.bits = if bitsCode == 0 { info.bits } else { sizes[bitsCode] }
+    h.channels = if h.assignment < 8 { h.assignment + 1 } else { 2 }
+    if p >= d.count {
+        return nil
+    }
+    if flacCrc8(d, from: at, to: p) != d[p] {
+        return nil
+    }
+    h.size = p + 1 - at
+    if h.bits == 0 || h.rate == 0 {
+        return nil
+    }
+    h
+}
+
+// The offsets of the frames of a raw .flac file (after its metadata),
+// found by sync code + header CRC-8 and checked against the stream's
+// channel count and frame numbering. Each frame runs to the next offset
+// (the last one to the end of the file).
+public fn flacFrameOffsets(_ file: Data) -> [Int] {
+    var out: [Int] = []
+    if file.count < 8 || file.slice(from: 0, to: 4).latin1 != "fLaC" {
+        return out
+    }
+    let info = parseFlacInfo(file) ?? FlacInfo()
+    // Skip the metadata blocks.
+    var at = 4
+    while at + 4 <= file.count {
+        let last = file[at] & 0x80 != 0
+        let size = (file[at + 1] << 16) | (file[at + 2] << 8) | file[at + 3]
+        at += 4 + size
+        if last {
+            break
+        }
+    }
+    var expect = 0
+    let minStep = max(info.minFrame, 10)
+    while at + 6 <= file.count {
+        if file[at] == 0xff && (file[at + 1] & 0xfe) == 0xf8 {
+            if let h = parseFlacHeader(file, at: at, info: info) {
+                let numberOk = if h.variable { true } else { h.number == expect }
+                if numberOk && (info.channels == 0 || h.channels == info.channels) {
+                    out.append(at)
+                    expect = h.number + 1
+                    at += max(minStep, h.size)
+                    continue
+                }
+            }
+        }
+        at += 1
+    }
+    out
+}
+
+// The setup bytes a demuxer would give ("fLaC" + metadata blocks) from a
+// raw .flac file.
+public fn flacExtraFromFile(_ file: Data) -> Data {
+    if file.count < 8 || file.slice(from: 0, to: 4).latin1 != "fLaC" {
+        return Data()
+    }
+    var at = 4
+    while at + 4 <= file.count {
+        let last = file[at] & 0x80 != 0
+        let size = (file[at + 1] << 16) | (file[at + 2] << 8) | file[at + 3]
+        at += 4 + size
+        if last {
+            break
+        }
+    }
+    file.slice(from: 0, to: min(at, file.count))
+}
+
+// The decoding state of a FLAC stream: STREAMINFO plus scratch lists that
+// are reused from frame to frame.
+public struct FlacDecoder {
+    info: FlacInfo = FlacInfo()
+    br: core.BitReader = core.bitReader(Data())
+    // Decoded samples of every channel of the current frame, channel after
+    // channel (channel c at c * blockSize).
+    work: [Int] = []
+    blockSize: Int = 0
+    channels: Int = 0
+    bits: Int = 0
+    rate: Int = 0
+    coefs: [Int] = []
+    // Problem found in the last frame ("" when none).
+    problem: String = ""
+    crcMismatch: Bool = false
+
+    // Decodes one frame. On success `work`, `blockSize`, `channels`, `bits`
+    // and `rate` describe it; on failure returns false with `problem` set.
+    fn decodeFrame(_ d: Data) -> Bool {
+        problem = ""
+        crcMismatch = false
+        let hOpt = parseFlacHeader(d, at: 0, info: info)
+        if hOpt == nil {
+            problem = "bad FLAC frame header"
+            return false
+        }
+        let h = hOpt ?? FlacHeader()
+        blockSize = h.blockSize
+        channels = h.channels
+        bits = h.bits
+        rate = h.rate
+        let need = blockSize * channels
+        while work.count < need {
+            work.append(0)
+        }
+        br = core.bitReader(d)
+        br.skip(h.size * 8)
+        for ch in 0..channels {
+            // The side channel carries one more bit (RFC 9639 9.2).
+            var sbits = bits
+            if (h.assignment == 8 && ch == 1) || (h.assignment == 9 && ch == 0) || (h.assignment == 10 && ch == 1) {
+                sbits += 1
+            }
+            if !decodeSubframe(ch * blockSize, sbits) {
+                if problem == "" {
+                    problem = "damaged FLAC subframe"
+                }
+                return false
+            }
+            if br.overrun {
+                problem = "FLAC frame cut short"
+                return false
+            }
+        }
+        // Inter-channel decorrelation (RFC 9639 4.2).
+        let n = blockSize
+        if h.assignment == 8 {
+            // left, side: right = left - side
+            for i in 0..n {
+                work[n + i] = work[i] - work[n + i]
+            }
+        } else if h.assignment == 9 {
+            // side, right: left = side + right
+            for i in 0..n {
+                work[i] = work[i] + work[n + i]
+            }
+        } else if h.assignment == 10 {
+            for i in 0..n {
+                let side = work[n + i]
+                let mid = (work[i] << 1) | (side & 1)
+                work[i] = (mid + side) >> 1
+                work[n + i] = (mid - side) >> 1
+            }
+        }
+        // Frame footer: byte alignment and CRC-16 over everything before it.
+        br.alignToByte()
+        let end = br.position / 8
+        if end + 2 <= d.count {
+            let want = (d[end] << 8) | d[end + 1]
+            if flacCrc16(d, from: 0, to: end) != want {
+                crcMismatch = true
+            }
+        }
+        true
+    }
+
+    // One subframe (RFC 9639 9.2) into work[base ..< base + blockSize].
+    fn decodeSubframe(_ base: Int, _ sbitsIn: Int) -> Bool {
+        if br.bits(1) != 0 {
+            problem = "FLAC subframe padding bit set"
+            return false
+        }
+        let kind = br.bits(6)
+        var wasted = 0
+        if br.bits(1) == 1 {
+            wasted = 1
+            while br.bits(1) == 0 {
+                wasted += 1
+                if wasted > 32 {
+                    return false
+                }
+            }
+        }
+        let sbits = sbitsIn - wasted
+        if sbits <= 0 {
+            return false
+        }
+        let n = blockSize
+        if kind == 0 {
+            let v = readSigned(sbits)
+            for i in 0..n {
+                work[base + i] = v
+            }
+        } else if kind == 1 {
+            for i in 0..n {
+                work[base + i] = readSigned(sbits)
+            }
+        } else if kind >= 8 && kind <= 12 {
+            let order = kind - 8
+            if order > n {
+                return false
+            }
+            for i in 0..order {
+                work[base + i] = readSigned(sbits)
+            }
+            if !decodeResidual(base, order) {
+                return false
+            }
+            restoreFixed(base, order)
+        } else if kind >= 32 {
+            let order = kind - 31
+            if order > n {
+                return false
+            }
+            for i in 0..order {
+                work[base + i] = readSigned(sbits)
+            }
+            let precision = br.bits(4) + 1
+            if precision == 16 {
+                problem = "FLAC LPC precision code 15 is invalid"
+                return false
+            }
+            let shift = br.signed(5)
+            if shift < 0 {
+                problem = "negative FLAC LPC shift"
+                return false
+            }
+            while coefs.count < 32 {
+                coefs.append(0)
+            }
+            for i in 0..order {
+                coefs[i] = br.signed(precision)
+            }
+            if !decodeResidual(base, order) {
+                return false
+            }
+            restoreLpc(base, order, shift)
+        } else {
+            problem = "reserved FLAC subframe type {kind}"
+            return false
+        }
+        if wasted > 0 {
+            for i in 0..n {
+                work[base + i] = work[base + i] << wasted
+            }
+        }
+        true
+    }
+
+    // A two's complement number of n bits (n up to 33).
+    fn readSigned(_ n: Int) -> Int {
+        if n <= 32 {
+            return br.signed(n)
+        }
+        let v = br.long(n)
+        (v << (64 - n)) >> (64 - n)
+    }
+
+    // Rice-coded residual (RFC 9639 9.2.7) into the samples after the
+    // warm-up ones; the prediction is added afterwards.
+    fn decodeResidual(_ base: Int, _ order: Int) -> Bool {
+        let method = br.bits(2)
+        if method > 1 {
+            problem = "reserved FLAC residual coding method"
+            return false
+        }
+        let paramBits = if method == 0 { 4 } else { 5 }
+        let escape = if method == 0 { 15 } else { 31 }
+        let partOrder = br.bits(4)
+        let parts = 1 << partOrder
+        let n = blockSize
+        if n % parts != 0 || (n >> partOrder) < order {
+            problem = "bad FLAC partition order"
+            return false
+        }
+        var i = order
+        for p in 0..parts {
+            let count = if p == 0 { (n >> partOrder) - order } else { n >> partOrder }
+            let k = br.bits(paramBits)
+            if k == escape {
+                let raw = br.bits(5)
+                for _ in 0..count {
+                    work[base + i] = if raw == 0 { 0 } else { br.signed(raw) }
+                    i += 1
+                }
+            } else {
+                for _ in 0..count {
+                    // Unary quotient: count zero bits, a byte at a time.
+                    var q = 0
+                    var b = br.peek(8)
+                    while b == 0 {
+                        br.skip(8)
+                        q += 8
+                        if q > 4096 || br.overrun {
+                            problem = "runaway FLAC Rice code"
+                            return false
+                        }
+                        b = br.peek(8)
+                    }
+                    let z = flacClz8[b]
+                    br.skip(z + 1)
+                    q += z
+                    let u = (q << k) | br.bits(k)
+                    // Zigzag: 0, -1, 1, -2, ...
+                    work[base + i] = (u >> 1) ^ -(u & 1)
+                    i += 1
+                }
+            }
+        }
+        true
+    }
+
+    // Fixed polynomial predictors of order 0–4 (RFC 9639 9.2.5).
+    fn restoreFixed(_ base: Int, _ order: Int) {
+        let end = base + blockSize
+        var i = base + order
+        if order == 1 {
+            while i < end {
+                work[i] += work[i - 1]
+                i += 1
+            }
+        } else if order == 2 {
+            while i < end {
+                work[i] += 2 * work[i - 1] - work[i - 2]
+                i += 1
+            }
+        } else if order == 3 {
+            while i < end {
+                work[i] += 3 * work[i - 1] - 3 * work[i - 2] + work[i - 3]
+                i += 1
+            }
+        } else if order == 4 {
+            while i < end {
+                work[i] += 4 * work[i - 1] - 6 * work[i - 2] + 4 * work[i - 3] - work[i - 4]
+                i += 1
+            }
+        }
+    }
+
+    // Linear prediction with quantized coefficients (RFC 9639 9.2.6):
+    // sample = residual + (sum of coef[j] * sample[i - 1 - j]) >> shift.
+    fn restoreLpc(_ base: Int, _ order: Int, _ shift: Int) {
+        let end = base + blockSize
+        var i = base + order
+        while i < end {
+            var sum = 0
+            var j = 0
+            while j < order {
+                sum += coefs[j] * work[i - 1 - j]
+                j += 1
+            }
+            work[i] += sum >> shift
+            i += 1
+        }
+    }
+}

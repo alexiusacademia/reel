@@ -1,0 +1,545 @@
+// The second stage of the AV1 decoder: turns ParsedFrames into pictures.
+// It keeps the eight reference frames (7.20), allocates the frame planes,
+// runs the operation records in order — intra prediction, palette and
+// chroma from luma (intra.tsl), inter prediction (inter.tsl), inverse
+// transforms (itx.tsl) — then decode_frame_wrapup's filters (post.tsl:
+// loop filter, CDEF, superres, loop restoration), the reference update,
+// and the output process with film grain (grain.tsl, 7.18).
+//
+// The engines write in place into a plane held in their own field `pl`;
+// planes are moved between this struct and the engines (a move is a swap
+// of two list fields in a small method of its own, so no second reference
+// lives on and nothing is copied).
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../core"
+
+// Output facts kept with each reference slot.
+struct Av1SlotInfo {
+    ok: Bool = false
+    id: Int = 0
+    bitDepth: Int = 8
+    subX: Int = 1
+    subY: Int = 1
+    mono: Bool = false
+    upscaledWidth: Int = 0
+    frameHeight: Int = 0
+    renderWidth: Int = 0
+    renderHeight: Int = 0
+    matrixCoefficients: Int = 2
+    colorPrimaries: Int = 2
+    fullRange: Bool = false
+    key: Bool = false
+}
+
+// Film grain to add to an output picture later (Reconstructor.deferGrain;
+// see applyFilmGrain in api.tsl).
+public struct FilmGrain {
+    apply: Bool = false
+    params: Av1Grain = Av1Grain()
+    matrixCoefficients: Int = 2
+}
+
+public struct Reconstructor {
+    warnings: [String] = []
+    // When true, pictures come out without film grain and `grains` holds,
+    // for each picture of the last reconstruct call, the grain to add with
+    // applyFilmGrain (so another job can do it: at 1080p it takes ~10 ms).
+    deferGrain: Bool = false
+    grains: [FilmGrain] = []
+    ready: Bool = false
+    intra: Av1Intra = Av1Intra()
+    inter: Av1Inter = Av1Inter()
+    itx: Av1Itx = Av1Itx()
+    post: Av1Post = Av1Post()
+    grain: Av1FilmGrain = Av1FilmGrain()
+    refs: [Av1Ref] = []
+    info: [Av1SlotInfo] = []
+    nextId: Int = 1
+    // Free plane sets (not held by any slot): id, y, u, v.
+    poolId: [Int] = []
+    poolY: [[Int]] = []
+    poolU: [[Int]] = []
+    poolV: [[Int]] = []
+    // From the container: pixel shape, and the matrix when the stream
+    // doesn't say.
+    sarNum: Int = 1
+    sarDen: Int = 1
+    trackMatrix: core.ColorMatrix = .unknown
+    lastPic: core.Picture = core.Picture(width: 0, height: 0)
+    hasLast: Bool = false
+    // Seconds spent on blocks and on the filters (benchmarks).
+    tBlocks: Float = 0.0
+    tFilter: Float = 0.0
+    tGrain: Float = 0.0
+
+    // The frame being reconstructed: its planes (when not lent to an
+    // engine) and where each one is: 0 here, 1 intra.pl, 2 intra.luma,
+    // 3 inter.pl, 4 itx.pl.
+    cy: [Int] = []
+    cu: [Int] = []
+    cv: [Int] = []
+    curId: Int = 0
+    loc: [Int] = [0, 0, 0]
+    yStride: Int = 0
+    cStride: Int = 0
+    rows: Int = 0
+    cRows: Int = 0
+    allocW: Int = 0
+    allocH: Int = 0
+
+    fn setup() {
+        if ready {
+            return
+        }
+        ready = true
+        intra.setup()
+        inter.setup()
+        itx.setup()
+        post.setup()
+        grain.setup()
+        for _ in 0..8 {
+            refs.append(Av1Ref())
+            info.append(Av1SlotInfo())
+        }
+    }
+
+    fn warn(_ s: String) {
+        if warnings.count < 200 {
+            warnings.append(s)
+        }
+    }
+
+    fn reset() {
+        setup()
+        for i in 0..8 {
+            refs[i] = Av1Ref()
+            info[i] = Av1SlotInfo()
+        }
+        hasLast = false
+    }
+
+    // ---- moving planes ---------------------------------------------------
+
+    fn swapHome(_ p: Int, _ where: Int) {
+        if where == 1 {
+            if p == 0 {
+                let t = cy
+                cy = intra.pl
+                intra.pl = t
+            } else if p == 1 {
+                let t = cu
+                cu = intra.pl
+                intra.pl = t
+            } else {
+                let t = cv
+                cv = intra.pl
+                intra.pl = t
+            }
+        } else if where == 2 {
+            let t = cy
+            cy = intra.luma
+            intra.luma = t
+        } else if where == 3 {
+            if p == 0 {
+                let t = cy
+                cy = inter.pl
+                inter.pl = t
+            } else if p == 1 {
+                let t = cu
+                cu = inter.pl
+                inter.pl = t
+            } else {
+                let t = cv
+                cv = inter.pl
+                inter.pl = t
+            }
+        } else if where == 4 {
+            if p == 0 {
+                let t = cy
+                cy = itx.pl
+                itx.pl = t
+            } else if p == 1 {
+                let t = cu
+                cu = itx.pl
+                itx.pl = t
+            } else {
+                let t = cv
+                cv = itx.pl
+                itx.pl = t
+            }
+        }
+    }
+
+    // Brings plane p back here.
+    fn fetch(_ p: Int) {
+        let w = loc[p]
+        if w != 0 {
+            swapHome(p, w)
+            loc[p] = 0
+        }
+    }
+
+    // Puts plane p into engine slot w (emptying the slot first).
+    fn lend(_ p: Int, _ w: Int) {
+        if loc[p] == w {
+            return
+        }
+        for q in 0..3 {
+            if q != p && loc[q] == w {
+                fetch(q)
+            }
+        }
+        fetch(p)
+        swapHome(p, w)
+        loc[p] = w
+    }
+
+    fn fetchAll() {
+        fetch(0)
+        fetch(1)
+        fetch(2)
+    }
+
+    // ---- frames ----------------------------------------------------------
+
+    fn picture(_ s: Av1SlotInfo, _ y: [Int], _ u: [Int], _ v: [Int], _ ys: Int, _ cs: Int, _ pts: Int, _ key: Bool) -> core.Picture {
+        var p = core.Picture(width: s.upscaledWidth, height: s.frameHeight)
+        if s.mono {
+            p.chroma = .gray
+        } else if s.subX == 1 && s.subY == 1 {
+            p.chroma = .yuv420
+        } else if s.subX == 1 {
+            p.chroma = .yuv422
+        } else {
+            p.chroma = .yuv444
+        }
+        p.depth = s.bitDepth
+        p.y = y
+        p.yStride = ys
+        if !s.mono {
+            p.u = u
+            p.v = v
+            p.cStride = cs
+        }
+        p.pts = pts
+        p.key = key
+        p.fullRange = s.fullRange
+        let mc = s.matrixCoefficients
+        if mc == 1 {
+            p.matrix = .bt709
+        } else if mc == 5 || mc == 6 {
+            p.matrix = .bt601
+        } else if mc == 9 || mc == 10 {
+            p.matrix = .bt2020
+        } else if trackMatrix != .unknown {
+            p.matrix = trackMatrix
+        } else {
+            p.matrix = core.guessMatrix(width: s.upscaledWidth, height: s.frameHeight)
+        }
+        p.sarNum = sarNum
+        p.sarDen = sarDen
+        p
+    }
+
+    // The output process (7.18) for slot planes: film grain on a copy.
+    fn output(_ s: Av1SlotInfo, _ r: Av1Ref, _ g: Av1Grain, _ pts: Int, _ key: Bool) -> core.Picture {
+        if deferGrain {
+            grains.append(FilmGrain(apply: g.applyGrain, params: g, matrixCoefficients: s.matrixCoefficients))
+            return picture(s, r.y, r.u, r.v, r.yStride, r.cStride, pts, key)
+        }
+        if !g.applyGrain {
+            return picture(s, r.y, r.u, r.v, r.yStride, r.cStride, pts, key)
+        }
+        let t0 = now()
+        // Lending the slot's planes: grain's first write copies them, the
+        // slot keeps its own.
+        grain.y = r.y
+        grain.u = r.u
+        grain.v = r.v
+        grain.apply(g, s.upscaledWidth, s.frameHeight, r.yStride, r.cStride, s.subX, s.subY, s.bitDepth, s.mono, s.matrixCoefficients)
+        let p = picture(s, grain.y, grain.u, grain.v, r.yStride, r.cStride, pts, key)
+        grain.y = []
+        grain.u = []
+        grain.v = []
+        tGrain += now() - t0
+        p
+    }
+
+    fn reconstruct(_ pf: ParsedFrame) -> [core.Picture] {
+        setup()
+        grains = []
+        var out: [core.Picture] = []
+        let h = pf.hdr
+        if pf.kind == 1 {
+            let i = h.frameToShowMapIdx
+            if !refs[i].ok {
+                warn("av1: show_existing_frame of an empty slot")
+                return out
+            }
+            let s = info[i]
+            let isKey = h.frameType == 0
+            let p = output(s, refs[i], h.grain, pf.pts, isKey)
+            if isKey {
+                // Refresh every slot with it (7.21 + 7.20).
+                for k in 0..8 {
+                    if k != i {
+                        refs[k] = refs[i]
+                        info[k] = info[i]
+                    }
+                }
+            }
+            lastPic = p
+            hasLast = true
+            out.append(p)
+            return out
+        }
+        if pf.kind == 2 {
+            warn("av1: damaged frame concealed")
+            if hasLast && h.showFrame {
+                var p = lastPic
+                p.pts = pf.pts
+                p.key = false
+                out.append(p)
+            }
+            return out
+        }
+        if pf.kind == 3 {
+            return out
+        }
+        decodeFrame(pf)
+        // The frame (LrFrame) goes into the slots refresh_frame_flags names.
+        var s = Av1SlotInfo()
+        s.ok = true
+        s.id = curId
+        s.bitDepth = h.bitDepth
+        s.subX = h.subX
+        s.subY = h.subY
+        s.mono = h.monochrome
+        s.upscaledWidth = h.upscaledWidth
+        s.frameHeight = h.frameHeight
+        s.renderWidth = h.renderWidth
+        s.renderHeight = h.renderHeight
+        s.matrixCoefficients = h.matrixCoefficients
+        s.colorPrimaries = h.colorPrimaries
+        s.fullRange = h.fullRange
+        s.key = h.frameType == 0
+        var r = Av1Ref()
+        r.ok = true
+        r.y = cy
+        r.u = cu
+        r.v = cv
+        r.yStride = yStride
+        r.cStride = cStride
+        r.upscaledWidth = h.upscaledWidth
+        r.frameHeight = h.frameHeight
+        r.miCols = h.miCols
+        r.miRows = h.miRows
+        var oldIds: [Int] = []
+        var oldRefs: [Av1Ref] = []
+        for i in 0..8 {
+            if (h.refreshFrameFlags >> i) & 1 == 1 {
+                if info[i].ok && !oldIds.contains(info[i].id) {
+                    oldIds.append(info[i].id)
+                    oldRefs.append(refs[i])
+                }
+                refs[i] = r
+                info[i] = s
+            }
+        }
+        if h.showFrame {
+            let p = output(s, r, h.grain, pf.pts, s.key)
+            lastPic = p
+            hasLast = true
+            out.append(p)
+        }
+        // Plane sets no slot holds any more go back to the pool (a
+        // picture handed out may still share them: the next write then
+        // copies, which is only slower).
+        for k in 0..oldIds.count {
+            if !held(oldIds[k]) {
+                keep(oldIds[k], oldRefs[k].y, oldRefs[k].u, oldRefs[k].v)
+            }
+        }
+        oldRefs = []
+        if h.refreshFrameFlags == 0 {
+            keep(curId, cy, cu, cv)
+        }
+        cy = []
+        cu = []
+        cv = []
+        out
+    }
+
+    fn held(_ id: Int) -> Bool {
+        for i in 0..8 {
+            if info[i].ok && info[i].id == id {
+                return true
+            }
+        }
+        false
+    }
+
+    fn keep(_ id: Int, _ y: [Int], _ u: [Int], _ v: [Int]) {
+        if poolId.count < 2 {
+            poolId.append(id)
+            poolY.append(y)
+            poolU.append(u)
+            poolV.append(v)
+        }
+    }
+
+    // Planes for a frame of the current size.
+    fn allocate(_ h: Av1Hdr) {
+        let w = max(h.miCols * 4, h.upscaledWidth)
+        let aw = (w + 127) & ~127
+        let ah = (h.miRows * 4 + 127) & ~127
+        let ny = aw * ah
+        let cw = aw >> h.subX
+        let ch = ah >> h.subY
+        let nc = if h.monochrome { 0 } else { cw * ch }
+        yStride = aw
+        cStride = cw
+        rows = ah
+        cRows = ch
+        curId = nextId
+        nextId += 1
+        // A pooled set of the right size, or one of the slots' sizes to
+        // copy, or new zeros.
+        var k = 0
+        while k < poolId.count {
+            if poolY[k].count == ny && poolU[k].count == nc {
+                cy = poolY[k]
+                cu = poolU[k]
+                cv = poolV[k]
+                poolId.remove(at: k)
+                poolY.remove(at: k)
+                poolU.remove(at: k)
+                poolV.remove(at: k)
+                return
+            }
+            k += 1
+        }
+        for i in 0..8 {
+            if refs[i].ok && refs[i].y.count == ny && refs[i].u.count == nc {
+                // Copy-on-write: the first write copies (a fast memcpy).
+                cy = refs[i].y
+                cu = refs[i].u
+                cv = refs[i].v
+                return
+            }
+        }
+        cy = av1Zeros(ny)
+        cu = av1Zeros(nc)
+        cv = av1Zeros(nc)
+    }
+
+    fn decodeFrame(_ pf: ParsedFrame) {
+        let h = pf.hdr
+        allocate(h)
+        loc = [0, 0, 0]
+        let t0 = now()
+        intra.ops = pf.ops
+        intra.palette = pf.palette
+        itx.coefs = pf.coefs
+        inter.ops = pf.ops
+        inter.gInfo = pf.gInfo
+        inter.gMv = pf.gMv
+        inter.miStride = pf.miStride
+        inter.hdr = h
+        // References of another format can't be predicted from (a
+        // damaged stream): they count as missing.
+        var usable: [Av1Ref] = []
+        for k in 0..8 {
+            let s = info[k]
+            if refs[k].ok && s.bitDepth == h.bitDepth && s.subX == h.subX && s.subY == h.subY && s.mono == h.monochrome {
+                usable.append(refs[k])
+            } else {
+                usable.append(Av1Ref())
+            }
+        }
+        inter.refs = usable
+        usable = []
+        inter.beginFrame()
+        let bitDepth = h.bitDepth
+        let subX = h.subX
+        let subY = h.subY
+        let edge = h.enableIntraEdgeFilter
+        let maxXY = h.miCols * 4 - 1
+        let maxYY = h.miRows * 4 - 1
+        let maxXC = ((h.miCols * 4) >> subX) - 1
+        let maxYC = ((h.miRows * 4) >> subY) - 1
+        let ys = yStride
+        let cs = cStride
+        let ops = pf.ops
+        let n = ops.count
+        var i = 0
+        var blockAt = 0
+        while i < n {
+            let kind = ops[i]
+            if kind == 1 {
+                blockAt = i
+                i += 34
+            } else if kind == 2 {
+                let plane = ops[i + 1]
+                lend(plane, 1)
+                if ops[i + 15] == 1 {
+                    lend(0, 2)
+                }
+                if plane == 0 {
+                    intra.predictIntra(i, ys, ys, maxXY, maxYY, 0, 0, bitDepth, edge)
+                } else {
+                    intra.predictIntra(i, cs, ys, maxXC, maxYC, subX, subY, bitDepth, edge)
+                }
+                i += 18
+            } else if kind == 3 {
+                let plane = ops[i + 1]
+                lend(plane, 1)
+                intra.predictPalette(i, if plane == 0 { ys } else { cs })
+                i += 9
+            } else if kind == 4 {
+                let plane = ops[i + 1]
+                lend(plane, 3)
+                inter.predictInter(i, blockAt, if plane == 0 { ys } else { cs })
+                i += 8
+            } else if kind == 5 {
+                let plane = ops[i + 1]
+                lend(plane, 4)
+                itx.reconstruct(ops[i + 2], ops[i + 3], if plane == 0 { ys } else { cs }, ops[i + 4], ops[i + 5],
+                                ops[i + 6], ops[i + 7], ops[i + 8] == 1, bitDepth)
+                i += 9
+            } else {
+                warn("av1: bad operation record")
+                break
+            }
+        }
+        fetchAll()
+        // The engines drop their references to this frame's lists.
+        inter.refs = []
+        let t1 = now()
+        tBlocks += t1 - t0
+        // decode_frame_wrapup steps 1–5.
+        swapPost()
+        post.yStride = ys
+        post.cStride = cs
+        post.rows = rows
+        post.cRows = cRows
+        post.filterFrame(pf)
+        swapPost()
+        tFilter += now() - t1
+    }
+
+    fn swapPost() {
+        let a = cy
+        cy = post.y
+        post.y = a
+        let b = cu
+        cu = post.u
+        post.u = b
+        let c = cv
+        cv = post.v
+        post.v = c
+    }
+}

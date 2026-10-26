@@ -1,0 +1,369 @@
+// Turning subtitle file bytes into text, and small text helpers shared by
+// the parsers: code points to strings, HTML entities, timestamps, colours.
+//
+// Subtitle files come in whatever encoding the person who made them used:
+// UTF-8 (with or without a byte order mark), UTF-16 (Windows Notepad's
+// "Unicode"), or a legacy code page; decodeText detects which
+// (encodings.tsl, added 2026-10-26).
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+// Windows-1252 bytes 0x80…0x9F as Unicode code points (0 = unassigned,
+// shown as U+FFFD). Bytes 0xA0…0xFF are the same as Unicode (Latin-1).
+let cp1252High = [
+    0x20AC, 0, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021,
+    0x02C6, 0x2030, 0x0160, 0x2039, 0x0152, 0, 0x017D, 0,
+    0, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014,
+    0x02DC, 0x2122, 0x0161, 0x203A, 0x0153, 0, 0x017E, 0x0178,
+]
+
+// Subtitle file bytes as text: by a byte order mark, as UTF-8 when they
+// are valid UTF-8, else in the encoding detectEncoding finds (UTF-16
+// without a BOM, the Windows and ISO 8859 code pages, KOI8, Shift_JIS,
+// EUC-JP, GBK/GB18030, Big5, EUC-KR; see encodings.tsl). To choose the
+// encoding yourself, use decodeAs.
+public fn decodeText(_ bytes: Data) -> String {
+    let n = bytes.count
+    if n >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF {
+        let body = bytes.slice(from: 3, to: n)
+        return body.text ?? decodeAs(body, encoding: "utf-8")
+    }
+    if n >= 2 && ((bytes[0] == 0xFF && bytes[1] == 0xFE) || (bytes[0] == 0xFE && bytes[1] == 0xFF)) {
+        return decodeAs(bytes, encoding: "auto")
+    }
+    // Valid UTF-8 (and plain ASCII) needs no detection, unless it is
+    // UTF-16 without a BOM (zero bytes are valid UTF-8).
+    if let t = bytes.text {
+        if !t.contains(charOf(0)) {
+            return t
+        }
+    }
+    decodeAs(bytes, encoding: "auto")
+}
+
+// A text packet of a subtitle track in a container: UTF-8 as the
+// containers specify, Windows-1252 when it isn't valid UTF-8 (detection on
+// a few bytes is guesswork).
+fn subsPacketText(_ bytes: Data) -> String {
+    if let t = bytes.text {
+        return t
+    }
+    if bytes.count >= 2 && ((bytes[0] == 0xFF && bytes[1] == 0xFE) || (bytes[0] == 0xFE && bytes[1] == 0xFF)) {
+        return decodeAs(bytes, encoding: "auto")
+    }
+    subsCp1252(bytes)
+}
+
+// Appends a code point to UTF-8 bytes (RFC 3629 §3).
+fn subsPutUtf8(_ out: Data, _ cp: Int) -> Data {
+    var d = out
+    var c = cp
+    if c < 0 || c > 0x10FFFF || (c >= 0xD800 && c < 0xE000) {
+        c = 0xFFFD
+    }
+    if c < 0x80 {
+        d.append(byte: c)
+    } else if c < 0x800 {
+        d.append(byte: 0xC0 | c >> 6)
+        d.append(byte: 0x80 | c & 0x3F)
+    } else if c < 0x10000 {
+        d.append(byte: 0xE0 | c >> 12)
+        d.append(byte: 0x80 | c >> 6 & 0x3F)
+        d.append(byte: 0x80 | c & 0x3F)
+    } else {
+        d.append(byte: 0xF0 | c >> 18)
+        d.append(byte: 0x80 | c >> 12 & 0x3F)
+        d.append(byte: 0x80 | c >> 6 & 0x3F)
+        d.append(byte: 0x80 | c & 0x3F)
+    }
+    d
+}
+
+// One code point as a string.
+public fn charOf(_ cp: Int) -> String {
+    subsPutUtf8(Data(), cp).text ?? "?"
+}
+
+fn subsCp1252(_ bytes: Data) -> String {
+    var out = Data()
+    for i in 0..bytes.count {
+        let b = bytes[i]
+        if b < 0x80 {
+            out.append(byte: b)
+        } else if b < 0xA0 {
+            let cp = cp1252High[b - 0x80]
+            out = subsPutUtf8(out, if cp == 0 { 0xFFFD } else { cp })
+        } else {
+            out = subsPutUtf8(out, b)
+        }
+    }
+    out.text ?? ""
+}
+
+// UTF-16 (RFC 2781) with surrogate pairs; lone surrogates become U+FFFD.
+fn subsUtf16(_ bytes: Data, from: Int, bigEndian: Bool) -> String {
+    var out = Data()
+    var i = from
+    let n = bytes.count
+    while i + 1 < n {
+        let u = bytes.uint16(at: i, bigEndian: bigEndian)
+        i += 2
+        if u >= 0xD800 && u < 0xDC00 && i + 1 < n {
+            let lo = bytes.uint16(at: i, bigEndian: bigEndian)
+            if lo >= 0xDC00 && lo < 0xE000 {
+                i += 2
+                out = subsPutUtf8(out, 0x10000 + ((u - 0xD800) << 10) + (lo - 0xDC00))
+                continue
+            }
+        }
+        out = subsPutUtf8(out, u)
+    }
+    out.text ?? ""
+}
+
+// HTML character references as SRT and WebVTT files use them: the named
+// ones that matter for subtitles, and &#NNN; / &#xHH;.
+fn subsEntity(_ name: String) -> String? {
+    match name {
+        "amp" -> "&"
+        "lt" -> "<"
+        "gt" -> ">"
+        "quot" -> "\""
+        "apos" -> "'"
+        "nbsp" -> charOf(0xA0)
+        "lrm" -> charOf(0x200E)
+        "rlm" -> charOf(0x200F)
+        "hellip" -> "…"
+        "mdash" -> "—"
+        "ndash" -> "–"
+        "copy" -> "©"
+        "reg" -> "®"
+        "eacute" -> "é"
+        _ -> {
+            if name.hasPrefix("#x") || name.hasPrefix("#X") {
+                let v = subsHex(name.substring(from: 2, to: name.count))
+                if v > 0 {
+                    return charOf(v)
+                }
+                return nil
+            }
+            if name.hasPrefix("#") {
+                if let v = Int(name.substring(from: 1, to: name.count)) {
+                    return charOf(v)
+                }
+            }
+            nil
+        }
+    }
+}
+
+// Hexadecimal digits as a number (stops at the first other character);
+// −1 if there are none.
+fn subsHex(_ s: String) -> Int {
+    var v = 0
+    var any = false
+    for c in s.characters {
+        let d = subsHexDigit(c)
+        if d < 0 {
+            break
+        }
+        if v > 0x7FFFFFFFFFFFFF {
+            break
+        }
+        v = v * 16 + d
+        any = true
+    }
+    if any { v } else { -1 }
+}
+
+fn subsHexDigit(_ c: String) -> Int {
+    match c {
+        "0" -> 0
+        "1" -> 1
+        "2" -> 2
+        "3" -> 3
+        "4" -> 4
+        "5" -> 5
+        "6" -> 6
+        "7" -> 7
+        "8" -> 8
+        "9" -> 9
+        "a", "A" -> 10
+        "b", "B" -> 11
+        "c", "C" -> 12
+        "d", "D" -> 13
+        "e", "E" -> 14
+        "f", "F" -> 15
+        "brown" -> 0xA52A2AFF
+        "gold" -> 0xFFD700FF
+        "violet" -> 0xEE82EEFF
+        "indigo" -> 0x4B0082FF
+        "crimson" -> 0xDC143CFF
+        "darkred" -> 0x8B0000FF
+        "darkgreen" -> 0x006400FF
+        "darkblue" -> 0x00008BFF
+        "lightblue" -> 0xADD8E6FF
+        "lightgreen" -> 0x90EE90FF
+        "skyblue" -> 0x87CEEBFF
+        "salmon" -> 0xFA8072FF
+        "coral" -> 0xFF7F50FF
+        "tomato" -> 0xFF6347FF
+        "chocolate" -> 0xD2691EFF
+        "tan" -> 0xD2B48CFF
+        "khaki" -> 0xF0E68CFF
+        "beige" -> 0xF5F5DCFF
+        "ivory" -> 0xFFFFF0FF
+        "lavender" -> 0xE6E6FAFF
+        "plum" -> 0xDDA0DDFF
+        "orchid" -> 0xDA70D6FF
+        "turquoise" -> 0x40E0D0FF
+        "lightgray", "lightgrey" -> 0xD3D3D3FF
+        "darkgray", "darkgrey" -> 0xA9A9A9FF
+        _ -> -1
+    }
+}
+
+fn subsIsDigit(_ c: String) -> Bool {
+    c >= "0" && c <= "9" && c.count == 1
+}
+
+// A clock time "h:mm:ss.fff", "mm:ss,fff", "h:mm:ss:ff" … in seconds:
+// the last part after '.' or ',' is a fraction (any number of digits), the
+// others are hours, minutes, seconds. −1 if it isn't one.
+fn subsClock(_ text: String) -> Float {
+    let t = text.trim()
+    if t.isEmpty {
+        return -1.0
+    }
+    var frac = 0.0
+    var main = t
+    var cut = -1
+    if let i = t.findLast(".") {
+        cut = i
+    }
+    if let i = t.findLast(",") {
+        if i > cut {
+            cut = i
+        }
+    }
+    if cut >= 0 {
+        let f = t.substring(from: cut + 1, to: t.count)
+        main = t.substring(from: 0, to: cut)
+        if f.isEmpty {
+            frac = 0.0
+        } else {
+            for c in f.characters {
+                if !subsIsDigit(c) {
+                    return -1.0
+                }
+            }
+            frac = (Float(f) ?? 0.0) / pow(10.0, Float(f.count))
+        }
+    }
+    let parts = main.split(":")
+    if parts.count > 3 {
+        return -1.0
+    }
+    var total = 0.0
+    for p in parts {
+        let q = p.trim()
+        if q.isEmpty {
+            return -1.0
+        }
+        for c in q.characters {
+            if !subsIsDigit(c) {
+                return -1.0
+            }
+        }
+        total = total * 60.0 + Float(Int(q) ?? 0)
+    }
+    total + frac
+}
+
+// "#rrggbb", "#rgb", "rrggbb" or a CSS colour name as packed rgba
+// (opaque); −1 if it isn't one.
+fn subsCssColor(_ text: String) -> Int {
+    var t = text.trim().lowercase()
+    if t.hasPrefix("\"") || t.hasPrefix("'") {
+        t = t.substring(from: 1, to: t.count)
+    }
+    if t.hasSuffix("\"") || t.hasSuffix("'") {
+        t = t.substring(from: 0, to: t.count - 1)
+    }
+    let named = subsNamedColor(t)
+    if named >= 0 {
+        return named
+    }
+    if t.hasPrefix("#") {
+        t = t.substring(from: 1, to: t.count)
+    }
+    if t.count == 3 {
+        let r = subsHexDigit(t.substring(from: 0, to: 1))
+        let g = subsHexDigit(t.substring(from: 1, to: 2))
+        let b = subsHexDigit(t.substring(from: 2, to: 3))
+        if r < 0 || g < 0 || b < 0 {
+            return -1
+        }
+        return rgba(r * 17, g * 17, b * 17)
+    }
+    if t.count == 6 || t.count == 8 {
+        for c in t.characters {
+            if subsHexDigit(c) < 0 {
+                return -1
+            }
+        }
+        let v = subsHex(t.substring(from: 0, to: 6))
+        return v << 8 | 0xFF
+    }
+    -1
+}
+
+fn subsNamedColor(_ t: String) -> Int {
+    match t {
+        "white" -> 0xFFFFFFFF
+        "black" -> 0x000000FF
+        "red" -> 0xFF0000FF
+        "lime" -> 0x00FF00FF
+        "green" -> 0x008000FF
+        "blue" -> 0x0000FFFF
+        "yellow" -> 0xFFFF00FF
+        "cyan", "aqua" -> 0x00FFFFFF
+        "magenta", "fuchsia" -> 0xFF00FFFF
+        "gray", "grey" -> 0x808080FF
+        "silver" -> 0xC0C0C0FF
+        "maroon" -> 0x800000FF
+        "olive" -> 0x808000FF
+        "navy" -> 0x000080FF
+        "purple" -> 0x800080FF
+        "teal" -> 0x008080FF
+        "orange" -> 0xFFA500FF
+        "pink" -> 0xFFC0CBFF
+        "brown" -> 0xA52A2AFF
+        "gold" -> 0xFFD700FF
+        "violet" -> 0xEE82EEFF
+        "indigo" -> 0x4B0082FF
+        "crimson" -> 0xDC143CFF
+        "darkred" -> 0x8B0000FF
+        "darkgreen" -> 0x006400FF
+        "darkblue" -> 0x00008BFF
+        "lightblue" -> 0xADD8E6FF
+        "lightgreen" -> 0x90EE90FF
+        "skyblue" -> 0x87CEEBFF
+        "salmon" -> 0xFA8072FF
+        "coral" -> 0xFF7F50FF
+        "tomato" -> 0xFF6347FF
+        "chocolate" -> 0xD2691EFF
+        "tan" -> 0xD2B48CFF
+        "khaki" -> 0xF0E68CFF
+        "beige" -> 0xF5F5DCFF
+        "ivory" -> 0xFFFFF0FF
+        "lavender" -> 0xE6E6FAFF
+        "plum" -> 0xDDA0DDFF
+        "orchid" -> 0xDA70D6FF
+        "turquoise" -> 0x40E0D0FF
+        "lightgray", "lightgrey" -> 0xD3D3D3FF
+        "darkgray", "darkgrey" -> 0xA9A9A9FF
+        _ -> -1
+    }
+}

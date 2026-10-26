@@ -1,0 +1,942 @@
+// A small non-validating XML 1.0 parser and writer, for playlists (XSPF),
+// DASH manifests (MPD), podcast feeds (RSS, Atom) and anything else Reel
+// reads that is XML.
+//
+// Follows the W3C XML 1.0 (Fifth Edition) recommendation: elements and
+// attributes (§3.1), character and entity references (§4.1, the five
+// predefined entities §4.6, and internal general entities declared in the
+// DOCTYPE's internal subset §4.2), CDATA sections (§2.7), comments (§2.5)
+// and processing instructions (§2.6) skipped, line-end handling (§2.11:
+// CR LF and CR become LF), attribute-value normalisation for CDATA
+// attributes (§3.3.3: tab/CR/LF become spaces). Namespaces are not
+// resolved: names keep their prefixes ("itunes:image") and xmlns
+// attributes stay ordinary attributes.
+//
+// The tree follows the ElementTree model: an element's `text` is the
+// character data before its first child element, and each child's `tail`
+// is the character data after that child's end tag, so mixed content keeps
+// its order and the writer can give it back.
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+public struct Attribute {
+    name: String
+    value: String
+}
+
+public struct Node {
+    // The element's name with its prefix, e.g. "MPD", "itunes:duration".
+    name: String = ""
+    // In the order they were written.
+    attributes: [Attribute] = []
+    // Child elements, in order (`children(name)` filters them by name).
+    elements: [Node] = []
+    // Character data before the first child element (all of it when there
+    // are no children), with entities and CDATA sections decoded.
+    text: String = ""
+    // Character data after this element's end tag, up to the next sibling
+    // or the parent's end tag.
+    tail: String = ""
+    // The line the start tag is on (1-based), for error messages.
+    line: Int = 0
+
+    // The name without its namespace prefix.
+    localName: String {
+        if let i = name.find(":") {
+            return name.substring(from: i + 1, to: name.count)
+        }
+        name
+    }
+
+    // The prefix ("" when there is none).
+    prefix: String {
+        if let i = name.find(":") {
+            return name.substring(from: 0, to: i)
+        }
+        ""
+    }
+
+    // All character data inside the element, in document order (its own
+    // text, every descendant's text and tails).
+    innerText: String {
+        var s = text
+        for c in elements {
+            s += c.innerText + c.tail
+        }
+        s
+    }
+
+    // The first child element called `name` (with its prefix). With
+    // `anyPrefix`, a name without a colon matches the local name of a
+    // child in any namespace prefix too.
+    fn child(_ name: String, anyPrefix: Bool = false) -> Node? {
+        for c in elements {
+            if xmlNameMatches(c.name, name, anyPrefix) {
+                return c
+            }
+        }
+        nil
+    }
+
+    // Every child element called `name`.
+    fn children(_ name: String, anyPrefix: Bool = false) -> [Node] {
+        var out: [Node] = []
+        for c in elements {
+            if xmlNameMatches(c.name, name, anyPrefix) {
+                out.append(c)
+            }
+        }
+        out
+    }
+
+    // The value of an attribute, or nil.
+    fn attr(_ name: String) -> String? {
+        for a in attributes {
+            if a.name == name {
+                return a.value
+            }
+        }
+        nil
+    }
+
+    // The value of an attribute, or `fallback`.
+    fn attrOr(_ name: String, _ fallback: String) -> String {
+        attr(name) ?? fallback
+    }
+
+    // The text of the first child called `name`, trimmed; "" when missing.
+    fn childText(_ name: String, anyPrefix: Bool = false) -> String {
+        if let c = child(name, anyPrefix: anyPrefix) {
+            return c.innerText.trim()
+        }
+        ""
+    }
+
+    // The first element anywhere below (depth first) called `name`.
+    fn find(_ name: String, anyPrefix: Bool = false) -> Node? {
+        for c in elements {
+            if xmlNameMatches(c.name, name, anyPrefix) {
+                return c
+            }
+            if let d = c.find(name, anyPrefix: anyPrefix) {
+                return d
+            }
+        }
+        nil
+    }
+
+    // A copy with an attribute set (replaced when it exists, else added).
+    fn with(_ name: String, _ value: String) -> Node {
+        var n = self
+        for i in 0..n.attributes.count {
+            if n.attributes[i].name == name {
+                n.attributes[i].value = value
+                return n
+            }
+        }
+        n.attributes.append(Attribute(name: name, value: value))
+        n
+    }
+
+    // The element as XML text. `indent` spaces per level put each child
+    // element on its own line, where the element holds only elements and
+    // whitespace (mixed content is written as it is); 0 writes everything
+    // on one line. `declaration` puts `<?xml version="1.0" encoding="UTF-8"?>`
+    // first.
+    fn toText(indent: Int = 2, declaration: Bool = false) -> String {
+        var out = ""
+        if declaration {
+            out = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+            if indent > 0 {
+                out += "\n"
+            }
+        }
+        out += xmlWrite(self, indent, 0)
+        if indent > 0 {
+            out += "\n"
+        }
+        out
+    }
+}
+
+// An element, for building documents to write.
+public fn element(_ name: String, _ text: String = "", attributes: [Attribute] = [], elements: [Node] = []) -> Node {
+    Node(name: name, attributes: attributes, elements: elements, text: text)
+}
+
+// Parses an XML document and gives its root element. With `strict`
+// false (the default), mistakes common in feeds found on the web are
+// forgiven: an `&` that doesn't start a known reference is kept as text
+// (HTML entities like `&nbsp;` and `&eacute;` are decoded), and missing
+// end tags at the end of the document are closed. Mismatched end tags are
+// always an error.
+public fn parse(_ text: String, strict: Bool = false) -> Result<Node> {
+    parseData(Data(text: text), strict: strict)
+}
+
+// Parses XML bytes: UTF-8 (with or without a byte order mark), UTF-16 with
+// a byte order mark, or a document declaring encoding ISO-8859-1 /
+// Windows-1252 (read as Latin-1).
+public fn parseData(_ bytes: Data, strict: Bool = false) -> Result<Node> {
+    var d = bytes
+    if d.count >= 2 && ((d[0] == 0xff && d[1] == 0xfe) || (d[0] == 0xfe && d[1] == 0xff)) {
+        d = xmlFromUtf16(d)
+    } else if d.count >= 3 && d[0] == 0xef && d[1] == 0xbb && d[2] == 0xbf {
+        d = d.slice(from: 3, to: d.count)
+    }
+    var latin = false
+    if d.count > 5 && d.slice(from: 0, to: 5).latin1 == "<?xml" {
+        var e = 5
+        while e < d.count && e < 400 && d[e] != 0x3e {
+            e += 1
+        }
+        let decl = d.slice(from: 0, to: e).latin1.lowercase()
+        if decl.contains("iso-8859-1") || decl.contains("windows-1252") || decl.contains("latin1") || decl.contains("latin-1") {
+            latin = true
+        }
+    }
+    var p = XmlParser(d: d, n: d.count, strict: strict, latin: latin)
+    p.run()
+}
+
+// Escapes text for element content: & < >.
+public fn escapeText(_ s: String) -> String {
+    if !s.contains("&") && !s.contains("<") && !s.contains(">") {
+        return s
+    }
+    s.replace("&", with: "&amp;").replace("<", with: "&lt;").replace(">", with: "&gt;")
+}
+
+// Escapes text for a double-quoted attribute value: & < " and the
+// whitespace characters that attribute-value normalisation would change.
+public fn escapeAttribute(_ s: String) -> String {
+    var r = escapeText(s).replace("\"", with: "&quot;")
+    if r.contains("\n") || r.contains("\t") || r.contains("\r") {
+        r = r.replace("\n", with: "&#10;").replace("\t", with: "&#9;").replace("\r", with: "&#13;")
+    }
+    r
+}
+
+// Decodes character and entity references in a piece of text
+// ("&lt;b&gt; &#233;" → "<b> é"), as the parser does inside content.
+public fn unescape(_ s: String) -> String {
+    if !s.contains("&") {
+        return s
+    }
+    var p = XmlParser(d: Data(text: s), n: Data(text: s).count, strict: false, latin: false)
+    p.textUntil(-1)
+}
+
+fn xmlNameMatches(_ have: String, _ want: String, _ anyPrefix: Bool) -> Bool {
+    if have == want {
+        return true
+    }
+    if anyPrefix && !want.contains(":") {
+        if let i = have.find(":") {
+            return have.substring(from: i + 1, to: have.count) == want
+        }
+    }
+    false
+}
+
+fn xmlIsBlank(_ s: String) -> Bool {
+    s.trim().isEmpty
+}
+
+fn xmlWrite(_ n: Node, _ indent: Int, _ depth: Int) -> String {
+    var out = "<" + n.name
+    for a in n.attributes {
+        out += " " + a.name + "=\"" + escapeAttribute(a.value) + "\""
+    }
+    if n.elements.isEmpty {
+        if n.text.isEmpty {
+            return out + "/>"
+        }
+        return out + ">" + escapeText(n.text) + "</" + n.name + ">"
+    }
+    out += ">"
+    // Pretty-print only element-only content (text and tails blank).
+    var pretty = indent > 0 && xmlIsBlank(n.text)
+    if pretty {
+        for c in n.elements {
+            if !xmlIsBlank(c.tail) {
+                pretty = false
+                break
+            }
+        }
+    }
+    if pretty {
+        let pad = " ".repeated(indent * (depth + 1))
+        for c in n.elements {
+            out += "\n" + pad + xmlWrite(c, indent, depth + 1)
+        }
+        out += "\n" + " ".repeated(indent * depth)
+    } else {
+        out += escapeText(n.text)
+        for c in n.elements {
+            out += xmlWrite(c, indent, depth + 1) + escapeText(c.tail)
+        }
+    }
+    out + "</" + n.name + ">"
+}
+
+// UTF-16 (with a byte order mark) to UTF-8 bytes, surrogate pairs joined.
+fn xmlFromUtf16(_ d: Data) -> Data {
+    let big = d[0] == 0xfe
+    var out = Data()
+    var i = 2
+    while i + 1 < d.count {
+        var u = if big { (d[i] << 8) | d[i + 1] } else { d[i] | (d[i + 1] << 8) }
+        i += 2
+        if u >= 0xd800 && u < 0xdc00 && i + 1 < d.count {
+            let lo = if big { (d[i] << 8) | d[i + 1] } else { d[i] | (d[i + 1] << 8) }
+            if lo >= 0xdc00 && lo < 0xe000 {
+                u = 0x10000 + ((u - 0xd800) << 10) + (lo - 0xdc00)
+                i += 2
+            }
+        }
+        xmlAppendUtf8(out, u)
+    }
+    out
+}
+
+// Appends a code point as UTF-8.
+fn xmlAppendUtf8(_ out: bind Data, _ c: Int) {
+    if c < 0x80 {
+        out.append(byte: c)
+    } else if c < 0x800 {
+        out.append(byte: 0xc0 | (c >> 6))
+        out.append(byte: 0x80 | (c & 0x3f))
+    } else if c < 0x10000 {
+        out.append(byte: 0xe0 | (c >> 12))
+        out.append(byte: 0x80 | ((c >> 6) & 0x3f))
+        out.append(byte: 0x80 | (c & 0x3f))
+    } else {
+        out.append(byte: 0xf0 | (c >> 18))
+        out.append(byte: 0x80 | ((c >> 12) & 0x3f))
+        out.append(byte: 0x80 | ((c >> 6) & 0x3f))
+        out.append(byte: 0x80 | (c & 0x3f))
+    }
+}
+
+// HTML entities often found unescaped in feeds (non-strict mode only).
+fn xmlHtmlEntity(_ name: String) -> Int {
+    match name {
+        "nbsp" -> 160
+        "copy" -> 169
+        "reg" -> 174
+        "trade" -> 8482
+        "hellip" -> 8230
+        "mdash" -> 8212
+        "ndash" -> 8211
+        "lsquo" -> 8216
+        "rsquo" -> 8217
+        "ldquo" -> 8220
+        "rdquo" -> 8221
+        "laquo" -> 171
+        "raquo" -> 187
+        "bull" -> 8226
+        "middot" -> 183
+        "deg" -> 176
+        "euro" -> 8364
+        "pound" -> 163
+        "yen" -> 165
+        "cent" -> 162
+        "sect" -> 167
+        "para" -> 182
+        "times" -> 215
+        "divide" -> 247
+        "iexcl" -> 161
+        "iquest" -> 191
+        "szlig" -> 223
+        "agrave" -> 224
+        "aacute" -> 225
+        "acirc" -> 226
+        "atilde" -> 227
+        "auml" -> 228
+        "aring" -> 229
+        "aelig" -> 230
+        "ccedil" -> 231
+        "egrave" -> 232
+        "eacute" -> 233
+        "ecirc" -> 234
+        "euml" -> 235
+        "igrave" -> 236
+        "iacute" -> 237
+        "icirc" -> 238
+        "iuml" -> 239
+        "ntilde" -> 241
+        "ograve" -> 242
+        "oacute" -> 243
+        "ocirc" -> 244
+        "otilde" -> 245
+        "ouml" -> 246
+        "oslash" -> 248
+        "ugrave" -> 249
+        "uacute" -> 250
+        "ucirc" -> 251
+        "uuml" -> 252
+        "yacute" -> 253
+        "Agrave" -> 192
+        "Aacute" -> 193
+        "Acirc" -> 194
+        "Auml" -> 196
+        "Aring" -> 197
+        "Ccedil" -> 199
+        "Egrave" -> 200
+        "Eacute" -> 201
+        "Ntilde" -> 209
+        "Ouml" -> 214
+        "Uuml" -> 220
+        _ -> -1
+    }
+}
+
+struct XmlEntity {
+    name: String
+    value: String
+}
+
+struct XmlParser {
+    d: Data
+    n: Int
+    strict: Bool
+    latin: Bool
+    pos: Int = 0
+    line: Int = 1
+    err: String = ""
+    entities: [XmlEntity] = []
+
+    fn fail(_ msg: String) {
+        if err.isEmpty {
+            err = "XML line {line}: {msg}"
+        }
+    }
+
+    fn str(_ a: Int, _ b: Int) -> String {
+        let s = d.slice(from: a, to: b)
+        if latin {
+            return xmlLatin1(s)
+        }
+        s.text ?? xmlLatin1(s)
+    }
+
+    fn startsWith(_ s: String) -> Bool {
+        let b = Data(text: s)
+        if pos + b.count > n {
+            return false
+        }
+        for i in 0..b.count {
+            if d[pos + i] != b[i] {
+                return false
+            }
+        }
+        true
+    }
+
+    // Moves past `s` (the first occurrence at or after pos); false at EOF.
+    fn skipPast(_ s: String) -> Bool {
+        let b = Data(text: s)
+        let first = b[0]
+        while pos < n {
+            let c = d[pos]
+            if c == first && startsWith(s) {
+                countLines(pos, pos + b.count)
+                pos += b.count
+                return true
+            }
+            if c == 10 {
+                line += 1
+            }
+            pos += 1
+        }
+        false
+    }
+
+    fn countLines(_ a: Int, _ b: Int) {
+        for i in a..b {
+            if d[i] == 10 {
+                line += 1
+            }
+        }
+    }
+
+    fn skipSpace() {
+        while pos < n {
+            let c = d[pos]
+            if c == 32 || c == 9 || c == 13 {
+                pos += 1
+            } else if c == 10 {
+                line += 1
+                pos += 1
+            } else {
+                break
+            }
+        }
+    }
+
+    fn isNameEnd(_ c: Int) -> Bool {
+        c == 32 || c == 9 || c == 10 || c == 13 || c == 0x2f || c == 0x3e || c == 0x3d || c == 0x3f || c == 0x3c || c == 0x5b || c == 0x22 || c == 0x27
+    }
+
+    fn name() -> String {
+        let a = pos
+        while pos < n && !isNameEnd(d[pos]) {
+            pos += 1
+        }
+        str(a, pos)
+    }
+
+    fn run() -> Result<Node> {
+        // Prolog (§2.8): declaration, comments, PIs, DOCTYPE, whitespace.
+        var root = Node()
+        var haveRoot = false
+        while pos < n && err.isEmpty {
+            skipSpace()
+            if pos >= n {
+                break
+            }
+            if d[pos] != 0x3c {
+                if haveRoot {
+                    // Text after the root element: ignore when not strict.
+                    if strict {
+                        fail("text after the root element")
+                    }
+                    break
+                }
+                fail("content before the root element")
+                break
+            }
+            if startsWith("<?") {
+                if !skipPast("?>") {
+                    fail("unclosed processing instruction")
+                }
+            } else if startsWith("<!--") {
+                if !skipPast("-->") {
+                    fail("unclosed comment")
+                }
+            } else if startsWith("<!DOCTYPE") || startsWith("<!doctype") {
+                doctype()
+            } else if haveRoot {
+                if strict {
+                    fail("a second root element")
+                }
+                break
+            } else {
+                root = element()
+                haveRoot = true
+            }
+        }
+        if !err.isEmpty {
+            return Result.failure(error: Error(err))
+        }
+        if !haveRoot {
+            return Result.failure(error: Error("XML: no root element"))
+        }
+        Result.ok(value: root)
+    }
+
+    // <!DOCTYPE name ... [ internal subset ]>: keeps <!ENTITY n "v"> of the
+    // internal subset (§4.2.2 internal general entities), skips the rest.
+    fn doctype() {
+        pos += 9
+        while pos < n {
+            let c = d[pos]
+            if c == 0x3e {
+                pos += 1
+                return
+            }
+            if c == 0x5b {
+                pos += 1
+                subset()
+                continue
+            }
+            if c == 0x22 || c == 0x27 {
+                pos += 1
+                while pos < n && d[pos] != c {
+                    if d[pos] == 10 {
+                        line += 1
+                    }
+                    pos += 1
+                }
+            } else if c == 10 {
+                line += 1
+            }
+            pos += 1
+        }
+        fail("unclosed DOCTYPE")
+    }
+
+    fn subset() {
+        while pos < n && err.isEmpty {
+            skipSpace()
+            if pos >= n {
+                break
+            }
+            if d[pos] == 0x5d {
+                pos += 1
+                return
+            }
+            if startsWith("<!--") {
+                if !skipPast("-->") {
+                    fail("unclosed comment")
+                }
+            } else if startsWith("<!ENTITY") {
+                pos += 8
+                skipSpace()
+                var parameter = false
+                if pos < n && d[pos] == 0x25 {
+                    parameter = true
+                    pos += 1
+                    skipSpace()
+                }
+                let nm = name()
+                skipSpace()
+                if pos < n && (d[pos] == 0x22 || d[pos] == 0x27) {
+                    let q = d[pos]
+                    pos += 1
+                    let a = pos
+                    while pos < n && d[pos] != q {
+                        pos += 1
+                    }
+                    let raw = str(a, pos)
+                    countLines(a, pos)
+                    pos += 1
+                    if !parameter {
+                        entities.append(XmlEntity(name: nm, value: unescape(raw)))
+                    }
+                }
+                skipDecl()
+            } else if startsWith("<?") {
+                if !skipPast("?>") {
+                    fail("unclosed processing instruction")
+                }
+            } else if d[pos] == 0x3c {
+                skipDecl()
+            } else {
+                pos += 1
+            }
+        }
+    }
+
+    // Skips to the end of a markup declaration, minding quoted strings.
+    fn skipDecl() {
+        while pos < n {
+            let c = d[pos]
+            if c == 0x3e {
+                pos += 1
+                return
+            }
+            if c == 0x22 || c == 0x27 {
+                pos += 1
+                while pos < n && d[pos] != c {
+                    pos += 1
+                }
+            } else if c == 10 {
+                line += 1
+            }
+            pos += 1
+        }
+    }
+
+    // An element starting at '<' (§3.1).
+    fn element() -> Node {
+        var node = Node(line: line)
+        pos += 1
+        node.name = name()
+        if node.name.isEmpty {
+            fail("a tag without a name")
+            return node
+        }
+        // Attributes.
+        while pos < n && err.isEmpty {
+            skipSpace()
+            if pos >= n {
+                break
+            }
+            let c = d[pos]
+            if c == 0x3e {
+                pos += 1
+                break
+            }
+            if c == 0x2f {
+                if pos + 1 < n && d[pos + 1] == 0x3e {
+                    pos += 2
+                    return node
+                }
+                fail("unexpected / in <{node.name}>")
+                return node
+            }
+            let an = name()
+            if an.isEmpty {
+                fail("bad character in <{node.name}>")
+                return node
+            }
+            skipSpace()
+            if pos >= n || d[pos] != 0x3d {
+                if strict {
+                    fail("attribute {an} without a value")
+                    return node
+                }
+                // HTML-style attribute without a value.
+                node.attributes.append(Attribute(name: an, value: an))
+                continue
+            }
+            pos += 1
+            skipSpace()
+            if pos >= n || (d[pos] != 0x22 && d[pos] != 0x27) {
+                fail("attribute {an} value isn't quoted")
+                return node
+            }
+            let q = d[pos]
+            pos += 1
+            node.attributes.append(Attribute(name: an, value: textUntil(q)))
+            pos += 1
+        }
+        if pos >= n {
+            if strict {
+                fail("unclosed start tag <{node.name}>")
+            }
+            return node
+        }
+        // Content (§3.1 content).
+        var haveChild = false
+        while pos < n && err.isEmpty {
+            if d[pos] != 0x3c {
+                let t = textUntil(0x3c)
+                if haveChild {
+                    node.elements[node.elements.count - 1].tail += t
+                } else {
+                    node.text += t
+                }
+                continue
+            }
+            if startsWith("</") {
+                pos += 2
+                let en = name()
+                skipSpace()
+                if pos < n && d[pos] == 0x3e {
+                    pos += 1
+                }
+                if en != node.name {
+                    fail("</{en}> closes <{node.name}> (line {node.line})")
+                }
+                return node
+            }
+            if startsWith("<!--") {
+                if !skipPast("-->") {
+                    fail("unclosed comment")
+                }
+                continue
+            }
+            if startsWith("<![CDATA[") {
+                pos += 9
+                let a = pos
+                if !skipPast("]]>") {
+                    fail("unclosed CDATA section")
+                    return node
+                }
+                let t = xmlNormaliseLines(str(a, pos - 3))
+                if haveChild {
+                    node.elements[node.elements.count - 1].tail += t
+                } else {
+                    node.text += t
+                }
+                continue
+            }
+            if startsWith("<?") {
+                if !skipPast("?>") {
+                    fail("unclosed processing instruction")
+                }
+                continue
+            }
+            if startsWith("<!") {
+                skipDecl()
+                continue
+            }
+            let child = element()
+            node.elements.append(child)
+            haveChild = true
+        }
+        if err.isEmpty && strict {
+            fail("<{node.name}> (line {node.line}) is never closed")
+        }
+        node
+    }
+
+    // Character data up to the byte `stop` (or the end when -1), with
+    // references decoded and line ends normalised; inside attribute values
+    // (stop is a quote) whitespace becomes spaces (§3.3.3).
+    fn textUntil(_ stop: Int) -> String {
+        let attribute = stop == 0x22 || stop == 0x27
+        var out = Data()
+        var plain = pos
+        var simple = true
+        while pos < n {
+            let c = d[pos]
+            if c == stop {
+                break
+            }
+            if c == 10 {
+                line += 1
+                if attribute {
+                    simple = false
+                }
+            } else if c == 13 || (attribute && c == 9) {
+                simple = false
+            } else if c == 0x26 {
+                simple = false
+            } else if c == 0x3c && attribute && strict {
+                fail("< in an attribute value")
+            }
+            pos += 1
+        }
+        if simple {
+            return str(plain, pos)
+        }
+        // Slow path: decode piece by piece.
+        let end = pos
+        var i = plain
+        plain = i
+        while i < end {
+            let c = d[i]
+            if c == 0x26 {
+                out.append(d.slice(from: plain, to: i))
+                i = reference(i, end, out)
+                plain = i
+                continue
+            }
+            if c == 13 {
+                out.append(d.slice(from: plain, to: i))
+                if i + 1 < end && d[i + 1] == 10 {
+                    i += 1
+                    plain = i
+                    if attribute {
+                        out.append(byte: 32)
+                        i += 1
+                        plain = i
+                    }
+                    continue
+                }
+                out.append(byte: if attribute { 32 } else { 10 })
+                i += 1
+                plain = i
+                continue
+            }
+            if attribute && (c == 10 || c == 9) {
+                out.append(d.slice(from: plain, to: i))
+                out.append(byte: 32)
+                i += 1
+                plain = i
+                continue
+            }
+            i += 1
+        }
+        out.append(d.slice(from: plain, to: end))
+        if latin {
+            return xmlLatin1(out)
+        }
+        out.text ?? xmlLatin1(out)
+    }
+
+    // A reference at d[i] == '&' (§4.1); appends what it stands for and
+    // gives the index after it.
+    fn reference(_ i: Int, _ end: Int, _ out: bind Data) -> Int {
+        var j = i + 1
+        while j < end && j < i + 40 && d[j] != 0x3b && d[j] != 0x26 && d[j] != 0x3c && d[j] != 32 {
+            j += 1
+        }
+        if j >= end || d[j] != 0x3b {
+            if strict {
+                fail("& that doesn't start a reference")
+            }
+            out.append(byte: 0x26)
+            return i + 1
+        }
+        let ref = d.slice(from: i + 1, to: j).latin1
+        if ref.hasPrefix("#") {
+            var code = -1
+            if ref.hasPrefix("#x") || ref.hasPrefix("#X") {
+                code = xmlParseHex(ref.substring(from: 2, to: ref.count))
+            } else {
+                code = parseInt(ref.substring(from: 1, to: ref.count)).valueOr(-1)
+            }
+            if code > 0 && code <= 0x10ffff && !(code >= 0xd800 && code < 0xe000) {
+                xmlAppendUtf8(out, code)
+                return j + 1
+            }
+            if strict {
+                fail("bad character reference &{ref};")
+            }
+            out.append(d.slice(from: i, to: j + 1))
+            return j + 1
+        }
+        let v = match ref {
+            "lt" -> "<"
+            "gt" -> ">"
+            "amp" -> "&"
+            "quot" -> "\""
+            "apos" -> "'"
+            _ -> ""
+        }
+        if !v.isEmpty {
+            out.append(Data(text: v))
+            return j + 1
+        }
+        for e in entities {
+            if e.name == ref {
+                out.append(Data(text: e.value))
+                return j + 1
+            }
+        }
+        if !strict {
+            let h = xmlHtmlEntity(ref)
+            if h > 0 {
+                xmlAppendUtf8(out, h)
+                return j + 1
+            }
+        } else {
+            fail("unknown entity &{ref};")
+        }
+        out.append(d.slice(from: i, to: j + 1))
+        j + 1
+    }
+}
+
+fn xmlParseHex(_ s: String) -> Int {
+    if s.isEmpty || s.count > 8 {
+        return -1
+    }
+    var v = 0
+    for ch in Data(text: s).bytes {
+        var k = -1
+        if ch >= 48 && ch <= 57 {
+            k = ch - 48
+        } else if ch >= 97 && ch <= 102 {
+            k = ch - 87
+        } else if ch >= 65 && ch <= 70 {
+            k = ch - 55
+        } else {
+            return -1
+        }
+        v = v * 16 + k
+    }
+    v
+}
+
+fn xmlNormaliseLines(_ s: String) -> String {
+    if !s.contains("\r") {
+        return s
+    }
+    s.replace("\r\n", with: "\n").replace("\r", with: "\n")
+}
+
+// Bytes as Latin-1 characters (all of them: Data.latin1 stops at a zero).
+fn xmlLatin1(_ d: Data) -> String {
+    var out = Data()
+    for b in d.bytes {
+        xmlAppendUtf8(out, b)
+    }
+    out.text ?? ""
+}

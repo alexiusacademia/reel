@@ -1,0 +1,148 @@
+// The Media Information window's text: the file, its container, tags,
+// chapters and every track with its codec details.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "core"
+import "play"
+
+fn mediaInfoLines(_ p: Player) -> [String] {
+    if !p.loaded {
+        return ["Nothing is open."]
+    }
+    let m = p.media
+    var out: [String] = []
+    out.append("File: {p.path}")
+    out.append("Size: {sizeText(p.file.count)}")
+    out.append("Container: {m.format}")
+    out.append("Duration: {timeText(m.duration)}")
+    if !m.tags.isEmpty {
+        out.append("")
+        out.append("Tags")
+        for k in m.tags.keys.sorted() {
+            if k == "delay" || k == "padding" {
+                continue
+            }
+            out.append("    {k}: {m.tags[k] ?? ""}")
+        }
+    }
+    if !m.chapters.isEmpty {
+        out.append("")
+        out.append("Chapters")
+        for c in m.chapters {
+            out.append("    {timeText(c.start)}  {c.title}")
+        }
+    }
+    for t in m.tracks {
+        out.append("")
+        let kind = match t.kind {
+            .video -> "Video"
+            .audio -> "Audio"
+            .subtitle -> "Subtitles"
+            .other -> "Other"
+        }
+        var playable = ""
+        if t.kind == .video && !play.canDecodeVideo(t.codec) {
+            playable = "  (Reel can't decode this yet)"
+        }
+        if t.kind == .audio && !play.canDecodeAudio(t.codec) {
+            playable = "  (Reel can't decode this yet)"
+        }
+        out.append("Track {t.index + 1}: {kind}{playable}")
+        out.append("    Codec: {t.codec}")
+        if !t.language.isEmpty {
+            out.append("    Language: {play.languageName(t.language)} ({t.language})")
+        }
+        if !t.title.isEmpty {
+            out.append("    Title: {t.title}")
+        }
+        if t.kind == .video {
+            out.append("    Size: {t.width} × {t.height}")
+            if t.sarNum != t.sarDen {
+                out.append("    Pixel shape: {t.sarNum}:{t.sarDen}")
+            }
+            if t.fpsNum > 0 && t.fpsDen > 0 {
+                let fps = Float(t.fpsNum) / Float(t.fpsDen)
+                out.append("    Frame rate: {Int(fps * 1000.0 + 0.5) / 1000} fps")
+            }
+            if t.rotation != 0 {
+                out.append("    Rotation: {t.rotation}°")
+            }
+        }
+        if t.kind == .audio {
+            out.append("    Sample rate: {t.sampleRate} Hz")
+            out.append("    Channels: {play.channelName(t.channels)}")
+            if t.bitsPerSample > 0 {
+                out.append("    Bits: {t.bitsPerSample}")
+            }
+        }
+        if t.bitrate > 0 {
+            out.append("    Bit rate: {t.bitrate / 1000} kb/s")
+        }
+        let count = m.packets.count(where: { pk in pk.track == t.index })
+        out.append("    Packets: {count}")
+        if t.isDefault {
+            out.append("    Default track")
+        }
+    }
+    if !m.warnings.isEmpty || !p.warnings.isEmpty {
+        out.append("")
+        out.append("Warnings")
+        for w in m.warnings.prefix(20) {
+            out.append("    {w}")
+        }
+        for w in p.warnings.prefix(20) {
+            out.append("    {w}")
+        }
+    }
+    out
+}
+
+fn sizeText(_ bytes: Int) -> String {
+    if bytes >= 1073741824 {
+        return "{Int(Float(bytes) / 1073741824.0 * 100.0) / 100} GB"
+    }
+    if bytes >= 1048576 {
+        return "{Int(Float(bytes) / 1048576.0 * 10.0) / 10} MB"
+    }
+    "{bytes / 1024} KB"
+}
+
+// A codec's everyday name, for messages.
+fn codecName(_ codec: String) -> String {
+    match codec {
+        "hevc" -> "HEVC (H.265)"
+        "h264" -> "H.264"
+        "av1" -> "AV1"
+        "vp9" -> "VP9"
+        "vp8" -> "VP8"
+        "prores" -> "ProRes"
+        "theora" -> "Theora"
+        "mpeg4" -> "MPEG-4"
+        "mpeg2" -> "MPEG-2"
+        "mpeg1" -> "MPEG-1"
+        "mjpeg" -> "Motion JPEG"
+        "dnxhd" -> "DNxHD"
+        "vc1" -> "VC-1"
+        "wmv3" -> "WMV9"
+        "wmv2" -> "WMV8"
+        "wmv1" -> "WMV7"
+        "msmpeg4v3" -> "DivX 3 (MS-MPEG4 v3)"
+        "msmpeg4v2" -> "MS-MPEG4 v2"
+        "msmpeg4v1" -> "MS-MPEG4 v1"
+        "truehd" -> "TrueHD"
+        "mlp" -> "MLP"
+        "eac3" -> "E-AC-3"
+        "ac3" -> "AC-3"
+        "wmav1" -> "WMA 1"
+        "wmav2" -> "WMA 2"
+        "wmapro" -> "WMA Pro"
+        "wmalossless" -> "WMA Lossless"
+        "vorbis" -> "Vorbis"
+        "opus" -> "Opus"
+        "flac" -> "FLAC"
+        "alac" -> "ALAC"
+        _ -> codec.uppercase()
+    }
+}

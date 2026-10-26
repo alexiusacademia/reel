@@ -1,0 +1,167 @@
+// The public face of the Windows Media video decoders: one Decoder for
+// every Microsoft video codec Reel plays, and streamInfo for the media
+// info window.
+//
+//   "msmpeg4v1" "msmpeg4v2" "msmpeg4v3"  MS-MPEG4 (MPG4, MP42, MP43/DIV3)
+//   "wmv1" "wmv2"                        Windows Media Video 7 and 8
+//     — H.263-like codecs: the MsDecoder (ms*.tsl, x8*.tsl)
+//   "wmv3"                               WMV9 = VC-1 Simple/Main profile
+//   "vc1"                                VC-1 Advanced profile (WVC1/WMVA)
+//     — the VcDecoder (vc*.tsl)
+//
+// Track.extra (core/media.tsl): for wmv1/wmv2/msmpeg4 the bytes after the
+// BITMAPINFOHEADER (WMV2 keeps 4 bytes of settings there); for wmv3 the
+// 4+ bytes of STRUCT_C (the sequence header, SMPTE 421M Annex J); for vc1
+// the sequence header and entry point (with start codes, maybe after a
+// leading byte), or empty when they come in the stream (MPEG-TS, raw).
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../core"
+
+public struct Decoder {
+    // When true, B pictures (which nothing refers to) aren't decoded.
+    skipNonReference: Bool = false
+    // Damaged or unsupported data found; decoding goes on.
+    warnings: [String] = []
+    // 0: an MsDecoder (MS-MPEG4, WMV1, WMV2); 1: a VcDecoder (WMV9, VC-1).
+    family: Int = 0
+    ms: MsDecoder = MsDecoder()
+    vc: VcDecoder = VcDecoder()
+
+    // Decodes one packet (one picture, as AVI/ASF/MKV store them); returns
+    // the pictures ready, in display order.
+    fn decode(_ packet: Data, pts: Int, dts: Int, key: Bool) -> [core.Picture] {
+        var out: [core.Picture] = []
+        if family == 0 {
+            ms.skipNonReference = skipNonReference
+            out = ms.decode(packet, pts: pts, dts: dts, key: key)
+            takeWarnings(ms.warnings)
+            ms.warnings = []
+        } else {
+            vc.skipNonReference = skipNonReference
+            out = vc.decode(packet, pts: pts, dts: dts, key: key)
+            takeWarnings(vc.warnings)
+            vc.warnings = []
+        }
+        out
+    }
+
+    // End of stream: the pictures still held back for reordering.
+    fn flush() -> [core.Picture] {
+        var out: [core.Picture] = []
+        if family == 0 {
+            out = ms.flush()
+            takeWarnings(ms.warnings)
+            ms.warnings = []
+        } else {
+            out = vc.flush()
+            takeWarnings(vc.warnings)
+            vc.warnings = []
+        }
+        out
+    }
+
+    // After a seek: drop references and held pictures, wait for a keyframe.
+    fn reset() {
+        if family == 0 {
+            ms.reset()
+        } else {
+            vc.reset()
+        }
+    }
+
+    fn takeWarnings(_ list: [String]) {
+        for w in list {
+            if warnings.count < 200 {
+                warnings.append(w)
+            }
+        }
+    }
+}
+
+// A decoder for a Windows Media video track (codec names above).
+public fn newDecoder(_ track: core.Track) -> Result<Decoder> {
+    let c = track.codec
+    if c == "msmpeg4v1" || c == "msmpeg4v2" || c == "msmpeg4v3" || c == "wmv1" || c == "wmv2" {
+        let ms = try msNewDecoder(track)
+        return Result.ok(value: Decoder(family: 0, ms: ms))
+    }
+    if c == "wmv3" || c == "vc1" {
+        let vc = try vcNewDecoder(track)
+        return Result.ok(value: Decoder(family: 1, vc: vc))
+    }
+    Result.failure(error: Error("wmv: not a Windows Media video track ({c})"))
+}
+
+// "WMV9 Main, 640×480", "VC-1 Advanced@L3, 1920×1080, interlaced",
+// "MS-MPEG4 v3 (DivX ;-) 3), 720×576" from the track (and its extra).
+public fn streamInfo(_ track: core.Track) -> String {
+    var info = match track.codec {
+        "msmpeg4v1" -> "MS-MPEG4 v1"
+        "msmpeg4v2" -> "MS-MPEG4 v2"
+        "msmpeg4v3" -> "MS-MPEG4 v3 (DivX ;-) 3)"
+        "wmv1" -> "WMV7"
+        "wmv2" -> "WMV8"
+        "wmv3" -> "WMV9"
+        "vc1" -> "VC-1"
+        _ -> track.codec
+    }
+    var width = track.width
+    var height = track.height
+    var interlaced = false
+    let x = track.extra
+    if track.codec == "wmv3" && x.count >= 4 {
+        // STRUCT_C (Annex J.2): PROFILE in the top 2 bits.
+        let p = x[0] >> 6
+        info += match p {
+            0 -> " Simple"
+            1 -> " Main"
+            _ -> " Complex"
+        }
+    } else if track.codec == "vc1" {
+        // The sequence header (6.1): start code 00 00 01 0F, PROFILE (2),
+        // LEVEL (3), COLORDIFF (2), FRMRTQ (3), BITRTQ (5), POSTPROCFLAG,
+        // MAX_CODED_WIDTH (12), MAX_CODED_HEIGHT (12), PULLDOWN,
+        // INTERLACE, ….
+        var i = 0
+        var found = false
+        while i + 4 < x.count {
+            if x[i] == 0 && x[i + 1] == 0 && x[i + 2] == 1 && x[i + 3] == 0x0F {
+                found = true
+                break
+            }
+            i += 1
+        }
+        if found && i + 10 <= x.count {
+            var br = core.bitReaderRange(x, from: i + 4, to: x.count)
+            let profile = br.bits(2)
+            let level = br.bits(3)
+            if profile == 3 {
+                info += " Advanced@L{level}"
+            }
+            br.bits(2)
+            br.bits(3)
+            br.bits(5)
+            br.bits(1)
+            let w = br.bits(12) * 2 + 2
+            let h = br.bits(12) * 2 + 2
+            if width == 0 || height == 0 {
+                width = w
+                height = h
+            }
+            br.bits(1)
+            interlaced = br.bit() == 1
+        } else {
+            info += " Advanced"
+        }
+    }
+    if width > 0 && height > 0 {
+        info += ", {width}×{height}"
+    }
+    if interlaced {
+        info += ", interlaced"
+    }
+    info
+}

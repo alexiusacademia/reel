@@ -1,0 +1,239 @@
+// The Opus range decoder (RFC 6716 section 4.1): the entropy decoder that
+// SILK and CELT both read their symbols from, plus the raw bits CELT reads
+// backwards from the end of a frame (section 4.1.4).
+//
+// A range coder keeps an interval [val, val + rng) inside a 32-bit window.
+// Each symbol narrows the interval by its probability; whenever rng gets
+// small (<= 2^23) another byte is shifted in (section 4.1.2.1). Values are
+// unsigned 32-bit in the spec; here they are 64-bit Ints that stay below
+// 2^32, so nothing overflows.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+let rcCodeTop = 2147483648      // 2^31
+let rcCodeBot = 8388608         // 2^23
+let rcCodeExtra = 7             // (32 - 2) % 8 + 1
+
+// ec_tell_frac's thresholds (entcode.c): which eighth of a bit rng is in.
+let rcCorrection = [35733, 38967, 42495, 46340, 50535, 55109, 60097, 65535]
+
+public struct OpusRange {
+    data: Data = Data()
+    // The frame's first byte in `data` and its size in bytes ("storage").
+    base: Int = 0
+    storage: Int = 0
+    offs: Int = 0
+    endOffs: Int = 0
+    endWindow: Int = 0
+    nendBits: Int = 0
+    nbitsTotal: Int = 0
+    rng: Int = 0
+    val: Int = 0
+    ext: Int = 0
+    rem: Int = 0
+    error: Bool = false
+
+    fn readByte() -> Int {
+        if offs < storage {
+            let b = data[base + offs]
+            offs += 1
+            return b
+        }
+        0
+    }
+
+    fn readByteFromEnd() -> Int {
+        if endOffs < storage {
+            endOffs += 1
+            return data[base + storage - endOffs]
+        }
+        0
+    }
+
+    // Section 4.1.2.1: keep rng above 2^23 by shifting in bytes.
+    fn normalize() {
+        while rng <= rcCodeBot {
+            nbitsTotal += 8
+            rng = rng << 8
+            var sym = rem
+            rem = readByte()
+            sym = ((sym << 8) | rem) >> 1
+            val = ((val << 8) + (255 & ~sym)) & (rcCodeTop - 1)
+        }
+    }
+
+    // Section 4.1.3: the cumulative frequency of the next symbol, for a
+    // distribution with total ft (followed by update()).
+    fn decode(_ ft: Int) -> Int {
+        ext = rng / ft
+        let s = val / ext
+        ft - min(s + 1, ft)
+    }
+
+    fn decodeBin(_ bits: Int) -> Int {
+        ext = rng >> bits
+        let s = val / ext
+        (1 << bits) - min(s + 1, 1 << bits)
+    }
+
+    fn update(_ fl: Int, _ fh: Int, _ ft: Int) {
+        let s = ext * (ft - fh)
+        val -= s
+        if fl > 0 {
+            rng = ext * (fh - fl)
+        } else {
+            rng = rng - s
+        }
+        normalize()
+    }
+
+    // Section 4.1.3.2: a bit that is 1 with probability 1/2^logp.
+    fn bitLogp(_ logp: Int) -> Bool {
+        let r = rng
+        let d = val
+        let s = r >> logp
+        let one = d < s
+        if !one {
+            val = d - s
+        }
+        rng = if one { s } else { r - s }
+        normalize()
+        one
+    }
+
+    // Section 4.1.3.3: a symbol from an inverse cumulative table (8-bit
+    // entries, total 2^ftb), the form SILK's and CELT's tables are in.
+    fn icdf(_ table: [Int], _ ftb: Int) -> Int {
+        var s = rng
+        let d = val
+        let r = s >> ftb
+        var ret = -1
+        var t = 0
+        while true {
+            t = s
+            ret += 1
+            s = r * table[ret]
+            if d >= s {
+                break
+            }
+        }
+        val = d - s
+        rng = t - s
+        normalize()
+        ret
+    }
+
+    // The same with the table starting at `from` in a bigger list.
+    fn icdfAt(_ table: [Int], _ from: Int, _ ftb: Int) -> Int {
+        var s = rng
+        let d = val
+        let r = s >> ftb
+        var ret = -1
+        var t = 0
+        while true {
+            t = s
+            ret += 1
+            s = r * table[from + ret]
+            if d >= s {
+                break
+            }
+        }
+        val = d - s
+        rng = t - s
+        normalize()
+        ret
+    }
+
+    // Section 4.1.5: a whole number from 0 to ft - 1 (ft up to 2^32).
+    fn uint(_ ftIn: Int) -> Int {
+        let ft1 = ftIn - 1
+        var ftb = rcIlog(ft1)
+        if ftb > 8 {
+            ftb -= 8
+            let ft = (ft1 >> ftb) + 1
+            let s = decode(ft)
+            update(s, s + 1, ft)
+            let t = (s << ftb) | bits(ftb)
+            if t <= ft1 {
+                return t
+            }
+            error = true
+            return ft1
+        }
+        let s = decode(ftIn)
+        update(s, s + 1, ftIn)
+        s
+    }
+
+    // Section 4.1.4: raw bits, read from the end of the frame backwards.
+    fn bits(_ n: Int) -> Int {
+        var window = endWindow
+        var available = nendBits
+        if available < n {
+            while true {
+                window = window | (readByteFromEnd() << available)
+                available += 8
+                if available > 24 {
+                    break
+                }
+            }
+        }
+        let ret = window & ((1 << n) - 1)
+        window = window >> n
+        available -= n
+        endWindow = window
+        nendBits = available
+        nbitsTotal += n
+        ret
+    }
+
+    // Section 4.1.6: bits used so far, whole and in eighths of a bit.
+    fn tell() -> Int {
+        nbitsTotal - rcIlog(rng)
+    }
+
+    fn tellFrac() -> Int {
+        let nbits = nbitsTotal << 3
+        var l = rcIlog(rng)
+        let r = rng >> (l - 16)
+        var b = (r >> 12) - 8
+        if r > rcCorrection[b] {
+            b += 1
+        }
+        l = (l << 3) + b
+        nbits - l
+    }
+
+    // Shrinks the frame (the redundancy bytes at its end belong to CELT).
+    fn shrink(_ bytes: Int) {
+        storage -= bytes
+    }
+}
+
+// A decoder over data[from..<from+size] (section 4.1.1).
+public fn opusRange(_ data: Data, from: Int, size: Int) -> OpusRange {
+    var r = OpusRange(data: data, base: from, storage: size)
+    // nbits_total = 32 + 1 - ((32 - 7) / 8) * 8
+    r.nbitsTotal = 9
+    r.rng = 1 << rcCodeExtra
+    r.rem = r.readByte()
+    r.val = r.rng - 1 - (r.rem >> 1)
+    r.normalize()
+    r
+}
+
+// The number of bits needed to write v (0 for 0): ec_ilog.
+fn rcIlog(_ v: Int) -> Int {
+    var x = v
+    var n = 0
+    while x >= 256 {
+        x = x >> 8
+        n += 8
+    }
+    while x > 0 {
+        x = x >> 1
+        n += 1
+    }
+    n
+}

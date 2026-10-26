@@ -1,0 +1,811 @@
+// MPEG-DASH media presentation descriptions (MPD), ISO/IEC 23009-1:
+// static and dynamic presentations, periods, adaptation sets,
+// representations, BaseURL resolution at every level (§5.6), and the
+// three ways of describing segments (§5.3.9): SegmentBase (one file, with
+// a `sidx` index, §5.3.9.2), SegmentList (§5.3.9.3) and SegmentTemplate
+// (§5.3.9.4) with $RepresentationID$, $Number$, $Bandwidth$, $Time$ and
+// printf-style widths like $Number%05d$ (§5.3.9.4.4), with or without a
+// SegmentTimeline (§5.3.9.6). Segment information is inherited from the
+// Period and AdaptationSet levels (§5.3.9.1). Live (dynamic) availability
+// follows §5.3.9.5 and annex A.3. The `sidx` box is parsed from ISO/IEC
+// 14496-12 §8.16.3.
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+import "../xml"
+
+public struct DashSegment {
+    url: String
+    // Byte range, -1 for the whole resource.
+    offset: Int = -1
+    length: Int = -1
+    // Seconds on the presentation timeline.
+    start: Float = 0.0
+    duration: Float = 0.0
+    // $Number$ and $Time$ of the segment (0 when they don't apply).
+    number: Int = 0
+    time: Int = 0
+}
+
+public struct DashRepresentation {
+    id: String = ""
+    bandwidth: Int = 0
+    width: Int = 0
+    height: Int = 0
+    frameRate: Float = 0.0
+    codecs: String = ""
+    mimeType: String = ""
+    // "video", "audio", "text" or "" (from contentType or mimeType).
+    kind: String = ""
+    language: String = ""
+    sampleRate: Int = 0
+    channels: Int = 0
+    // The resolved BaseURL of the representation.
+    baseUrl: String = ""
+    // The initialisation segment; url "" when there is none.
+    initialization: DashSegment = DashSegment(url: "")
+    // The media segments (for a dynamic presentation: those listed or
+    // available when the MPD was read; see dashLiveSegments).
+    segments: [DashSegment] = []
+    // SegmentBase: the `sidx` byte range to load and give to dashApplySidx
+    // before the segments are known (offset -1 when there is none).
+    indexOffset: Int = -1
+    indexLength: Int = -1
+    needsIndex: Bool = false
+    // The merged segment information, kept for live updates.
+    info: DashSegmentInfo = DashSegmentInfo()
+    // ContentProtection present: encrypted (Reel can't play it).
+    protected: Bool = false
+}
+
+public struct DashAdaptationSet {
+    id: String = ""
+    kind: String = ""
+    mimeType: String = ""
+    language: String = ""
+    // Role values ("main", "alternate", "subtitle", "caption" …).
+    roles: [String] = []
+    label: String = ""
+    // Representations sorted by bandwidth, lowest first.
+    representations: [DashRepresentation] = []
+}
+
+public struct DashPeriod {
+    id: String = ""
+    // Seconds on the presentation timeline.
+    start: Float = 0.0
+    // -1 when unknown (the last period of a live presentation).
+    duration: Float = -1.0
+    adaptationSets: [DashAdaptationSet] = []
+}
+
+public struct DashManifest {
+    url: String = ""
+    // "static" or "dynamic".
+    type: String = "static"
+    // Seconds, -1 when not given.
+    duration: Float = -1.0
+    minBufferTime: Float = 0.0
+    minimumUpdatePeriod: Float = -1.0
+    timeShiftBufferDepth: Float = -1.0
+    suggestedPresentationDelay: Float = -1.0
+    maxSegmentDuration: Float = -1.0
+    // Seconds since 1970, -1 when not given.
+    availabilityStartTime: Float = -1.0
+    publishTime: Float = -1.0
+    periods: [DashPeriod] = []
+    warnings: [String] = []
+
+    isLive: Bool { type == "dynamic" }
+}
+
+// The segment information of one level, merged with the levels above it
+// (§5.3.9.1: a lower level's attributes and elements override).
+public struct DashSegmentInfo {
+    // "" (none), "base", "list" or "template".
+    kind: String = ""
+    timescale: Int = 1
+    hasTimescale: Bool = false
+    duration: Int = 0
+    startNumber: Int = 1
+    hasStartNumber: Bool = false
+    endNumber: Int = -1
+    presentationTimeOffset: Int = 0
+    // SegmentTemplate attributes.
+    media: String = ""
+    initTemplate: String = ""
+    // Initialization element (SegmentBase/SegmentList) or init range.
+    initUrl: String = ""
+    hasInit: Bool = false
+    initOffset: Int = -1
+    initLength: Int = -1
+    // SegmentBase@indexRange.
+    indexOffset: Int = -1
+    indexLength: Int = -1
+    // SegmentTimeline S elements: t (or -1), d, r.
+    timeline: [Int] = []
+    // SegmentList SegmentURL elements: media, and range as offset/length.
+    listUrls: [String] = []
+    listRanges: [Int] = []
+    availabilityTimeOffset: Float = 0.0
+}
+
+// Whether text looks like an MPD.
+public fn isDashManifest(_ text: String) -> Bool {
+    text.contains("<MPD") || text.contains(":MPD")
+}
+
+// Parses an MPD. `url` is where it came from (the base for BaseURLs);
+// `now` (seconds since 1970) is used for the segments a dynamic
+// presentation has available.
+public fn parseDash(_ text: String, url: String = "", now: Float = -1.0) -> Result<DashManifest> {
+    let root = try xml.parse(text)
+    if root.localName != "MPD" {
+        return Result.failure(error: Error("DASH: the root element isn't MPD"))
+    }
+    var m = DashManifest(url: url)
+    m.type = root.attrOr("type", "static")
+    m.duration = dashDuration(root.attrOr("mediaPresentationDuration", ""))
+    m.minBufferTime = max(0.0, dashDuration(root.attrOr("minBufferTime", "")))
+    m.minimumUpdatePeriod = dashDuration(root.attrOr("minimumUpdatePeriod", ""))
+    m.timeShiftBufferDepth = dashDuration(root.attrOr("timeShiftBufferDepth", ""))
+    m.suggestedPresentationDelay = dashDuration(root.attrOr("suggestedPresentationDelay", ""))
+    m.maxSegmentDuration = dashDuration(root.attrOr("maxSegmentDuration", ""))
+    m.availabilityStartTime = hlsParseDate(root.attrOr("availabilityStartTime", ""))
+    m.publishTime = hlsParseDate(root.attrOr("publishTime", ""))
+    let mpdBase = dashBase(root, url)
+    let periods = root.children("Period", anyPrefix: true)
+    var nextStart = 0.0
+    for (pi, pn) in periods.enumerated() {
+        var p = DashPeriod(id: pn.attrOr("id", ""))
+        let st = dashDuration(pn.attrOr("start", ""))
+        p.start = if st >= 0.0 { st } else { nextStart }
+        p.duration = dashDuration(pn.attrOr("duration", ""))
+        if p.duration < 0.0 {
+            if pi + 1 < periods.count {
+                let ns = dashDuration(periods[pi + 1].attrOr("start", ""))
+                if ns >= 0.0 {
+                    p.duration = ns - p.start
+                }
+            } else if m.duration >= 0.0 {
+                p.duration = m.duration - p.start
+            }
+        }
+        nextStart = p.start + max(p.duration, 0.0)
+        let pBase = dashBase(pn, mpdBase)
+        let pInfo = dashInfo(pn, DashSegmentInfo())
+        for an in pn.children("AdaptationSet", anyPrefix: true) {
+            var a = DashAdaptationSet(id: an.attrOr("id", ""))
+            a.mimeType = an.attrOr("mimeType", "")
+            a.language = an.attrOr("lang", "")
+            a.kind = dashKind(an.attrOr("contentType", ""), a.mimeType)
+            a.label = an.childText("Label", anyPrefix: true)
+            for r in an.children("Role", anyPrefix: true) {
+                a.roles.append(r.attrOr("value", ""))
+            }
+            let aBase = dashBase(an, pBase)
+            let aInfo = dashInfo(an, pInfo)
+            let aProtected = an.child("ContentProtection", anyPrefix: true) != nil
+            let aChannels = dashChannels(an)
+            for rn in an.children("Representation", anyPrefix: true) {
+                var r = DashRepresentation(id: rn.attrOr("id", ""))
+                r.bandwidth = parseInt(rn.attrOr("bandwidth", "0")).valueOr(0)
+                r.width = parseInt(rn.attrOr("width", an.attrOr("width", "0"))).valueOr(0)
+                r.height = parseInt(rn.attrOr("height", an.attrOr("height", "0"))).valueOr(0)
+                r.frameRate = dashFrameRate(rn.attrOr("frameRate", an.attrOr("frameRate", "")))
+                r.codecs = rn.attrOr("codecs", an.attrOr("codecs", ""))
+                r.mimeType = rn.attrOr("mimeType", a.mimeType)
+                r.kind = dashKind(rn.attrOr("contentType", an.attrOr("contentType", "")), r.mimeType)
+                if r.kind.isEmpty {
+                    r.kind = dashKindFromCodecs(r.codecs)
+                }
+                r.language = a.language
+                r.sampleRate = parseInt(rn.attrOr("audioSamplingRate", an.attrOr("audioSamplingRate", "0"))).valueOr(0)
+                r.channels = dashChannels(rn)
+                if r.channels == 0 {
+                    r.channels = aChannels
+                }
+                r.protected = aProtected || rn.child("ContentProtection", anyPrefix: true) != nil
+                r.baseUrl = dashBase(rn, aBase)
+                r.info = dashInfo(rn, aInfo)
+                dashExpand(m, p, r, now)
+                a.representations.append(r)
+            }
+            if a.kind.isEmpty && !a.representations.isEmpty {
+                a.kind = a.representations[0].kind
+            }
+            a.representations = a.representations.sorted(by: { x, y in x.bandwidth < y.bandwidth })
+            p.adaptationSets.append(a)
+        }
+        m.periods.append(p)
+    }
+    if m.duration < 0.0 && !m.periods.isEmpty {
+        let l = m.periods[m.periods.count - 1]
+        if l.duration >= 0.0 {
+            m.duration = l.start + l.duration
+        }
+    }
+    Result.ok(value: m)
+}
+
+// The first BaseURL child resolved against the parent's base (§5.6.4).
+fn dashBase(_ n: xml.Node, _ parent: String) -> String {
+    if let b = n.child("BaseURL", anyPrefix: true) {
+        let t = b.innerText.trim()
+        if !t.isEmpty {
+            return resolveUrl(parent, t)
+        }
+    }
+    parent
+}
+
+fn dashKind(_ contentType: String, _ mime: String) -> String {
+    if !contentType.isEmpty {
+        return contentType
+    }
+    if mime.hasPrefix("video/") {
+        return "video"
+    }
+    if mime.hasPrefix("audio/") {
+        return "audio"
+    }
+    if mime.hasPrefix("text/") || mime.hasPrefix("application/ttml") || mime == "application/mp4" {
+        return "text"
+    }
+    ""
+}
+
+fn dashKindFromCodecs(_ codecs: String) -> String {
+    let c = codecs.lowercase()
+    if c.hasPrefix("avc") || c.hasPrefix("hvc") || c.hasPrefix("hev") || c.hasPrefix("av01") || c.hasPrefix("vp09") || c.hasPrefix("vp9") || c.hasPrefix("vp8") {
+        return "video"
+    }
+    if c.hasPrefix("mp4a") || c.hasPrefix("opus") || c.hasPrefix("ac-3") || c.hasPrefix("ec-3") || c.hasPrefix("flac") {
+        return "audio"
+    }
+    if c.hasPrefix("wvtt") || c.hasPrefix("stpp") {
+        return "text"
+    }
+    ""
+}
+
+fn dashChannels(_ n: xml.Node) -> Int {
+    if let c = n.child("AudioChannelConfiguration", anyPrefix: true) {
+        return parseInt(c.attrOr("value", "0")).valueOr(0)
+    }
+    0
+}
+
+// "30000/1001" or "25".
+fn dashFrameRate(_ s: String) -> Float {
+    if s.isEmpty {
+        return 0.0
+    }
+    if let i = s.find("/") {
+        let a = parseFloat(s.substring(from: 0, to: i)).valueOr(0.0)
+        let b = parseFloat(s.substring(from: i + 1, to: s.count)).valueOr(1.0)
+        return if b > 0.0 { a / b } else { 0.0 }
+    }
+    parseFloat(s).valueOr(0.0)
+}
+
+// "a-b" byte range → (offset, length).
+fn dashRange(_ s: String) -> (Int, Int) {
+    if let i = s.find("-") {
+        let a = parseInt(s.substring(from: 0, to: i).trim()).valueOr(-1)
+        let b = parseInt(s.substring(from: i + 1, to: s.count).trim()).valueOr(-1)
+        if a >= 0 && b >= a {
+            return (a, b - a + 1)
+        }
+    }
+    (-1, -1)
+}
+
+// The segment information at a level, merged over the parent's.
+fn dashInfo(_ n: xml.Node, _ parent: DashSegmentInfo) -> DashSegmentInfo {
+    var info = parent
+    var el = xml.Node()
+    var found = false
+    for name in ["SegmentTemplate", "SegmentList", "SegmentBase"] {
+        if let e = n.child(name, anyPrefix: true) {
+            el = e
+            found = true
+            info.kind = match name {
+                "SegmentTemplate" -> "template"
+                "SegmentList" -> "list"
+                _ -> "base"
+            }
+            break
+        }
+    }
+    if !found {
+        return info
+    }
+    if let ts = el.attr("timescale") {
+        info.timescale = max(1, parseInt(ts).valueOr(1))
+        info.hasTimescale = true
+    }
+    if let d = el.attr("duration") {
+        info.duration = parseInt(d).valueOr(0)
+    }
+    if let s = el.attr("startNumber") {
+        info.startNumber = parseInt(s).valueOr(1)
+        info.hasStartNumber = true
+    }
+    if let e = el.attr("endNumber") {
+        info.endNumber = parseInt(e).valueOr(-1)
+    }
+    if let p = el.attr("presentationTimeOffset") {
+        info.presentationTimeOffset = parseInt(p).valueOr(0)
+    }
+    if let a = el.attr("availabilityTimeOffset") {
+        info.availabilityTimeOffset = parseFloat(a).valueOr(0.0)
+    }
+    if let mt = el.attr("media") {
+        info.media = mt
+    }
+    if let it = el.attr("initialization") {
+        info.initTemplate = it
+        info.hasInit = true
+    }
+    if let ir = el.attr("indexRange") {
+        let (o, l) = dashRange(ir)
+        info.indexOffset = o
+        info.indexLength = l
+    }
+    if let ie = el.child("Initialization", anyPrefix: true) {
+        info.hasInit = true
+        info.initTemplate = ""
+        info.initUrl = ie.attrOr("sourceURL", "")
+        let (o, l) = dashRange(ie.attrOr("range", ""))
+        info.initOffset = o
+        info.initLength = l
+    }
+    if let tl = el.child("SegmentTimeline", anyPrefix: true) {
+        info.timeline = []
+        for s in tl.children("S", anyPrefix: true) {
+            info.timeline.append(parseInt(s.attrOr("t", "-1")).valueOr(-1))
+            info.timeline.append(parseInt(s.attrOr("d", "0")).valueOr(0))
+            info.timeline.append(parseInt(s.attrOr("r", "0")).valueOr(0))
+        }
+    }
+    let urls = el.children("SegmentURL", anyPrefix: true)
+    if !urls.isEmpty {
+        info.listUrls = []
+        info.listRanges = []
+        for u in urls {
+            info.listUrls.append(u.attrOr("media", ""))
+            let (o, l) = dashRange(u.attrOr("mediaRange", ""))
+            info.listRanges.append(o)
+            info.listRanges.append(l)
+        }
+    }
+    info
+}
+
+// Fills a representation's init and media segments.
+fn dashExpand(_ m: DashManifest, _ p: DashPeriod, _ r: bind DashRepresentation, _ now: Float) {
+    let info = r.info
+    let base = r.baseUrl
+    let ts = Float(info.timescale)
+    let pto = info.presentationTimeOffset
+    match info.kind {
+        "" -> {
+            // Only a BaseURL: the whole file is one segment.
+            r.segments = [DashSegment(url: base, start: p.start, duration: max(p.duration, 0.0))]
+        }
+        "base" -> {
+            if info.hasInit {
+                r.initialization = DashSegment(url: if info.initUrl.isEmpty { base } else { resolveUrl(base, info.initUrl) }, offset: info.initOffset, length: info.initLength)
+            }
+            r.indexOffset = info.indexOffset
+            r.indexLength = info.indexLength
+            r.needsIndex = info.indexOffset >= 0
+            r.segments = [DashSegment(url: base, start: p.start, duration: max(p.duration, 0.0))]
+        }
+        "list" -> {
+            if info.hasInit {
+                r.initialization = DashSegment(url: if info.initUrl.isEmpty { base } else { resolveUrl(base, info.initUrl) }, offset: info.initOffset, length: info.initLength)
+            }
+            var times = dashTimeline(info, p)
+            var segs: [DashSegment] = []
+            for (k, u) in info.listUrls.enumerated() {
+                var s = DashSegment(url: if u.isEmpty { base } else { resolveUrl(base, u) }, offset: info.listRanges[k * 2], length: info.listRanges[k * 2 + 1])
+                s.number = info.startNumber + k
+                if k * 2 + 1 < times.count {
+                    s.time = times[k * 2]
+                    s.start = p.start + Float(times[k * 2] - pto) / ts
+                    s.duration = Float(times[k * 2 + 1]) / ts
+                } else if info.duration > 0 {
+                    s.time = k * info.duration
+                    s.start = p.start + Float(k * info.duration - pto) / ts
+                    s.duration = Float(info.duration) / ts
+                }
+                segs.append(s)
+            }
+            r.segments = segs
+        }
+        _ -> {
+            if info.hasInit && !info.initTemplate.isEmpty {
+                r.initialization = DashSegment(url: resolveUrl(base, dashTemplate(info.initTemplate, r.id, r.bandwidth, 0, 0)))
+            } else if info.hasInit && !info.initUrl.isEmpty {
+                r.initialization = DashSegment(url: resolveUrl(base, info.initUrl), offset: info.initOffset, length: info.initLength)
+            }
+            if m.type == "dynamic" && info.timeline.isEmpty {
+                r.segments = dashLiveSegments(m, p, r, now: if now < 0.0 { 0.0 } else { now })
+            } else {
+                r.segments = dashTemplateSegments(info, p, r, -1, -1)
+            }
+        }
+    }
+}
+
+// The (time, duration) pairs of a SegmentTimeline, r = -1 repeating up to
+// the next S or the end of the period (§5.3.9.6).
+fn dashTimeline(_ info: DashSegmentInfo, _ p: DashPeriod) -> [Int] {
+    var out: [Int] = []
+    let tl = info.timeline
+    var t = 0
+    var i = 0
+    let n = tl.count / 3
+    while i < n {
+        if tl[i * 3] >= 0 {
+            t = tl[i * 3]
+        }
+        let d = tl[i * 3 + 1]
+        var r = tl[i * 3 + 2]
+        if d <= 0 {
+            i += 1
+            continue
+        }
+        if r < 0 {
+            // Up to the next S's t, or the end of the period.
+            var until = -1
+            if i + 1 < n && tl[(i + 1) * 3] >= 0 {
+                until = tl[(i + 1) * 3]
+            } else if p.duration > 0.0 {
+                until = info.presentationTimeOffset + Int(p.duration * Float(info.timescale) + 0.5)
+            }
+            r = if until > t { (until - t + d - 1) / d - 1 } else { 0 }
+        }
+        for _ in 0..r + 1 {
+            out.append(t)
+            out.append(d)
+            t += d
+            if out.count > 2000000 {
+                return out
+            }
+        }
+        i += 1
+    }
+    out
+}
+
+// SegmentTemplate segments; with fromNumber/toNumber ≥ 0 only those
+// numbers (for live windows without a timeline).
+fn dashTemplateSegments(_ info: DashSegmentInfo, _ p: DashPeriod, _ r: DashRepresentation, _ fromNumber: Int, _ toNumber: Int) -> [DashSegment] {
+    let ts = Float(info.timescale)
+    let pto = info.presentationTimeOffset
+    var segs: [DashSegment] = []
+    if !info.timeline.isEmpty {
+        let times = dashTimeline(info, p)
+        var k = 0
+        while k * 2 + 1 < times.count {
+            let num = info.startNumber + k
+            let t = times[k * 2]
+            var s = DashSegment(url: resolveUrl(r.baseUrl, dashTemplate(info.media, r.id, r.bandwidth, num, t)))
+            s.number = num
+            s.time = t
+            s.start = p.start + Float(t - pto) / ts
+            s.duration = Float(times[k * 2 + 1]) / ts
+            segs.append(s)
+            k += 1
+        }
+        return segs
+    }
+    if info.duration <= 0 {
+        return segs
+    }
+    let segDur = Float(info.duration) / ts
+    var first = info.startNumber
+    var last = info.startNumber
+    if fromNumber >= 0 {
+        first = fromNumber
+        last = toNumber
+    } else if p.duration > 0.0 {
+        last = info.startNumber + Int(ceil(p.duration / segDur - 0.0001)) - 1
+    } else {
+        last = info.startNumber - 1
+    }
+    if info.endNumber >= 0 {
+        last = min(last, info.endNumber)
+    }
+    var num = first
+    while num <= last {
+        let k = num - info.startNumber
+        let t = k * info.duration + pto
+        var s = DashSegment(url: resolveUrl(r.baseUrl, dashTemplate(info.media, r.id, r.bandwidth, num, t)))
+        s.number = num
+        s.time = t
+        s.start = p.start + Float(k) * segDur
+        s.duration = segDur
+        if p.duration > 0.0 && fromNumber < 0 {
+            s.duration = min(segDur, p.start + p.duration - s.start)
+        }
+        segs.append(s)
+        num += 1
+    }
+    segs
+}
+
+// The segments of a dynamic presentation's representation available at
+// `now` (seconds since 1970): §5.3.9.5.3 — a segment is available from
+// availabilityStartTime + period start + its end (minus
+// availabilityTimeOffset), for timeShiftBufferDepth.
+public fn dashLiveSegments(_ m: DashManifest, _ p: DashPeriod, _ r: DashRepresentation, now: Float) -> [DashSegment] {
+    let info = r.info
+    if !info.timeline.isEmpty || info.kind != "template" || info.duration <= 0 {
+        return dashTemplateSegments(info, p, r, -1, -1)
+    }
+    let segDur = Float(info.duration) / Float(info.timescale)
+    let ast = max(m.availabilityStartTime, 0.0)
+    // Time since the period began, as of now.
+    let elapsed = now - ast - p.start + info.availabilityTimeOffset
+    if elapsed < segDur {
+        return []
+    }
+    // Segments whose end ≤ elapsed are available.
+    let lastK = Int(floor(elapsed / segDur)) - 1
+    var firstK = 0
+    if m.timeShiftBufferDepth >= 0.0 {
+        firstK = max(0, Int(floor((elapsed - m.timeShiftBufferDepth) / segDur)))
+    }
+    if p.duration > 0.0 {
+        let total = Int(ceil(p.duration / segDur - 0.0001))
+        if lastK >= total {
+            return dashTemplateSegments(info, p, r, info.startNumber + firstK, info.startNumber + total - 1)
+        }
+    }
+    dashTemplateSegments(info, p, r, info.startNumber + firstK, info.startNumber + lastK)
+}
+
+// The live edge to start at (seconds on the presentation timeline):
+// suggestedPresentationDelay (else 3 segments, at least minBufferTime)
+// before the newest segment's end.
+public fn dashLiveStart(_ m: DashManifest, _ r: DashRepresentation) -> Float {
+    if r.segments.isEmpty {
+        return 0.0
+    }
+    let l = r.segments[r.segments.count - 1]
+    let end = l.start + l.duration
+    var delay = m.suggestedPresentationDelay
+    if delay < 0.0 {
+        delay = max(3.0 * l.duration, m.minBufferTime)
+    }
+    max(r.segments[0].start, end - delay)
+}
+
+// Expands a segment template (§5.3.9.4.4): $RepresentationID$, $Number$,
+// $Bandwidth$, $Time$ with optional %0Nd widths, and $$.
+public fn dashTemplate(_ t: String, _ id: String, _ bandwidth: Int, _ number: Int, _ time: Int) -> String {
+    if !t.contains("$") {
+        return t
+    }
+    let parts = t.split("$")
+    var out = parts[0]
+    var i = 1
+    while i < parts.count {
+        let ident = parts[i]
+        if i + 1 >= parts.count {
+            // An unpaired $: keep it.
+            out += "$" + ident
+            break
+        }
+        if ident.isEmpty {
+            out += "$"
+        } else {
+            var name = ident
+            var fmt = ""
+            if let f = ident.find("%") {
+                name = ident.substring(from: 0, to: f)
+                fmt = ident.substring(from: f, to: ident.count)
+            }
+            out += match name {
+                "RepresentationID" -> id
+                "Number" -> dashFormat(number, fmt)
+                "Bandwidth" -> dashFormat(bandwidth, fmt)
+                "Time" -> dashFormat(time, fmt)
+                "SubNumber" -> dashFormat(0, fmt)
+                _ -> "$" + ident + "$"
+            }
+        }
+        out += parts[i + 1]
+        i += 2
+    }
+    out
+}
+
+// printf %0Nd / %Nd / %d (and x, X, o) for template identifiers.
+fn dashFormat(_ v: Int, _ fmt: String) -> String {
+    if fmt.isEmpty {
+        return "{v}"
+    }
+    var f = fmt.substring(from: 1, to: fmt.count)
+    var conv = "d"
+    if f.hasSuffix("d") || f.hasSuffix("x") || f.hasSuffix("X") || f.hasSuffix("o") || f.hasSuffix("i") || f.hasSuffix("u") {
+        conv = f.substring(from: f.count - 1, to: f.count)
+        f = f.substring(from: 0, to: f.count - 1)
+    }
+    let zero = f.hasPrefix("0")
+    let width = parseInt(if f.isEmpty { "0" } else { f }).valueOr(0)
+    var s = "{v}"
+    if conv == "x" || conv == "X" || conv == "o" {
+        let base = if conv == "o" { 8 } else { 16 }
+        let digits = if conv == "X" { "0123456789ABCDEF" } else { "0123456789abcdef" }
+        var n = v
+        s = ""
+        if n == 0 {
+            s = "0"
+        }
+        while n > 0 {
+            s = (digits.character(at: n % base) ?? "0") + s
+            n = n / base
+        }
+    }
+    s.padStart(width, with: if zero { "0" } else { " " })
+}
+
+// ISO 8601 durations (xs:duration) as MPDs write them: "PT1H2M3.5S",
+// "P1DT12H", "PT0S". Years count 365 days and months 30. -1 when empty or
+// unreadable.
+public fn dashDuration(_ text: String) -> Float {
+    var s = text.trim()
+    if s.isEmpty {
+        return -1.0
+    }
+    var sign = 1.0
+    if s.hasPrefix("-") {
+        sign = -1.0
+        s = s.substring(from: 1, to: s.count)
+    }
+    if !s.hasPrefix("P") {
+        return -1.0
+    }
+    var total = 0.0
+    var num = ""
+    var inTime = false
+    for ch in s.substring(from: 1, to: s.count).characters {
+        if ch == "T" {
+            inTime = true
+            continue
+        }
+        if (ch >= "0" && ch <= "9") || ch == "." {
+            num += ch
+            continue
+        }
+        let v = parseFloat(if num.isEmpty { "0" } else { num }).valueOr(0.0)
+        num = ""
+        if inTime {
+            total += match ch {
+                "H" -> v * 3600.0
+                "M" -> v * 60.0
+                "S" -> v
+                _ -> 0.0
+            }
+        } else {
+            total += match ch {
+                "Y" -> v * 365.0 * 86400.0
+                "M" -> v * 30.0 * 86400.0
+                "W" -> v * 7.0 * 86400.0
+                "D" -> v * 86400.0
+                _ -> 0.0
+            }
+        }
+    }
+    sign * total
+}
+
+// One reference of a `sidx` box (ISO/IEC 14496-12 §8.16.3).
+public struct SidxEntry {
+    // Byte offset in the file and size.
+    offset: Int
+    size: Int
+    // Seconds.
+    start: Float
+    duration: Float
+    // Points to another sidx rather than media.
+    isIndex: Bool = false
+    startsWithSap: Bool = false
+}
+
+// Parses a `sidx` box found at `boxOffset` of a file whose bytes from
+// `boxOffset` are `d` (the box first). Gives its references with their
+// byte offsets in the file.
+public fn parseSidx(_ d: Data, boxOffset: Int = 0) -> Result<[SidxEntry]> {
+    // Find the sidx box (it may follow other boxes in the given range).
+    var p = 0
+    while p + 8 <= d.count {
+        var size = d.uint32(at: p, bigEndian: true)
+        let type = d.slice(from: p + 4, to: p + 8).latin1
+        var hdr = 8
+        if size == 1 && p + 16 <= d.count {
+            size = d.int64(at: p + 8, bigEndian: true)
+            hdr = 16
+        }
+        if size < 8 {
+            break
+        }
+        if type == "sidx" {
+            return dashSidxBody(d, p, p + hdr, min(d.count, p + size), boxOffset)
+        }
+        p += size
+    }
+    Result.failure(error: Error("DASH: no sidx box in the index range"))
+}
+
+fn dashSidxBody(_ d: Data, _ box: Int, _ s: Int, _ e: Int, _ boxOffset: Int) -> Result<[SidxEntry]> {
+    if s + 24 > e {
+        return Result.failure(error: Error("DASH: sidx box too short"))
+    }
+    let version = d[s]
+    let timescale = max(1, d.uint32(at: s + 8, bigEndian: true))
+    var q = s + 12
+    var ept = 0
+    var first = 0
+    if version == 0 {
+        ept = d.uint32(at: q, bigEndian: true)
+        first = d.uint32(at: q + 4, bigEndian: true)
+        q += 8
+    } else {
+        ept = d.int64(at: q, bigEndian: true)
+        first = d.int64(at: q + 8, bigEndian: true)
+        q += 16
+    }
+    q += 2
+    let count = d.uint16(at: q, bigEndian: true)
+    q += 2
+    // The anchor: the first byte after the sidx box.
+    var offset = boxOffset + e + first
+    var t = ept
+    var out: [SidxEntry] = []
+    for _ in 0..count {
+        if q + 12 > e {
+            break
+        }
+        let w = d.uint32(at: q, bigEndian: true)
+        let dur = d.uint32(at: q + 4, bigEndian: true)
+        let sap = d.uint32(at: q + 8, bigEndian: true)
+        let size = w & 0x7fffffff
+        out.append(SidxEntry(offset: offset, size: size, start: Float(t) / Float(timescale), duration: Float(dur) / Float(timescale), isIndex: (w >> 31) == 1, startsWithSap: (sap >> 31) == 1))
+        offset += size
+        t += dur
+        q += 12
+    }
+    Result.ok(value: out)
+}
+
+// Fills a SegmentBase representation's segments from its loaded index
+// range (`index` holds the bytes of [indexOffset, indexOffset+indexLength)).
+public fn dashApplySidx(_ r: DashRepresentation, _ index: Data, periodStart: Float = 0.0) -> Result<DashRepresentation> {
+    let entries = try parseSidx(index, boxOffset: r.indexOffset)
+    var out = r
+    var segs: [DashSegment] = []
+    let pto = Float(r.info.presentationTimeOffset) / Float(max(1, r.info.timescale))
+    let ptoUsed = if r.info.hasTimescale { pto } else { 0.0 }
+    for (k, e) in entries.enumerated() {
+        var s = DashSegment(url: r.baseUrl, offset: e.offset, length: e.size)
+        s.start = periodStart + e.start - ptoUsed
+        s.duration = e.duration
+        s.number = k + 1
+        segs.append(s)
+    }
+    out.segments = segs
+    out.needsIndex = false
+    if out.initialization.url.isEmpty && r.indexOffset > 0 {
+        // Without an Initialization element the init section is the start
+        // of the file, before the index.
+        out.initialization = DashSegment(url: r.baseUrl, offset: 0, length: r.indexOffset)
+    }
+    Result.ok(value: out)
+}

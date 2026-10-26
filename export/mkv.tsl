@@ -1,0 +1,812 @@
+// The Matroska writer (RFC 9559, on EBML RFC 8794): writes a ClipPlan as
+// an .mkv (or .webm when every codec is a WebM one).
+//
+// Layout (all sizes are known before anything is written, so the file is
+// written front to back in pieces, with an index at the front):
+//   EBML header (DocType, versions)
+//   Segment (size known)
+//     SeekHead      positions of the elements below (§5.1.1)
+//     Info          TimestampScale 1 ms, Duration, Title, MuxingApp (§5.1.2)
+//     Tracks        one TrackEntry per track (§5.1.4), CodecID and
+//                   CodecPrivate from core.Track.extra (the inverse of
+//                   demux/mkv.tsl's mapping; see exMkvCodec)
+//     Chapters      one edition (§5.1.7)
+//     Tags          file tags + each track's DURATION (§5.1.8)
+//     Attachments   fonts etc. and the cover (§5.1.6)
+//     Cues          one CuePoint per video keyframe cluster (§5.1.5)
+//     Cluster*      Timestamp + SimpleBlocks (BlockGroups with
+//                   BlockDuration for subtitles) (§5.1.3, §10)
+// Positions inside the Segment are written as 8-byte unsigned integers so
+// the sizes don't depend on the values.
+//
+// Block times are pts in milliseconds + the track's CodecDelay (Opus
+// pre-skip; §5.1.4.1.25 says players subtract it). A clip planned with
+// exactStart keeps its negative times (pictures before the cut get the
+// invisible flag, §10.2); other plans are shifted so no block is negative.
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+import "../core"
+
+// What a writer did.
+public struct WriteResult {
+    // Bytes written.
+    bytes: Int = 0
+    // The whole output when it was written to memory (path "").
+    data: Data = Data()
+    // Tracks left out, things changed on the way.
+    warnings: [String] = []
+}
+
+// A track as the Matroska writer writes it.
+struct ExMkvTrack {
+    keep: Bool = false
+    number: Int = 0
+    uid: Int = 0
+    codecId: String = ""
+    priv: Data = Data()
+    mode: Int = 0
+    hevc: Bool = false
+    delayNs: Int = 0
+    delayMs: Int = 0
+    preRollNs: Int = 0
+    // SamplingFrequency when it isn't the output rate (HE-AAC's core rate).
+    coreRate: Int = 0
+}
+
+struct ExCluster {
+    first: Int = 0
+    count: Int = 0
+    time: Int = 0
+    size: Int = 0
+    pos: Int = 0
+    cueTime: Int = -1
+}
+
+// Writes `plan` (packets read from `file`) as Matroska to `path`, or to
+// memory when path is "" (then the result's `data`).
+public fn writeMkv(_ file: Data, _ plan0: ClipPlan, path: String = "", title: String = "") -> Result<WriteResult> {
+    let plan = withoutEmptySubtitles(file, plan0)
+    var res = WriteResult()
+    res.warnings = plan.warnings
+    let scale = 1000000
+    // Tracks.
+    var outs: [ExMkvTrack] = []
+    var number = 0
+    var webm = true
+    var firstPacket: [Int] = []
+    for _ in plan.tracks {
+        firstPacket.append(-1)
+    }
+    for (j, p) in plan.packets.enumerated() {
+        if firstPacket[p.track] < 0 {
+            firstPacket[p.track] = j
+        }
+    }
+    for (k, t) in plan.tracks.enumerated() {
+        var o = exMkvCodec(t)
+        o.mode = payloadMode(t, mp4: false)
+        if !o.keep {
+            res.warnings.append("track {plan.sources[k]} ({t.codec}) can't be stored in Matroska and was left out")
+            outs.append(o)
+            continue
+        }
+        if firstPacket[k] < 0 && t.kind != .subtitle {
+            res.warnings.append("track {plan.sources[k]} ({t.codec}) has no packets and was left out")
+            o.keep = false
+            outs.append(o)
+            continue
+        }
+        // Setup that has to come from the packets.
+        if o.mode == exAnnexB {
+            var ps = ExParamSets()
+            var seen = 0
+            for p in plan.packets {
+                if p.track == k && seen < 300 && !ps.complete(o.hevc) {
+                    ps.collect(exSourceBytes(file, plan.prefixes[k], p), o.hevc)
+                    seen += 1
+                }
+            }
+            o.priv = if o.hevc { exBuildHvcC(ps) } else { exBuildAvcC(ps) }
+            if o.priv.isEmpty {
+                res.warnings.append("track {plan.sources[k]}: no parameter sets found in the stream")
+            }
+        } else if o.mode == exAdts && firstPacket[k] >= 0 {
+            o.priv = exAscFromAdts(exSourceBytes(file, plan.prefixes[k], plan.packets[firstPacket[k]]))
+        }
+        if t.codec == "aac" {
+            let core0 = exAscRate(o.priv)
+            if core0 > 0 && t.sampleRate > 0 && core0 != t.sampleRate {
+                o.coreRate = core0
+            }
+        }
+        number += 1
+        o.number = number
+        o.uid = exUid(number)
+        if !exWebmCodec(t.codec) {
+            webm = false
+        }
+        outs.append(o)
+    }
+    if number == 0 {
+        return Result.failure(error: Error("none of the tracks can be stored in Matroska"))
+    }
+    // Block times (ms) and payload sizes.
+    let n = plan.packets.count
+    var times: [Int] = []
+    var sizes: [Int] = []
+    var minTime = 0
+    for p in plan.packets {
+        let o = outs[p.track]
+        if !o.keep {
+            times.append(0)
+            sizes.append(0)
+            continue
+        }
+        let ts = plan.tracks[p.track].timescale
+        let tm = exRescale(p.pts, ts, 1000) + o.delayMs
+        times.append(tm)
+        minTime = min(minTime, tm)
+        if o.mode == exCopy {
+            sizes.append(plan.prefixes[p.track].count + p.size)
+        } else {
+            sizes.append(exTransform(exSourceBytes(file, plan.prefixes[p.track], p), o.mode, o.hevc).count)
+        }
+    }
+    var shift = 0
+    if minTime < 0 && !plan.exactStart {
+        shift = -minTime
+        for j in 0..n {
+            times[j] += shift
+        }
+    }
+    // The track cues point at: the first video track, else the first.
+    var cueTrack = -1
+    for (k, o) in outs.enumerated() {
+        if o.keep && cueTrack < 0 && plan.tracks[k].kind == .video {
+            cueTrack = k
+        }
+    }
+    let hasVideo = cueTrack >= 0
+    if cueTrack < 0 {
+        for (k, o) in outs.enumerated() {
+            if o.keep && cueTrack < 0 {
+                cueTrack = k
+            }
+        }
+    }
+    // Clusters.
+    var clusters: [ExCluster] = []
+    var cur = ExCluster()
+    var curBytes = 0
+    var open = false
+    for j in 0..n {
+        let p = plan.packets[j]
+        if !outs[p.track].keep {
+            continue
+        }
+        var tm = times[j]
+        let isCueKey = p.track == cueTrack && p.key
+        var startNew = !open
+        if open {
+            let rel = tm - cur.time
+            if rel > 32767 || rel < -32768 || curBytes > 8388608 {
+                startNew = true
+            } else if hasVideo && isCueKey && cur.count > 0 {
+                startNew = true
+            } else if !hasVideo && rel > 5000 {
+                startNew = true
+            } else if hasVideo && rel > 10000 && p.track == cueTrack {
+                startNew = true
+            }
+        }
+        if startNew {
+            if open {
+                clusters.append(cur)
+            }
+            cur = ExCluster(first: j, count: 0, time: max(0, tm), size: 0)
+            curBytes = 0
+            open = true
+        }
+        if tm - cur.time < -32768 {
+            tm = cur.time - 32768
+            times[j] = tm
+        }
+        if isCueKey && cur.cueTime < 0 {
+            cur.cueTime = tm
+        }
+        cur.count = j - cur.first + 1
+        curBytes += sizes[j]
+    }
+    if open {
+        clusters.append(cur)
+    }
+    // Cluster sizes.
+    for c in 0..clusters.count {
+        var body = exUint(0xE7, clusters[c].time).count
+        for j in clusters[c].first..(clusters[c].first + clusters[c].count) {
+            let p = plan.packets[j]
+            if !outs[p.track].keep {
+                continue
+            }
+            body += exBlockSize(plan.tracks[p.track].kind == .subtitle, outs[p.track].number, sizes[j], exMkvDuration(p, plan.tracks[p.track]))
+        }
+        clusters[c].size = exElSize(0x1F43B675, body)
+    }
+    // Header elements.
+    let docType = if webm { "webm" } else { "matroska" }
+    var ebml = Data()
+    ebml += exUint(0x4286, 1)
+    ebml += exUint(0x42F7, 1)
+    ebml += exUint(0x42F2, 4)
+    ebml += exUint(0x42F3, 8)
+    ebml += exString(0x4282, docType)
+    ebml += exUint(0x4287, 4)
+    ebml += exUint(0x4285, 2)
+    let header = exEl(0x1A45DFA3, ebml)
+    var info = Data()
+    info += exUint(0x2AD7B1, scale)
+    info += exFloat(0x4489, (plan.duration * 1000.0) + Float(shift))
+    let name = if title.isEmpty { plan.tags["title"] ?? "" } else { title }
+    if !name.isEmpty {
+        info += exString(0x7BA9, name)
+    }
+    info += exString(0x4D80, "Reel")
+    info += exString(0x5741, "Reel")
+    let infoEl = exEl(0x1549A966, info)
+    var tracksBody = Data()
+    var defaultSeen: [core.TrackKind] = []
+    for t in plan.tracks {
+        if t.isDefault && !defaultSeen.contains(t.kind) {
+            defaultSeen.append(t.kind)
+        }
+    }
+    for (k, t) in plan.tracks.enumerated() {
+        let o = outs[k]
+        if !o.keep {
+            continue
+        }
+        var isDefault = t.isDefault
+        if !defaultSeen.contains(t.kind) {
+            isDefault = true
+            defaultSeen.append(t.kind)
+        }
+        tracksBody += exEl(0xAE, exTrackEntry(t, o, isDefault))
+    }
+    let tracksEl = exEl(0x1654AE6B, tracksBody)
+    let chaptersEl = exChaptersEl(plan.chapters, Float(shift) / 1000.0)
+    let tagsEl = exTagsEl(plan, outs, Float(shift) / 1000.0)
+    let attachEl = exAttachmentsEl(plan)
+    // Positions inside the Segment body.
+    var seekIds: [Int] = [0x1549A966, 0x1654AE6B]
+    if !chaptersEl.isEmpty {
+        seekIds.append(0x1043A770)
+    }
+    if !tagsEl.isEmpty {
+        seekIds.append(0x1254C367)
+    }
+    if !attachEl.isEmpty {
+        seekIds.append(0x1941A469)
+    }
+    seekIds.append(0x1C53BB6B)
+    let seekSize = exSeekHead(seekIds, seekIds).count
+    let cuesSize = exCuesEl(clusters, outs[cueTrack].number).count
+    var pos = seekSize
+    var seekPos: [Int] = []
+    seekPos.append(pos)
+    pos += infoEl.count
+    seekPos.append(pos)
+    pos += tracksEl.count
+    if !chaptersEl.isEmpty {
+        seekPos.append(pos)
+        pos += chaptersEl.count
+    }
+    if !tagsEl.isEmpty {
+        seekPos.append(pos)
+        pos += tagsEl.count
+    }
+    if !attachEl.isEmpty {
+        seekPos.append(pos)
+        pos += attachEl.count
+    }
+    seekPos.append(pos)
+    pos += cuesSize
+    for c in 0..clusters.count {
+        clusters[c].pos = pos
+        pos += clusters[c].size
+    }
+    let segmentSize = pos
+    // Write.
+    var sink = newSink(path)
+    sink.put(header)
+    var segHead = exId(0x18538067)
+    segHead += exVint(segmentSize, 8)
+    sink.put(segHead)
+    sink.put(exSeekHead(seekIds, seekPos))
+    sink.put(infoEl)
+    sink.put(tracksEl)
+    sink.put(chaptersEl)
+    sink.put(tagsEl)
+    sink.put(attachEl)
+    sink.put(exCuesEl(clusters, outs[cueTrack].number))
+    for c in clusters {
+        var body = exUint(0xE7, c.time).count
+        for j in c.first..(c.first + c.count) {
+            let p = plan.packets[j]
+            if outs[p.track].keep {
+                body += exBlockSize(plan.tracks[p.track].kind == .subtitle, outs[p.track].number, sizes[j], exMkvDuration(p, plan.tracks[p.track]))
+            }
+        }
+        var head = exElHead(0x1F43B675, body)
+        head += exUint(0xE7, c.time)
+        sink.put(head)
+        for j in c.first..(c.first + c.count) {
+            let p = plan.packets[j]
+            let o = outs[p.track]
+            if !o.keep {
+                continue
+            }
+            var payload = exSourceBytes(file, plan.prefixes[p.track], p)
+            if o.mode != exCopy {
+                payload = exTransform(payload, o.mode, o.hevc)
+            }
+            let t = plan.tracks[p.track]
+            let invisible = plan.exactStart && t.kind == .video && p.pts < 0
+            sink.put(exBlockHead(t.kind == .subtitle, o.number, times[j] - c.time, p.key || t.kind != .video, invisible, payload.count, exMkvDuration(p, t)))
+            sink.put(payload)
+        }
+    }
+    sink.flush()
+    if sink.failed {
+        return Result.failure(error: Error("couldn't write {path}"))
+    }
+    res.bytes = sink.written
+    if path.isEmpty {
+        res.data = sink.data
+    }
+    Result.ok(value: res)
+}
+
+// A subtitle's (or any BlockGroup's) duration in ms.
+fn exMkvDuration(_ p: core.PacketRef, _ t: core.Track) -> Int {
+    if t.kind != .subtitle {
+        return 0
+    }
+    max(0, exRescale(p.duration, t.timescale, 1000))
+}
+
+// The bytes a block takes in its cluster: a SimpleBlock, or for subtitles
+// a BlockGroup { Block, BlockDuration }.
+fn exBlockSize(_ group: Bool, _ number: Int, _ payload: Int, _ dur: Int) -> Int {
+    let body = exVintLen(number) + 3 + payload
+    if !group {
+        return exElSize(0xA3, body)
+    }
+    let inner = exElSize(0xA1, body) + exUint(0x9B, dur).count
+    exElSize(0xA0, inner)
+}
+
+// Everything of a block before its frame's bytes (§10.1: track number,
+// 16-bit signed relative time, flags).
+fn exBlockHead(_ group: Bool, _ number: Int, _ rel: Int, _ key: Bool, _ invisible: Bool, _ payload: Int, _ dur: Int) -> Data {
+    let body = exVintLen(number) + 3 + payload
+    var head = Data()
+    if group {
+        let inner = exElSize(0xA1, body) + exUint(0x9B, dur).count
+        head += exElHead(0xA0, inner)
+        // BlockDuration goes first so the Block's bytes can follow last.
+        head += exUint(0x9B, dur)
+        head += exElHead(0xA1, body)
+    } else {
+        head += exElHead(0xA3, body)
+    }
+    head += exVint(number, exVintLen(number))
+    let r = rel & 0xFFFF
+    head.append(byte: r >> 8)
+    head.append(byte: r & 255)
+    var flags = 0
+    if !group && key {
+        flags = flags | 0x80
+    }
+    if invisible {
+        flags = flags | 0x08
+    }
+    head.append(byte: flags)
+    head
+}
+
+fn exSeekHead(_ ids: [Int], _ positions: [Int]) -> Data {
+    var body = Data()
+    for (i, id) in ids.enumerated() {
+        var s = Data()
+        s += exEl(0x53AB, exId(id))
+        s += exUint8(0x53AC, positions[i])
+        body += exEl(0x4DBB, s)
+    }
+    exEl(0x114D9B74, body)
+}
+
+fn exCuesEl(_ clusters: [ExCluster], _ trackNumber: Int) -> Data {
+    var body = Data()
+    for c in clusters {
+        if c.cueTime < 0 {
+            continue
+        }
+        var tp = Data()
+        tp += exUint(0xF7, trackNumber)
+        tp += exUint8(0xF1, c.pos)
+        var cp = Data()
+        cp += exUint(0xB3, max(0, c.cueTime))
+        cp += exEl(0xB7, tp)
+        body += exEl(0xBB, cp)
+    }
+    if body.isEmpty {
+        // A Cues element needs a CuePoint: point at the first cluster.
+        if !clusters.isEmpty {
+            var tp = Data()
+            tp += exUint(0xF7, trackNumber)
+            tp += exUint8(0xF1, clusters[0].pos)
+            var cp = Data()
+            cp += exUint(0xB3, clusters[0].time)
+            cp += exEl(0xB7, tp)
+            body += exEl(0xBB, cp)
+        }
+    }
+    exEl(0x1C53BB6B, body)
+}
+
+fn exTrackEntry(_ t: core.Track, _ o: ExMkvTrack, _ isDefault: Bool) -> Data {
+    var e = Data()
+    e += exUint(0xD7, o.number)
+    e += exUint(0x73C5, o.uid)
+    let type = match t.kind {
+        .video -> 1
+        .audio -> 2
+        .subtitle -> 0x11
+        _ -> 0x11
+    }
+    e += exUint(0x83, type)
+    e += exUint(0x88, if isDefault { 1 } else { 0 })
+    if t.isForced {
+        e += exUint(0x55AA, 1)
+    }
+    e += exUint(0x9C, 0)
+    if !t.title.isEmpty {
+        e += exString(0x536E, t.title)
+    }
+    e += exString(0x22B59C, if t.language.isEmpty { "und" } else { t.language })
+    e += exString(0x86, o.codecId)
+    if !o.priv.isEmpty {
+        e += exEl(0x63A2, o.priv)
+    }
+    if o.delayNs > 0 {
+        e += exUint(0x56AA, o.delayNs)
+    }
+    if o.preRollNs > 0 {
+        e += exUint(0x56BB, o.preRollNs)
+    }
+    if t.kind == .video {
+        if t.fpsNum > 0 && t.fpsDen > 0 {
+            e += exUint(0x23E383, exRescale(t.fpsDen, t.fpsNum, 1000000000))
+        }
+        var v = Data()
+        v += exUint(0xB0, t.width)
+        v += exUint(0xBA, t.height)
+        if t.sarNum > 0 && t.sarDen > 0 && t.sarNum != t.sarDen {
+            v += exUint(0x54B0, max(1, (t.width * t.sarNum + t.sarDen / 2) / t.sarDen))
+            v += exUint(0x54BA, t.height)
+        }
+        let mc = match t.matrix {
+            .bt709 -> 1
+            .bt601 -> 6
+            .bt2020 -> 9
+            _ -> -1
+        }
+        if mc >= 0 || t.fullRange {
+            var c = Data()
+            if mc >= 0 {
+                c += exUint(0x55B1, mc)
+            }
+            c += exUint(0x55B9, if t.fullRange { 2 } else { 1 })
+            v += exEl(0x55B0, c)
+        }
+        e += exEl(0xE0, v)
+    } else if t.kind == .audio {
+        var a = Data()
+        if o.coreRate > 0 {
+            a += exFloat(0xB5, Float(o.coreRate))
+            a += exFloat(0x78B5, Float(t.sampleRate))
+        } else {
+            a += exFloat(0xB5, Float(max(1, t.sampleRate)))
+        }
+        a += exUint(0x9F, max(1, t.channels))
+        let bits = if t.codec == "pcm" { t.pcm.bits } else { t.bitsPerSample }
+        if bits > 0 {
+            a += exUint(0x6264, bits)
+        }
+        e += exEl(0xE1, a)
+    }
+    e
+}
+
+// The CodecID, CodecPrivate and packet rewrite for a track (RFC 9559
+// §19 and the Matroska codec mappings), the inverse of demux/mkv.tsl.
+fn exMkvCodec(_ t: core.Track) -> ExMkvTrack {
+    var o = ExMkvTrack(keep: true)
+    o.priv = t.extra
+    let c = t.codec
+    if c == "h264" || c == "hevc" {
+        o.codecId = if c == "h264" { "V_MPEG4/ISO/AVC" } else { "V_MPEGH/ISO/HEVC" }
+        o.hevc = c == "hevc"
+        if t.extra.isEmpty || exIsAnnexB(t.extra) {
+            o.mode = exAnnexB
+            o.priv = Data()
+        }
+        return o
+    }
+    if c == "aac" {
+        o.codecId = "A_AAC"
+        if t.adts || t.extra.isEmpty {
+            o.mode = exAdts
+            o.priv = exAscFor(t.sampleRate, t.channels)
+        }
+        return o
+    }
+    if c == "vorbis" || c == "theora" {
+        o.codecId = if c == "vorbis" { "A_VORBIS" } else { "V_THEORA" }
+        o.priv = exXiphLace(t.extra)
+        if o.priv.isEmpty {
+            o.keep = false
+        }
+        return o
+    }
+    if c == "opus" {
+        o.codecId = "A_OPUS"
+        if t.extra.count < 19 {
+            o.priv = exOpusHeadFor(t.channels)
+        }
+        let pre = exOpusPreSkip(o.priv)
+        o.delayNs = exRescale(pre, 48000, 1000000000)
+        o.delayMs = exRescale(pre, 48000, 1000)
+        o.preRollNs = 80000000
+        return o
+    }
+    if c == "pcm" {
+        let f = t.pcm
+        if f.float {
+            o.codecId = "A_PCM/FLOAT/IEEE"
+            if f.bigEndian {
+                o.keep = false
+            }
+        } else if f.bigEndian && f.bits > 8 {
+            o.codecId = "A_PCM/INT/BIG"
+        } else {
+            o.codecId = "A_PCM/INT/LIT"
+            // Matroska's 8-bit PCM is unsigned, as in WAV.
+            if f.bits == 8 && f.signed {
+                o.keep = false
+            }
+        }
+        o.priv = Data()
+        return o
+    }
+    if c == "alaw" || c == "ulaw" || c.hasPrefix("wma") {
+        let tag = match c {
+            "alaw" -> 6
+            "ulaw" -> 7
+            "wmav1" -> 0x160
+            "wmav2" -> 0x161
+            "wmapro" -> 0x162
+            _ -> 0x163
+        }
+        o.codecId = "A_MS/ACM"
+        o.priv = exWaveFormat(tag, t)
+        return o
+    }
+    let fourcc = exVfwFourcc(c)
+    if !fourcc.isEmpty {
+        o.codecId = "V_MS/VFW/FOURCC"
+        o.priv = exBitmapInfo(fourcc, t.width, t.height, t.extra)
+        return o
+    }
+    if c == "tx3g" || c == "text" {
+        o.codecId = "S_TEXT/UTF8"
+        o.priv = Data()
+        o.mode = if c == "tx3g" { exFromTx3g } else { exCopy }
+        return o
+    }
+    if c == "prores" {
+        o.codecId = "V_PRORES"
+        o.priv = if t.tag.count == 4 { exLatin1(t.tag, 4) } else { Data(text: "apcn") }
+        return o
+    }
+    o.codecId = match c {
+        "vp8" -> "V_VP8"
+        "vp9" -> "V_VP9"
+        "av1" -> "V_AV1"
+        "mpeg1" -> "V_MPEG1"
+        "mpeg2" -> "V_MPEG2"
+        "mpeg4" -> "V_MPEG4/ISO/ASP"
+        "msmpeg4v3" -> "V_MPEG4/MS/V3"
+        "mjpeg" -> "V_MJPEG"
+        "mp3" -> "A_MPEG/L3"
+        "mp2" -> "A_MPEG/L2"
+        "mp1" -> "A_MPEG/L1"
+        "flac" -> "A_FLAC"
+        "ac3" -> "A_AC3"
+        "eac3" -> "A_EAC3"
+        "dts" -> "A_DTS"
+        "truehd" -> "A_TRUEHD"
+        "mlp" -> "A_MLP"
+        "alac" -> "A_ALAC"
+        "srt" -> "S_TEXT/UTF8"
+        "ass" -> "S_TEXT/ASS"
+        "webvtt" -> "S_TEXT/WEBVTT"
+        "pgs" -> "S_HDMV/PGS"
+        "dvdsub" -> "S_VOBSUB"
+        "dvbsub" -> "S_DVBSUB"
+        _ -> ""
+    }
+    if o.codecId.isEmpty {
+        o.keep = false
+    }
+    if c == "vp9" && t.extra.count >= 4 && t.extra[0] == 1 {
+        // An MP4 vpcC: Matroska's VP9 CodecPrivate is optional; leave it out.
+        o.priv = Data()
+    }
+    if c == "webvtt" && t.extra.count > 0 {
+        // MP4's vttC holds the WebVTT file header; Matroska doesn't need it.
+        o.priv = Data()
+    }
+    if c == "mp3" || c == "mp2" || c == "mp1" || c == "ac3" || c == "eac3" || c == "dts" || c == "mjpeg" {
+        o.priv = Data()
+    }
+    o
+}
+
+fn exWebmCodec(_ c: String) -> Bool {
+    c == "vp8" || c == "vp9" || c == "av1" || c == "opus" || c == "vorbis" || c == "webvtt"
+}
+
+// The AudioSpecificConfig's core sampling rate, 0 when unknown.
+fn exAscRate(_ asc: Data) -> Int {
+    if asc.count < 2 {
+        return 0
+    }
+    let sfi = ((asc[0] & 7) << 1) | (asc[1] >> 7)
+    let rates = [96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350]
+    if sfi < rates.count { rates[sfi] } else { 0 }
+}
+
+// A TrackUID: any nonzero number unique in the file.
+fn exUid(_ n: Int) -> Int {
+    (0x5265656C << 8) + n * 7919
+}
+
+fn exChaptersEl(_ chapters: [core.Chapter], _ shift: Float) -> Data {
+    if chapters.isEmpty {
+        return Data()
+    }
+    var ed = Data()
+    ed += exUint(0x45BC, exUid(100))
+    for (i, c) in chapters.enumerated() {
+        var a = Data()
+        a += exUint(0x73C4, exUid(1000 + i))
+        a += exUint(0x91, Int((c.start + shift) * 1e9 + 0.5))
+        if c.end >= 0.0 {
+            a += exUint(0x92, Int((c.end + shift) * 1e9 + 0.5))
+        }
+        var disp = Data()
+        disp += exString(0x85, c.title)
+        disp += exString(0x437C, "eng")
+        a += exEl(0x80, disp)
+        ed += exEl(0xB6, a)
+    }
+    exEl(0x1043A770, exEl(0x45B9, ed))
+}
+
+// Reel's tag keys as Matroska tag names (RFC 9559 §5.1.8 / the Matroska
+// tagging guidelines).
+fn exMkvTagName(_ key: String) -> String {
+    match key {
+        "track" -> "PART_NUMBER"
+        "date" -> "DATE_RELEASED"
+        "albumartist" -> "ALBUM_ARTIST"
+        _ -> key.uppercase()
+    }
+}
+
+fn exSimpleTag(_ name: String, _ value: String) -> Data {
+    var s = Data()
+    s += exString(0x45A3, name)
+    s += exString(0x4487, value)
+    exEl(0x67C8, s)
+}
+
+fn exTagsEl(_ plan: ClipPlan, _ outs: [ExMkvTrack], _ shift: Float) -> Data {
+    var body = Data()
+    var simple = Data()
+    let keys = plan.tags.keys.sorted()
+    for k in keys {
+        if k == "delay" || k == "padding" || k == "duration" || k.isEmpty {
+            continue
+        }
+        simple += exSimpleTag(exMkvTagName(k), plan.tags[k] ?? "")
+    }
+    if !simple.isEmpty {
+        var tag = exEl(0x63C0, exUint(0x68CA, 50))
+        tag += simple
+        body += exEl(0x7373, tag)
+    }
+    // Each track's length, as "HH:MM:SS.nnnnnnnnn" (read back by players
+    // and by Reel's demuxer).
+    var ends: [Int] = []
+    for _ in plan.tracks {
+        ends.append(0)
+    }
+    for p in plan.packets {
+        let t = plan.tracks[p.track]
+        let e = exRescale(p.pts + max(0, p.duration), t.timescale, 1000000000)
+        ends[p.track] = max(ends[p.track], e)
+    }
+    for (k, o) in outs.enumerated() {
+        if !o.keep {
+            continue
+        }
+        let ns = ends[k] + Int(shift * 1e9)
+        let target = exEl(0x63C0, exUint(0x63C5, o.uid))
+        var tag = target
+        tag += exSimpleTag("DURATION", exDurationText(ns))
+        body += exEl(0x7373, tag)
+    }
+    exEl(0x1254C367, body)
+}
+
+fn exDurationText(_ ns: Int) -> String {
+    let v = max(0, ns)
+    let s = v / 1000000000
+    let frac = v % 1000000000
+    let h = s / 3600
+    let m = (s / 60) % 60
+    let sec = s % 60
+    "{h}".padStart(2, with: "0") + ":" + "{m}".padStart(2, with: "0") + ":" + "{sec}".padStart(2, with: "0") + "." + "{frac}".padStart(9, with: "0")
+}
+
+fn exAttachmentsEl(_ plan: ClipPlan) -> Data {
+    var body = Data()
+    var hasCover = false
+    for (i, a) in plan.attachments.enumerated() {
+        if a.name.lowercase().hasPrefix("cover.") {
+            hasCover = true
+        }
+        body += exEl(0x61A7, exAttachedFile(a, i))
+    }
+    if !plan.cover.isEmpty && !hasCover {
+        let png = plan.cover.count > 4 && plan.cover[0] == 0x89 && plan.cover[1] == 0x50
+        let a = core.Attachment(name: if png { "cover.png" } else { "cover.jpg" }, mime: if png { "image/png" } else { "image/jpeg" }, data: plan.cover)
+        body += exEl(0x61A7, exAttachedFile(a, plan.attachments.count))
+    }
+    if body.isEmpty {
+        return Data()
+    }
+    exEl(0x1941A469, body)
+}
+
+fn exAttachedFile(_ a: core.Attachment, _ i: Int) -> Data {
+    var f = Data()
+    f += exString(0x466E, if a.name.isEmpty { "attachment{i}" } else { a.name })
+    f += exString(0x4660, if a.mime.isEmpty { exGuessMime(a.name) } else { a.mime })
+    f += exEl(0x465C, a.data)
+    f += exUint(0x46AE, exUid(5000 + i))
+    f
+}
+
+fn exGuessMime(_ name: String) -> String {
+    let n = name.lowercase()
+    if n.hasSuffix(".ttf") { return "font/ttf" }
+    if n.hasSuffix(".otf") { return "font/otf" }
+    if n.hasSuffix(".jpg") || n.hasSuffix(".jpeg") { return "image/jpeg" }
+    if n.hasSuffix(".png") { return "image/png" }
+    "application/octet-stream"
+}

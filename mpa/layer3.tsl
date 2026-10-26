@@ -1,0 +1,1141 @@
+// Layer III (ISO/IEC 11172-3 section 2.4.1.7 and 2.4.3.4; 13818-3 for
+// the low sampling frequencies): side information, the bit reservoir
+// (main data that starts in earlier frames, main_data_begin bytes back),
+// scale factors, Huffman-coded spectral values, requantization
+// (|x|^(4/3) * 2^(gain/4)), joint stereo (mid/side and intensity),
+// reordering of short blocks, alias reduction, and the hybrid filterbank's
+// IMDCT (36-point for long blocks, three 12-point ones for short blocks)
+// with overlap-add. The polyphase synthesis is in synth.tsl.
+//
+// Arithmetic follows ffmpeg's floating-point decoder (its default for
+// MP3), step for step, so the two agree to rounding.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../core"
+
+// ---- Huffman tables as lookup lists ----
+//
+// Each table is a 256-entry first level indexed by the next 8 bits; an
+// entry is symbol * 64 + length for codes of up to 8 bits, or a negative
+// pointer -(offset * 64 + bits) to a second-level list indexed by the next
+// `bits` bits (whose entries hold the remaining length). 0 is "no code".
+
+struct MpaVlcBuild {
+    all: [Int] = []
+    bases: [Int] = []
+}
+
+fn mpaVlcAdd(_ b: MpaVlcBuild, _ codes: [Int], _ lens: [Int], _ syms: [Int]) -> MpaVlcBuild {
+    var out = b
+    let base = out.all.count
+    out.bases.append(base)
+    var tab: [Int] = []
+    for _ in 0..256 {
+        tab.append(0)
+    }
+    // First level.
+    for i in 0..codes.count {
+        let len = lens[i]
+        if len <= 8 {
+            let first = codes[i] << (8 - len)
+            for k in 0..(1 << (8 - len)) {
+                tab[first + k] = syms[i] * 64 + len
+            }
+        }
+    }
+    // Second levels, one per 8-bit prefix of the longer codes.
+    for prefix in 0..256 {
+        var bits = 0
+        for i in 0..codes.count {
+            if lens[i] > 8 && (codes[i] >> (lens[i] - 8)) == prefix {
+                bits = max(bits, lens[i] - 8)
+            }
+        }
+        if bits == 0 {
+            continue
+        }
+        let off = tab.count
+        for _ in 0..(1 << bits) {
+            tab.append(0)
+        }
+        for i in 0..codes.count {
+            let len = lens[i]
+            if len > 8 && (codes[i] >> (len - 8)) == prefix {
+                let rem = len - 8
+                let low = codes[i] & ((1 << rem) - 1)
+                let first = low << (bits - rem)
+                for k in 0..(1 << (bits - rem)) {
+                    tab[off + first + k] = syms[i] * 64 + rem
+                }
+            }
+        }
+        tab[prefix] = -(off * 64 + bits)
+    }
+    out.all += tab
+    out
+}
+
+fn mpaMakeVlcs() -> MpaVlcBuild {
+    var b = MpaVlcBuild()
+    var at = 0
+    for t in 0..15 {
+        let n = mpaHuffSizes[t]
+        // Canonical codes in listed order (left-aligned accumulator).
+        var codes: [Int] = []
+        var lens: [Int] = []
+        var syms: [Int] = []
+        var acc = 0
+        for i in 0..n {
+            let len = mpaHuffLens[at + i]
+            codes.append(acc >> (32 - len))
+            acc += 1 << (32 - len)
+            lens.append(len)
+            syms.append(mpaHuffSymbols[at + i])
+        }
+        at += n
+        b = mpaVlcAdd(b, codes, lens, syms)
+    }
+    // count1 tables A and B.
+    for t in 0..2 {
+        var codes: [Int] = []
+        var lens: [Int] = []
+        var syms: [Int] = []
+        for i in 0..16 {
+            codes.append(mpaQuadCodes[t * 16 + i])
+            lens.append(mpaQuadBits[t * 16 + i])
+            syms.append(i)
+        }
+        b = mpaVlcAdd(b, codes, lens, syms)
+    }
+    b
+}
+
+let mpaVlcs = mpaMakeVlcs()
+let mpaVlcAll = mpaVlcs.all
+// Base of code table 1–15 at index 0–14, quad A at 15, quad B at 16.
+let mpaVlcBase = mpaVlcs.bases
+
+// ---- Requantization tables ----
+
+// x^(4/3) for x up to 15 + 2^13 (the largest value with linbits).
+fn mpaMakePow43() -> [Float] {
+    var out: [Float] = []
+    for i in 0..8207 {
+        out.append(pow(Float(i), 4.0 / 3.0))
+    }
+    out
+}
+
+// 2^((e - 400) / 4) in the decoder's scale (2^28 / IMDCT_SCALAR = 1.759,
+// which the IMDCT windows multiply back), for e = 0…511.
+fn mpaMakeExp2() -> [Float] {
+    let lut = [1.0, 1.18920711500272106672, 1.41421356237309504880, 1.68179283050742908606]
+    var out: [Float] = []
+    var base = 2.11758236813575084767080625169910490512847900390625e-22
+    for e in 0..512 {
+        if e != 0 && e & 3 == 0 {
+            base *= 2.0
+        }
+        out.append(base * lut[e & 3] / 1.759)
+    }
+    out
+}
+
+let mpaPow43 = mpaMakePow43()
+let mpaExp2 = mpaMakeExp2()
+
+// MPEG-2 intensity stereo ratios [compress & 1][left/right][is_pos].
+fn mpaMakeIsLsf() -> [Float] {
+    var out: [Float] = []
+    for _ in 0..64 {
+        out.append(0.0)
+    }
+    for i in 0..16 {
+        for j in 0..2 {
+            let e = -(j + 1) * ((i + 1) >> 1)
+            let f = pow(2.0, Float(e) / 4.0)
+            let k = i & 1
+            out[(j * 2 + (k ^ 1)) * 16 + i] = f
+            out[(j * 2 + k) * 16 + i] = 1.0
+        }
+    }
+    out
+}
+
+let mpaIsLsf = mpaMakeIsLsf()
+
+// IMDCT windows, with the IMDCT's last stage folded in (ffmpeg's
+// ff_mdct_win): kind 0 normal, 1 start, 2 short (12 taps), 3 stop; kinds
+// 4–7 are the same with odd taps negated (the frequency inversion of odd
+// subbands). 36 taps each.
+fn mpaMakeMdctWin() -> [Float] {
+    var w: [Float] = []
+    for _ in 0..(8 * 36) {
+        w.append(0.0)
+    }
+    for i in 0..36 {
+        for j in 0..4 {
+            if j == 2 && i % 3 != 1 {
+                continue
+            }
+            var d = sin(pi * (Float(i) + 0.5) / 36.0)
+            if j == 1 {
+                if i >= 30 {
+                    d = 0.0
+                } else if i >= 24 {
+                    d = sin(pi * (Float(i - 18) + 0.5) / 12.0)
+                } else if i >= 18 {
+                    d = 1.0
+                }
+            } else if j == 3 {
+                if i < 6 {
+                    d = 0.0
+                } else if i < 12 {
+                    d = sin(pi * (Float(i - 6) + 0.5) / 12.0)
+                } else if i < 18 {
+                    d = 1.0
+                }
+            }
+            d = d * 0.5 * 1.759 / cos(pi * Float(2 * i + 19) / 72.0)
+            if j == 2 {
+                w[j * 36 + i / 3] = d / 32.0
+            } else {
+                w[j * 36 + i] = d / 32.0
+            }
+        }
+    }
+    for j in 0..4 {
+        for i in 0..36 {
+            w[(j + 4) * 36 + i] = if i & 1 == 1 { -w[j * 36 + i] } else { w[j * 36 + i] }
+        }
+    }
+    w
+}
+
+let mpaMdctWin = mpaMakeMdctWin()
+
+// Constants of the 36-point IMDCT: cos(i pi / 18) / 2 and
+// 0.5 / cos((2i + 1) pi / 36).
+let mpaC1 = 0.98480775301220805936 / 2.0
+let mpaC2 = 0.93969262078590838405 / 2.0
+let mpaC3 = 0.86602540378443864676 / 2.0
+let mpaC4 = 0.76604444311897803520 / 2.0
+let mpaC5 = 0.64278760968653932632 / 2.0
+let mpaC7 = 0.34202014332566873304 / 2.0
+let mpaC8 = 0.17364817766693034885 / 2.0
+let mpaIcos36 = [
+    0.50190991877167369479, 0.51763809020504152469, 0.55168895948124587824,
+    0.61038729438072803416, 0.70710678118654752439, 0.87172339781054900991,
+    1.18310079157624925896, 1.93185165257813657349, 5.73685662283492756461,
+]
+let mpaIcos36h = [
+    0.50190991877167369479 / 2.0, 0.51763809020504152469 / 2.0, 0.55168895948124587824 / 2.0,
+    0.61038729438072803416 / 2.0, 0.70710678118654752439 / 2.0, 0.87172339781054900991 / 2.0,
+    1.18310079157624925896 / 4.0, 1.93185165257813657349 / 4.0,
+]
+// Constants of the 12-point IMDCT.
+let mpaS3 = 0.86602540378443864676 / 2.0
+let mpaS4 = 0.70710678118654752439 / 2.0
+let mpaS5 = 0.51763809020504152469 / 2.0
+let mpaS6 = 1.93185165257813657349 / 4.0
+
+// Cumulative long band starts in pairs of values (ffmpeg's
+// ff_band_index_long), 23 per rate.
+fn mpaMakeBandIndex() -> [Int] {
+    var out: [Int] = []
+    for r in 0..9 {
+        var k = 0
+        for j in 0..22 {
+            out.append(k)
+            k += mpaBandLong[r * 22 + j] >> 1
+        }
+        out.append(k)
+    }
+    out
+}
+
+let mpaBandIndexLong = mpaMakeBandIndex()
+
+public struct MpaLayer3 {
+    // Main data left over from earlier frames (the bit reservoir).
+    reservoir: Data = Data()
+    br: core.BitReader = core.bitReader(Data())
+
+    // Side information of granule gr, channel ch at g = gr * 2 + ch.
+    part23: [Int] = [0, 0, 0, 0]
+    bigValues: [Int] = [0, 0, 0, 0]
+    globalGain: [Int] = [0, 0, 0, 0]
+    sfCompress: [Int] = [0, 0, 0, 0]
+    blockType: [Int] = [0, 0, 0, 0]
+    switchPoint: [Int] = [0, 0, 0, 0]
+    tableSelect: [Int] = []
+    subblockGain: [Int] = []
+    regionSize: [Int] = []
+    preflag: [Int] = [0, 0, 0, 0]
+    scalefacScale: [Int] = [0, 0, 0, 0]
+    count1Select: [Int] = [0, 0, 0, 0]
+    shortStart: [Int] = [0, 0, 0, 0]
+    longEnd: [Int] = [0, 0, 0, 0]
+    scfsi: [Int] = [0, 0, 0, 0]
+    mainDataBegin: Int = 0
+    // Scale factors, 40 per granule and channel.
+    sf: [Int] = []
+    // Spectral values of the current granule, 576 per channel.
+    hyb: [Float] = []
+    exps: [Int] = []
+    // Overlap of the IMDCT, 18 per subband, 576 per channel.
+    overlap: [Float] = []
+    // Output of the hybrid filterbank: channel c, slot t, subband i at
+    // c * 1152 + t * 32 + i.
+    sb: [Float] = []
+    tmp: [Float] = []
+    t18: [Float] = []
+    out12: [Float] = []
+    problem: String = ""
+
+    fn setup() {
+        tableSelect = []
+        subblockGain = []
+        regionSize = []
+        for _ in 0..12 {
+            tableSelect.append(0)
+            subblockGain.append(0)
+            regionSize.append(0)
+        }
+        sf = []
+        for _ in 0..160 {
+            sf.append(0)
+        }
+        hyb = []
+        overlap = []
+        exps = []
+        tmp = []
+        for _ in 0..1152 {
+            hyb.append(0.0)
+            overlap.append(0.0)
+        }
+        for _ in 0..576 {
+            exps.append(0)
+            tmp.append(0.0)
+        }
+        sb = []
+        for _ in 0..2304 {
+            sb.append(0.0)
+        }
+        t18 = []
+        for _ in 0..18 {
+            t18.append(0.0)
+        }
+        out12 = []
+        for _ in 0..12 {
+            out12.append(0.0)
+        }
+        reservoir = Data()
+    }
+
+    fn clear() {
+        for i in 0..overlap.count {
+            overlap[i] = 0.0
+        }
+        reservoir = Data()
+    }
+
+    // Decodes the frame at d[at…]; returns the slots made (18 per
+    // granule), or 0 when the frame's side information is damaged.
+    fn decode(_ h: MpaHeader, _ d: Data, _ at: Int) -> Int {
+        problem = ""
+        let nch = h.channels
+        let ngr = if h.lsf { 1 } else { 2 }
+        let end = min(at + h.frameSize, d.count)
+        let sideSize = if h.lsf { if nch == 1 { 9 } else { 17 } } else { if nch == 1 { 17 } else { 32 } }
+        let mainStart = at + 4 + (if h.crc { 2 } else { 0 }) + sideSize
+        if mainStart > end || !sideInfo(h, d, at) {
+            if problem == "" {
+                problem = "MP3 frame too short for its side information"
+            }
+            let keep = min(512, max(end - at - 4, 0))
+            reservoir = d.slice(from: end - keep, to: end)
+            return 0
+        }
+        let main = d.slice(from: mainStart, to: end)
+        let resLen = reservoir.count
+        let buf = if resLen == 0 { main } else { reservoir + main }
+        br = core.bitReader(buf)
+        let bufBits = buf.count * 8
+        // Granules whose main data lies before what we hold (the stream
+        // started or was cut there) are left silent.
+        var lastBits = resLen * 8
+        var gr = 0
+        while gr < ngr && (lastBits >> 3) < mainDataBegin {
+            for ch in 0..nch {
+                lastBits += part23[gr * 2 + ch]
+                for i in 0..576 {
+                    hyb[ch * 576 + i] = 0.0
+                }
+                imdct(ch, gr, h)
+            }
+            gr += 1
+        }
+        // (No warning: this is normal for the first frames after a seek
+        // or when a stream is cut mid-way.)
+        br.seek(toBit: lastBits - 8 * mainDataBegin)
+        while gr < ngr {
+            for ch in 0..nch {
+                let g = gr * 2 + ch
+                let start = br.position
+                if h.lsf {
+                    scaleFactorsLsf(g, ch, h)
+                } else {
+                    scaleFactors(g, ch)
+                }
+                exponents(g, h)
+                huffman(g, ch, start + part23[g], bufBits)
+            }
+            if h.mode == 1 {
+                stereo(gr, h)
+            }
+            for ch in 0..nch {
+                reorder(gr * 2 + ch, ch, h)
+                antialias(gr * 2 + ch, ch)
+                imdct(ch, gr, h)
+            }
+            gr += 1
+        }
+        // Keep what the next frames may point back to (as ffmpeg does).
+        let pos = (br.position + 7) >> 3
+        if pos < resLen {
+            // Everything came from earlier frames: keep their unused bytes
+            // and the end of this frame.
+            var kept = Data()
+            if resLen - pos <= 512 {
+                kept = reservoir.slice(from: pos, to: resLen)
+            }
+            let tail = min(512, main.count)
+            reservoir = kept + main.slice(from: main.count - tail, to: main.count)
+        } else {
+            let p = pos - resLen
+            let left = main.count - p
+            if left < 0 || left > 512 {
+                let n = min(512, end - at - 4)
+                reservoir = d.slice(from: end - n, to: end)
+            } else {
+                reservoir = main.slice(from: p, to: main.count)
+            }
+        }
+        18 * ngr
+    }
+
+    // Side information (2.4.1.7, 13818-3 2.4.1.7).
+    fn sideInfo(_ h: MpaHeader, _ d: Data, _ at: Int) -> Bool {
+        var r = core.bitReaderRange(d, from: at + 4 + (if h.crc { 2 } else { 0 }), to: min(at + h.frameSize, d.count))
+        let nch = h.channels
+        let ngr = if h.lsf { 1 } else { 2 }
+        if h.lsf {
+            mainDataBegin = r.bits(8)
+            r.skip(nch)
+        } else {
+            mainDataBegin = r.bits(9)
+            r.skip(if nch == 2 { 3 } else { 5 })
+            for ch in 0..nch {
+                scfsi[ch] = 0
+                scfsi[2 + ch] = r.bits(4)
+            }
+        }
+        let ri = h.rateIndex
+        for gr in 0..ngr {
+            for ch in 0..nch {
+                let g = gr * 2 + ch
+                part23[g] = r.bits(12)
+                bigValues[g] = r.bits(9)
+                if bigValues[g] > 288 {
+                    problem = "MP3 big_values {bigValues[g]} is too big"
+                    return false
+                }
+                globalGain[g] = r.bits(8)
+                // With mid/side alone, the 1/sqrt(2) of the M/S matrix is
+                // taken from the gain (ffmpeg's way).
+                if h.modeExt & 3 == 2 {
+                    globalGain[g] -= 2
+                }
+                sfCompress[g] = if h.lsf { r.bits(9) } else { r.bits(4) }
+                if r.bits(1) == 1 {
+                    blockType[g] = r.bits(2)
+                    if blockType[g] == 0 {
+                        problem = "MP3 window switching with block type 0"
+                        return false
+                    }
+                    switchPoint[g] = r.bits(1)
+                    tableSelect[g * 3] = r.bits(5)
+                    tableSelect[g * 3 + 1] = r.bits(5)
+                    tableSelect[g * 3 + 2] = 0
+                    for i in 0..3 {
+                        subblockGain[g * 3 + i] = r.bits(3)
+                    }
+                    if blockType[g] == 2 {
+                        regionSize[g * 3] = if ri != 8 { 18 } else { 36 }
+                    } else if ri <= 2 {
+                        regionSize[g * 3] = 18
+                    } else if ri != 8 {
+                        regionSize[g * 3] = 27
+                    } else {
+                        regionSize[g * 3] = 54
+                    }
+                    regionSize[g * 3 + 1] = 288
+                } else {
+                    blockType[g] = 0
+                    switchPoint[g] = 0
+                    for i in 0..3 {
+                        tableSelect[g * 3 + i] = r.bits(5)
+                        subblockGain[g * 3 + i] = 0
+                    }
+                    let ra1 = r.bits(4)
+                    let ra2 = r.bits(3)
+                    regionSize[g * 3] = mpaBandIndexLong[ri * 23 + ra1 + 1]
+                    regionSize[g * 3 + 1] = mpaBandIndexLong[ri * 23 + min(ra1 + ra2 + 2, 22)]
+                }
+                // Region starts → region lengths (in value pairs), cut at
+                // big_values.
+                regionSize[g * 3 + 2] = 288
+                var j = 0
+                for i in 0..3 {
+                    let k = min(regionSize[g * 3 + i], bigValues[g])
+                    regionSize[g * 3 + i] = k - j
+                    j = k
+                }
+                // Which bands are long and which short.
+                if blockType[g] == 2 {
+                    if switchPoint[g] == 1 {
+                        longEnd[g] = if ri <= 2 { 8 } else { 6 }
+                        shortStart[g] = 3
+                    } else {
+                        longEnd[g] = 0
+                        shortStart[g] = 0
+                    }
+                } else {
+                    shortStart[g] = 13
+                    longEnd[g] = 22
+                }
+                preflag[g] = if h.lsf { 0 } else { r.bits(1) }
+                scalefacScale[g] = r.bits(1)
+                count1Select[g] = r.bits(1)
+            }
+        }
+        if r.overrun {
+            problem = "MP3 side information cut short"
+            return false
+        }
+        true
+    }
+
+    // MPEG-1 scale factors (2.4.1.7, Table B.4 slen), with scfsi reuse of
+    // granule 0's values in granule 1.
+    fn scaleFactors(_ g: Int, _ ch: Int) {
+        let c = sfCompress[g]
+        let slen1 = mpaSlen[c]
+        let slen2 = mpaSlen[16 + c]
+        let s = g * 40
+        var j = 0
+        if blockType[g] == 2 {
+            let n = if switchPoint[g] == 1 { 17 } else { 18 }
+            for _ in 0..n {
+                sf[s + j] = if slen1 > 0 { br.bits(slen1) } else { 0 }
+                j += 1
+            }
+            for _ in 0..18 {
+                sf[s + j] = if slen2 > 0 { br.bits(slen2) } else { 0 }
+                j += 1
+            }
+            for _ in 0..3 {
+                sf[s + j] = 0
+                j += 1
+            }
+        } else {
+            let g0 = ch * 40
+            for k in 0..4 {
+                let n = if k == 0 { 6 } else { 5 }
+                if scfsi[g] & (8 >> k) == 0 {
+                    let slen = if k < 2 { slen1 } else { slen2 }
+                    for _ in 0..n {
+                        sf[s + j] = if slen > 0 { br.bits(slen) } else { 0 }
+                        j += 1
+                    }
+                } else {
+                    for _ in 0..n {
+                        sf[s + j] = sf[g0 + j]
+                        j += 1
+                    }
+                }
+            }
+            sf[s + j] = 0
+        }
+    }
+
+    // MPEG-2 LSF scale factors (13818-3 2.4.3.2): scalefac_compress
+    // splits into up to four lengths; intensity-coded right channels use
+    // other tables.
+    fn scaleFactorsLsf(_ g: Int, _ ch: Int, _ h: MpaHeader) {
+        let tindex = if blockType[g] == 2 { if switchPoint[g] == 1 { 2 } else { 1 } } else { 0 }
+        var c = sfCompress[g]
+        var tindex2 = 0
+        var slen = [0, 0, 0, 0]
+        var ns = [0, 0, 0]
+        if h.modeExt & 1 != 0 && ch == 1 {
+            c = c >> 1
+            if c < 180 {
+                ns = [6, 6, 0]
+                tindex2 = 3
+            } else if c < 244 {
+                c -= 180
+                ns = [4, 4, 0]
+                tindex2 = 4
+            } else {
+                c -= 244
+                ns = [3, 0, 0]
+                tindex2 = 5
+            }
+        } else {
+            if c < 400 {
+                ns = [5, 4, 4]
+                tindex2 = 0
+            } else if c < 500 {
+                c -= 400
+                ns = [5, 4, 0]
+                tindex2 = 1
+            } else {
+                c -= 500
+                ns = [3, 0, 0]
+                tindex2 = 2
+                preflag[g] = 1
+            }
+        }
+        // Split c into slen[0..3] by the radixes n1, n2, n3 (last first).
+        var v = c
+        var k = 3
+        while k >= 1 {
+            let n = ns[k - 1]
+            if n == 3 {
+                let m = (v * 171) >> 9
+                slen[k] = v - 3 * m
+                v = m
+            } else if n == 4 {
+                slen[k] = v & 3
+                v = v >> 2
+            } else if n == 5 {
+                let m = (v * 205) >> 10
+                slen[k] = v - 5 * m
+                v = m
+            } else if n == 6 {
+                let m = (v * 171) >> 10
+                slen[k] = v - 6 * m
+                v = m
+            } else {
+                slen[k] = 0
+            }
+            k -= 1
+        }
+        slen[0] = v
+        let s = g * 40
+        var j = 0
+        for p in 0..4 {
+            let n = mpaLsfNsf[(tindex2 * 3 + tindex) * 4 + p]
+            let sl = slen[p]
+            for _ in 0..n {
+                sf[s + j] = if sl > 0 { br.bits(sl) } else { 0 }
+                j += 1
+            }
+        }
+        while j < 40 {
+            sf[s + j] = 0
+            j += 1
+        }
+    }
+
+    // The exponent of every spectral value: global gain, scale factors
+    // (+ pre-emphasis) and short-block subblock gains, as 4·log2 steps
+    // offset by 400.
+    fn exponents(_ g: Int, _ h: MpaHeader) {
+        let ri = h.rateIndex
+        let gain = globalGain[g] - 210
+        let shift = scalefacScale[g] + 1
+        let pre = preflag[g] * 22
+        var e = 0
+        for i in 0..longEnd[g] {
+            let v0 = gain - ((sf[g * 40 + i] + mpaPretab[pre + i]) << shift) + 400
+            let len = mpaBandLong[ri * 22 + i]
+            for _ in 0..len {
+                exps[e] = v0
+                e += 1
+            }
+        }
+        if shortStart[g] < 13 {
+            var k = longEnd[g]
+            for i in shortStart[g]..13 {
+                let len = mpaBandShort[ri * 13 + i]
+                for l in 0..3 {
+                    let v0 = gain - (subblockGain[g * 3 + l] << 3) - (sf[g * 40 + k] << shift) + 400
+                    k += 1
+                    for _ in 0..len {
+                        exps[e] = v0
+                        e += 1
+                    }
+                }
+            }
+        }
+    }
+
+    fn vlc(_ base: Int) -> Int {
+        let e = mpaVlcAll[base + br.peek(8)]
+        if e > 0 {
+            br.skip(e & 63)
+            return e >> 6
+        }
+        if e == 0 {
+            br.skip(1)
+            return 0
+        }
+        br.skip(8)
+        let p = -e
+        let e2 = mpaVlcAll[base + (p >> 6) + br.peek(p & 63)]
+        br.skip(max(e2 & 63, 1))
+        e2 >> 6
+    }
+
+    fn value(_ x: Int, _ e: Int) -> Float {
+        mpaPow43[x] * mpaExp2[min(max(e, 0), 511)]
+    }
+
+    // Huffman decoding of the big values and count1 regions (2.4.2.7
+    // huffmancodebits), requantized on the way.
+    fn huffman(_ g: Int, _ ch: Int, _ endPos2: Int, _ bufBits: Int) {
+        let endPos = min(endPos2, bufBits)
+        let hb = ch * 576
+        var s = 0
+        for i in 0..3 {
+            var j = regionSize[g * 3 + i]
+            if j <= 0 {
+                continue
+            }
+            let k = tableSelect[g * 3 + i]
+            let l = mpaHuffData[k * 2]
+            let linbits = mpaHuffData[k * 2 + 1]
+            if l == 0 {
+                for _ in 0..(2 * j) {
+                    hyb[hb + s] = 0.0
+                    s += 1
+                }
+                continue
+            }
+            let base = mpaVlcBase[l - 1]
+            while j > 0 {
+                if br.position >= endPos {
+                    break
+                }
+                let sym = vlc(base)
+                if sym == 0 {
+                    hyb[hb + s] = 0.0
+                    hyb[hb + s + 1] = 0.0
+                } else {
+                    let e = exps[s]
+                    var x = sym >> 4
+                    var y = sym & 15
+                    var vx = 0.0
+                    if x != 0 {
+                        if x == 15 {
+                            x += br.bits(linbits)
+                        }
+                        vx = value(x, e)
+                        if br.bits(1) == 1 {
+                            vx = -vx
+                        }
+                    }
+                    var vy = 0.0
+                    if y != 0 {
+                        if y == 15 {
+                            y += br.bits(linbits)
+                        }
+                        vy = value(y, e)
+                        if br.bits(1) == 1 {
+                            vy = -vy
+                        }
+                    }
+                    hyb[hb + s] = vx
+                    hyb[hb + s + 1] = vy
+                }
+                s += 2
+                j -= 1
+            }
+        }
+        // count1: quadruples of values -1, 0, 1.
+        let qbase = mpaVlcBase[15 + count1Select[g]]
+        var lastPos = 0
+        while s <= 572 {
+            let pos = br.position
+            if pos >= endPos {
+                if pos > endPos2 && lastPos != 0 {
+                    // The last quadruple ran past the granule: drop it.
+                    s -= 4
+                }
+                break
+            }
+            lastPos = pos
+            let code = vlc(qbase)
+            hyb[hb + s] = 0.0
+            hyb[hb + s + 1] = 0.0
+            hyb[hb + s + 2] = 0.0
+            hyb[hb + s + 3] = 0.0
+            var bit = 8
+            var idx = 0
+            while bit > 0 {
+                if code & bit != 0 {
+                    let p = s + idx
+                    var v = mpaExp2[min(max(exps[p], 0), 511)]
+                    if br.bits(1) == 1 {
+                        v = -v
+                    }
+                    hyb[hb + p] = v
+                }
+                bit = bit >> 1
+                idx += 1
+            }
+            s += 4
+        }
+        while s < 576 {
+            hyb[hb + s] = 0.0
+            s += 1
+        }
+        br.seek(toBit: endPos2)
+    }
+
+    // Joint stereo (2.4.3.4.9–10): intensity stereo above the highest
+    // non-zero band of the right channel, mid/side elsewhere.
+    fn stereo(_ gr: Int, _ h: MpaHeader) {
+        let g1 = gr * 2 + 1
+        let ri = h.rateIndex
+        let ms = h.modeExt & 2 != 0
+        if h.modeExt & 1 != 0 {
+            let sfMax = if h.lsf { 16 } else { 7 }
+            let lsfSel = sfCompress[g1] & 1
+            var t = 576
+            var nz = [false, false, false]
+            var k = (13 - shortStart[g1]) * 3 + longEnd[g1] - 3
+            var i = 12
+            while i >= shortStart[g1] {
+                if i != 11 {
+                    k -= 3
+                }
+                let len = mpaBandShort[ri * 13 + i]
+                var l = 2
+                while l >= 0 {
+                    t -= len
+                    var doMs = true
+                    if !nz[l] {
+                        var found = false
+                        for j in 0..len {
+                            if hyb[576 + t + j] != 0.0 {
+                                found = true
+                                break
+                            }
+                        }
+                        if found {
+                            nz[l] = true
+                        } else {
+                            let s = sf[g1 * 40 + k + l]
+                            if s < sfMax {
+                                intensity(t, len, s, h.lsf, lsfSel)
+                                doMs = false
+                            }
+                        }
+                    }
+                    if doMs && ms {
+                        midSide(t, len)
+                    }
+                    l -= 1
+                }
+                i -= 1
+            }
+            var nonZero = nz[0] || nz[1] || nz[2]
+            i = longEnd[g1] - 1
+            while i >= 0 {
+                let len = mpaBandLong[ri * 22 + i]
+                t -= len
+                var doMs = true
+                if !nonZero {
+                    var found = false
+                    for j in 0..len {
+                        if hyb[576 + t + j] != 0.0 {
+                            found = true
+                            break
+                        }
+                    }
+                    if found {
+                        nonZero = true
+                    } else {
+                        let kk = if i == 21 { 20 } else { i }
+                        let s = sf[g1 * 40 + kk]
+                        if s < sfMax {
+                            intensity(t, len, s, h.lsf, lsfSel)
+                            doMs = false
+                        }
+                    }
+                }
+                if doMs && ms {
+                    midSide(t, len)
+                }
+                i -= 1
+            }
+        } else if ms {
+            // The 1/sqrt(2) was taken from the global gain.
+            for i in 0..576 {
+                let a = hyb[i]
+                let b = hyb[576 + i]
+                hyb[i] = a + b
+                hyb[576 + i] = a - b
+            }
+        }
+    }
+
+    fn intensity(_ t: Int, _ len: Int, _ s: Int, _ lsf: Bool, _ sel: Int) {
+        var v1 = 0.0
+        var v2 = 0.0
+        if lsf {
+            v1 = mpaIsLsf[(sel * 2) * 16 + s]
+            v2 = mpaIsLsf[(sel * 2 + 1) * 16 + s]
+        } else {
+            v1 = mpaIsTable[s]
+            v2 = mpaIsTable[7 + s]
+        }
+        for j in 0..len {
+            let x = hyb[t + j]
+            hyb[t + j] = x * v1
+            hyb[576 + t + j] = x * v2
+        }
+    }
+
+    fn midSide(_ t: Int, _ len: Int) {
+        let r = 0.70710678118654752440
+        for j in 0..len {
+            let a = hyb[t + j]
+            let b = hyb[576 + t + j]
+            hyb[t + j] = (a + b) * r
+            hyb[576 + t + j] = (a - b) * r
+        }
+    }
+
+    // Short blocks come window by window in each band; the IMDCT wants
+    // the three windows interleaved (2.4.3.4.7 reordering).
+    fn reorder(_ g: Int, _ ch: Int, _ h: MpaHeader) {
+        if blockType[g] != 2 {
+            return
+        }
+        let ri = h.rateIndex
+        let hb = ch * 576
+        var p = if switchPoint[g] == 1 { if ri != 8 { 36 } else { 72 } } else { 0 }
+        for i in shortStart[g]..13 {
+            let len = mpaBandShort[ri * 13 + i]
+            var d = 0
+            for j in 0..len {
+                tmp[d] = hyb[hb + p + j]
+                tmp[d + 1] = hyb[hb + p + len + j]
+                tmp[d + 2] = hyb[hb + p + 2 * len + j]
+                d += 3
+            }
+            for j in 0..(3 * len) {
+                hyb[hb + p + j] = tmp[j]
+            }
+            p += 3 * len
+        }
+    }
+
+    // Alias reduction butterflies between long subbands (2.4.3.4.8).
+    fn antialias(_ g: Int, _ ch: Int) {
+        var n = 31
+        if blockType[g] == 2 {
+            if switchPoint[g] == 0 {
+                return
+            }
+            n = 1
+        }
+        var p = ch * 576 + 18
+        for _ in 0..n {
+            for j in 0..8 {
+                let a = hyb[p - 1 - j]
+                let b = hyb[p + j]
+                let cs = mpaCsa[j * 4]
+                let ca = mpaCsa[j * 4 + 1]
+                hyb[p - 1 - j] = a * cs - b * ca
+                hyb[p + j] = a * ca + b * cs
+            }
+            p += 18
+        }
+    }
+
+    // The hybrid filterbank's IMDCT with overlap-add (2.4.3.4.10), into
+    // the 18 slots of granule gr of sb.
+    fn imdct(_ ch: Int, _ gr: Int, _ h: MpaHeader) {
+        let g = gr * 2 + ch
+        let hb = ch * 576
+        // The last subband with non-zero values (at least 2).
+        var p = 576
+        while p >= 36 {
+            p -= 6
+            var nz = false
+            for q in 0..6 {
+                if hyb[hb + p + q] != 0.0 {
+                    nz = true
+                }
+            }
+            if nz {
+                break
+            }
+        }
+        let sblimit = p / 18 + 1
+        let longEndSb = if blockType[g] == 2 { if switchPoint[g] == 1 { 2 } else { 0 } } else { sblimit }
+        let ob = ch * 1152 + 18 * gr * 32
+        for j in 0..longEndSb {
+            let wi = if switchPoint[g] == 1 && j < 2 { 0 } else { blockType[g] }
+            let win = (wi + (if j & 1 == 1 { 4 } else { 0 })) * 36
+            imdct36(ob + j, ch * 576 + j * 18, hb + j * 18, win)
+        }
+        for j in longEndSb..sblimit {
+            let win = (2 + (if j & 1 == 1 { 4 } else { 0 })) * 36
+            let o = ob + j
+            let bf = ch * 576 + j * 18
+            let ip = hb + j * 18
+            for i in 0..6 {
+                sb[o + i * 32] = overlap[bf + i]
+            }
+            imdct12(ip)
+            for i in 0..6 {
+                sb[o + (6 + i) * 32] = out12[i] * mpaMdctWin[win + i] + overlap[bf + 6 + i]
+                overlap[bf + 12 + i] = out12[6 + i] * mpaMdctWin[win + 6 + i]
+            }
+            imdct12(ip + 1)
+            for i in 0..6 {
+                sb[o + (12 + i) * 32] = out12[i] * mpaMdctWin[win + i] + overlap[bf + 12 + i]
+                overlap[bf + i] = out12[6 + i] * mpaMdctWin[win + 6 + i]
+            }
+            imdct12(ip + 2)
+            for i in 0..6 {
+                overlap[bf + i] = out12[i] * mpaMdctWin[win + i] + overlap[bf + i]
+                overlap[bf + 6 + i] = out12[6 + i] * mpaMdctWin[win + 6 + i]
+                overlap[bf + 12 + i] = 0.0
+            }
+        }
+        for j in sblimit..32 {
+            let o = ob + j
+            let bf = ch * 576 + j * 18
+            for i in 0..18 {
+                sb[o + i * 32] = overlap[bf + i]
+                overlap[bf + i] = 0.0
+            }
+        }
+    }
+
+    // 12-point IMDCT of hyb[ip], hyb[ip + 3], … into out12 (ffmpeg's
+    // imdct12).
+    fn imdct12(_ ip: Int) {
+        var in0 = hyb[ip]
+        var in1 = hyb[ip + 3] + hyb[ip]
+        var in2 = hyb[ip + 6] + hyb[ip + 3]
+        var in3 = hyb[ip + 9] + hyb[ip + 6]
+        var in4 = hyb[ip + 12] + hyb[ip + 9]
+        var in5 = hyb[ip + 15] + hyb[ip + 12]
+        in5 += in3
+        in3 += in1
+        in2 = 2.0 * mpaS3 * in2
+        in3 = 4.0 * mpaS3 * in3
+        let t1 = in0 - in4
+        let t2 = 2.0 * mpaS4 * (in1 - in5)
+        out12[7] = t1 + t2
+        out12[10] = t1 + t2
+        out12[1] = t1 - t2
+        out12[4] = t1 - t2
+        in0 += in4 * 0.5
+        in4 = in0 + in2
+        in5 += 2.0 * in1
+        in1 = mpaS5 * (in5 + in3)
+        out12[8] = in4 + in1
+        out12[9] = in4 + in1
+        out12[2] = in4 - in1
+        out12[3] = in4 - in1
+        in0 -= in2
+        in5 = 2.0 * mpaS6 * (in5 - in3)
+        out12[0] = in0 - in5
+        out12[5] = in0 - in5
+        out12[6] = in0 + in5
+        out12[11] = in0 + in5
+    }
+
+    // 36-point IMDCT of hyb[ip ..< ip + 18] (changed in place), windowed
+    // by window `win`, overlapped with overlap[bf…], into sb[o], sb[o+32]…
+    // (ffmpeg's imdct36).
+    fn imdct36(_ o: Int, _ bf: Int, _ ip: Int, _ win: Int) {
+        var i = 17
+        while i >= 1 {
+            hyb[ip + i] += hyb[ip + i - 1]
+            i -= 1
+        }
+        i = 17
+        while i >= 3 {
+            hyb[ip + i] += hyb[ip + i - 2]
+            i -= 2
+        }
+        for j in 0..2 {
+            let a = ip + j
+            var t2 = hyb[a + 8] + hyb[a + 16] - hyb[a + 4]
+            var t3 = hyb[a] + hyb[a + 12] * 0.5
+            var t1 = hyb[a] - hyb[a + 12]
+            t18[j + 6] = t1 - t2 * 0.5
+            t18[j + 16] = t1 + t2
+            var t0 = 2.0 * mpaC2 * (hyb[a + 4] + hyb[a + 8])
+            t1 = 1.0 * (-2.0 * mpaC8) * (hyb[a + 8] - hyb[a + 16])
+            t2 = 2.0 * (-mpaC4) * (hyb[a + 4] + hyb[a + 16])
+            t18[j + 10] = t3 - t0 - t2
+            t18[j + 2] = t3 + t0 + t1
+            t18[j + 14] = t3 + t2 - t1
+            t18[j + 4] = 2.0 * (-mpaC3) * (hyb[a + 10] + hyb[a + 14] - hyb[a + 2])
+            t2 = 2.0 * mpaC1 * (hyb[a + 2] + hyb[a + 10])
+            t3 = 1.0 * (-2.0 * mpaC7) * (hyb[a + 10] - hyb[a + 14])
+            t0 = 2.0 * mpaC3 * hyb[a + 6]
+            t1 = 2.0 * (-mpaC5) * (hyb[a + 2] + hyb[a + 14])
+            t18[j] = t2 + t3 + t0
+            t18[j + 12] = t2 + t1 - t0
+            t18[j + 8] = t3 - t1 - t0
+        }
+        let w = win
+        i = 0
+        for j in 0..4 {
+            var t0 = t18[i]
+            var t1 = t18[i + 2]
+            let s0 = t1 + t0
+            let s2 = t1 - t0
+            let t2 = t18[i + 1]
+            let t3 = t18[i + 3]
+            let s1 = 2.0 * mpaIcos36h[j] * (t3 + t2)
+            let s3 = mpaIcos36[8 - j] * (t3 - t2)
+            t0 = s0 + s1
+            t1 = s0 - s1
+            sb[o + (9 + j) * 32] = mpaMdctWin[w + 9 + j] * t1 + overlap[bf + 9 + j]
+            sb[o + (8 - j) * 32] = mpaMdctWin[w + 8 - j] * t1 + overlap[bf + 8 - j]
+            overlap[bf + 9 + j] = mpaMdctWin[w + 18 + 9 + j] * t0
+            overlap[bf + 8 - j] = mpaMdctWin[w + 18 + 8 - j] * t0
+            t0 = s2 + s3
+            t1 = s2 - s3
+            sb[o + (17 - j) * 32] = mpaMdctWin[w + 17 - j] * t1 + overlap[bf + 17 - j]
+            sb[o + j * 32] = mpaMdctWin[w + j] * t1 + overlap[bf + j]
+            overlap[bf + 17 - j] = mpaMdctWin[w + 18 + 17 - j] * t0
+            overlap[bf + j] = mpaMdctWin[w + 18 + j] * t0
+            i += 4
+        }
+        let s0 = t18[16]
+        let s1 = 2.0 * mpaIcos36h[4] * t18[17]
+        let t0 = s0 + s1
+        let t1 = s0 - s1
+        sb[o + 13 * 32] = mpaMdctWin[w + 13] * t1 + overlap[bf + 13]
+        sb[o + 4 * 32] = mpaMdctWin[w + 4] * t1 + overlap[bf + 4]
+        overlap[bf + 13] = mpaMdctWin[w + 18 + 13] * t0
+        overlap[bf + 4] = mpaMdctWin[w + 18 + 4] * t0
+    }
+}

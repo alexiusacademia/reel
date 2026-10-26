@@ -1,0 +1,491 @@
+// SILK's fixed-point arithmetic and its LPC/NLSF helpers (RFC 6716
+// section 4.2.7.5: NLSF decoding, stabilisation and conversion to LPC
+// coefficients; section 4.2.7.4: gain dequantisation).
+//
+// SILK is defined in 32-bit integer arithmetic (libopus silk/macros.h,
+// SigProc_FIX.h, Inlines.h). Tessel Ints are 64-bit, so most products are
+// exact here; the helpers below cut results back to 16 or 32 bits wherever
+// the C code truncates or wraps, so the output stays bit-exact with
+// libopus.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+let silkInt32Max = 2147483647
+let silkInt32Min = -2147483648
+
+// The low 16 bits as a signed number: C's (opus_int16) cast.
+fn silkI16(_ x: Int) -> Int {
+    ((x + 32768) & 65535) - 32768
+}
+
+// The low 32 bits as a signed number: C's (opus_int32) cast / wraparound.
+fn silkI32(_ x: Int) -> Int {
+    ((x + 2147483648) & 4294967295) - 2147483648
+}
+
+// silk_SMULWB: (a32 * (int16)b) >> 16.
+fn silkSMULWB(_ a: Int, _ b: Int) -> Int {
+    (a * silkI16(b)) >> 16
+}
+
+// silk_SMLAWB: a + ((b * (int16)c) >> 16).
+fn silkSMLAWB(_ a: Int, _ b: Int, _ c: Int) -> Int {
+    silkI32(a + ((b * silkI16(c)) >> 16))
+}
+
+// silk_SMULWW: (a32 * b32) >> 16, kept to 32 bits.
+fn silkSMULWW(_ a: Int, _ b: Int) -> Int {
+    silkI32((a * b) >> 16)
+}
+
+fn silkSMLAWW(_ a: Int, _ b: Int, _ c: Int) -> Int {
+    silkI32(a + ((b * c) >> 16))
+}
+
+fn silkSMULBB(_ a: Int, _ b: Int) -> Int {
+    silkI16(a) * silkI16(b)
+}
+
+// silk_SMMUL: the top 32 bits of a 64-bit product.
+fn silkSMMUL(_ a: Int, _ b: Int) -> Int {
+    (a * b) >> 32
+}
+
+fn silkRshiftRound(_ a: Int, _ shift: Int) -> Int {
+    if shift == 1 {
+        return (a >> 1) + (a & 1)
+    }
+    ((a >> (shift - 1)) + 1) >> 1
+}
+
+fn silkSat16(_ a: Int) -> Int {
+    if a > 32767 { 32767 } else if a < -32768 { -32768 } else { a }
+}
+
+fn silkSat32(_ a: Int) -> Int {
+    if a > silkInt32Max { silkInt32Max } else if a < silkInt32Min { silkInt32Min } else { a }
+}
+
+// silk_ADD_SAT32 on two 32-bit values.
+fn silkAddSat32(_ a: Int, _ b: Int) -> Int {
+    silkSat32(a + b)
+}
+
+fn silkSubSat32(_ a: Int, _ b: Int) -> Int {
+    silkSat32(a - b)
+}
+
+// silk_LIMIT: works with the limits in either order.
+fn silkLimit(_ a: Int, _ l1: Int, _ l2: Int) -> Int {
+    if l1 > l2 {
+        return if a > l1 { l1 } else if a < l2 { l2 } else { a }
+    }
+    if a > l2 { l2 } else if a < l1 { l1 } else { a }
+}
+
+// silk_LSHIFT_SAT32: shift left, saturating at the 32-bit limits.
+fn silkLshiftSat32(_ a: Int, _ shift: Int) -> Int {
+    silkLimit(a, silkInt32Min >> shift, silkInt32Max >> shift) << shift
+}
+
+// Count of leading zeros of a 32-bit value (32 for 0).
+fn silkCLZ32(_ v: Int) -> Int {
+    var x = v & 4294967295
+    if x == 0 {
+        return 32
+    }
+    var n = 0
+    while x >= 256 {
+        x = x >> 8
+        n += 8
+    }
+    while x > 0 {
+        x = x >> 1
+        n += 1
+    }
+    32 - n
+}
+
+// silk_CLZ_FRAC: leading zeros and the 7 bits after the leading one.
+fn silkCLZFrac(_ v: Int) -> (Int, Int) {
+    let lz = silkCLZ32(v)
+    let x = v & 4294967295
+    let rot = 24 - lz
+    var frac = 0
+    if rot == 0 {
+        frac = x & 127
+    } else if rot < 0 {
+        frac = (x << (-rot)) & 127
+    } else {
+        frac = (x >> rot) & 127
+    }
+    (lz, frac)
+}
+
+// silk_SQRT_APPROX.
+fn silkSqrtApprox(_ x: Int) -> Int {
+    if x <= 0 {
+        return 0
+    }
+    let (lz, frac) = silkCLZFrac(x)
+    var y = if lz & 1 != 0 { 32768 } else { 46214 }
+    y = y >> (lz >> 1)
+    silkSMLAWB(y, y, silkSMULBB(213, frac))
+}
+
+// silk_DIV32_varQ: about (a32 << Qres) / b32.
+fn silkDiv32VarQ(_ a32: Int, _ b32: Int, _ qres: Int) -> Int {
+    let aHead = silkCLZ32(abs(a32)) - 1
+    var aNrm = silkI32(a32 << aHead)
+    let bHead = silkCLZ32(abs(b32)) - 1
+    let bNrm = silkI32(b32 << bHead)
+    let bInv = (silkInt32Max >> 2) / (bNrm >> 16)
+    var result = silkSMULWB(aNrm, bInv)
+    aNrm = silkI32(aNrm - silkI32(silkSMMUL(bNrm, result) << 3))
+    result = silkSMLAWB(result, aNrm, bInv)
+    let lshift = 29 + aHead - bHead - qres
+    if lshift < 0 {
+        return silkLshiftSat32(result, -lshift)
+    }
+    if lshift < 32 {
+        return result >> lshift
+    }
+    0
+}
+
+// silk_INVERSE32_varQ: about (1 << Qres) / b32.
+fn silkInverse32VarQ(_ b32: Int, _ qres: Int) -> Int {
+    let bHead = silkCLZ32(abs(b32)) - 1
+    let bNrm = silkI32(b32 << bHead)
+    let bInv = (silkInt32Max >> 2) / (bNrm >> 16)
+    var result = silkI32(bInv << 16)
+    let errQ32 = silkI32(((1 << 29) - silkSMULWB(bNrm, bInv)) << 3)
+    result = silkSMLAWW(result, errQ32, bInv)
+    let lshift = 61 - bHead - qres
+    if lshift <= 0 {
+        return silkLshiftSat32(result, -lshift)
+    }
+    if lshift < 32 {
+        return result >> lshift
+    }
+    0
+}
+
+// silk_log2lin: about 2^(inLog_Q7 / 128).
+fn silkLog2Lin(_ inLog: Int) -> Int {
+    if inLog < 0 {
+        return 0
+    }
+    if inLog >= 3967 {
+        return silkInt32Max
+    }
+    var out = 1 << (inLog >> 7)
+    let frac = inLog & 127
+    let poly = silkSMLAWB(frac, silkSMULBB(frac, 128 - frac), -174)
+    if inLog < 2048 {
+        out = out + ((out * poly) >> 7)
+    } else {
+        out = out + (out >> 7) * poly
+    }
+    out
+}
+
+// silk_bwexpander on Q12 coefficients a[from..<from+d] (section 4.2.7.5.8).
+fn silkBwExpander(_ ar: bind [Int], _ from: Int, _ d: Int, _ chirpIn: Int) {
+    var chirp = chirpIn
+    let chirpMinusOne = chirp - 65536
+    for i in 0..(d - 1) {
+        ar[from + i] = silkI16(silkRshiftRound(chirp * ar[from + i], 16))
+        chirp += silkRshiftRound(chirp * chirpMinusOne, 16)
+    }
+    ar[from + d - 1] = silkI16(silkRshiftRound(chirp * ar[from + d - 1], 16))
+}
+
+// silk_bwexpander_32 on 32-bit coefficients.
+fn silkBwExpander32(_ ar: bind [Int], _ d: Int, _ chirpIn: Int) {
+    var chirp = chirpIn
+    let chirpMinusOne = chirp - 65536
+    for i in 0..(d - 1) {
+        ar[i] = silkSMULWW(chirp, ar[i])
+        chirp += silkRshiftRound(chirp * chirpMinusOne, 16)
+    }
+    ar[d - 1] = silkSMULWW(chirp, ar[d - 1])
+}
+
+// silk_LPC_inverse_pred_gain (section 4.2.7.5.8): 0 when the filter
+// a[from..<from+order] (Q12) is unstable, else its inverse prediction gain.
+fn silkLPCInversePredGain(_ aQ12: [Int], _ from: Int, _ order: Int) -> Int {
+    var a: [Int] = []
+    var dc = 0
+    for k in 0..order {
+        dc += aQ12[from + k]
+        a.append(aQ12[from + k] << 12)
+    }
+    if dc >= 4096 {
+        return 0
+    }
+    let aLimit = 16773022   // SILK_FIX_CONST(0.99975, 24)
+    var invGain = 1 << 30
+    var k = order - 1
+    while k > 0 {
+        if a[k] > aLimit || a[k] < -aLimit {
+            return 0
+        }
+        let rcQ31 = -(a[k] << 7)
+        let rcMult1 = (1 << 30) - silkSMMUL(rcQ31, rcQ31)
+        invGain = silkSMMUL(invGain, rcMult1) << 2
+        if invGain < 107374 {   // SILK_FIX_CONST(1/1e4, 30)
+            return 0
+        }
+        let mult2Q = 32 - silkCLZ32(abs(rcMult1))
+        let rcMult2 = silkInverse32VarQ(rcMult1, mult2Q + 30)
+        for n in 0..((k + 1) >> 1) {
+            let tmp1 = a[n]
+            let tmp2 = a[k - n - 1]
+            let v1 = silkRshiftRound(silkSubSat32(tmp1, silkRshiftRound(tmp2 * rcQ31, 31)) * rcMult2, mult2Q)
+            if v1 > silkInt32Max || v1 < silkInt32Min {
+                return 0
+            }
+            a[n] = v1
+            let v2 = silkRshiftRound(silkSubSat32(tmp2, silkRshiftRound(tmp1 * rcQ31, 31)) * rcMult2, mult2Q)
+            if v2 > silkInt32Max || v2 < silkInt32Min {
+                return 0
+            }
+            a[k - n - 1] = v2
+        }
+        k -= 1
+    }
+    if a[0] > aLimit || a[0] < -aLimit {
+        return 0
+    }
+    let rcQ31 = -(a[0] << 7)
+    let rcMult1 = (1 << 30) - silkSMMUL(rcQ31, rcQ31)
+    invGain = silkSMMUL(invGain, rcMult1) << 2
+    if invGain < 107374 {
+        return 0
+    }
+    invGain
+}
+
+// silk_LPC_fit: 32-bit QIN coefficients to 16-bit QOUT without wrapping.
+fn silkLPCFit(_ out: bind [Int], _ outFrom: Int, _ aQIN: bind [Int], _ qout: Int, _ qin: Int, _ d: Int) {
+    var idx = 0
+    var i = 0
+    while i < 10 {
+        var maxabs = 0
+        for k in 0..d {
+            let absval = abs(aQIN[k])
+            if absval > maxabs {
+                maxabs = absval
+                idx = k
+            }
+        }
+        maxabs = silkRshiftRound(maxabs, qin - qout)
+        if maxabs > 32767 {
+            maxabs = min(maxabs, 163838)
+            let chirp = 65470 - ((maxabs - 32767) << 14) / ((maxabs * (idx + 1)) >> 2)
+            silkBwExpander32(aQIN, d, chirp)
+        } else {
+            break
+        }
+        i += 1
+    }
+    if i == 10 {
+        for k in 0..d {
+            out[outFrom + k] = silkSat16(silkRshiftRound(aQIN[k], qin - qout))
+            aQIN[k] = out[outFrom + k] << (qin - qout)
+        }
+    } else {
+        for k in 0..d {
+            out[outFrom + k] = silkI16(silkRshiftRound(aQIN[k], qin - qout))
+        }
+    }
+}
+
+let silkOrdering16 = [0, 15, 8, 7, 4, 11, 12, 3, 2, 13, 10, 5, 6, 9, 14, 1]
+let silkOrdering10 = [0, 9, 6, 3, 4, 5, 8, 1, 2, 7]
+
+// One of the two polynomials of silk_NLSF2A (cLSF interleaved from `start`).
+fn silkNLSF2AFindPoly(_ out: bind [Int], _ cLSF: [Int], _ start: Int, _ dd: Int) {
+    out[0] = 1 << 16
+    out[1] = -cLSF[start]
+    for k in 1..dd {
+        let ftmp = cLSF[start + 2 * k]
+        out[k + 1] = (out[k - 1] << 1) - silkRshiftRound(ftmp * out[k], 16)
+        var n = k
+        while n > 1 {
+            out[n] += out[n - 2] - silkRshiftRound(ftmp * out[n - 1], 16)
+            n -= 1
+        }
+        out[1] -= ftmp
+    }
+}
+
+// silk_NLSF2A (section 4.2.7.5.6-8): Q15 NLSFs to Q12 LPC coefficients,
+// written to aQ12[outFrom..<outFrom+d], made stable.
+fn silkNLSF2A(_ aQ12: bind [Int], _ outFrom: Int, _ nlsf: [Int], _ d: Int) {
+    var cosLSF: [Int] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    for k in 0..d {
+        let fInt = nlsf[k] >> 8
+        let fFrac = nlsf[k] - (fInt << 8)
+        let cosVal = silkLSFCosTabFIXQ12[fInt]
+        let delta = silkLSFCosTabFIXQ12[fInt + 1] - cosVal
+        let o = if d == 16 { silkOrdering16[k] } else { silkOrdering10[k] }
+        cosLSF[o] = silkRshiftRound((cosVal << 8) + delta * fFrac, 4)
+    }
+    let dd = d >> 1
+    var p: [Int] = [0, 0, 0, 0, 0, 0, 0, 0, 0]
+    var q: [Int] = [0, 0, 0, 0, 0, 0, 0, 0, 0]
+    silkNLSF2AFindPoly(p, cosLSF, 0, dd)
+    silkNLSF2AFindPoly(q, cosLSF, 1, dd)
+    var a32: [Int] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    for k in 0..dd {
+        let ptmp = p[k + 1] + p[k]
+        let qtmp = q[k + 1] - q[k]
+        a32[k] = -qtmp - ptmp
+        a32[d - k - 1] = qtmp - ptmp
+    }
+    silkLPCFit(aQ12, outFrom, a32, 12, 17, d)
+    var i = 0
+    while silkLPCInversePredGain(aQ12, outFrom, d) == 0 && i < 16 {
+        silkBwExpander32(a32, d, 65536 - (2 << i))
+        for k in 0..d {
+            aQ12[outFrom + k] = silkI16(silkRshiftRound(a32[k], 5))
+        }
+        i += 1
+    }
+}
+
+// silk_NLSF_stabilize (section 4.2.7.5.4).
+fn silkNLSFStabilize(_ nlsf: bind [Int], _ deltaMin: [Int], _ l: Int) {
+    var loops = 0
+    while loops < 20 {
+        var minDiff = nlsf[0] - deltaMin[0]
+        var at = 0
+        for i in 1..l {
+            let diff = nlsf[i] - (nlsf[i - 1] + deltaMin[i])
+            if diff < minDiff {
+                minDiff = diff
+                at = i
+            }
+        }
+        let last = (1 << 15) - (nlsf[l - 1] + deltaMin[l])
+        if last < minDiff {
+            minDiff = last
+            at = l
+        }
+        if minDiff >= 0 {
+            return
+        }
+        if at == 0 {
+            nlsf[0] = deltaMin[0]
+        } else if at == l {
+            nlsf[l - 1] = (1 << 15) - deltaMin[l]
+        } else {
+            var minCenter = 0
+            for k in 0..at {
+                minCenter += deltaMin[k]
+            }
+            minCenter += deltaMin[at] >> 1
+            var maxCenter = 1 << 15
+            var k = l
+            while k > at {
+                maxCenter -= deltaMin[k]
+                k -= 1
+            }
+            maxCenter -= deltaMin[at] >> 1
+            let center = silkI16(silkLimit(silkRshiftRound(nlsf[at - 1] + nlsf[at], 1), minCenter, maxCenter))
+            nlsf[at - 1] = center - (deltaMin[at] >> 1)
+            nlsf[at] = nlsf[at - 1] + deltaMin[at]
+        }
+        loops += 1
+    }
+    // Fall back: sort, then push apart from both ends.
+    for i in 1..l {
+        let value = nlsf[i]
+        var j = i - 1
+        while j >= 0 && value < nlsf[j] {
+            nlsf[j + 1] = nlsf[j]
+            j -= 1
+        }
+        nlsf[j + 1] = value
+    }
+    nlsf[0] = max(nlsf[0], deltaMin[0])
+    for i in 1..l {
+        nlsf[i] = max(nlsf[i], silkSat16(nlsf[i - 1] + deltaMin[i]))
+    }
+    nlsf[l - 1] = min(nlsf[l - 1], (1 << 15) - deltaMin[l])
+    var i = l - 2
+    while i >= 0 {
+        nlsf[i] = min(nlsf[i], nlsf[i + 1] - deltaMin[i + 1])
+        i -= 1
+    }
+}
+
+// silk_sum_sqr_shift: energy of x[from..<from+len] and the right shift
+// that keeps it in 32 bits.
+fn silkSumSqrShift(_ x: [Int], _ from: Int, _ len: Int) -> (Int, Int) {
+    var shft = 31 - silkCLZ32(len)
+    var nrg = len
+    var i = 0
+    while i < len - 1 {
+        let a = x[from + i]
+        let b = x[from + i + 1]
+        nrg = nrg + ((a * a + b * b) >> shft)
+        i += 2
+    }
+    if i < len {
+        let a = x[from + i]
+        nrg = nrg + ((a * a) >> shft)
+    }
+    nrg = silkI32(nrg)
+    shft = max(0, shft + 3 - silkCLZ32(nrg))
+    nrg = 0
+    i = 0
+    while i < len - 1 {
+        let a = x[from + i]
+        let b = x[from + i + 1]
+        nrg = nrg + ((a * a + b * b) >> shft)
+        i += 2
+    }
+    if i < len {
+        let a = x[from + i]
+        nrg = nrg + ((a * a) >> shft)
+    }
+    (silkI32(nrg), shft)
+}
+
+// silk_LPC_analysis_filter: out[outFrom+ix] for ix in d..<len is the
+// prediction residual of input[inFrom+ix] with Q12 coefficients
+// b[bFrom..]; the first d outputs are zero.
+fn silkLPCAnalysisFilter(_ out: bind [Int], _ outFrom: Int, _ input: [Int], _ inFrom: Int, _ b: [Int], _ bFrom: Int, _ len: Int, _ d: Int) {
+    for ix in d..len {
+        let base = inFrom + ix - 1
+        var acc = 0
+        for j in 0..d {
+            acc += input[base - j] * b[bFrom + j]
+        }
+        let out32 = silkI32((input[base + 1] << 12) - acc)
+        out[outFrom + ix] = silkSat16(silkRshiftRound(out32, 12))
+    }
+    for j in 0..d {
+        out[outFrom + j] = 0
+    }
+}
+
+// One symbol from the two-entry table {v, 0} (the sign tables of section
+// 4.2.7.8.6): 0 with probability (256 - v) / 256.
+fn silkDecodeTwo(_ rc: bind OpusRange, _ v: Int) -> Int {
+    let r = rc.rng >> 8
+    let s = r * v
+    if rc.val >= s {
+        rc.val = rc.val - s
+        rc.rng = rc.rng - s
+        rc.normalize()
+        return 0
+    }
+    rc.rng = s
+    rc.normalize()
+    1
+}

@@ -1,0 +1,72 @@
+{
+ "format": "flac",
+ "duration": 0.2,
+ "tags": {
+  "encoder": "Lavf62.12.102"
+ },
+ "tracks": [
+  {
+   "index": 0,
+   "kind": "audio",
+   "codec": "flac",
+   "ffCodec": "flac",
+   "profile": "",
+   "timescale": 48000,
+   "duration": 9600,
+   "extraHex": "120012000004e00036680bb80370000025803211677c913bb1fc1be9da44ffc81cf0",
+   "width": 0,
+   "height": 0,
+   "sarNum": 1,
+   "sarDen": 1,
+   "fpsNum": 0,
+   "fpsDen": 0,
+   "rotation": 0,
+   "pixFmt": "",
+   "sampleRate": 48000,
+   "channels": 2,
+   "channelLayout": "stereo",
+   "bitsPerSample": 24,
+   "pcm": {
+    "bits": 16,
+    "float": false,
+    "bigEndian": false,
+    "signed": true
+   },
+   "language": "",
+   "title": "",
+   "isDefault": false,
+   "isCover": false,
+   "frames": -1
+  }
+ ],
+ "packets": [
+  {
+   "track": 0,
+   "pts": 0,
+   "dts": 0,
+   "duration": 4608,
+   "key": true,
+   "pos": 8288,
+   "size": 13308
+  },
+  {
+   "track": 0,
+   "pts": 4608,
+   "dts": 4608,
+   "duration": 4608,
+   "key": true,
+   "pos": 21596,
+   "size": 13928
+  },
+  {
+   "track": 0,
+   "pts": 9216,
+   "dts": 9216,
+   "duration": 384,
+   "key": true,
+   "pos": 35524,
+   "size": 1248
+  }
+ ],
+ "chapters": []
+}

@@ -1,0 +1,745 @@
+// HEVC parameter sets: the sequence parameter set (SPS, ITU-T H.265
+// 7.3.2.2 with VUI E.2.1 and the range extension flags 7.3.2.2.2), the
+// picture parameter set (PPS, 7.3.2.3), scaling lists (7.3.4, 7.4.5),
+// short-term reference picture sets (7.3.7, 7.4.8) and profile_tier_level
+// (7.3.3). The video parameter set carries nothing a single-layer decoder
+// needs, so it is not parsed.
+//
+// Parsing is done by HevcPs, which holds the bit reader of one NAL unit's
+// RBSP and has a method per syntax structure.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../core"
+
+// One short-term reference picture set: POC deltas of the pictures before
+// (s0, closest first) and after (s1, closest first) the current one, and
+// whether the current picture uses each for reference.
+struct HevcRps {
+    s0: [Int] = []
+    used0: [Int] = []
+    s1: [Int] = []
+    used1: [Int] = []
+
+    numDelta: Int { s0.count + s1.count }
+}
+
+struct HevcSps {
+    valid: Bool = false
+    id: Int = 0
+    maxSubLayers: Int = 1
+    profileIdc: Int = 0
+    profileCompat: Int = 0
+    tierFlag: Int = 0
+    levelIdc: Int = 0
+    chromaFormatIdc: Int = 1
+    width: Int = 0
+    height: Int = 0
+    // Conformance window in luma samples.
+    confLeft: Int = 0
+    confRight: Int = 0
+    confTop: Int = 0
+    confBottom: Int = 0
+    bitDepth: Int = 8
+    bitDepthC: Int = 8
+    log2MaxPocLsb: Int = 4
+    maxDecPicBuffering: Int = 1
+    numReorderPics: Int = 0
+    // SpsMaxLatencyPictures, or 0 when there is no limit.
+    maxLatencyPictures: Int = 0
+    log2MinCb: Int = 3
+    log2Ctb: Int = 4
+    log2MinTb: Int = 2
+    log2MaxTb: Int = 5
+    maxTrDepthInter: Int = 0
+    maxTrDepthIntra: Int = 0
+    scalingListEnabled: Bool = false
+    // Scaling lists: 4 sizes x 6 matrices x 64 coefficients (raster
+    // order, 4x4 lists use the first 16), and the DC values.
+    scaling: [Int] = []
+    scalingDc: [Int] = []
+    ampEnabled: Bool = false
+    saoEnabled: Bool = false
+    pcmEnabled: Bool = false
+    pcmBitDepth: Int = 8
+    pcmBitDepthC: Int = 8
+    log2MinPcm: Int = 3
+    log2MaxPcm: Int = 3
+    pcmLoopFilterDisabled: Bool = false
+    stRps: [HevcRps] = []
+    longTermPresent: Bool = false
+    ltPocLsbSps: [Int] = []
+    ltUsedSps: [Int] = []
+    temporalMvp: Bool = false
+    strongIntraSmoothing: Bool = false
+    // VUI.
+    sarNum: Int = 0
+    sarDen: Int = 0
+    fullRange: Bool = false
+    colourPrimaries: Int = 2
+    transfer: Int = 2
+    matrixCoeffs: Int = 2
+    fpsNum: Int = 0
+    fpsDen: Int = 0
+    // Range extension and other tools this decoder doesn't implement;
+    // "" when the stream needs none of them.
+    unsupported: String = ""
+
+    log2MinPu: Int { log2MinCb - 1 }
+    ctbSize: Int { 1 << log2Ctb }
+    picWidthInCtbs: Int { (width + (1 << log2Ctb) - 1) >> log2Ctb }
+    picHeightInCtbs: Int { (height + (1 << log2Ctb) - 1) >> log2Ctb }
+}
+
+struct HevcPps {
+    valid: Bool = false
+    id: Int = 0
+    spsId: Int = 0
+    dependentSliceSegments: Bool = false
+    outputFlagPresent: Bool = false
+    numExtraSliceHeaderBits: Int = 0
+    signDataHiding: Bool = false
+    cabacInitPresent: Bool = false
+    numRefIdxL0Default: Int = 1
+    numRefIdxL1Default: Int = 1
+    initQp: Int = 26
+    constrainedIntraPred: Bool = false
+    transformSkip: Bool = false
+    cuQpDeltaEnabled: Bool = false
+    diffCuQpDeltaDepth: Int = 0
+    cbQpOffset: Int = 0
+    crQpOffset: Int = 0
+    sliceChromaQpOffsetsPresent: Bool = false
+    weightedPred: Bool = false
+    weightedBipred: Bool = false
+    transquantBypass: Bool = false
+    tiles: Bool = false
+    entropySync: Bool = false
+    numTileCols: Int = 1
+    numTileRows: Int = 1
+    uniformSpacing: Bool = true
+    // Explicit column widths / row heights in CTBs (all but the last).
+    colWidths: [Int] = []
+    rowHeights: [Int] = []
+    loopFilterAcrossTiles: Bool = true
+    loopFilterAcrossSlices: Bool = false
+    deblockingOverrideEnabled: Bool = false
+    deblockingDisabled: Bool = false
+    betaOffsetDiv2: Int = 0
+    tcOffsetDiv2: Int = 0
+    scalingListPresent: Bool = false
+    scaling: [Int] = []
+    scalingDc: [Int] = []
+    listsModification: Bool = false
+    log2ParMrgLevel: Int = 2
+    sliceHeaderExtension: Bool = false
+    log2MaxTransformSkipSize: Int = 2
+    unsupported: String = ""
+}
+
+// Default scaling lists (7.4.5): flat 16 for 4x4, Table 7-6 for the rest.
+fn hevcDefaultScaling() -> [Int] {
+    var sl: [Int] = []
+    for sizeId in 0..4 {
+        for matrixId in 0..6 {
+            for i in 0..64 {
+                if sizeId == 0 {
+                    sl.append(16)
+                } else if matrixId < 3 {
+                    sl.append(hevcDefaultIntra8[i])
+                } else {
+                    sl.append(hevcDefaultInter8[i])
+                }
+            }
+        }
+    }
+    sl
+}
+
+fn hevcFilled(_ n: Int, _ v: Int) -> [Int] {
+    var out: [Int] = []
+    for _ in 0..n {
+        out.append(v)
+    }
+    out
+}
+
+// A reader over one RBSP with a method for each syntax structure.
+struct HevcPs {
+    r: core.BitReader
+    diag4: [Int] = []
+    diag8: [Int] = []
+
+    fn bits(_ n: Int) -> Int {
+        r.bits(n)
+    }
+
+    fn flag() -> Bool {
+        r.bits(1) == 1
+    }
+
+    fn ue() -> Int {
+        r.ue()
+    }
+
+    fn se() -> Int {
+        r.se()
+    }
+
+    // profile_tier_level(1, maxNumSubLayersMinus1) (7.3.3): the general
+    // profile and level into the SPS, the sub-layer parts skipped.
+    fn parsePtl(_ s: HevcSps, _ maxSubLayersMinus1: Int) -> HevcSps {
+        var out = s
+        bits(2)
+        out.tierFlag = bits(1)
+        out.profileIdc = bits(5)
+        out.profileCompat = bits(32)
+        // progressive/interlaced/non-packed/frame-only flags and 43 + 1
+        // bits of constraints.
+        r.skip(4 + 43 + 1)
+        out.levelIdc = bits(8)
+        var subProfile: [Bool] = []
+        var subLevel: [Bool] = []
+        for _ in 0..maxSubLayersMinus1 {
+            subProfile.append(flag())
+            subLevel.append(flag())
+        }
+        if maxSubLayersMinus1 > 0 {
+            for _ in maxSubLayersMinus1..8 {
+                bits(2)
+            }
+        }
+        for i in 0..maxSubLayersMinus1 {
+            if subProfile[i] {
+                r.skip(88)
+            }
+            if subLevel[i] {
+                bits(8)
+            }
+        }
+        out
+    }
+
+    // scaling_list_data() (7.3.4) into a list laid out as in HevcSps.
+    fn parseScalingList() -> ([Int], [Int]) {
+        var sl = hevcDefaultScaling()
+        var dc = hevcFilled(24, 16)
+        for sizeId in 0..4 {
+            var matrixId = 0
+            while matrixId < 6 {
+                let predModeFlag = flag()
+                let base = (sizeId * 6 + matrixId) * 64
+                let n = min(64, 1 << (4 + (sizeId << 1)))
+                if !predModeFlag {
+                    // Copy of an earlier list (or the default for delta 0).
+                    let delta = ue() * (if sizeId == 3 { 3 } else { 1 })
+                    if delta > 0 && delta <= matrixId {
+                        let src = (sizeId * 6 + matrixId - delta) * 64
+                        for i in 0..64 {
+                            sl[base + i] = sl[src + i]
+                        }
+                        dc[sizeId * 6 + matrixId] = dc[sizeId * 6 + matrixId - delta]
+                    } else if delta == 0 {
+                        dc[sizeId * 6 + matrixId] = 16
+                    }
+                } else {
+                    var next = 8
+                    if sizeId > 1 {
+                        next = se() + 8
+                        dc[sizeId * 6 + matrixId] = next
+                    }
+                    let scan = if sizeId == 0 { diag4 } else { diag8 }
+                    for i in 0..n {
+                        let delta = se()
+                        next = (next + delta + 256) % 256
+                        // The diagonal scan positions are x + y * size.
+                        let p = scan[i]
+                        if sizeId == 0 {
+                            sl[base + p] = next
+                        } else {
+                            sl[base + p] = next
+                        }
+                    }
+                }
+                matrixId += if sizeId == 3 { 3 } else { 1 }
+            }
+        }
+        // 32x32 chroma lists (4:4:4 only) copy the 16x16 ones.
+        for m in [1, 2, 4, 5] {
+            for i in 0..64 {
+                sl[(18 + m) * 64 + i] = sl[(12 + m) * 64 + i]
+            }
+            dc[18 + m] = dc[12 + m]
+        }
+        (sl, dc)
+    }
+
+    // st_ref_pic_set(stRpsIdx) (7.3.7) with the derivation of 7.4.8.
+    fn parseStRps(_ idx: Int, _ sets: [HevcRps], inSlice: Bool) -> HevcRps {
+        var out = HevcRps()
+        var interPred = false
+        if idx != 0 {
+            interPred = flag()
+        }
+        if interPred {
+            var deltaIdx = 1
+            if inSlice {
+                deltaIdx = ue() + 1
+            }
+            let sign = bits(1)
+            let absDelta = ue() + 1
+            let deltaRps = if sign == 1 { -absDelta } else { absDelta }
+            let refIdx = idx - deltaIdx
+            if refIdx < 0 || refIdx >= sets.count {
+                r.overrun = true
+                return out
+            }
+            let ref = sets[refIdx]
+            let nd = ref.s0.count + ref.s1.count
+            var usedBy: [Int] = []
+            var useDelta: [Int] = []
+            for _ in 0..(nd + 1) {
+                let u = bits(1)
+                usedBy.append(u)
+                if u == 0 {
+                    useDelta.append(bits(1))
+                } else {
+                    useDelta.append(1)
+                }
+            }
+            let nNeg = ref.s0.count
+            let nPos = ref.s1.count
+            // DeltaPocS0 (7-61).
+            var j = nPos - 1
+            while j >= 0 {
+                let d = ref.s1[j] + deltaRps
+                if d < 0 && useDelta[nNeg + j] == 1 {
+                    out.s0.append(d)
+                    out.used0.append(usedBy[nNeg + j])
+                }
+                j -= 1
+            }
+            if deltaRps < 0 && useDelta[nd] == 1 {
+                out.s0.append(deltaRps)
+                out.used0.append(usedBy[nd])
+            }
+            for k in 0..nNeg {
+                let d = ref.s0[k] + deltaRps
+                if d < 0 && useDelta[k] == 1 {
+                    out.s0.append(d)
+                    out.used0.append(usedBy[k])
+                }
+            }
+            // DeltaPocS1 (7-62).
+            j = nNeg - 1
+            while j >= 0 {
+                let d = ref.s0[j] + deltaRps
+                if d > 0 && useDelta[j] == 1 {
+                    out.s1.append(d)
+                    out.used1.append(usedBy[j])
+                }
+                j -= 1
+            }
+            if deltaRps > 0 && useDelta[nd] == 1 {
+                out.s1.append(deltaRps)
+                out.used1.append(usedBy[nd])
+            }
+            for k in 0..nPos {
+                let d = ref.s1[k] + deltaRps
+                if d > 0 && useDelta[nNeg + k] == 1 {
+                    out.s1.append(d)
+                    out.used1.append(usedBy[nNeg + k])
+                }
+            }
+        } else {
+            let nNeg = ue()
+            let nPos = ue()
+            if nNeg > 16 || nPos > 16 {
+                r.overrun = true
+                return out
+            }
+            var prev = 0
+            for _ in 0..nNeg {
+                prev -= ue() + 1
+                out.s0.append(prev)
+                out.used0.append(bits(1))
+            }
+            prev = 0
+            for _ in 0..nPos {
+                prev += ue() + 1
+                out.s1.append(prev)
+                out.used1.append(bits(1))
+            }
+        }
+        out
+    }
+
+    // hrd_parameters(commonInfPresentFlag, maxNumSubLayersMinus1) (E.2.2),
+    // skipped.
+    fn skipHrd(_ common: Bool, _ maxSubLayersMinus1: Int) {
+        var nalHrd = false
+        var vclHrd = false
+        var subPic = false
+        if common {
+            nalHrd = flag()
+            vclHrd = flag()
+            if nalHrd || vclHrd {
+                subPic = flag()
+                if subPic {
+                    bits(8)
+                    bits(5)
+                    bits(1)
+                    bits(5)
+                }
+                bits(4)
+                bits(4)
+                if subPic {
+                    bits(4)
+                }
+                bits(5)
+                bits(5)
+                bits(5)
+            }
+        }
+        for _ in 0..(maxSubLayersMinus1 + 1) {
+            let fixedGeneral = flag()
+            var fixedCvs = true
+            if !fixedGeneral {
+                fixedCvs = flag()
+            }
+            var lowDelay = false
+            if fixedCvs {
+                ue()
+            } else {
+                lowDelay = flag()
+            }
+            var cpbCnt = 1
+            if !lowDelay {
+                cpbCnt = ue() + 1
+                if cpbCnt > 32 {
+                    r.overrun = true
+                    return
+                }
+            }
+            let n = (if nalHrd { 1 } else { 0 }) + (if vclHrd { 1 } else { 0 })
+            for _ in 0..n {
+                for _ in 0..cpbCnt {
+                    ue()
+                    ue()
+                    if subPic {
+                        ue()
+                        ue()
+                    }
+                    bits(1)
+                }
+            }
+        }
+    }
+
+    // vui_parameters() (E.2.1): sample aspect ratio, range, colour, timing.
+    fn parseVui(_ s: HevcSps) -> HevcSps {
+        var out = s
+        if flag() {
+            let idc = bits(8)
+            if idc == 255 {
+                out.sarNum = bits(16)
+                out.sarDen = bits(16)
+            } else if idc > 0 && idc < 17 {
+                out.sarNum = hevcSarTable[idc * 2]
+                out.sarDen = hevcSarTable[idc * 2 + 1]
+            }
+        }
+        if flag() {
+            bits(1)
+        }
+        if flag() {
+            bits(3)
+            out.fullRange = flag()
+            if flag() {
+                out.colourPrimaries = bits(8)
+                out.transfer = bits(8)
+                out.matrixCoeffs = bits(8)
+            }
+        }
+        if flag() {
+            ue()
+            ue()
+        }
+        bits(3)
+        if flag() {
+            // default display window (not applied, as in other players)
+            ue()
+            ue()
+            ue()
+            ue()
+        }
+        if flag() {
+            let units = r.long(32)
+            let scale = r.long(32)
+            if units > 0 && scale > 0 {
+                out.fpsNum = scale
+                out.fpsDen = units
+            }
+            if flag() {
+                ue()
+            }
+            if flag() {
+                skipHrd(true, s.maxSubLayers - 1)
+            }
+        }
+        if flag() {
+            bits(3)
+            ue()
+            ue()
+            ue()
+            ue()
+            ue()
+        }
+        out
+    }
+
+    // seq_parameter_set_rbsp() (7.3.2.2), from after the NAL header.
+    fn parseSps() -> HevcSps {
+        var s = HevcSps()
+        bits(4)
+        s.maxSubLayers = bits(3) + 1
+        bits(1)
+        s = parsePtl(s, s.maxSubLayers - 1)
+        s.id = ue()
+        if s.id > 15 {
+            return s
+        }
+        s.chromaFormatIdc = ue()
+        if s.chromaFormatIdc == 3 {
+            if flag() {
+                s.unsupported = "separate colour planes"
+            }
+        }
+        s.width = ue()
+        s.height = ue()
+        let subW = if s.chromaFormatIdc == 1 || s.chromaFormatIdc == 2 { 2 } else { 1 }
+        let subH = if s.chromaFormatIdc == 1 { 2 } else { 1 }
+        if flag() {
+            s.confLeft = ue() * subW
+            s.confRight = ue() * subW
+            s.confTop = ue() * subH
+            s.confBottom = ue() * subH
+            if s.confLeft + s.confRight >= s.width || s.confTop + s.confBottom >= s.height {
+                s.confLeft = 0
+                s.confRight = 0
+                s.confTop = 0
+                s.confBottom = 0
+            }
+        }
+        s.bitDepth = ue() + 8
+        s.bitDepthC = ue() + 8
+        s.log2MaxPocLsb = ue() + 4
+        if s.log2MaxPocLsb > 16 {
+            return s
+        }
+        let orderingAll = flag()
+        let start = if orderingAll { 0 } else { s.maxSubLayers - 1 }
+        for _ in start..s.maxSubLayers {
+            // The values of the highest sub-layer are the ones used.
+            s.maxDecPicBuffering = ue() + 1
+            s.numReorderPics = ue()
+            let latencyPlus1 = ue()
+            s.maxLatencyPictures = if latencyPlus1 != 0 { s.numReorderPics + latencyPlus1 - 1 } else { 0 }
+        }
+        s.log2MinCb = ue() + 3
+        s.log2Ctb = s.log2MinCb + ue()
+        s.log2MinTb = ue() + 2
+        s.log2MaxTb = s.log2MinTb + ue()
+        s.maxTrDepthInter = ue()
+        s.maxTrDepthIntra = ue()
+        s.scalingListEnabled = flag()
+        if s.scalingListEnabled {
+            if flag() {
+                let (sl, dc) = parseScalingList()
+                s.scaling = sl
+                s.scalingDc = dc
+            } else {
+                s.scaling = hevcDefaultScaling()
+                s.scalingDc = hevcFilled(24, 16)
+            }
+        }
+        s.ampEnabled = flag()
+        s.saoEnabled = flag()
+        s.pcmEnabled = flag()
+        if s.pcmEnabled {
+            s.pcmBitDepth = bits(4) + 1
+            s.pcmBitDepthC = bits(4) + 1
+            s.log2MinPcm = ue() + 3
+            s.log2MaxPcm = s.log2MinPcm + ue()
+            s.pcmLoopFilterDisabled = flag()
+        }
+        let numStRps = ue()
+        if numStRps > 64 {
+            return s
+        }
+        for i in 0..numStRps {
+            let rps = parseStRps(i, s.stRps, inSlice: false)
+            s.stRps.append(rps)
+        }
+        s.longTermPresent = flag()
+        if s.longTermPresent {
+            let n = ue()
+            if n > 32 {
+                return s
+            }
+            for _ in 0..n {
+                s.ltPocLsbSps.append(bits(s.log2MaxPocLsb))
+                s.ltUsedSps.append(bits(1))
+            }
+        }
+        s.temporalMvp = flag()
+        s.strongIntraSmoothing = flag()
+        if flag() {
+            s = parseVui(s)
+        }
+        if flag() {
+            let rangeExt = flag()
+            let multilayer = flag()
+            let ext3d = flag()
+            let scc = flag()
+            bits(4)
+            if rangeExt {
+                var tools: [String] = []
+                let names = ["transform skip rotation", "transform skip context", "implicit RDPCM", "explicit RDPCM", "extended precision", "intra smoothing disabled", "high precision offsets", "persistent Rice adaptation", "CABAC bypass alignment"]
+                for name in names {
+                    if flag() {
+                        tools.append(name)
+                    }
+                }
+                if !tools.isEmpty {
+                    s.unsupported = "range extension tools (" + tools.joined(separator: ", ") + ")"
+                }
+            }
+            if multilayer || ext3d || scc {
+                s.unsupported = if scc { "screen content coding" } else { "multi-layer extensions" }
+            }
+        }
+        if s.chromaFormatIdc == 2 || s.chromaFormatIdc == 3 {
+            s.unsupported = if s.chromaFormatIdc == 2 { "4:2:2 chroma" } else { "4:4:4 chroma" }
+        }
+        if s.chromaFormatIdc > 3 || s.log2MaxPocLsb > 16 || (s.pcmEnabled && (s.pcmBitDepth > s.bitDepth || s.pcmBitDepthC > s.bitDepthC || s.log2MaxPcm > 5)) {
+            return s
+        }
+        if s.bitDepth > 10 || s.bitDepthC > 10 {
+            s.unsupported = "bit depth above 10"
+        } else if s.chromaFormatIdc != 0 && s.bitDepth != s.bitDepthC {
+            s.unsupported = "different luma and chroma bit depths"
+        }
+        if s.log2Ctb < 4 || s.log2Ctb > 6 || s.log2MinTb > 5 || s.log2MaxTb > 5 || s.log2MinTb >= s.log2MinCb || s.log2MaxTb > s.log2Ctb || s.width <= 0 || s.height <= 0 || s.width > 16888 || s.height > 16888 {
+            return s
+        }
+        if s.width % (1 << s.log2MinCb) != 0 || s.height % (1 << s.log2MinCb) != 0 {
+            return s
+        }
+        s.valid = !r.overrun
+        s
+    }
+
+    // pic_parameter_set_rbsp() (7.3.2.3).
+    fn parsePps() -> HevcPps {
+        var p = HevcPps()
+        p.id = ue()
+        p.spsId = ue()
+        if p.id > 63 || p.spsId > 15 {
+            return p
+        }
+        p.dependentSliceSegments = flag()
+        p.outputFlagPresent = flag()
+        p.numExtraSliceHeaderBits = bits(3)
+        p.signDataHiding = flag()
+        p.cabacInitPresent = flag()
+        p.numRefIdxL0Default = ue() + 1
+        p.numRefIdxL1Default = ue() + 1
+        p.initQp = 26 + se()
+        p.constrainedIntraPred = flag()
+        p.transformSkip = flag()
+        p.cuQpDeltaEnabled = flag()
+        if p.cuQpDeltaEnabled {
+            p.diffCuQpDeltaDepth = ue()
+        }
+        p.cbQpOffset = se()
+        p.crQpOffset = se()
+        p.sliceChromaQpOffsetsPresent = flag()
+        p.weightedPred = flag()
+        p.weightedBipred = flag()
+        p.transquantBypass = flag()
+        p.tiles = flag()
+        p.entropySync = flag()
+        if p.tiles {
+            p.numTileCols = ue() + 1
+            p.numTileRows = ue() + 1
+            if p.numTileCols > 64 || p.numTileRows > 64 {
+                return p
+            }
+            p.uniformSpacing = flag()
+            if !p.uniformSpacing {
+                for _ in 0..(p.numTileCols - 1) {
+                    p.colWidths.append(ue() + 1)
+                }
+                for _ in 0..(p.numTileRows - 1) {
+                    p.rowHeights.append(ue() + 1)
+                }
+            }
+            p.loopFilterAcrossTiles = flag()
+        }
+        p.loopFilterAcrossSlices = flag()
+        if flag() {
+            p.deblockingOverrideEnabled = flag()
+            p.deblockingDisabled = flag()
+            if !p.deblockingDisabled {
+                p.betaOffsetDiv2 = se()
+                p.tcOffsetDiv2 = se()
+            }
+        }
+        p.scalingListPresent = flag()
+        if p.scalingListPresent {
+            let (sl, dc) = parseScalingList()
+            p.scaling = sl
+            p.scalingDc = dc
+        }
+        p.listsModification = flag()
+        p.log2ParMrgLevel = ue() + 2
+        p.sliceHeaderExtension = flag()
+        if flag() {
+            let rangeExt = flag()
+            let multilayer = flag()
+            let ext3d = flag()
+            let scc = flag()
+            bits(4)
+            if rangeExt {
+                if p.transformSkip {
+                    p.log2MaxTransformSkipSize = ue() + 2
+                }
+                if flag() {
+                    p.unsupported = "cross-component prediction"
+                }
+                if flag() {
+                    p.unsupported = "chroma QP offset lists"
+                }
+                if ue() != 0 || ue() != 0 {
+                    p.unsupported = "SAO offset scaling"
+                }
+            }
+            if multilayer || ext3d || scc {
+                p.unsupported = if scc { "screen content coding" } else { "multi-layer extensions" }
+            }
+        }
+        p.valid = !r.overrun
+        p
+    }
+}
+
+fn hevcNewPs(_ rbsp: Data, from: Int) -> HevcPs {
+    var ps = HevcPs(r: core.bitReader(rbsp))
+    ps.r.seek(toBit: from * 8)
+    ps.diag4 = hevcDiagScan(4)
+    // 8x8 positions as y * 8 + x.
+    ps.diag8 = hevcDiagScan(8)
+    ps
+}

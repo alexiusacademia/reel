@@ -1,0 +1,1128 @@
+// Windows Media Audio 9 Lossless (WAVE format tag 0x163): the decoder
+// engine, following the bitstream as the FFmpeg project documented it
+// (libavcodec/wmalosslessdec.c), bit-exact with it.
+//
+// Packets and frames are framed as in WMA Pro (sequence number, bits of
+// the previous frame, a bit reservoir, tiles of subframes per channel). A
+// subframe is raw PCM, or adaptive-Golomb coded residues run through, in
+// reverse, cascaded sign-LMS filters per channel (CDLMS), a multichannel
+// LMS (MCLMS), the stereo inter-channel decorrelation and an
+// all-coefficient filter (ACFILTER), then the quantizer step. All the
+// filter arithmetic is in C's 16- and 32-bit integers, wrapping as they
+// do; that is kept exactly here (wma16/wma32 below), since the output must
+// be bit-exact. 16- and 24-bit, up to 8 channels.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../core"
+
+let llMaxChannels = 8
+let llMaxOrder = 256
+let llBlockMax = 16384
+// Per channel and filter: coefficients and the doubled history buffers.
+let llHist = 528
+
+struct WmaLossless {
+    nbChannels: Int = 0
+    rate: Int = 0
+    blockAlign: Int = 0
+    decodeFlags: Int = 0
+    channelMask: Int = 0
+    bitsPerSample: Int = 16
+    lenPrefix: Bool = false
+    drc: Bool = false
+    v3rtm: Bool = false
+    samplesPerFrame: Int = 2048
+    log2FrameSize: Int = 0
+    maxNumSubframes: Int = 1
+    minSamplesPerSubframe: Int = 0
+    maxFrameSize: Int = 0
+
+    // Packet state.
+    pbr: core.BitReader = core.bitReader(Data())
+    packetBits: Int = 0
+    packetSequenceNumber: Int = 0
+    packetLoss: Bool = true
+    packetDone: Bool = false
+    frameData: [Int] = []
+    pbBits: Int = 0
+    numSavedBits: Int = 0
+    frameOffset: Int = 0
+    br: core.BitReader = core.bitReader(Data())
+    // Where the frame reader stops moving (numSavedBits + 8).
+    limit: Int = 0
+
+    // Frame state.
+    parsedAllSubframes: Bool = false
+    channelsForCurSubframe: Int = 0
+    channelIndexes: [Int] = []
+    numSubframes: [Int] = []
+    chSubframeLen: [Int] = []
+    curSubframe: [Int] = []
+    decodedSamples: [Int] = []
+    transientCounter: [Int] = []
+    // The frame's samples per channel (samplesPerFrame each) and how many
+    // are written; the frame's sample count after the end trim.
+    frameSamples: [Int] = []
+    written: [Int] = []
+    frameCount: Int = 0
+
+    // Filters.
+    seekableTile: Bool = false
+    doAcFilter: Bool = false
+    doInterChDecorr: Bool = false
+    doMclms: Bool = false
+    doLpc: Bool = false
+    acfilterOrder: Int = 0
+    acfilterScaling: Int = 0
+    acfilterCoeffs: [Int] = []
+    acfilterPrev: [Int] = []
+    mclmsOrder: Int = 0
+    mclmsScaling: Int = 0
+    mclmsCoeffs: [Int] = []
+    mclmsCoeffsCur: [Int] = []
+    mclmsPrev: [Int] = []
+    mclmsUpdates: [Int] = []
+    mclmsRecent: Int = 0
+    movaveScaling: Int = 0
+    quantStepsize: Int = 1
+    // cdlms[channel][filter]: order, scaling, coefsend, bitsend, recent,
+    // and coefficient / history / update buffers (llHist each).
+    cdOrder: [Int] = []
+    cdScaling: [Int] = []
+    cdRecent: [Int] = []
+    cdCoefs: [Int] = []
+    cdPrev: [Int] = []
+    cdUpdates: [Int] = []
+    cdlmsTtl: [Int] = []
+    isChannelCoded: [Bool] = []
+    updateSpeed: [Int] = []
+    transient: [Bool] = []
+    transientPos: [Int] = []
+    aveSum: [Int] = []
+    residues: [Int] = []
+    lpcCoefs: [Int] = []
+    lpcOrder: Int = 0
+    pred: [Int] = []
+
+    samples: [Float] = []
+    warnings: [String] = []
+
+    fn note(_ w: String) {
+        if warnings.count < 20 && !warnings.contains(w) {
+            warnings.append(w)
+        }
+    }
+
+    count: Int {
+        br.position
+    }
+
+    // ffmpeg's frame reader: `numSavedBits` long, and (its "safe" reader)
+    // it stops moving 8 bits past the end, reading the bytes there, which
+    // hold what earlier frames left in the buffer. A frame cut off at the
+    // end of a file reads those; this keeps the output bit-exact then too.
+    fn gbits(_ n: Int) -> Int {
+        let v = br.bits(n)
+        if br.position > limit {
+            br.seek(toBit: limit)
+        }
+        v
+    }
+
+    fn glong(_ n: Int) -> Int {
+        if n <= 32 {
+            return gbits(n)
+        }
+        let hi = gbits(n - 32)
+        (hi << 32) | gbits(32)
+    }
+
+    fn gflag() -> Bool {
+        gbits(1) == 1
+    }
+
+    fn gsigned(_ n: Int) -> Int {
+        let v = gbits(n)
+        if n > 0 && v >= (1 << (n - 1)) {
+            return v - (1 << n)
+        }
+        v
+    }
+
+    fn gskip(_ n: Int) {
+        var left = n
+        while left > 0 {
+            let k = min(left, 32)
+            gbits(k)
+            left -= k
+        }
+    }
+
+    gleft: Int {
+        numSavedBits - br.position
+    }
+
+    // ---- Bit reservoir ----
+
+    // Writes bits into the (reused, never cleared) frame buffer.
+    fn putBits(_ v: Int, _ n: Int) {
+        var k = n - 1
+        while k >= 0 {
+            let byte = pbBits >> 3
+            if byte < frameData.count {
+                let m = 0x80 >> (pbBits & 7)
+                if ((v >> k) & 1) == 1 {
+                    frameData[byte] = frameData[byte] | m
+                } else {
+                    frameData[byte] = frameData[byte] & (255 - m)
+                }
+            }
+            pbBits += 1
+            k -= 1
+        }
+    }
+
+    fn copyBits(_ n: Int) {
+        var left = n
+        while left > 0 {
+            let k = min(left, 24)
+            putBits(pbr.bits(k), k)
+            left -= k
+        }
+    }
+
+    fn saveBits(_ len: Int, append: Bool) {
+        let pos = pbr.position
+        if !append {
+            frameOffset = pos & 7
+            numSavedBits = frameOffset
+            pbBits = 0
+        }
+        let buflen = (numSavedBits + len + 8) >> 3
+        if len <= 0 || buflen > maxFrameSize {
+            packetLoss = true
+            numSavedBits = 0
+            return
+        }
+        numSavedBits += len
+        if !append {
+            let back = pbr
+            pbr.seek(toBit: pos - frameOffset)
+            copyBits(numSavedBits)
+            pbr = back
+            pbr.skip(len)
+        } else {
+            copyBits(len)
+        }
+        // flush_put_bits: the last byte's unused bits are zero.
+        if (pbBits & 7) != 0 && (pbBits >> 3) < frameData.count {
+            let keep = 8 - (pbBits & 7)
+            let b = pbBits >> 3
+            frameData[b] = frameData[b] & (255 - ((1 << keep) - 1))
+        }
+        // The reader sees the buffer a little past the end (see gbits).
+        let to = min(frameData.count, ((numSavedBits + 8) >> 3) + 8)
+        br = core.bitReaderRange(Data(bytes: frameData.slice(from: 0, to: to)), from: 0, to: to)
+        limit = numSavedBits + 8
+        gbits(frameOffset)
+    }
+
+    // ---- Packets ----
+
+    fn decodePacket(_ buf: Data) {
+        packetDone = false
+        packetBits = buf.count * 8
+        pbr = core.bitReader(buf)
+        let seq = pbr.bits(4)
+        pbr.bits(1)
+        pbr.bits(1)
+        var prevBits = pbr.bits(log2FrameSize)
+        if !packetLoss && ((packetSequenceNumber + 1) & 15) != seq {
+            packetLoss = true
+            note("WMA Lossless: packet loss (sequence {packetSequenceNumber} then {seq})")
+        }
+        packetSequenceNumber = seq
+        if prevBits > 0 {
+            let remaining = packetBits - pbr.position
+            if prevBits >= remaining {
+                prevBits = remaining
+                packetDone = true
+            }
+            saveBits(prevBits, append: true)
+            if prevBits < remaining && !packetLoss {
+                decodeFrame()
+            }
+        }
+        if packetLoss {
+            numSavedBits = 0
+            packetLoss = false
+            pbBits = 0
+        }
+        afterCall()
+        var guardCount = 0
+        while !packetDone && guardCount < 100000 {
+            guardCount += 1
+            let remaining = packetBits - pbr.position
+            if lenPrefix && remaining > log2FrameSize {
+                let frameSize = pbr.peek(log2FrameSize)
+                if frameSize > 0 && frameSize <= remaining {
+                    saveBits(frameSize, append: false)
+                    if !packetLoss {
+                        packetDone = !decodeFrame()
+                    }
+                } else {
+                    packetDone = true
+                }
+            } else if !lenPrefix && numSavedBits > count {
+                packetDone = !decodeFrame()
+            } else {
+                packetDone = true
+            }
+            afterCall()
+            if packetLoss {
+                return
+            }
+        }
+    }
+
+    fn afterCall() {
+        let remaining = packetBits - pbr.position
+        if remaining < 0 {
+            packetLoss = true
+            packetDone = true
+        }
+        if packetDone && !packetLoss && remaining > 0 {
+            saveBits(remaining, append: false)
+        }
+    }
+
+    // End of stream: frames still in the reservoir.
+    fn flushFrames() {
+        var guardCount = 0
+        while numSavedBits > count && guardCount < 1000 {
+            guardCount += 1
+            if !decodeFrame() {
+                numSavedBits = 0
+            }
+        }
+    }
+
+    // ---- Frames ----
+
+    // One frame (its samples appended to `samples`); returns whether more
+    // frames follow.
+    fn decodeFrame() -> Bool {
+        frameCount = samplesPerFrame
+        for c in 0..nbChannels {
+            written[c] = 0
+        }
+        var len = 0
+        if lenPrefix {
+            len = gbits(log2FrameSize)
+        }
+        if !decodeTileHeader() {
+            packetLoss = true
+            note("WMA Lossless: a damaged frame (tile header) was skipped")
+            return false
+        }
+        if drc {
+            gbits(8)
+        }
+        if gflag() {
+            let tb = wmaLog2(samplesPerFrame * 2)
+            if gflag() {
+                gbits(tb)
+            }
+            if gflag() {
+                let skip = gbits(tb)
+                frameCount -= skip
+                if frameCount <= 0 {
+                    return false
+                }
+            }
+        }
+        parsedAllSubframes = false
+        for c in 0..nbChannels {
+            decodedSamples[c] = 0
+            curSubframe[c] = 0
+        }
+        while !parsedAllSubframes {
+            let done = decodedSamples[0]
+            let r = decodeSubframe()
+            if r < 0 {
+                packetLoss = true
+                if r == -2 {
+                    // Waiting for a seekable tile: nothing out.
+                    return false
+                }
+                note("WMA Lossless: a damaged subframe; the frame is cut short")
+                if frameCount > 0 {
+                    frameCount = done
+                }
+                emitFrame()
+                return false
+            }
+        }
+        emitFrame()
+        if lenPrefix {
+            if len != (count - frameOffset) + 2 {
+                note("WMA Lossless: a frame's length doesn't match")
+                packetLoss = true
+                return false
+            }
+            gskip(len - (count - frameOffset) - 1)
+        }
+        gflag()
+    }
+
+    // The frame's samples, interleaved, as floats (s16 / 2^15, s32 / 2^31).
+    fn emitFrame() {
+        let n = frameCount
+        if n <= 0 {
+            return
+        }
+        let c = nbChannels
+        let scale = if bitsPerSample == 16 { 1.0 / 32768.0 } else { 1.0 / 2147483648.0 }
+        let o = samples.count
+        for _ in 0..(n * c) {
+            samples.append(0.0)
+        }
+        for ch in 0..c {
+            let base = ch * llBlockMax
+            var k = o + ch
+            for i in 0..n {
+                samples[k] = Float(frameSamples[base + i]) * scale
+                k += c
+            }
+        }
+    }
+
+    fn decodeTileHeader() -> Bool {
+        var numSamples: [Int] = []
+        var contains: [Bool] = []
+        for c in 0..nbChannels {
+            numSubframes[c] = 0
+            numSamples.append(0)
+            contains.append(false)
+        }
+        var channelsForCur = nbChannels
+        var minChannelLen = 0
+        let aligned = gflag()
+        let fixedLayout = maxNumSubframes == 1 || aligned
+        while true {
+            var inUse = false
+            for c in 0..nbChannels {
+                if numSamples[c] == minChannelLen {
+                    if fixedLayout || channelsForCur == 1 || minChannelLen == samplesPerFrame - minSamplesPerSubframe {
+                        contains[c] = true
+                    } else {
+                        contains[c] = gflag()
+                    }
+                    if contains[c] {
+                        inUse = true
+                    }
+                } else {
+                    contains[c] = false
+                }
+            }
+            if !inUse {
+                return false
+            }
+            var len = minSamplesPerSubframe
+            if minChannelLen != samplesPerFrame - minSamplesPerSubframe {
+                let bits = wmaLog2(maxNumSubframes - 1) + 1
+                len = minSamplesPerSubframe * (gbits(bits) + 1)
+            }
+            if len < minSamplesPerSubframe || len > samplesPerFrame {
+                return false
+            }
+            minChannelLen += len
+            for c in 0..nbChannels {
+                if contains[c] {
+                    if numSubframes[c] >= 32 {
+                        return false
+                    }
+                    chSubframeLen[c * 32 + numSubframes[c]] = len
+                    numSamples[c] += len
+                    numSubframes[c] += 1
+                    if numSamples[c] > samplesPerFrame {
+                        return false
+                    }
+                } else if numSamples[c] <= minChannelLen {
+                    if numSamples[c] < minChannelLen {
+                        channelsForCur = 0
+                        minChannelLen = numSamples[c]
+                    }
+                    channelsForCur += 1
+                }
+            }
+            if minChannelLen >= samplesPerFrame {
+                break
+            }
+            if (count >= limit) {
+                return false
+            }
+        }
+        true
+    }
+
+    // ---- Subframes ----
+
+    // 0 when decoded, -1 when damaged, -2 when waiting for a seekable tile.
+    fn decodeSubframe() -> Int {
+        var offset = samplesPerFrame
+        var len = samplesPerFrame
+        var total = samplesPerFrame * nbChannels
+        for i in 0..nbChannels {
+            if offset > decodedSamples[i] {
+                offset = decodedSamples[i]
+                len = chSubframeLen[i * 32 + curSubframe[i]]
+            }
+        }
+        channelsForCurSubframe = 0
+        for i in 0..nbChannels {
+            let cur = curSubframe[i]
+            total -= decodedSamples[i]
+            if offset == decodedSamples[i] && len == chSubframeLen[i * 32 + cur] {
+                total -= chSubframeLen[i * 32 + cur]
+                decodedSamples[i] += chSubframeLen[i * 32 + cur]
+                channelIndexes[channelsForCurSubframe] = i
+                channelsForCurSubframe += 1
+            }
+        }
+        if total == 0 {
+            parsedAllSubframes = true
+        }
+        seekableTile = gflag()
+        if seekableTile {
+            clearCodecBuffers()
+            if gflag() {
+                note("WMA Lossless: arithmetic coding isn't supported")
+                return -1
+            }
+            doAcFilter = gflag()
+            doInterChDecorr = gflag()
+            doMclms = gflag()
+            if doAcFilter {
+                acfilterOrder = gbits(4) + 1
+                acfilterScaling = gbits(4)
+                for i in 0..acfilterOrder {
+                    acfilterCoeffs[i] = wma16(gbits(acfilterScaling) + 1)
+                }
+            }
+            if doMclms {
+                decodeMclms()
+            }
+            if !decodeCdlms() {
+                return -1
+            }
+            movaveScaling = gbits(3)
+            quantStepsize = gbits(8) + 1
+            resetCodec()
+        }
+        let rawPcm = gflag()
+        if !rawPcm && cdOrder[0] == 0 {
+            return -2
+        }
+        for i in 0..nbChannels {
+            isChannelCoded[i] = true
+        }
+        if !rawPcm {
+            for i in 0..nbChannels {
+                isChannelCoded[i] = gflag()
+            }
+            if v3rtm {
+                doLpc = gflag()
+                if doLpc {
+                    // Read but not applied, as ffmpeg (it warns).
+                    lpcOrder = gbits(5) + 1
+                    let scaling = gbits(4)
+                    let intbits = gbits(3) + 1
+                    for ch in 0..nbChannels {
+                        for k in 0..lpcOrder {
+                            lpcCoefs[ch * 40 + k] = gsigned(scaling + intbits)
+                        }
+                    }
+                    note("WMA Lossless: inverse LPC isn't done (as in ffmpeg); expect wrong output")
+                }
+            } else {
+                doLpc = false
+            }
+        }
+        if gleft < 1 {
+            return -1
+        }
+        let padding = if gflag() { gbits(5) } else { 0 }
+        if rawPcm {
+            let bits = bitsPerSample - padding
+            if bits <= 0 {
+                return -1
+            }
+            for i in 0..nbChannels {
+                for j in 0..len {
+                    residues[i * llBlockMax + j] = readSigned(bits)
+                }
+            }
+        } else {
+            if bitsPerSample < padding {
+                return -1
+            }
+            for i in 0..nbChannels {
+                if isChannelCoded[i] {
+                    if !decodeChannelResidues(i, len) {
+                        // (ffmpeg goes on with what it has.)
+                    }
+                    if seekableTile {
+                        useHighUpdateSpeed(i)
+                    } else {
+                        useNormalUpdateSpeed(i)
+                    }
+                    revertCdlms(i, len)
+                } else {
+                    for j in 0..len {
+                        residues[i * llBlockMax + j] = 0
+                    }
+                }
+            }
+            if doMclms {
+                revertMclms(len)
+            }
+            if doInterChDecorr {
+                revertInterChDecorr(len)
+            }
+            if doAcFilter {
+                revertAcfilter(len)
+            }
+            if quantStepsize != 1 {
+                for i in 0..nbChannels {
+                    for j in 0..len {
+                        let k = i * llBlockMax + j
+                        residues[k] = wma32(residues[k] * quantStepsize)
+                    }
+                }
+            }
+        }
+        // Into the frame, by bit depth.
+        for i in 0..channelsForCurSubframe {
+            let c = channelIndexes[i]
+            let n = chSubframeLen[c * 32 + curSubframe[c]]
+            for j in 0..n {
+                let r = residues[c * llBlockMax + j]
+                let v = if bitsPerSample == 16 { wma16(wma16(r) * (1 << padding)) } else { wma32(r * (256 << padding)) }
+                if written[c] < samplesPerFrame {
+                    frameSamples[c * llBlockMax + written[c]] = v
+                }
+                written[c] += 1
+            }
+        }
+        for i in 0..channelsForCurSubframe {
+            let c = channelIndexes[i]
+            if curSubframe[c] >= numSubframes[c] {
+                return -1
+            }
+            curSubframe[c] += 1
+        }
+        0
+    }
+
+    // get_sbits_long: n bits as two's complement.
+    fn readSigned(_ n: Int) -> Int {
+        let v = glong(n)
+        if n > 0 && v >= (1 << (n - 1)) {
+            return v - (1 << n)
+        }
+        v
+    }
+
+    fn decodeMclms() {
+        mclmsOrder = (gbits(4) + 1) * 2
+        mclmsScaling = gbits(4)
+        if gflag() {
+            var cbits = wmaLog2(mclmsScaling + 1)
+            if (1 << cbits) < mclmsScaling + 1 {
+                cbits += 1
+            }
+            let sendBits = gbits(cbits) + 2
+            let nc = nbChannels
+            for i in 0..(mclmsOrder * nc * nc) {
+                mclmsCoeffs[i] = wma16(gbits(sendBits))
+            }
+            for i in 0..nc {
+                for c in 0..i {
+                    mclmsCoeffsCur[i * nc + c] = wma16(gbits(sendBits))
+                }
+            }
+        }
+    }
+
+    fn decodeCdlms() -> Bool {
+        let sendCoef = gflag()
+        for c in 0..nbChannels {
+            cdlmsTtl[c] = gbits(3) + 1
+            for i in 0..cdlmsTtl[c] {
+                let order = (gbits(7) + 1) * 8
+                if order > llMaxOrder {
+                    note("WMA Lossless: filter order {order} is too high")
+                    cdOrder[0] = 0
+                    return false
+                }
+                cdOrder[c * 9 + i] = order
+            }
+            for i in 0..cdlmsTtl[c] {
+                cdScaling[c * 9 + i] = gbits(4)
+            }
+            if sendCoef {
+                for i in 0..cdlmsTtl[c] {
+                    let f = c * 9 + i
+                    let order = cdOrder[f]
+                    var cbits = wmaLog2(order)
+                    if (1 << cbits) < order {
+                        cbits += 1
+                    }
+                    let coefsend = gbits(cbits) + 1
+                    let sc = cdScaling[f]
+                    var cb2 = wmaLog2(sc + 1)
+                    if (1 << cb2) < sc + 1 {
+                        cb2 += 1
+                    }
+                    let bitsend = gbits(cb2) + 2
+                    let shiftL = 32 - bitsend
+                    let shiftR = 32 - sc - 2
+                    for j in 0..coefsend {
+                        // (get_bits << shift_l) >> shift_r in 32-bit ints.
+                        let v = wma32(gbits(bitsend) << shiftL)
+                        cdCoefs[f * llHist + j] = wma16(v >> shiftR)
+                    }
+                }
+            }
+            for i in 0..cdlmsTtl[c] {
+                let f = c * 9 + i
+                for k in cdOrder[f]..(cdOrder[f] + 8) {
+                    cdCoefs[f * llHist + k] = 0
+                }
+            }
+        }
+        true
+    }
+
+    fn clearCodecBuffers() {
+        for i in 0..acfilterCoeffs.count {
+            acfilterCoeffs[i] = 0
+        }
+        for i in 0..acfilterPrev.count {
+            acfilterPrev[i] = 0
+        }
+        for i in 0..lpcCoefs.count {
+            lpcCoefs[i] = 0
+        }
+        for i in 0..mclmsCoeffs.count {
+            mclmsCoeffs[i] = 0
+        }
+        for i in 0..mclmsCoeffsCur.count {
+            mclmsCoeffsCur[i] = 0
+        }
+        for i in 0..mclmsPrev.count {
+            mclmsPrev[i] = 0
+            mclmsUpdates[i] = 0
+        }
+        for c in 0..nbChannels {
+            for f in 0..cdlmsTtl[c] {
+                let b = (c * 9 + f) * llHist
+                for k in 0..llHist {
+                    cdCoefs[b + k] = 0
+                    cdPrev[b + k] = 0
+                    cdUpdates[b + k] = 0
+                }
+            }
+            aveSum[c] = 0
+        }
+    }
+
+    fn resetCodec() {
+        mclmsRecent = mclmsOrder * nbChannels
+        for c in 0..nbChannels {
+            for f in 0..cdlmsTtl[c] {
+                cdRecent[c * 9 + f] = cdOrder[c * 9 + f]
+            }
+            transientCounter[c] = samplesPerFrame
+            transient[c] = true
+            transientPos[c] = 0
+        }
+    }
+
+    // Adaptive Golomb residues of one channel.
+    fn decodeChannelResidues(_ ch: Int, _ tileSize: Int) -> Bool {
+        var i = 0
+        transient[ch] = gflag()
+        if transient[ch] {
+            transientPos[ch] = gbits(wmaLog2(tileSize))
+            if transientPos[ch] != 0 {
+                transient[ch] = false
+            }
+            transientCounter[ch] = max(transientCounter[ch], samplesPerFrame / 2)
+        } else if transientCounter[ch] != 0 {
+            transient[ch] = true
+        }
+        let ms = movaveScaling
+        if seekableTile {
+            let mean = glong(bitsPerSample)
+            aveSum[ch] = (mean << (ms + 1)) & 0xffffffff
+            let bits = if doInterChDecorr { bitsPerSample + 1 } else { bitsPerSample }
+            residues[ch * llBlockMax] = readSigned(bits)
+            i += 1
+        }
+        let base = ch * llBlockMax
+        var sum = aveSum[ch]
+        while i < tileSize {
+            var quo = 0
+            while gbits(1) == 1 {
+                quo += 1
+                if gleft <= 0 {
+                    aveSum[ch] = sum
+                    return false
+                }
+            }
+            if quo >= 32 {
+                quo += glong(gbits(5) + 1)
+            }
+            let mean = ((sum + (1 << ms)) & 0xffffffff) >> (ms + 1)
+            var residue = quo
+            if mean > 1 {
+                let remBits = wmaLog2((mean - 1) << 1)
+                let rem = glong(remBits)
+                residue = ((quo << remBits) + rem) & 0xffffffff
+            }
+            sum = (residue + sum - (sum >> ms)) & 0xffffffff
+            // (residue >> 1) ^ -(residue & 1), unsigned, as a 32-bit int.
+            let r = (residue >> 1) ^ ((0 - (residue & 1)) & 0xffffffff)
+            residues[base + i] = wma32(r)
+            i += 1
+        }
+        aveSum[ch] = sum
+        true
+    }
+
+    fn useHighUpdateSpeed(_ ch: Int) {
+        for fi in 0..cdlmsTtl[ch] {
+            let f = ch * 9 + (cdlmsTtl[ch] - 1 - fi)
+            if updateSpeed[ch] == 16 {
+                continue
+            }
+            let b = f * llHist
+            let off = if v3rtm { cdRecent[f] } else { 0 }
+            for k in 0..cdOrder[f] {
+                cdUpdates[b + off + k] = wma16(cdUpdates[b + off + k] * 2)
+            }
+        }
+        updateSpeed[ch] = 16
+    }
+
+    fn useNormalUpdateSpeed(_ ch: Int) {
+        for fi in 0..cdlmsTtl[ch] {
+            let f = ch * 9 + (cdlmsTtl[ch] - 1 - fi)
+            if updateSpeed[ch] == 8 {
+                continue
+            }
+            let b = f * llHist
+            let off = if v3rtm { cdRecent[f] } else { 0 }
+            for k in 0..cdOrder[f] {
+                // C's / truncates toward zero, as Tessel's.
+                cdUpdates[b + off + k] = cdUpdates[b + off + k] / 2
+            }
+        }
+        updateSpeed[ch] = 8
+    }
+
+    // The cascaded sign-LMS filters of one channel, undone (revert_cdlms).
+    fn revertCdlms(_ ch: Int, _ len: Int) {
+        let range = 1 << (bitsPerSample - 1)
+        let base = ch * llBlockMax
+        var fi = cdlmsTtl[ch] - 1
+        while fi >= 0 {
+            let f = ch * 9 + fi
+            let b = f * llHist
+            let order = cdOrder[f]
+            let scaling = cdScaling[f]
+            let round = (1 << scaling) >> 1
+            let speed = updateSpeed[ch]
+            var recent = cdRecent[f]
+            for icoef in 0..len {
+                let residue = residues[base + icoef]
+                let mul = if residue > 0 { 1 } else if residue < 0 { -1 } else { 0 }
+                // scalarproduct_and_madd: sum of coefs × history, and
+                // coefs += mul × updates (16-bit coefficients).
+                var res = 0
+                let pv = b + recent
+                for k in 0..order {
+                    let c = cdCoefs[b + k]
+                    res += c * cdPrev[pv + k]
+                    if mul != 0 {
+                        var nc = c + mul * cdUpdates[pv + k]
+                        if nc > 32767 || nc < -32768 {
+                            nc = wma16(nc)
+                        }
+                        cdCoefs[b + k] = nc
+                    }
+                }
+                let pred = wma32(round + wma32(res))
+                let input = wma32(residue + (pred >> scaling))
+                // lms_update.
+                if recent > 0 {
+                    recent -= 1
+                } else {
+                    for k in 0..order {
+                        cdPrev[b + order + k] = cdPrev[b + k]
+                        cdUpdates[b + order + k] = cdUpdates[b + k]
+                    }
+                    recent = order - 1
+                }
+                cdPrev[b + recent] = min(max(input, -range), range - 1)
+                let sgn = if input > 0 { 1 } else if input < 0 { -1 } else { 0 }
+                cdUpdates[b + recent] = wma16(sgn * speed)
+                cdUpdates[b + recent + (order >> 4)] = cdUpdates[b + recent + (order >> 4)] >> 2
+                cdUpdates[b + recent + (order >> 3)] = cdUpdates[b + recent + (order >> 3)] >> 1
+                // ffmpeg clears every update from recent + order on; all
+                // of those but this one are already zero (the window only
+                // moves down by one, or wraps after copying order values).
+                cdUpdates[b + recent + order] = 0
+                residues[base + icoef] = input
+            }
+            cdRecent[f] = recent
+            fi -= 1
+        }
+    }
+
+    fn revertMclms(_ len: Int) {
+        let order = mclmsOrder
+        let nc = nbChannels
+        let range = 1 << (bitsPerSample - 1)
+        for icoef in 0..len {
+            // mclms_predict.
+            for ich in 0..nc {
+                pred[ich] = 0
+                if !isChannelCoded[ich] {
+                    continue
+                }
+                var p = 0
+                for i in 0..(order * nc) {
+                    p += mclmsPrev[i + mclmsRecent] * mclmsCoeffs[i + order * nc * ich]
+                }
+                for i in 0..ich {
+                    p += residues[i * llBlockMax + icoef] * mclmsCoeffsCur[i + nc * ich]
+                }
+                p = wma32(p)
+                p = wma32(p + ((1 << mclmsScaling) >> 1))
+                p = p >> mclmsScaling
+                pred[ich] = p
+                let k = ich * llBlockMax + icoef
+                residues[k] = wma32(residues[k] + p)
+            }
+            // mclms_update.
+            for ich in 0..nc {
+                let err = wma32(residues[ich * llBlockMax + icoef] - pred[ich])
+                if err > 0 {
+                    for i in 0..(order * nc) {
+                        let k = i + ich * order * nc
+                        mclmsCoeffs[k] = wma16(mclmsCoeffs[k] + mclmsUpdates[mclmsRecent + i])
+                    }
+                    for j in 0..ich {
+                        let k = ich * nc + j
+                        mclmsCoeffsCur[k] = wma16(mclmsCoeffsCur[k] + wmaSign(residues[j * llBlockMax + icoef]))
+                    }
+                } else if err < 0 {
+                    for i in 0..(order * nc) {
+                        let k = i + ich * order * nc
+                        mclmsCoeffs[k] = wma16(mclmsCoeffs[k] - mclmsUpdates[mclmsRecent + i])
+                    }
+                    for j in 0..ich {
+                        let k = ich * nc + j
+                        mclmsCoeffsCur[k] = wma16(mclmsCoeffsCur[k] - wmaSign(residues[j * llBlockMax + icoef]))
+                    }
+                }
+            }
+            var ich = nc - 1
+            while ich >= 0 {
+                mclmsRecent -= 1
+                let r = residues[ich * llBlockMax + icoef]
+                mclmsPrev[mclmsRecent] = min(max(r, -range), range - 1)
+                mclmsUpdates[mclmsRecent] = wmaSign(r)
+                ich -= 1
+            }
+            if mclmsRecent == 0 {
+                for i in 0..(order * nc) {
+                    mclmsPrev[order * nc + i] = mclmsPrev[i]
+                    mclmsUpdates[order * nc + i] = mclmsUpdates[i]
+                }
+                mclmsRecent = nc * order
+            }
+        }
+    }
+
+    fn revertInterChDecorr(_ len: Int) {
+        if nbChannels != 2 {
+            return
+        }
+        if isChannelCoded[0] || isChannelCoded[1] {
+            for i in 0..len {
+                let a = wma32(residues[i] - (residues[llBlockMax + i] >> 1))
+                residues[i] = a
+                residues[llBlockMax + i] = wma32(residues[llBlockMax + i] + a)
+            }
+        }
+    }
+
+    fn revertAcfilter(_ len: Int) {
+        let order = acfilterOrder
+        let scaling = acfilterScaling
+        for ich in 0..nbChannels {
+            let base = ich * llBlockMax
+            let pb = ich * 16
+            for i in 0..min(order, len) {
+                var p = 0
+                for j in 0..order {
+                    if i <= j {
+                        p += acfilterCoeffs[j] * acfilterPrev[pb + j - i]
+                    } else {
+                        p += residues[base + i - j - 1] * acfilterCoeffs[j]
+                    }
+                }
+                p = wma32(p) >> scaling
+                residues[base + i] = wma32(residues[base + i] + p)
+            }
+            if order < len {
+                for i in order..len {
+                    var p = 0
+                    for j in 0..order {
+                        p += residues[base + i - j - 1] * acfilterCoeffs[j]
+                    }
+                    p = wma32(p) >> scaling
+                    residues[base + i] = wma32(residues[base + i] + p)
+                }
+            }
+            var j = order - 1
+            while j >= 0 {
+                if len <= j {
+                    acfilterPrev[pb + j] = acfilterPrev[pb + j - len]
+                } else {
+                    acfilterPrev[pb + j] = residues[base + len - j - 1]
+                }
+                j -= 1
+            }
+        }
+    }
+
+    fn resetState() {
+        packetLoss = true
+        packetDone = false
+        numSavedBits = 0
+        frameOffset = 0
+        pbBits = 0
+        cdOrder[0] = 0
+    }
+}
+
+// A value as C's int16_t / int32_t holds it (wrapping).
+fn wma16(_ v: Int) -> Int {
+    ((v + 32768) & 0xffff) - 32768
+}
+
+fn wma32(_ v: Int) -> Int {
+    ((v + 2147483648) & 0xffffffff) - 2147483648
+}
+
+fn wmaSign(_ v: Int) -> Int {
+    if v > 0 { 1 } else if v < 0 { -1 } else { 0 }
+}
+
+fn wmaNewLossless(channels: Int, rate: Int, blockAlign: Int, extra: Data) -> Result<WmaLossless> {
+    if blockAlign <= 0 || blockAlign > (1 << 21) {
+        return Result.failure(error: Error("WMA Lossless: the packet size (nBlockAlign) isn't known"))
+    }
+    if extra.count < 18 {
+        return Result.failure(error: Error("WMA Lossless: the setup bytes are missing"))
+    }
+    var s = WmaLossless(rate: rate, blockAlign: blockAlign)
+    s.decodeFlags = extra.uint16(at: 14)
+    s.channelMask = extra.uint32(at: 2)
+    s.bitsPerSample = extra.uint16(at: 0)
+    if s.bitsPerSample != 16 && s.bitsPerSample != 24 {
+        return Result.failure(error: Error("WMA Lossless: {s.bitsPerSample}-bit isn't supported"))
+    }
+    s.nbChannels = if s.channelMask != 0 { wmaPopCount(s.channelMask) } else { channels }
+    if s.nbChannels <= 0 || s.nbChannels > llMaxChannels {
+        return Result.failure(error: Error("WMA Lossless: {s.nbChannels} channels aren't supported"))
+    }
+    s.maxFrameSize = 32768 * s.nbChannels
+    for _ in 0..(s.maxFrameSize + 64) {
+        s.frameData.append(0)
+    }
+    s.log2FrameSize = wmaLog2(blockAlign) + 4
+    s.lenPrefix = (s.decodeFlags & 0x40) != 0
+    s.samplesPerFrame = 1 << wmaFrameLenBits(rate, 3, s.decodeFlags)
+    if s.samplesPerFrame > llBlockMax {
+        return Result.failure(error: Error("WMA Lossless: frames are too long"))
+    }
+    let log2Max = (s.decodeFlags & 0x38) >> 3
+    s.maxNumSubframes = 1 << log2Max
+    s.minSamplesPerSubframe = s.samplesPerFrame / s.maxNumSubframes
+    s.drc = (s.decodeFlags & 0x80) != 0
+    s.v3rtm = (s.decodeFlags & 0x100) != 0
+    if s.maxNumSubframes > 32 {
+        return Result.failure(error: Error("WMA Lossless: bad subframe setup"))
+    }
+    let nc = s.nbChannels
+    for _ in 0..nc {
+        s.channelIndexes.append(0)
+        s.numSubframes.append(0)
+        s.curSubframe.append(0)
+        s.decodedSamples.append(0)
+        s.transientCounter.append(0)
+        s.written.append(0)
+        s.cdlmsTtl.append(0)
+        s.isChannelCoded.append(false)
+        s.updateSpeed.append(0)
+        s.transient.append(false)
+        s.transientPos.append(0)
+        s.aveSum.append(0)
+        s.pred.append(0)
+    }
+    for _ in 0..(nc * 32) {
+        s.chSubframeLen.append(0)
+    }
+    for _ in 0..(nc * llBlockMax) {
+        s.frameSamples.append(0)
+        s.residues.append(0)
+    }
+    for _ in 0..16 {
+        s.acfilterCoeffs.append(0)
+    }
+    for _ in 0..(llMaxChannels * 16) {
+        s.acfilterPrev.append(0)
+    }
+    for _ in 0..(llMaxChannels * llMaxChannels * 32) {
+        s.mclmsCoeffs.append(0)
+    }
+    for _ in 0..(llMaxChannels * llMaxChannels) {
+        s.mclmsCoeffsCur.append(0)
+    }
+    for _ in 0..(llMaxChannels * 2 * 32) {
+        s.mclmsPrev.append(0)
+        s.mclmsUpdates.append(0)
+    }
+    for _ in 0..(nc * 9) {
+        s.cdOrder.append(0)
+        s.cdScaling.append(0)
+        s.cdRecent.append(0)
+    }
+    for _ in 0..(nc * 9 * llHist) {
+        s.cdCoefs.append(0)
+        s.cdPrev.append(0)
+        s.cdUpdates.append(0)
+    }
+    for _ in 0..(llMaxChannels * 40) {
+        s.lpcCoefs.append(0)
+    }
+    Result.ok(value: s)
+}

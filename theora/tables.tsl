@@ -1,0 +1,121 @@
+// Fixed tables of the Theora I decoder: the zig-zag scan, the token
+// alphabet (Theora I specification §7.7.1, Table 7.33), the macroblock
+// mode alphabets (§7.4, Table 7.19), the DC predictor weights (§7.8.1,
+// Table 7.47), the Hilbert order of the 16 blocks of a superblock (§2.3)
+// and the fixed-length motion vector codes (§7.5.1).
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+// Zig-zag order: the raster position (row * 8 + column) of the i-th
+// coefficient of a block (§2.5, Figure 2.8).
+let thZigzag: [Int] = [
+    0, 1, 8, 16, 9, 2, 3, 10, 17, 24, 32, 25, 18, 11, 4, 5,
+    12, 19, 26, 33, 40, 48, 41, 34, 27, 20, 13, 6, 7, 14, 21, 28,
+    35, 42, 49, 56, 57, 50, 43, 36, 29, 22, 15, 23, 30, 37, 44, 51,
+    58, 59, 52, 45, 38, 31, 39, 46, 53, 60, 61, 54, 47, 55, 62, 63,
+]
+
+// The Hilbert curve through a superblock's 4×4 blocks: x, y pairs
+// (y counts upwards, as all Theora coordinates do).
+let thHilbert: [Int] = [
+    0, 0, 1, 0, 1, 1, 0, 1, 0, 2, 0, 3, 1, 3, 1, 2,
+    2, 2, 2, 3, 3, 3, 3, 2, 3, 1, 2, 1, 2, 0, 3, 0,
+]
+
+// Tokens 0…6 are end-of-block runs: base run length and extra bits.
+let thEobBase: [Int] = [1, 2, 3, 4, 8, 16, 0]
+let thEobBits: [Int] = [0, 0, 0, 2, 3, 4, 12]
+
+// Tokens 7…31: the coefficient's base value and its extra bits (the
+// first extra bit read is the sign when there are any), then the zero
+// run's base and extra bits. Tokens 9…12 are fixed values (+1 −1 +2 −2).
+let thCoefBase: [Int] = [
+    0, 0, 0, 0, 0, 0, 0,
+    0, 0, 1, -1, 2, -2, 3, 4, 5, 6, 7, 9, 13, 21, 37, 69,
+    1, 1, 1, 1, 1, 1, 1, 2, 2,
+]
+let thCoefBits: [Int] = [
+    0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 3, 4, 5, 6, 10,
+    1, 1, 1, 1, 1, 1, 1, 2, 2,
+]
+let thRunBase: [Int] = [
+    0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    1, 2, 3, 4, 5, 6, 10, 1, 2,
+]
+let thRunBits: [Int] = [
+    0, 0, 0, 0, 0, 0, 0,
+    3, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 2, 3, 0, 1,
+]
+
+// Coding modes (§7.4, Table 7.18) and the internal "not coded" mode.
+let thModeInterNoMv = 0
+let thModeIntra = 1
+let thModeInterMv = 2
+let thModeInterLast = 3
+let thModeInterPrior = 4
+let thModeGolden = 5
+let thModeGoldenMv = 6
+let thModeFourMv = 7
+let thModeCopy = 8
+
+// The six preset mode alphabets (schemes 1–6), 8 modes each.
+let thModeAlphabets: [Int] = [
+    3, 4, 2, 0, 1, 5, 6, 7,
+    3, 4, 0, 2, 1, 5, 6, 7,
+    3, 2, 4, 0, 1, 5, 6, 7,
+    3, 2, 0, 4, 1, 5, 6, 7,
+    0, 3, 4, 2, 1, 5, 6, 7,
+    0, 5, 3, 4, 2, 1, 6, 7,
+]
+
+// DC predictor weights for each combination of available neighbours
+// (bit 3 up-left, 2 up, 1 up-right, 0 left): up-left, up, up-right, left.
+let thPredWeights: [Int] = [
+    0, 0, 0, 0,
+    0, 0, 0, 128,
+    0, 0, 128, 0,
+    0, 0, 53, 75,
+    0, 128, 0, 0,
+    0, 64, 0, 64,
+    0, 128, 0, 0,
+    0, 0, 53, 75,
+    128, 0, 0, 0,
+    0, 0, 0, 128,
+    64, 0, 64, 0,
+    0, 0, 53, 75,
+    0, 128, 0, 0,
+    -104, 116, 0, 116,
+    24, 80, 24, 0,
+    -104, 116, 0, 116,
+]
+
+// Which modes may predict DC from each other (§7.8.1): intra 0, inter
+// from the previous frame 1, from the golden frame 2, not coded 3.
+let thPredGroup: [Int] = [1, 0, 1, 1, 1, 2, 2, 1, 3]
+
+// Fixed-length motion vector components (6 bits: magnitude then sign).
+let thFixedMv: [Int] = [
+    0, 0, 1, -1, 2, -2, 3, -3, 4, -4, 5, -5, 6, -6, 7, -7,
+    8, -8, 9, -9, 10, -10, 11, -11, 12, -12, 13, -13, 14, -14, 15, -15,
+    16, -16, 17, -17, 18, -18, 19, -19, 20, -20, 21, -21, 22, -22, 23, -23,
+    24, -24, 25, -25, 26, -26, 27, -27, 28, -28, 29, -29, 30, -30, 31, -31,
+]
+
+// The variable-length motion vector code (§7.5.1, Table 7.23): values in
+// code order with their lengths (codes are canonical in this order).
+let thMvValues: [Int] = [
+    0, 1, -1, 2, -2, 3, -3, 4, -4, 5, -5, 6, -6, 7, -7,
+    8, -8, 9, -9, 10, -10, 11, -11, 12, -12, 13, -13, 14, -14, 15, -15,
+    16, -16, 17, -17, 18, -18, 19, -19, 20, -20, 21, -21, 22, -22, 23, -23,
+    24, -24, 25, -25, 26, -26, 27, -27, 28, -28, 29, -29, 30, -30, 31, -31,
+]
+let thMvLens: [Int] = [
+    3, 3, 3, 4, 4, 4, 4, 6, 6, 6, 6, 6, 6, 6, 6,
+    7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+    8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
+    8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
+]

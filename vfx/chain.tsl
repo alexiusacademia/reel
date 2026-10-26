@@ -1,0 +1,129 @@
+// The player's video filter chain in one struct: deinterlacing, then
+// noise reduction, then sharpening, plus black bar detection, applied to
+// each decoded picture before render.Renderer.frame converts it. The
+// settings are a plain struct (vfx.Settings) the player keeps per file
+// and saves as JSON; vfx.Chain holds the filters' state between pictures
+// and is plain data, so it can live in the player's Converter and go to
+// and from background work with it.
+//
+// Use (in display order):
+//     chain.configure(settings)            // whenever settings change
+//     for f in chain.process(pic, time: t) { convert f.picture, show at f.time }
+//     chain.reset()                        // after a seek
+//     chain.flush()                        // at the end of the stream
+// With autoCrop on, `chain.crop` holds the bars found so far;
+// applyCrop(view) copies them into a render.View.
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+import "../core"
+import "../render"
+
+public struct Settings {
+    // "off", "bob", "blend" or "adaptive".
+    deinterlace: String = "adaptive"
+    doubleRate: Bool = false
+    // Deinterlace only pictures marked interlaced (false: all of them).
+    autoDeinterlace: Bool = true
+    // 0 = off; noise reduction strength 0…1.
+    denoise: Float = 0.0
+    // 0 = off; unsharp-mask amount 0…4.
+    sharpen: Float = 0.0
+    // Detect black bars.
+    autoCrop: Bool = false
+}
+
+public struct Chain {
+    settings: Settings = Settings()
+    deint: Deinterlacer = Deinterlacer()
+    denoiser: Denoiser = Denoiser()
+    sharpener: Sharpener = Sharpener()
+    cropper: CropDetector = CropDetector()
+    crop: Crop = Crop()
+    // Milliseconds spent, for the stats overlay.
+    filterMs: Float = 0.0
+
+    // Takes new settings (keeps the state that still applies).
+    fn configure(_ s: Settings) {
+        let mode = deinterlaceMode(s.deinterlace)
+        if mode != deint.mode || s.doubleRate != deint.doubleRate {
+            deint.reset()
+        }
+        deint.mode = mode
+        deint.doubleRate = s.doubleRate
+        deint.auto = s.autoDeinterlace
+        denoiser.strength = s.denoise
+        if s.denoise <= 0.0 {
+            denoiser.reset()
+        }
+        sharpener.amount = s.sharpen
+        if !s.autoCrop {
+            cropper.reset()
+            crop = Crop()
+        }
+        settings = s
+    }
+
+    // The next decoded picture (display order) and its time; returns the
+    // pictures to show with their times (two per picture at double rate,
+    // one picture late).
+    fn process(_ p: core.Picture, time: Float) -> [Field] {
+        let t0 = now()
+        if settings.autoCrop {
+            crop = cropper.push(p)
+        }
+        var out = deint.push(p, time: time)
+        finish(out)
+        filterMs += (now() - t0) * 1000.0
+        out
+    }
+
+    // Pictures still held at the end of the stream.
+    fn flush() -> [Field] {
+        var out = deint.flush()
+        finish(out)
+        out
+    }
+
+    // After a seek: no history from before it.
+    fn reset() {
+        deint.reset()
+        denoiser.reset()
+    }
+
+    fn finish(_ out: bind [Field]) {
+        if settings.denoise <= 0.0 && settings.sharpen <= 0.0 {
+            return
+        }
+        for i in 0..out.count {
+            var pic = out[i].picture
+            if settings.denoise > 0.0 {
+                pic = denoiser.apply(pic)
+            }
+            if settings.sharpen > 0.0 {
+                pic = sharpener.apply(pic)
+            }
+            out[i].picture = pic
+        }
+    }
+
+    // A view with the detected crop in it (unchanged when nothing was
+    // found or autoCrop is off).
+    fn applyCrop(_ v: render.View) -> render.View {
+        var out = v
+        if settings.autoCrop && !crop.isEmpty {
+            out.cropLeft = crop.left
+            out.cropTop = crop.top
+            out.cropRight = crop.right
+            out.cropBottom = crop.bottom
+        }
+        out
+    }
+}
+
+public fn newChain(_ s: Settings = Settings()) -> Chain {
+    var c = Chain()
+    c.configure(s)
+    c
+}

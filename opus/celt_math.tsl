@@ -1,0 +1,124 @@
+// Integer helpers of the CELT layer that must be bit-exact on every
+// platform because the bit allocation depends on them (RFC 6716 sections
+// 4.3.3 and 4.3.4): the cosine and log2(tan) approximations used to split
+// bands, the integer square root, the pseudo-random generator, the pulse
+// cache lookups and the PVQ codebook sizes U(N, K) and V(N, K).
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+// (16384 + a*b) >> 15 with a and b 16-bit (FRAC_MUL16).
+fn celtFracMul16(_ a: Int, _ b: Int) -> Int {
+    (16384 + a * b) >> 15
+}
+
+// bitexact_cos: cos(x * pi / 32768) in Q15, for x from 0 to 16384.
+fn celtBitexactCos(_ x: Int) -> Int {
+    let tmp = (4096 + x * x) >> 13
+    let x2 = tmp
+    let r = (32767 - x2) + celtFracMul16(x2, -7651 + celtFracMul16(x2, 8277 + celtFracMul16(-626, x2)))
+    1 + r
+}
+
+// bitexact_log2tan: log2(isin / icos) in Q11.
+fn celtBitexactLog2tan(_ isin: Int, _ icos: Int) -> Int {
+    let lc = rcIlog(icos)
+    let ls = rcIlog(isin)
+    let c = icos << (15 - lc)
+    let s = isin << (15 - ls)
+    (ls - lc) * 2048 + celtFracMul16(s, celtFracMul16(s, -2597) + 7932) - celtFracMul16(c, celtFracMul16(c, -2597) + 7932)
+}
+
+// isqrt32: the integer square root, rounded down.
+fn celtIsqrt32(_ v: Int) -> Int {
+    var val = v
+    var g = 0
+    var bshift = (rcIlog(val) - 1) >> 1
+    var b = 1 << bshift
+    while true {
+        let t = ((g << 1) + b) << bshift
+        if t <= val {
+            g += b
+            val -= t
+        }
+        b = b >> 1
+        bshift -= 1
+        if bshift < 0 {
+            break
+        }
+    }
+    g
+}
+
+// The linear congruential generator used for noise filling (32 bits).
+fn celtLcgRand(_ seed: Int) -> Int {
+    (1664525 * seed + 1013904223) & 0xFFFFFFFF
+}
+
+// A 32-bit unsigned value read as signed, then >> 20 (folding noise).
+fn celtSeedNoise(_ seed: Int) -> Float {
+    let s = if seed >= 2147483648 { seed - 4294967296 } else { seed }
+    Float(s >> 20)
+}
+
+// get_pulses: the number of pulses for a pulse-cache index (rate.h).
+fn celtGetPulses(_ i: Int) -> Int {
+    if i < 8 {
+        return i
+    }
+    (8 + (i & 7)) << ((i >> 3) - 1)
+}
+
+// bits2pulses: the largest pseudo-pulse count whose cost fits in `bits`
+// (1/8 bits), by bisection in the band's pulse cache (rate.h).
+fn celtBits2Pulses(_ band: Int, _ lm: Int, _ bitsIn: Int) -> Int {
+    let base = celtCacheIndex[(lm + 1) * 21 + band]
+    var lo = 0
+    var hi = celtCacheBits[base]
+    let bits = bitsIn - 1
+    for _ in 0..6 {
+        let mid = (lo + hi + 1) >> 1
+        if celtCacheBits[base + mid] >= bits {
+            hi = mid
+        } else {
+            lo = mid
+        }
+    }
+    let loBits = if lo == 0 { -1 } else { celtCacheBits[base + lo] }
+    if bits - loBits <= celtCacheBits[base + hi] - bits {
+        return lo
+    }
+    hi
+}
+
+fn celtPulses2Bits(_ band: Int, _ lm: Int, _ pulses: Int) -> Int {
+    if pulses == 0 {
+        return 0
+    }
+    let base = celtCacheIndex[(lm + 1) * 21 + band]
+    celtCacheBits[base + pulses] + 1
+}
+
+// U(N, K): the number of PVQ codewords of N dimensions and K pulses with
+// the the first pulse's sign left out, as tabulated in cwrs.c (symmetric).
+fn celtU(_ n: Int, _ k: Int) -> Int {
+    let a = min(n, k)
+    let b = max(n, k)
+    celtPvqU[celtPvqURow[a] + b]
+}
+
+// Row `row`, column `col` of the U table as stored (row <= col).
+fn celtUrow(_ row: Int, _ col: Int) -> Int {
+    celtPvqU[celtPvqURow[row] + col]
+}
+
+// V(N, K) = U(N, K) + U(N, K + 1): the size of the codebook (section
+// 4.3.4.2).
+fn celtV(_ n: Int, _ k: Int) -> Int {
+    celtU(n, k) + celtU(n, k + 1)
+}
+
+// e^(ln 2 * x), as the reference's float build computes celt_exp2.
+fn celtExp2(_ x: Float) -> Float {
+    exp(0.6931471805599453094 * x)
+}

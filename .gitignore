@@ -1,0 +1,7 @@
+.DS_Store
+# Scratch work, downloaded conformance files, binaries (tens of GB): only
+# the builders' briefs and notes are kept.
+build/*
+!build/*.md
+# Made by tools/make_fixtures.sh.
+tests/fixtures/

@@ -1,0 +1,192 @@
+// Helpers of the vfx test: the check tally, fixture clips, weaving
+// progressive pictures into interlaced ones, PSNR, synthetic noise and
+// big test pictures.
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+import "../../vfx"
+import "../../core"
+
+struct Tally {
+    passed: Int = 0
+    total: Int = 0
+
+    fn check(_ ok: Bool, _ what: String) {
+        total += 1
+        if ok {
+            passed += 1
+        } else {
+            print("FAIL: {what}")
+        }
+    }
+}
+
+fn ms(_ t: Float) -> Float {
+    (now() - t) * 1000.0
+}
+
+fn f2(_ x: Float) -> String {
+    x.formatted(decimals: 2)
+}
+
+// A clip from tests/vfx/fixtures (zlib-compressed raw 8-bit 4:2:0).
+fn loadClip(_ name: String, _ w: Int, _ h: Int) -> [core.Picture] {
+    let z = readData("tests/vfx/fixtures/" + name + ".yuv.z") ?? Data()
+    let bytes = (z.decompressed() ?? Data()).bytes
+    let cw = (w + 1) / 2
+    let ch = (h + 1) / 2
+    let size = w * h + 2 * cw * ch
+    var out: [core.Picture] = []
+    var at = 0
+    while at + size <= bytes.count {
+        var p = core.Picture(width: w, height: h)
+        p.yStride = w
+        p.cStride = cw
+        p.y = bytes.slice(from: at, to: at + w * h)
+        p.u = bytes.slice(from: at + w * h, to: at + w * h + cw * ch)
+        p.v = bytes.slice(from: at + w * h + cw * ch, to: at + size)
+        p.matrix = .bt601
+        p.pts = out.count * 2
+        p.duration = 2
+        out.append(p)
+        at += size
+    }
+    out
+}
+
+// Two progressive pictures woven into one interlaced picture: even rows
+// (and even chroma rows) from `top`, odd ones from `bottom`.
+fn weave(_ top: core.Picture, _ bottom: core.Picture) -> core.Picture {
+    var p = top
+    p.interlaced = true
+    p.topFieldFirst = true
+    for r in 0..p.height {
+        if r % 2 == 1 {
+            for x in 0..p.width {
+                p.y[r * p.yStride + x] = bottom.y[r * p.yStride + x]
+            }
+        }
+    }
+    for r in 0..p.chromaHeight {
+        if r % 2 == 1 {
+            for x in 0..p.chromaWidth {
+                p.u[r * p.cStride + x] = bottom.u[r * p.cStride + x]
+                p.v[r * p.cStride + x] = bottom.v[r * p.cStride + x]
+            }
+        }
+    }
+    p
+}
+
+// Each pair of progressive pictures woven (pts of the first of the pair).
+fn interlaceClip(_ prog: [core.Picture]) -> [core.Picture] {
+    var out: [core.Picture] = []
+    var i = 0
+    while i + 1 < prog.count {
+        var p = weave(prog[i], prog[i + 1])
+        p.pts = prog[i].pts
+        p.duration = 4
+        out.append(p)
+        i += 2
+    }
+    out
+}
+
+// PSNR of the luma of two pictures (99 when equal).
+fn lumaPsnr(_ a: core.Picture, _ b: core.Picture) -> Float {
+    var sum = 0
+    var n = 0
+    for y in 0..min(a.height, b.height) {
+        for x in 0..min(a.width, b.width) {
+            let d = a.luma(x, y) - b.luma(x, y)
+            sum += d * d
+            n += 1
+        }
+    }
+    if sum == 0 || n == 0 {
+        return 99.0
+    }
+    let peak = Float((1 << a.depth) - 1)
+    10.0 * log10(peak * peak * Float(n) / Float(sum))
+}
+
+// A deterministic noise source (an LCG), roughly Gaussian (sum of 4
+// uniforms), with the given sigma.
+struct Noise {
+    seed: Int = 12345
+
+    fn next() -> Float {
+        var s = 0.0
+        for _ in 0..4 {
+            seed = (seed * 1103515245 + 12345) % 2147483648
+            s += Float(seed) / 2147483648.0
+        }
+        (s - 2.0) * 1.7320508
+    }
+}
+
+fn noisy(_ p: core.Picture, _ sigma: Float, _ noise: bind Noise) -> core.Picture {
+    var q = p
+    let top = (1 << p.depth) - 1
+    for i in 0..q.y.count {
+        q.y[i] = max(0, min(top, q.y[i] + Int(floor(noise.next() * sigma + 0.5))))
+    }
+    for i in 0..q.u.count {
+        q.u[i] = max(0, min(top, q.u[i] + Int(floor(noise.next() * sigma * 0.5 + 0.5))))
+        q.v[i] = max(0, min(top, q.v[i] + Int(floor(noise.next() * sigma * 0.5 + 0.5))))
+    }
+    q
+}
+
+// A plane scaled by nearest-neighbour + a little smoothing (for big test
+// pictures from the small clips).
+fn bigPlane(_ src: [Int], _ sw: Int, _ sh: Int, _ dw: Int, _ dh: Int) -> [Int] {
+    var out: [Int] = []
+    for y in 0..dh {
+        let sy = y * sh / dh
+        let b = sy * sw
+        for x in 0..dw {
+            out.append(src[b + x * sw / dw])
+        }
+    }
+    out
+}
+
+fn bigPicture(_ p: core.Picture, _ w: Int, _ h: Int) -> core.Picture {
+    var q = core.Picture(width: w, height: h)
+    q.yStride = w
+    q.cStride = w / 2
+    q.y = bigPlane(p.y, p.width, p.height, w, h)
+    q.u = bigPlane(p.u, p.chromaWidth, p.chromaHeight, w / 2, h / 2)
+    q.v = bigPlane(p.v, p.chromaWidth, p.chromaHeight, w / 2, h / 2)
+    q.matrix = .bt709
+    q.interlaced = p.interlaced
+    q.pts = p.pts
+    q.duration = p.duration
+    q
+}
+
+// 10-bit 4:2:2 version of a progressive 4:2:0 picture (samples ×4 + a
+// ramp, each chroma row used for two rows).
+fn tenBit422(_ p: core.Picture) -> core.Picture {
+    var q = core.Picture(width: p.width, height: p.height, chroma: .yuv422, depth: 10)
+    q.yStride = p.yStride
+    q.cStride = p.cStride
+    for i in 0..p.y.count {
+        q.y.append(p.y[i] * 4 + i % 4)
+    }
+    for r in 0..p.height {
+        let k = min(r / 2, p.chromaHeight - 1)
+        for x in 0..p.chromaWidth {
+            q.u.append(p.u[k * p.cStride + x] * 4)
+            q.v.append(p.v[k * p.cStride + x] * 4)
+        }
+    }
+    q.matrix = p.matrix
+    q.interlaced = p.interlaced
+    q.topFieldFirst = p.topFieldFirst
+    q.pts = p.pts
+    q.duration = p.duration
+    q
+}

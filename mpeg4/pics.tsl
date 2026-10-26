@@ -1,0 +1,732 @@
+// The pictures of the MPEG-4 Part 2 decoder and the per-block work done on
+// them: motion compensation (ISO/IEC 14496-2 7.6): fetching a
+// reference area with unrestricted motion vectors (7.6.4: positions
+// outside the picture take the nearest edge sample), half sample
+// interpolation with rounding control (7.6.2.1), quarter sample
+// interpolation with the 8-tap filter (7.6.2.2), and the bilinear warp of
+// one-point global motion compensation (7.8.7).
+//
+// Every prediction first copies the reference area it needs into a small
+// scratch list (`fetch`), clamping positions to the picture; the filters
+// then work on that copy, so they never look outside it. The inverse DCTs
+// (constants in idct.tsl) write blocks into the pictures here too.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../core"
+
+// The pictures and the scratch lists motion compensation and the IDCT
+// work on. Their methods change these fields directly (passing list
+// fields as `bind` arguments into big functions costs a call per access).
+struct M4Pics {
+    // The two references (past = older, fut = newest), the picture being
+    // written, and the B picture buffer.
+    pastY: [Int] = []
+    pastU: [Int] = []
+    pastV: [Int] = []
+    futY: [Int] = []
+    futU: [Int] = []
+    futV: [Int] = []
+    curY: [Int] = []
+    curU: [Int] = []
+    curV: [Int] = []
+    bY: [Int] = []
+    bU: [Int] = []
+    bV: [Int] = []
+    ys: Int = 0
+    cs: Int = 0
+    // Where reference pictures end for motion compensation.
+    edgeW: Int = 0
+    edgeH: Int = 0
+    // A block of coefficients (raster order).
+    blk: [Int] = []
+    // The reference area of a prediction, qpel scratch, and predictions:
+    // two slots of 384 (luma 16×16, then U and V 8×8).
+    fetch: [Int] = []
+    qbuf: [Int] = []
+    predBuf: [Int] = []
+
+    fn setup(ys: Int, cs: Int, rows: Int, edgeW: Int, edgeH: Int) {
+        self.ys = ys
+        self.cs = cs
+        self.edgeW = edgeW
+        self.edgeH = edgeH
+        let ln = ys * rows
+        let cn = cs * (rows / 2)
+        pastY = core.filled(ln, 16)
+        pastU = core.filled(cn, 128)
+        pastV = core.filled(cn, 128)
+        futY = pastY
+        futU = pastU
+        futV = pastV
+        bY = pastY
+        bU = pastU
+        bV = pastV
+        curY = []
+        curU = []
+        curV = []
+        blk = core.zeros(64)
+        fetch = core.zeros(24 * 24)
+        qbuf = core.zeros(16 * 17)
+        predBuf = core.zeros(768)
+    }
+
+    // Fetches the w×h reference area at (sx, sy) of plane 0 (Y), 1 (U) or
+    // 2 (V) of reference 0 (past) or 1 (newest); field -1 for the frame,
+    // else 0 (top) or 1 (bottom), sy then counting field rows. Field rows
+    // are clamped in the frame, as ffmpeg's edge emulation does.
+    fn fetchRef(_ ref: Int, _ plane: Int, _ field: Int, _ sx: Int, _ sy: Int, _ w: Int, _ h: Int) {
+        let luma = plane == 0
+        let pw = if luma { edgeW } else { edgeW >> 1 }
+        let ph = if luma { edgeH } else { edgeH >> 1 }
+        let stride = if luma { ys } else { cs }
+        let src = if ref == 0 {
+            if plane == 0 { pastY } else if plane == 1 { pastU } else { pastV }
+        } else {
+            if plane == 0 { futY } else if plane == 1 { futU } else { futV }
+        }
+        if field >= 0 {
+            fetchFieldArea(src, stride: stride, pw: pw, ph: ph, x: sx, firstRow: 2 * sy + field, w: w, h: h)
+        } else {
+            fetchArea(src, base: 0, stride: stride, pw: pw, ph: ph, x: sx, y: sy, w: w, h: h)
+        }
+    }
+
+    // Copies the w×h area whose top left is (x, y) in a plane into `fetch` (row
+    // stride w). The plane's samples start at `base`, rows are `stride` apart,
+    // and it is pw×ph samples; outside it, the nearest edge sample is used.
+    fn fetchArea(_ src: [Int], base: Int, stride: Int, pw: Int, ph: Int, x: Int, y: Int, w: Int, h: Int) {
+        if x >= 0 && y >= 0 && x + w <= pw && y + h <= ph {
+            var o = 0
+            for r in 0..h {
+                let s = base + (y + r) * stride + x
+                for c in 0..w {
+                    fetch[o + c] = src[s + c]
+                }
+                o += w
+            }
+            return
+        }
+        var o = 0
+        for r in 0..h {
+            let yy = min(max(y + r, 0), ph - 1)
+            let s = base + yy * stride
+            for c in 0..w {
+                let xx = min(max(x + c, 0), pw - 1)
+                fetch[o + c] = src[s + xx]
+            }
+            o += w
+        }
+    }
+
+    // The same for a field: rows firstRow, firstRow + 2, … of the frame, each
+    // clamped to the frame's rows 0…ph-1.
+    fn fetchFieldArea(_ src: [Int], stride: Int, pw: Int, ph: Int, x: Int, firstRow: Int, w: Int, h: Int) {
+        var o = 0
+        let inside = x >= 0 && x + w <= pw
+        for r in 0..h {
+            let yy = min(max(firstRow + 2 * r, 0), ph - 1)
+            let s = yy * stride
+            if inside {
+                for c in 0..w {
+                    fetch[o + c] = src[s + x + c]
+                }
+            } else {
+                for c in 0..w {
+                    fetch[o + c] = src[s + min(max(x + c, 0), pw - 1)]
+                }
+            }
+            o += w
+        }
+    }
+
+    // Half sample prediction (7.6.2.1) of a w×h block from `fetch` (stride ts,
+    // holding (w+1)×(h+1) samples) into predBuf. dxy: bit 0 horizontal half, bit 1
+    // vertical half. rnd is vop_rounding_type (0 or 1).
+    fn hpel(ts: Int, dOff: Int, dStride: Int, w: Int, h: Int, dxy: Int, rnd: Int) {
+        var d = dOff
+        var s = 0
+        if dxy == 0 {
+            for _ in 0..h {
+                for c in 0..w {
+                    predBuf[d + c] = fetch[s + c]
+                }
+                d += dStride
+                s += ts
+            }
+        } else if dxy == 1 {
+            let r = 1 - rnd
+            for _ in 0..h {
+                for c in 0..w {
+                    predBuf[d + c] = (fetch[s + c] + fetch[s + c + 1] + r) >> 1
+                }
+                d += dStride
+                s += ts
+            }
+        } else if dxy == 2 {
+            let r = 1 - rnd
+            for _ in 0..h {
+                for c in 0..w {
+                    predBuf[d + c] = (fetch[s + c] + fetch[s + c + ts] + r) >> 1
+                }
+                d += dStride
+                s += ts
+            }
+        } else {
+            let r = 2 - rnd
+            for _ in 0..h {
+                for c in 0..w {
+                    let p = s + c
+                    predBuf[d + c] = (fetch[p] + fetch[p + 1] + fetch[p + ts] + fetch[p + ts + 1] + r) >> 2
+                }
+                d += dStride
+                s += ts
+            }
+        }
+    }
+
+    // Quarter sample prediction (7.6.2.2) of an n×n block (n = 8 or 16),
+    // computed the way ffmpeg's qpel functions do (horizontal pass to the
+    // quarter position, then the vertical one). tmp holds the (n+1)×(n+1)
+    // reference area (stride ts); q is scratch of n×(n+1); dx, dy are the
+    // quarter positions 0…3; rnd is the rounding control.
+    fn qpel(ts: Int, dOff: Int, dStride: Int, n: Int, dx: Int, dy: Int, rnd: Int) {
+        let rows = if dy == 0 { n } else { n + 1 }
+        let ar = 1 - rnd
+        // Horizontal: qbuf[r * n + c] is the sample at the horizontal quarter
+        // position dx, rows 0…n.
+        for r in 0..rows {
+            let s = r * ts
+            let o = r * n
+            if dx == 0 {
+                for c in 0..n {
+                    qbuf[o + c] = fetch[s + c]
+                }
+            } else {
+                for c in 0..n {
+                    var v = 0
+                    if c >= 3 && c + 4 <= n {
+                        let p = s + c
+                        v = (fetch[p] + fetch[p + 1]) * 20 - (fetch[p - 1] + fetch[p + 2]) * 6 + (fetch[p - 2] + fetch[p + 3]) * 3 - (fetch[p - 3] + fetch[p + 4])
+                    } else {
+                        v = (fetch[s + m4Mirror(c, n)] + fetch[s + m4Mirror(c + 1, n)]) * 20 -
+                            (fetch[s + m4Mirror(c - 1, n)] + fetch[s + m4Mirror(c + 2, n)]) * 6 +
+                            (fetch[s + m4Mirror(c - 2, n)] + fetch[s + m4Mirror(c + 3, n)]) * 3 -
+                            (fetch[s + m4Mirror(c - 3, n)] + fetch[s + m4Mirror(c + 4, n)])
+                    }
+                    let half = m4QpelClip(v, rnd)
+                    if dx == 2 {
+                        qbuf[o + c] = half
+                    } else if dx == 1 {
+                        qbuf[o + c] = (half + fetch[s + c] + ar) >> 1
+                    } else {
+                        qbuf[o + c] = (half + fetch[s + c + 1] + ar) >> 1
+                    }
+                }
+            }
+        }
+        // Vertical.
+        for r in 0..n {
+            let d = dOff + r * dStride
+            let o = r * n
+            if dy == 0 {
+                for c in 0..n {
+                    predBuf[d + c] = qbuf[o + c]
+                }
+                continue
+            }
+            let inner = r >= 3 && r + 4 <= n
+            let m0 = m4Mirror(r, n) * n
+            let m1 = m4Mirror(r + 1, n) * n
+            let mm1 = m4Mirror(r - 1, n) * n
+            let m2 = m4Mirror(r + 2, n) * n
+            let mm2 = m4Mirror(r - 2, n) * n
+            let m3 = m4Mirror(r + 3, n) * n
+            let mm3 = m4Mirror(r - 3, n) * n
+            let m4 = m4Mirror(r + 4, n) * n
+            for c in 0..n {
+                var v = 0
+                if inner {
+                    let p = o + c
+                    v = (qbuf[p] + qbuf[p + n]) * 20 - (qbuf[p - n] + qbuf[p + 2 * n]) * 6 + (qbuf[p - 2 * n] + qbuf[p + 3 * n]) * 3 - (qbuf[p - 3 * n] + qbuf[p + 4 * n])
+                } else {
+                    v = (qbuf[m0 + c] + qbuf[m1 + c]) * 20 - (qbuf[mm1 + c] + qbuf[m2 + c]) * 6 + (qbuf[mm2 + c] + qbuf[m3 + c]) * 3 - (qbuf[mm3 + c] + qbuf[m4 + c])
+                }
+                let half = m4QpelClip(v, rnd)
+                if dy == 2 {
+                    predBuf[d + c] = half
+                } else if dy == 1 {
+                    predBuf[d + c] = (half + qbuf[o + c] + ar) >> 1
+                } else {
+                    predBuf[d + c] = (half + qbuf[o + n + c] + ar) >> 1
+                }
+            }
+        }
+    }
+
+    // One-point GMC (ffmpeg's gmc1): bilinear interpolation at sixteenth
+    // positions fx, fy of a w×h block from tmp ((w+1)×(h+1) samples).
+    fn gmc1(ts: Int, dOff: Int, dStride: Int, w: Int, h: Int, fx: Int, fy: Int, rounder: Int) {
+        let a = (16 - fx) * (16 - fy)
+        let b = fx * (16 - fy)
+        let c = (16 - fx) * fy
+        let e = fx * fy
+        for r in 0..h {
+            let s = r * ts
+            let d = dOff + r * dStride
+            for k in 0..w {
+                let p = s + k
+                predBuf[d + k] = (a * fetch[p] + b * fetch[p + 1] + c * fetch[p + ts] + e * fetch[p + ts + 1] + rounder) >> 8
+            }
+        }
+    }
+
+    // GMC with two or three warping points (ffmpeg's gmc_c): each sample of
+    // a w×h block is taken from the reference at a position that moves by
+    // (dxx, dyx) per column and (dxy, dyy) per row, in 16.16 fixed point of
+    // 1/2^shift samples, interpolated bilinearly; positions are clamped to the
+    // pw×ph picture.
+    fn gmcWarp(_ src: [Int], _ stride: Int, _ dOff: Int, _ dStride: Int, _ w: Int, _ h: Int, _ ox0: Int, _ oy0: Int, _ dxx: Int, _ dxy: Int, _ dyx: Int, _ dyy: Int, _ shift: Int, _ r: Int, _ pw: Int, _ ph: Int) {
+        let s = 1 << shift
+        let wl = pw - 1
+        let hl = ph - 1
+        var ox = ox0
+        var oy = oy0
+        for yy in 0..h {
+            var vx = ox
+            var vy = oy
+            let d = dOff + yy * dStride
+            for xx in 0..w {
+                var sx = vx >> 16
+                var sy = vy >> 16
+                let fx = sx & (s - 1)
+                let fy = sy & (s - 1)
+                sx = sx >> shift
+                sy = sy >> shift
+                var v = 0
+                if sx >= 0 && sx < wl {
+                    if sy >= 0 && sy < hl {
+                        let i = sx + sy * stride
+                        v = ((src[i] * (s - fx) + src[i + 1] * fx) * (s - fy) + (src[i + stride] * (s - fx) + src[i + stride + 1] * fx) * fy + r) >> (shift * 2)
+                    } else {
+                        let i = sx + min(max(sy, 0), hl) * stride
+                        v = ((src[i] * (s - fx) + src[i + 1] * fx) * s + r) >> (shift * 2)
+                    }
+                } else {
+                    if sy >= 0 && sy < hl {
+                        let i = min(max(sx, 0), wl) + sy * stride
+                        v = ((src[i] * (s - fy) + src[i + stride] * fy) * s + r) >> (shift * 2)
+                    } else {
+                        v = src[min(max(sx, 0), wl) + min(max(sy, 0), hl) * stride]
+                    }
+                }
+                predBuf[d + xx] = v
+                vx += dxx
+                vy += dyx
+            }
+            ox += dxy
+            oy += dyy
+        }
+    }
+
+    // Slot 0 of predBuf, or the rounded-up average of slots 0 and 1
+    // (bidirectional prediction, 7.6.7.3), into the picture at macroblock
+    // (x, y).
+    fn putPrediction(_ x: Int, _ y: Int, average: Bool) {
+        if average {
+            for i in 0..384 {
+                predBuf[i] = (predBuf[i] + predBuf[i + 384] + 1) >> 1
+            }
+        }
+        var d = y * 16 * ys + x * 16
+        var s = 0
+        for _ in 0..16 {
+            for c in 0..16 {
+                curY[d + c] = predBuf[s + c]
+            }
+            d += ys
+            s += 16
+        }
+        d = y * 8 * cs + x * 8
+        s = 256
+        for _ in 0..8 {
+            for c in 0..8 {
+                curU[d + c] = predBuf[s + c]
+                curV[d + c] = predBuf[s + 64 + c]
+            }
+            d += cs
+            s += 8
+        }
+    }
+
+    // A macroblock copied from a reference (not-coded and concealed ones).
+    fn copyMb(_ ref: Int, _ x: Int, _ y: Int) {
+        var d = y * 16 * ys + x * 16
+        for _ in 0..16 {
+            for c in 0..16 {
+                curY[d + c] = if ref == 0 { pastY[d + c] } else { futY[d + c] }
+            }
+            d += ys
+        }
+        d = y * 8 * cs + x * 8
+        for _ in 0..8 {
+            for c in 0..8 {
+                curU[d + c] = if ref == 0 { pastU[d + c] } else { futU[d + c] }
+                curV[d + c] = if ref == 0 { pastV[d + c] } else { futV[d + c] }
+            }
+            d += cs
+        }
+    }
+
+    // A grey macroblock (concealment before there is any reference).
+    fn greyMb(_ x: Int, _ y: Int) {
+        for r in 0..16 {
+            for c in 0..16 {
+                curY[(y * 16 + r) * ys + x * 16 + c] = 128
+            }
+        }
+        for r in 0..8 {
+            for c in 0..8 {
+                curU[(y * 8 + r) * cs + x * 8 + c] = 128
+                curV[(y * 8 + r) * cs + x * 8 + c] = 128
+            }
+        }
+    }
+
+    // Writes (or adds) the 8×8 values in blk into plane 0, 1 or 2 of the
+    // picture at off, clipped to 0…255.
+    fn storeBlock(_ plane: Int, _ off: Int, _ stride: Int, add: Bool) {
+        var d = off
+        var s = 0
+        if plane == 0 {
+            for _ in 0..8 {
+                for c in 0..8 {
+                    curY[d + c] = m4Clip255(blk[s + c] + (if add { curY[d + c] } else { 0 }))
+                }
+                d += stride
+                s += 8
+            }
+        } else if plane == 1 {
+            for _ in 0..8 {
+                for c in 0..8 {
+                    curU[d + c] = m4Clip255(blk[s + c] + (if add { curU[d + c] } else { 0 }))
+                }
+                d += stride
+                s += 8
+            }
+        } else {
+            for _ in 0..8 {
+                for c in 0..8 {
+                    curV[d + c] = m4Clip255(blk[s + c] + (if add { curV[d + c] } else { 0 }))
+                }
+                d += stride
+                s += 8
+            }
+        }
+    }
+
+    // --- The IDCTs (see idct.tsl) ---
+
+    // One row of the block, in place.
+    fn idctRow(_ o: Int) {
+        let r0 = blk[o]
+        let r1 = blk[o + 1]
+        let r2 = blk[o + 2]
+        let r3 = blk[o + 3]
+        let r4 = blk[o + 4]
+        let r5 = blk[o + 5]
+        let r6 = blk[o + 6]
+        let r7 = blk[o + 7]
+        if (r1 | r2 | r3 | r4 | r5 | r6 | r7) == 0 {
+            // ffmpeg's NEON version has no "DC only" shortcut (the C one
+            // writes r0 * 8, which differs by one for |r0| >= 1024).
+            if r0 != 0 {
+                let dc = (m4W4 * r0 + 1024) >> 11
+                for k in 0..8 {
+                    blk[o + k] = dc
+                }
+            }
+            return
+        }
+        var a0 = m4W4 * r0 + 1024
+        var a1 = a0
+        var a2 = a0
+        var a3 = a0
+        a0 += m4W2 * r2
+        a1 += m4W6 * r2
+        a2 -= m4W6 * r2
+        a3 -= m4W2 * r2
+        var b0 = m4W1 * r1 + m4W3 * r3
+        var b1 = m4W3 * r1 - m4W7 * r3
+        var b2 = m4W5 * r1 - m4W1 * r3
+        var b3 = m4W7 * r1 - m4W5 * r3
+        if (r4 | r5 | r6 | r7) != 0 {
+            a0 += m4W4 * r4 + m4W6 * r6
+            a1 += -m4W4 * r4 - m4W2 * r6
+            a2 += -m4W4 * r4 + m4W2 * r6
+            a3 += m4W4 * r4 - m4W6 * r6
+            b0 += m4W5 * r5 + m4W7 * r7
+            b1 += -m4W1 * r5 - m4W5 * r7
+            b2 += m4W7 * r5 + m4W3 * r7
+            b3 += m4W3 * r5 - m4W1 * r7
+        }
+        blk[o] = (a0 + b0) >> 11
+        blk[o + 7] = (a0 - b0) >> 11
+        blk[o + 1] = (a1 + b1) >> 11
+        blk[o + 6] = (a1 - b1) >> 11
+        blk[o + 2] = (a2 + b2) >> 11
+        blk[o + 5] = (a2 - b2) >> 11
+        blk[o + 3] = (a3 + b3) >> 11
+        blk[o + 4] = (a3 - b3) >> 11
+    }
+
+    // The simple IDCT of blk (rows, then columns), written or added into
+    // plane 0, 1 or 2 of the picture at off. dcOnly: only blk[0] is set.
+    fn idct(_ plane: Int, _ off: Int, _ stride: Int, add: Bool, dcOnly: Bool) {
+        if dcOnly {
+            // Rows: every value (W4·r0 + 2^10) >> 11; columns: W4·(that + 32)
+            // >> 20 everywhere.
+            let v = (m4W4 * (((m4W4 * blk[0] + 1024) >> 11) + 32)) >> 20
+            for i in 0..64 {
+                blk[i] = v
+            }
+            storeBlock(plane, off, stride, add: add)
+            return
+        }
+        for r in 0..8 {
+            idctRow(r * 8)
+        }
+        for c in 0..8 {
+            let c0 = blk[c]
+            let c1 = blk[c + 8]
+            let c2 = blk[c + 16]
+            let c3 = blk[c + 24]
+            let c4 = blk[c + 32]
+            let c5 = blk[c + 40]
+            let c6 = blk[c + 48]
+            let c7 = blk[c + 56]
+            var a0 = m4W4 * (c0 + 32)
+            var a1 = a0
+            var a2 = a0
+            var a3 = a0
+            a0 += m4W2 * c2
+            a1 += m4W6 * c2
+            a2 -= m4W6 * c2
+            a3 -= m4W2 * c2
+            var b0 = m4W1 * c1 + m4W3 * c3
+            var b1 = m4W3 * c1 - m4W7 * c3
+            var b2 = m4W5 * c1 - m4W1 * c3
+            var b3 = m4W7 * c1 - m4W5 * c3
+            if c4 != 0 {
+                a0 += m4W4 * c4
+                a1 -= m4W4 * c4
+                a2 -= m4W4 * c4
+                a3 += m4W4 * c4
+            }
+            if c5 != 0 {
+                b0 += m4W5 * c5
+                b1 -= m4W1 * c5
+                b2 += m4W7 * c5
+                b3 += m4W3 * c5
+            }
+            if c6 != 0 {
+                a0 += m4W6 * c6
+                a1 -= m4W2 * c6
+                a2 += m4W2 * c6
+                a3 -= m4W6 * c6
+            }
+            if c7 != 0 {
+                b0 += m4W7 * c7
+                b1 -= m4W5 * c7
+                b2 += m4W3 * c7
+                b3 -= m4W1 * c7
+            }
+            blk[c] = (a0 + b0) >> 20
+            blk[c + 8] = (a1 + b1) >> 20
+            blk[c + 16] = (a2 + b2) >> 20
+            blk[c + 24] = (a3 + b3) >> 20
+            blk[c + 32] = (a3 - b3) >> 20
+            blk[c + 40] = (a2 - b2) >> 20
+            blk[c + 48] = (a1 - b1) >> 20
+            blk[c + 56] = (a0 - b0) >> 20
+        }
+        storeBlock(plane, off, stride, add: add)
+    }
+
+    fn xvidRow(_ o: Int, _ row: Int) {
+        let t = row * 7
+        let c1 = m4XRowTab[t]
+        let c2 = m4XRowTab[t + 1]
+        let c3 = m4XRowTab[t + 2]
+        let c4 = m4XRowTab[t + 3]
+        let c5 = m4XRowTab[t + 4]
+        let c6 = m4XRowTab[t + 5]
+        let c7 = m4XRowTab[t + 6]
+        let rnd = m4XRowRnd[row]
+        let i0 = blk[o]
+        let i1 = blk[o + 1]
+        let i2 = blk[o + 2]
+        let i3 = blk[o + 3]
+        let i4 = blk[o + 4]
+        let i5 = blk[o + 5]
+        let i6 = blk[o + 6]
+        let i7 = blk[o + 7]
+        let right = i5 | i6 | i7
+        let left = i1 | i2 | i3
+        if (right | i4) == 0 {
+            let k = c4 * i0 + rnd
+            if left != 0 {
+                let a0 = k + c2 * i2
+                let a1 = k + c6 * i2
+                let a2 = k - c6 * i2
+                let a3 = k - c2 * i2
+                let b0 = c1 * i1 + c3 * i3
+                let b1 = c3 * i1 - c7 * i3
+                let b2 = c5 * i1 - c1 * i3
+                let b3 = c7 * i1 - c5 * i3
+                blk[o] = (a0 + b0) >> 11
+                blk[o + 1] = (a1 + b1) >> 11
+                blk[o + 2] = (a2 + b2) >> 11
+                blk[o + 3] = (a3 + b3) >> 11
+                blk[o + 4] = (a3 - b3) >> 11
+                blk[o + 5] = (a2 - b2) >> 11
+                blk[o + 6] = (a1 - b1) >> 11
+                blk[o + 7] = (a0 - b0) >> 11
+            } else {
+                let a0 = k >> 11
+                // (When a0 is 0 the row is left as it was, as in ffmpeg.)
+                if a0 != 0 {
+                    for k2 in 0..8 {
+                        blk[o + k2] = a0
+                    }
+                }
+            }
+        } else if (left | right) == 0 {
+            let a0 = (rnd + c4 * (i0 + i4)) >> 11
+            let a1 = (rnd + c4 * (i0 - i4)) >> 11
+            blk[o] = a0
+            blk[o + 3] = a0
+            blk[o + 4] = a0
+            blk[o + 7] = a0
+            blk[o + 1] = a1
+            blk[o + 2] = a1
+            blk[o + 5] = a1
+            blk[o + 6] = a1
+        } else {
+            let k = c4 * i0 + rnd
+            let a0 = k + c2 * i2 + c4 * i4 + c6 * i6
+            let a1 = k + c6 * i2 - c4 * i4 - c2 * i6
+            let a2 = k - c6 * i2 - c4 * i4 + c2 * i6
+            let a3 = k - c2 * i2 + c4 * i4 - c6 * i6
+            let b0 = c1 * i1 + c3 * i3 + c5 * i5 + c7 * i7
+            let b1 = c3 * i1 - c7 * i3 - c1 * i5 - c5 * i7
+            let b2 = c5 * i1 - c1 * i3 + c7 * i5 + c3 * i7
+            let b3 = c7 * i1 - c5 * i3 + c3 * i5 - c1 * i7
+            blk[o] = (a0 + b0) >> 11
+            blk[o + 1] = (a1 + b1) >> 11
+            blk[o + 2] = (a2 + b2) >> 11
+            blk[o + 3] = (a3 + b3) >> 11
+            blk[o + 4] = (a3 - b3) >> 11
+            blk[o + 5] = (a2 - b2) >> 11
+            blk[o + 6] = (a1 - b1) >> 11
+            blk[o + 7] = (a0 - b0) >> 11
+        }
+    }
+
+    // The Xvid IDCT of blk, written or added into plane 0, 1 or 2.
+    fn xvidIdct(_ plane: Int, _ off: Int, _ stride: Int, add: Bool) {
+        for r in 0..8 {
+            xvidRow(r * 8, r)
+        }
+        let tan1 = 0x32EC
+        let tan2 = 0x6A0A
+        let tan3 = 0xAB0E
+        let sqrt2 = 0x5A82
+        for c in 0..8 {
+            // Odd part.
+            var mm4 = blk[c + 56]
+            var mm5 = blk[c + 40]
+            var mm6 = blk[c + 24]
+            var mm7 = blk[c + 8]
+            var mm0 = m4XMul(tan1, mm4) + mm7
+            var mm1 = m4XMul(tan1, mm7) - mm4
+            var mm2 = m4XMul(tan3, mm5) + mm6
+            var mm3 = m4XMul(tan3, mm6) - mm5
+            mm7 = mm0 + mm2
+            mm4 = mm1 - mm3
+            mm0 = mm0 - mm2
+            mm1 = mm1 + mm3
+            mm6 = mm0 + mm1
+            mm5 = mm0 - mm1
+            mm5 = 2 * m4XMul(sqrt2, mm5)
+            mm6 = 2 * m4XMul(sqrt2, mm6)
+            // Even part.
+            mm1 = blk[c + 16]
+            mm2 = blk[c + 48]
+            mm3 = m4XMul(tan2, mm2) + mm1
+            mm2 = m4XMul(tan2, mm1) - mm2
+            mm0 = blk[c] + blk[c + 32]
+            mm1 = blk[c] - blk[c + 32]
+            // BUTF(mm0, mm3); BUTF(mm0, mm7)
+            var t = mm0 + mm3
+            mm3 = mm0 - mm3
+            mm0 = t
+            t = mm0 + mm7
+            mm7 = mm0 - mm7
+            mm0 = t
+            let o0 = m4I16(mm0 >> 6)
+            let o7 = m4I16(mm7 >> 6)
+            t = mm3 + mm4
+            mm4 = mm3 - mm4
+            mm3 = t
+            let o3 = m4I16(mm3 >> 6)
+            let o4 = m4I16(mm4 >> 6)
+            t = mm1 + mm2
+            mm2 = mm1 - mm2
+            mm1 = t
+            t = mm1 + mm6
+            mm6 = mm1 - mm6
+            mm1 = t
+            let o1 = m4I16(mm1 >> 6)
+            let o6 = m4I16(mm6 >> 6)
+            t = mm2 + mm5
+            mm5 = mm2 - mm5
+            mm2 = t
+            let o2 = m4I16(mm2 >> 6)
+            let o5 = m4I16(mm5 >> 6)
+            blk[c] = o0
+            blk[c + 8] = o1
+            blk[c + 16] = o2
+            blk[c + 24] = o3
+            blk[c + 32] = o4
+            blk[c + 40] = o5
+            blk[c + 48] = o6
+            blk[c + 56] = o7
+        }
+        storeBlock(plane, off, stride, add: add)
+    }
+}
+
+// Mirrors a tap position into 0…n (7.6.2.2: samples beyond the block's
+// (n+1)×(n+1) area are taken from inside it, reflected at its edge).
+fn m4Mirror(_ i: Int, _ n: Int) -> Int {
+    if i < 0 {
+        return -1 - i
+    }
+    if i > n {
+        return 2 * n + 1 - i
+    }
+    i
+}
+
+fn m4QpelClip(_ v: Int, _ rnd: Int) -> Int {
+    let x = (v + 16 - rnd) >> 5
+    if x < 0 {
+        return 0
+    }
+    if x > 255 {
+        return 255
+    }
+    x
+}

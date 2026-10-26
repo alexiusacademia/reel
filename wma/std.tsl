@@ -1,0 +1,1144 @@
+// Windows Media Audio 1 and 2 (WAVE format tags 0x160 and 0x161): the
+// decoder engine. There is no public specification; this follows the
+// bitstream as the FFmpeg project documented it (libavcodec wma.c,
+// wmadec.c), whose output it matches.
+//
+// A packet ("superframe", nBlockAlign bytes) holds whole frames of
+// frame_len samples (512, 1024 or 2048 by sample rate); with the bit
+// reservoir (WMA 2 always) a superframe header says how many frames start
+// in it and where the first one begins, and a frame may straddle two
+// superframes. A frame is one or more MDCT blocks (block switching: the
+// block sizes frame_len / 2^k), each: M/S stereo flag, per-channel coded
+// flags, total gain, noise-coded high bands, exponents (an LSP curve, or
+// Huffman-coded steps of 1.5 dB per band as AAC scalefactors), run-level
+// Huffman-coded coefficients, then inverse MDCT with sine windows and
+// overlap-add.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../core"
+
+let wmaBlockMinBits = 7
+let wmaBlockMaxBits = 11
+let wmaBlockMax = 2048
+let wmaHighBandMax = 16
+let wmaNoiseSize = 8192
+let wmaMaxSuperframe = 32768
+
+struct WmaStd {
+    version: Int = 2
+    channels: Int = 1
+    rate: Int = 44100
+    blockAlign: Int = 0
+    useExpVlc: Bool = false
+    useBitReservoir: Bool = false
+    useVariableBlockLen: Bool = false
+    useNoiseCoding: Bool = true
+    byteOffsetBits: Int = 0
+    frameLenBits: Int = 11
+    frameLen: Int = 2048
+    nbBlockSizes: Int = 1
+
+    // Per block size k (frame_len >> k): exponent band widths (25 a
+    // size), the first high band coefficient, the coded coefficients'
+    // end, the noise-coded high bands' widths (16 a size).
+    exponentSizes: [Int] = []
+    exponentBands: [Int] = []
+    highBandStart: [Int] = []
+    coefsStart: Int = 0
+    coefsEnd: [Int] = []
+    exponentHighSizes: [Int] = []
+    exponentHighBands: [Int] = []
+
+    // Huffman tables: exponents, high band gains, the two coefficient
+    // tables (the second for the side channel of M/S stereo) with their
+    // run and level per code.
+    expVlc: [Int] = []
+    hgainVlc: [Int] = []
+    coefVlc0: [Int] = []
+    coefVlc1: [Int] = []
+    run0: [Int] = []
+    run1: [Int] = []
+    level0: [Float] = []
+    level1: [Float] = []
+
+    // Block state.
+    resetBlockLengths: Bool = true
+    blockLenBits: Int = 11
+    nextBlockLenBits: Int = 11
+    prevBlockLenBits: Int = 11
+    blockLen: Int = 2048
+    blockPos: Int = 0
+    msStereo: Bool = false
+    channelCoded: [Bool] = [false, false]
+    exponentsBsize: [Int] = [0, 0]
+    exponentsInitialized: [Bool] = [false, false]
+    maxExponent: [Float] = [1.0, 1.0]
+    highBandCoded: [Bool] = []
+    highBandValues: [Int] = []
+    expPower: [Float] = []
+    // 2 × 2048 each: per channel.
+    exponents: [Float] = []
+    coefs1: [Float] = []
+    coefs: [Float] = []
+    // One frame of output and the overlap: 2 × 4096.
+    frameOut: [Float] = []
+    windows: [[Float]] = []
+    mdct: WmaMdct = WmaMdct()
+
+    // Bit reservoir: the end of the last superframe (bytes), and the bits
+    // to skip in it.
+    lastSuperframe: [Int] = []
+    lastSuperframeLen: Int = 0
+    lastBitoffset: Int = 0
+
+    noiseTable: [Float] = []
+    noiseIndex: Int = 0
+    noiseMult: Float = 0.04
+    lspCosTable: [Float] = []
+    lspPowETable: [Float] = []
+    lspPowMTable1: [Float] = []
+    lspPowMTable2: [Float] = []
+    powTab: [Float] = []
+
+    br: core.BitReader = core.bitReader(Data())
+    // Output of the current packet (interleaved).
+    out: [Float] = []
+    warnings: [String] = []
+
+    // Huffman decoding (see wma/vlc.tsl); -1 for a bad code.
+    fn readVlc(_ t: [Int], _ bits: Int) -> Int {
+        var e = t[br.peek(bits)]
+        if e > 0 {
+            br.bits(e & 31)
+            return e >> 5
+        }
+        var nb = bits
+        while e < 0 {
+            br.bits(nb)
+            let p = -e
+            nb = p & 31
+            e = t[(p >> 5) + br.peek(nb)]
+        }
+        if e == 0 {
+            return -1
+        }
+        br.bits(e & 31)
+        e >> 5
+    }
+
+    // A superframe (one packet of nBlockAlign bytes) → `out` (decoded
+    // frames, interleaved). Returns false when it's damaged.
+    fn decodeSuperframe(_ buf: Data) -> Bool {
+        let bufSize = buf.count
+        br = core.bitReader(buf)
+        var nbFrames = 1
+        if useBitReservoir {
+            // Superframe header: index (4 bits), frame count (4 bits).
+            br.bits(4)
+            nbFrames = br.bits(4) - (if lastSuperframeLen <= 0 { 1 } else { 0 })
+            if nbFrames <= 0 {
+                let isError = nbFrames < 0 || br.left <= 8
+                if isError {
+                    return false
+                }
+                if lastSuperframeLen + bufSize - 1 > wmaMaxSuperframe {
+                    lastSuperframeLen = 0
+                    return false
+                }
+                // No frame starts here: all of it carries on.
+                var q = lastSuperframeLen
+                for _ in 0..(bufSize - 1) {
+                    wmaPut(lastSuperframe, q, br.bits(8))
+                    q += 1
+                }
+                lastSuperframeLen += 8 * bufSize - 8
+                return true
+            }
+        }
+        if useBitReservoir {
+            let bitOffset = br.bits(byteOffsetBits + 3)
+            if bitOffset > br.left {
+                lastSuperframeLen = 0
+                return false
+            }
+            if lastSuperframeLen > 0 {
+                // The bits of the frame begun in the last superframe.
+                if lastSuperframeLen + ((bitOffset + 7) >> 3) > wmaMaxSuperframe {
+                    lastSuperframeLen = 0
+                    return false
+                }
+                var q = lastSuperframeLen
+                var len = bitOffset
+                while len > 7 {
+                    wmaPut(lastSuperframe, q, br.bits(8))
+                    q += 1
+                    len -= 8
+                }
+                if len > 0 {
+                    wmaPut(lastSuperframe, q, br.bits(len) << (8 - len))
+                    q += 1
+                }
+                let saved = br
+                var bytes: [Int] = []
+                for i in 0..q {
+                    bytes.append(lastSuperframe[i])
+                }
+                br = core.bitReader(Data(bytes: bytes))
+                if lastBitoffset > 0 {
+                    br.bits(lastBitoffset)
+                }
+                if !decodeFrame() {
+                    lastSuperframeLen = 0
+                    return false
+                }
+                nbFrames -= 1
+                br = saved
+            }
+            // The frames that start here, from bit_offset.
+            let pos = bitOffset + 4 + 4 + byteOffsetBits + 3
+            if pos >= wmaMaxSuperframe * 8 || pos > bufSize * 8 {
+                lastSuperframeLen = 0
+                return false
+            }
+            br = core.bitReaderRange(buf, from: pos >> 3, to: bufSize)
+            if (pos & 7) > 0 {
+                br.bits(pos & 7)
+            }
+            resetBlockLengths = true
+            for _ in 0..nbFrames {
+                if !decodeFrame() {
+                    lastSuperframeLen = 0
+                    return false
+                }
+            }
+            // Keep what's left for the next superframe.
+            let end = br.position
+            lastBitoffset = end & 7
+            let at = end >> 3
+            let len = bufSize - at
+            if len > wmaMaxSuperframe || len < 0 {
+                lastSuperframeLen = 0
+                return false
+            }
+            lastSuperframeLen = len
+            for i in 0..len {
+                wmaPut(lastSuperframe, i, buf[at + i])
+            }
+        } else {
+            if !decodeFrame() {
+                return false
+            }
+        }
+        true
+    }
+
+    // One frame: its blocks, then frame_len samples out.
+    fn decodeFrame() -> Bool {
+        blockPos = 0
+        while true {
+            let r = decodeBlock()
+            if r < 0 {
+                return false
+            }
+            if r == 1 {
+                break
+            }
+        }
+        let n = frameLen
+        let c = channels
+        let o = out.count
+        for _ in 0..(n * c) {
+            out.append(0.0)
+        }
+        for ch in 0..c {
+            let base = ch * 2 * wmaBlockMax
+            for i in 0..n {
+                out[o + i * c + ch] = frameOut[base + i]
+            }
+            for i in 0..n {
+                frameOut[base + i] = frameOut[base + n + i]
+            }
+        }
+        true
+    }
+
+    // One MDCT block: 0 when more follow in the frame, 1 at its end, -1
+    // when damaged.
+    fn decodeBlock() -> Int {
+        if useVariableBlockLen {
+            let n = wmaLog2(nbBlockSizes - 1) + 1
+            if resetBlockLengths {
+                resetBlockLengths = false
+                let v = br.bits(n)
+                if v >= nbBlockSizes {
+                    return -1
+                }
+                prevBlockLenBits = frameLenBits - v
+                let w = br.bits(n)
+                if w >= nbBlockSizes {
+                    return -1
+                }
+                blockLenBits = frameLenBits - w
+            } else {
+                prevBlockLenBits = blockLenBits
+                blockLenBits = nextBlockLenBits
+            }
+            let v = br.bits(n)
+            if v >= nbBlockSizes {
+                return -1
+            }
+            nextBlockLenBits = frameLenBits - v
+        } else {
+            nextBlockLenBits = frameLenBits
+            prevBlockLenBits = frameLenBits
+            blockLenBits = frameLenBits
+        }
+        if frameLenBits - blockLenBits >= nbBlockSizes {
+            return -1
+        }
+        blockLen = 1 << blockLenBits
+        if blockPos + blockLen > frameLen {
+            return -1
+        }
+        if channels == 2 {
+            msStereo = br.flag()
+        }
+        var anyCoded = false
+        for ch in 0..channels {
+            let a = br.flag()
+            channelCoded[ch] = a
+            if a {
+                anyCoded = true
+            }
+        }
+        let bsize = frameLenBits - blockLenBits
+        if anyCoded {
+            if decodeCoefficients(bsize) < 0 {
+                return -1
+            }
+        }
+        // Inverse MDCT and windowing into the frame.
+        let n4 = blockLen / 2
+        for ch in 0..channels {
+            if channelCoded[ch] {
+                let cb = ch * wmaBlockMax
+                for i in 0..blockLen {
+                    mdct.inp[i] = coefs[cb + i]
+                }
+                mdct.inverse(blockLen, -1.0 / 32768.0)
+            } else if !(msStereo && ch == 1) {
+                for i in 0..(2 * blockLen) {
+                    mdct.out[i] = 0.0
+                }
+            }
+            let index = frameLen / 2 + blockPos - n4
+            window(ch * 2 * wmaBlockMax + index)
+        }
+        blockPos += blockLen
+        if blockPos >= frameLen { 1 } else { 0 }
+    }
+
+    // Total gain, noise bands, exponents, coefficients → coefs.
+    fn decodeCoefficients(_ bsize: Int) -> Int {
+        var totalGain = 1
+        while true {
+            if br.left < 7 {
+                return -1
+            }
+            let a = br.bits(7)
+            totalGain += a
+            if a != 127 {
+                break
+            }
+        }
+        let coefNbBits = wmaTotalGainToBits(totalGain)
+        let n = coefsEnd[bsize] - coefsStart
+        var nbCoefs = [n, n]
+        let nh = exponentHighSizes[bsize]
+        if useNoiseCoding {
+            for ch in 0..channels {
+                if channelCoded[ch] {
+                    for i in 0..nh {
+                        let a = br.flag()
+                        highBandCoded[ch * wmaHighBandMax + i] = a
+                        if a {
+                            nbCoefs[ch] -= exponentHighBands[bsize * wmaHighBandMax + i]
+                        }
+                    }
+                }
+            }
+            for ch in 0..channels {
+                if channelCoded[ch] {
+                    var started = false
+                    var val = 0
+                    for i in 0..nh {
+                        if highBandCoded[ch * wmaHighBandMax + i] {
+                            if !started {
+                                val = br.bits(7) - 19
+                                started = true
+                            } else {
+                                let d = readVlc(hgainVlc, 9)
+                                if d < 0 {
+                                    return -1
+                                }
+                                val += d - 18
+                            }
+                            highBandValues[ch * wmaHighBandMax + i] = val
+                        }
+                    }
+                }
+            }
+        }
+        // Exponents (reused by shorter blocks when the flag says so).
+        if blockLenBits == frameLenBits || br.flag() {
+            for ch in 0..channels {
+                if channelCoded[ch] {
+                    if useExpVlc {
+                        if !decodeExpVlc(ch) {
+                            return -1
+                        }
+                    } else {
+                        decodeExpLsp(ch)
+                    }
+                    exponentsBsize[ch] = bsize
+                    exponentsInitialized[ch] = true
+                }
+            }
+        }
+        for ch in 0..channels {
+            if channelCoded[ch] && !exponentsInitialized[ch] {
+                return -1
+            }
+        }
+        // Run-level coded coefficients.
+        for ch in 0..channels {
+            if channelCoded[ch] {
+                let tab = if ch == 1 && msStereo { 1 } else { 0 }
+                if !runLevel(tab, ch * wmaBlockMax, nbCoefs[ch], coefNbBits) {
+                    return -1
+                }
+            }
+            if version == 1 && channels >= 2 {
+                br.alignToByte()
+            }
+        }
+        let n4 = blockLen / 2
+        var mdctNorm = 1.0 / Float(n4)
+        if version == 1 {
+            mdctNorm *= sqrt(Float(n4))
+        }
+        for ch in 0..channels {
+            if channelCoded[ch] {
+                computeCoefs(ch, bsize, mdctNorm, totalGain, nbCoefs[ch])
+            }
+        }
+        if msStereo && channelCoded[1] {
+            if !channelCoded[0] {
+                for i in 0..blockLen {
+                    coefs[i] = 0.0
+                }
+                channelCoded[0] = true
+            }
+            // Mid/side: L = M + S, R = M - S.
+            for i in 0..blockLen {
+                let a = coefs[i]
+                let b = coefs[wmaBlockMax + i]
+                coefs[i] = a + b
+                coefs[wmaBlockMax + i] = a - b
+            }
+        }
+        0
+    }
+
+    // Coefficient values: decoded levels (plus noise) times the exponent
+    // curve and the gain; noise-coded high bands; noise at the edges.
+    fn computeCoefs(_ ch: Int, _ bsize: Int, _ mdctNorm: Float, _ totalGain: Int, _ nb: Int) {
+        let eb = ch * wmaBlockMax
+        let esize = exponentsBsize[ch]
+        var mult = pow(10.0, Float(totalGain) * 0.05) / maxExponent[ch]
+        mult *= mdctNorm
+        let cbase = ch * wmaBlockMax
+        var c = cbase
+        var c1 = cbase
+        if useNoiseCoding {
+            let mult1 = mult
+            for i in 0..coefsStart {
+                coefs[c] = noiseTable[noiseIndex] * exponents[eb + ((i << bsize) >> esize)] * mult1
+                c += 1
+                noiseIndex = (noiseIndex + 1) & (wmaNoiseSize - 1)
+            }
+            let n1 = exponentHighSizes[bsize]
+            // Power of the noise-coded high bands.
+            var e = eb + ((highBandStart[bsize] << bsize) >> esize)
+            var lastHighBand = 0
+            for j in 0..n1 {
+                let n = exponentHighBands[bsize * wmaHighBandMax + j]
+                if highBandCoded[ch * wmaHighBandMax + j] {
+                    var e2 = 0.0
+                    for i in 0..n {
+                        let v = exponents[e + ((i << bsize) >> esize)]
+                        e2 += v * v
+                    }
+                    expPower[j] = e2 / Float(n)
+                    lastHighBand = j
+                }
+                e += (n << bsize) >> esize
+            }
+            // Main and high frequencies.
+            e = eb + ((coefsStart << bsize) >> esize)
+            for jj in 0..(n1 + 1) {
+                let j = jj - 1
+                let n = if j < 0 { highBandStart[bsize] - coefsStart } else { exponentHighBands[bsize * wmaHighBandMax + j] }
+                if j >= 0 && highBandCoded[ch * wmaHighBandMax + j] {
+                    var m1 = sqrt(expPower[j] / expPower[lastHighBand])
+                    m1 = m1 * pow(10.0, Float(highBandValues[ch * wmaHighBandMax + j]) * 0.05)
+                    m1 = m1 / (maxExponent[ch] * noiseMult)
+                    m1 *= mdctNorm
+                    for i in 0..n {
+                        let noise = noiseTable[noiseIndex]
+                        noiseIndex = (noiseIndex + 1) & (wmaNoiseSize - 1)
+                        coefs[c] = noise * exponents[e + ((i << bsize) >> esize)] * m1
+                        c += 1
+                    }
+                } else {
+                    for i in 0..n {
+                        let noise = noiseTable[noiseIndex]
+                        noiseIndex = (noiseIndex + 1) & (wmaNoiseSize - 1)
+                        coefs[c] = (coefs1[c1] + noise) * exponents[e + ((i << bsize) >> esize)] * mult
+                        c += 1
+                        c1 += 1
+                    }
+                }
+                e += (n << bsize) >> esize
+            }
+            // Very high frequencies: noise.
+            let n = blockLen - coefsEnd[bsize]
+            let m1 = mult * exponents[e + ((-(1 << bsize)) >> esize)]
+            for _ in 0..n {
+                coefs[c] = noiseTable[noiseIndex] * m1
+                c += 1
+                noiseIndex = (noiseIndex + 1) & (wmaNoiseSize - 1)
+            }
+        } else {
+            for _ in 0..coefsStart {
+                coefs[c] = 0.0
+                c += 1
+            }
+            for i in 0..nb {
+                coefs[c] = coefs1[c1 + i] * exponents[eb + ((i << bsize) >> esize)] * mult
+                c += 1
+            }
+            let n = blockLen - coefsEnd[bsize]
+            for _ in 0..n {
+                coefs[c] = 0.0
+                c += 1
+            }
+        }
+    }
+
+    // Run-level coefficients into coefs1 (ffmpeg's ff_wma_run_level_decode,
+    // version 0).
+    fn runLevel(_ tab: Int, _ base: Int, _ numCoefs: Int, _ coefNbBits: Int) -> Bool {
+        for i in 0..blockLen {
+            coefs1[base + i] = 0.0
+        }
+        let vlc = if tab == 0 { coefVlc0 } else { coefVlc1 }
+        let runs = if tab == 0 { run0 } else { run1 }
+        let levels = if tab == 0 { level0 } else { level1 }
+        let mask = blockLen - 1
+        var offset = 0
+        while offset < numCoefs {
+            let code = readVlc(vlc, 9)
+            if code > 1 {
+                offset += runs[code]
+                let positive = br.bits(1) == 1
+                let l = levels[code]
+                coefs1[base + (offset & mask)] = if positive { l } else { -l }
+            } else if code == 1 {
+                break
+            } else if code == 0 {
+                let level = br.bits(coefNbBits)
+                offset += br.bits(frameLenBits)
+                let positive = br.bits(1) == 1
+                coefs1[base + (offset & mask)] = if positive { Float(level) } else { -Float(level) }
+            } else {
+                return false
+            }
+            if br.overrun {
+                return false
+            }
+            offset += 1
+        }
+        if offset > numCoefs {
+            warnings.append("WMA: run-level coding overflows the block")
+            return false
+        }
+        true
+    }
+
+    // Exponents as Huffman-coded steps (pow(10, i/16) per band).
+    fn decodeExpVlc(_ ch: Int) -> Bool {
+        let bsize = frameLenBits - blockLenBits
+        var band = bsize * 25
+        let base = ch * wmaBlockMax
+        var q = 0
+        let qEnd = blockLen
+        var maxScale = 0.0
+        var lastExp = 36
+        if version == 1 {
+            lastExp = br.bits(5) + 10
+            let v = powTab[lastExp + 60]
+            maxScale = v
+            let n = exponentBands[band]
+            band += 1
+            let count = if n == 0 { 4 } else { n }
+            for _ in 0..count {
+                if q < wmaBlockMax {
+                    exponents[base + q] = v
+                }
+                q += 1
+            }
+        }
+        while q < qEnd {
+            let code = readVlc(expVlc, 8)
+            if code < 0 {
+                return false
+            }
+            lastExp += code - 60
+            if lastExp + 60 < 0 || lastExp + 60 >= powTab.count {
+                warnings.append("WMA: exponent out of range")
+                return false
+            }
+            let v = powTab[lastExp + 60]
+            if v > maxScale {
+                maxScale = v
+            }
+            let n = if band < exponentBands.count { exponentBands[band] } else { 0 }
+            band += 1
+            let count = if n == 0 { 4 } else { n }
+            for _ in 0..count {
+                if q < wmaBlockMax {
+                    exponents[base + q] = v
+                }
+                q += 1
+            }
+        }
+        maxExponent[ch] = maxScale
+        true
+    }
+
+    // Exponents as an LSP curve (10 coefficients from a codebook).
+    fn decodeExpLsp(_ ch: Int) {
+        var lsp: [Float] = []
+        for i in 0..10 {
+            let v = if i == 0 || i >= 8 { br.bits(3) } else { br.bits(4) }
+            lsp.append(wmaWmaLspCodebook[i * 16 + v])
+        }
+        let base = ch * wmaBlockMax
+        var valMax = 0.0
+        for i in 0..blockLen {
+            var p = 0.5
+            var q = 0.5
+            let w = lspCosTable[i]
+            var j = 1
+            while j < 10 {
+                q *= w - lsp[j - 1]
+                p *= w - lsp[j]
+                j += 2
+            }
+            p *= p * (2.0 - w)
+            q *= q * (2.0 + w)
+            let v = powM14(p + q)
+            if v > valMax {
+                valMax = v
+            }
+            exponents[base + i] = v
+        }
+        maxExponent[ch] = valMax
+    }
+
+    // x^(-1/4) the way ffmpeg's pow_m1_4 does it: the float's exponent
+    // from a table, the mantissa by linear interpolation in a 128-entry
+    // table.
+    fn powM14(_ x: Float) -> Float {
+        if !(x > 0.0) {
+            return 0.0
+        }
+        // x = 2^e * m, 1 <= m < 2 (e is the float's biased exponent - 127).
+        var e = Int(floor(log(x) / log(2.0)))
+        var m = x / pow(2.0, Float(e))
+        if m >= 2.0 {
+            m = m / 2.0
+            e += 1
+        } else if m < 1.0 {
+            m = m * 2.0
+            e -= 1
+        }
+        let biased = e + 127
+        if biased < 0 || biased > 255 {
+            return pow(x, -0.25)
+        }
+        let f = (m - 1.0) * 128.0
+        let idx = min(Int(f), 127)
+        let t = 1.0 + (f - Float(idx))
+        lspPowETable[biased] * (lspPowMTable1[idx] + lspPowMTable2[idx] * t)
+    }
+
+    // Windowing of mdct.out into the frame at frameOut[at...] (overlap-add
+    // on the left half, the right half stored for the next block).
+    fn window(_ at: Int) {
+        var o = at
+        var i0 = 0
+        if blockLenBits <= prevBlockLenBits {
+            let bl = blockLen
+            let w = windows[frameLenBits - blockLenBits]
+            for i in 0..bl {
+                frameOut[o + i] = mdct.out[i] * w[i] + frameOut[o + i]
+            }
+        } else {
+            let bl = 1 << prevBlockLenBits
+            let n = (blockLen - bl) / 2
+            let w = windows[frameLenBits - prevBlockLenBits]
+            for i in 0..bl {
+                frameOut[o + n + i] = mdct.out[n + i] * w[i] + frameOut[o + n + i]
+            }
+            for i in 0..n {
+                frameOut[o + n + bl + i] = mdct.out[n + bl + i]
+            }
+        }
+        o += blockLen
+        i0 = blockLen
+        if blockLenBits <= nextBlockLenBits {
+            let bl = blockLen
+            let w = windows[frameLenBits - blockLenBits]
+            for i in 0..bl {
+                frameOut[o + i] = mdct.out[i0 + i] * w[bl - 1 - i]
+            }
+        } else {
+            let bl = 1 << nextBlockLenBits
+            let n = (blockLen - bl) / 2
+            let w = windows[frameLenBits - nextBlockLenBits]
+            for i in 0..n {
+                frameOut[o + i] = mdct.out[i0 + i]
+            }
+            for i in 0..bl {
+                frameOut[o + n + i] = mdct.out[i0 + n + i] * w[bl - 1 - i]
+            }
+            for i in 0..n {
+                frameOut[o + n + bl + i] = 0.0
+            }
+        }
+    }
+
+    fn resetState() {
+        lastBitoffset = 0
+        lastSuperframeLen = 0
+        resetBlockLengths = true
+        for i in 0..frameOut.count {
+            frameOut[i] = 0.0
+        }
+    }
+}
+
+// Writes a byte into a growing list.
+fn wmaPut(_ list: bind [Int], _ at: Int, _ v: Int) {
+    while list.count <= at {
+        list.append(0)
+    }
+    list[at] = v
+}
+
+fn wmaLog2(_ v: Int) -> Int {
+    var n = 0
+    var x = v
+    while x > 1 {
+        x = x >> 1
+        n += 1
+    }
+    n
+}
+
+fn wmaTotalGainToBits(_ g: Int) -> Int {
+    if g < 15 {
+        13
+    } else if g < 32 {
+        12
+    } else if g < 40 {
+        11
+    } else if g < 45 {
+        10
+    } else {
+        9
+    }
+}
+
+// log2 of a frame's samples by sample rate and version (1, 2; 3 = Pro
+// with its decode flags), ffmpeg's ff_wma_get_frame_len_bits.
+fn wmaFrameLenBits(_ rate: Int, _ version: Int, _ flags: Int) -> Int {
+    var bits = 11
+    if rate <= 16000 {
+        bits = 9
+    } else if rate <= 22050 || (rate <= 32000 && version == 1) {
+        bits = 10
+    } else if rate <= 48000 || version < 3 {
+        bits = 11
+    } else if rate <= 96000 {
+        bits = 12
+    } else {
+        bits = 13
+    }
+    if version == 3 {
+        let t = flags & 6
+        if t == 2 {
+            bits += 1
+        } else if t == 4 {
+            bits -= 1
+        } else if t == 6 {
+            bits -= 2
+        }
+    }
+    bits
+}
+
+// Sets up a WMA 1/2 engine (ffmpeg's wma_decode_init and ff_wma_init).
+fn wmaNewStd(version: Int, channels: Int, rate: Int, bitrate: Int, blockAlign: Int, extra: Data) -> Result<WmaStd> {
+    if rate > 50000 || channels > 2 || channels < 1 || bitrate <= 0 || rate <= 0 {
+        return Result.failure(error: Error("WMA {version}: unsupported setup ({rate} Hz, {channels} channels, {bitrate} bit/s)"))
+    }
+    if blockAlign <= 0 {
+        return Result.failure(error: Error("WMA {version}: the packet size (nBlockAlign) isn't known"))
+    }
+    var s = WmaStd(version: version, channels: channels, rate: rate, blockAlign: blockAlign)
+    var flags2 = 0
+    if version == 1 && extra.count >= 4 {
+        flags2 = extra.uint16(at: 2)
+    } else if version == 2 && extra.count >= 6 {
+        flags2 = extra.uint16(at: 4)
+    }
+    s.useExpVlc = (flags2 & 1) != 0
+    s.useBitReservoir = (flags2 & 2) != 0
+    s.useVariableBlockLen = (flags2 & 4) != 0
+    if version == 2 && extra.count >= 8 && extra.uint16(at: 4) == 0xd && s.useVariableBlockLen {
+        // ffmpeg turns block switching off for these (its issue 1503).
+        s.useVariableBlockLen = false
+    }
+    s.frameLenBits = wmaFrameLenBits(rate, version, 0)
+    s.frameLen = 1 << s.frameLenBits
+    s.nextBlockLenBits = s.frameLenBits
+    s.prevBlockLenBits = s.frameLenBits
+    s.blockLenBits = s.frameLenBits
+    if s.useVariableBlockLen {
+        var nb = ((flags2 >> 3) & 3) + 1
+        if bitrate / channels >= 32000 {
+            nb += 2
+        }
+        let nbMax = s.frameLenBits - wmaBlockMinBits
+        if nb > nbMax {
+            nb = nbMax
+        }
+        s.nbBlockSizes = nb + 1
+    } else {
+        s.nbBlockSizes = 1
+    }
+    s.useNoiseCoding = true
+    var highFreq = Float(rate) * 0.5
+    var rate1 = rate
+    if version == 2 {
+        if rate1 >= 44100 {
+            rate1 = 44100
+        } else if rate1 >= 22050 {
+            rate1 = 22050
+        } else if rate1 >= 16000 {
+            rate1 = 16000
+        } else if rate1 >= 11025 {
+            rate1 = 11025
+        } else if rate1 >= 8000 {
+            rate1 = 8000
+        }
+    }
+    // ffmpeg computes these in single precision floats.
+    let bps = wmaF32(Float(bitrate) / Float(channels * rate))
+    s.byteOffsetBits = wmaLog2(Int(bps * Float(s.frameLen) / 8.0 + 0.5)) + 2
+    if s.byteOffsetBits + 3 > 25 {
+        return Result.failure(error: Error("WMA: the bitrate is too high for the frame size"))
+    }
+    var bps1 = bps
+    if channels == 2 {
+        bps1 = wmaF32(bps * 1.6)
+    }
+    if rate1 == 44100 {
+        if bps1 >= 0.61 {
+            s.useNoiseCoding = false
+        } else {
+            highFreq = highFreq * 0.4
+        }
+    } else if rate1 == 22050 {
+        if bps1 >= 1.16 {
+            s.useNoiseCoding = false
+        } else if bps1 >= 0.72 {
+            highFreq = highFreq * 0.7
+        } else {
+            highFreq = highFreq * 0.6
+        }
+    } else if rate1 == 16000 {
+        if bps > 0.5 {
+            highFreq = highFreq * 0.5
+        } else {
+            highFreq = highFreq * 0.3
+        }
+    } else if rate1 == 11025 {
+        highFreq = highFreq * 0.7
+    } else if rate1 == 8000 {
+        if bps <= 0.625 {
+            highFreq = highFreq * 0.5
+        } else if bps > 0.75 {
+            s.useNoiseCoding = false
+        } else {
+            highFreq = highFreq * 0.65
+        }
+    } else {
+        if bps >= 0.8 {
+            highFreq = highFreq * 0.75
+        } else if bps >= 0.6 {
+            highFreq = highFreq * 0.6
+        } else {
+            highFreq = highFreq * 0.5
+        }
+    }
+    highFreq = wmaF32(highFreq)
+
+    // Exponent bands per block size.
+    s.coefsStart = if version == 1 { 3 } else { 0 }
+    for _ in 0..(5 * 25) {
+        s.exponentBands.append(0)
+    }
+    for _ in 0..(5 * wmaHighBandMax) {
+        s.exponentHighBands.append(0)
+    }
+    for _ in 0..5 {
+        s.exponentSizes.append(0)
+        s.highBandStart.append(0)
+        s.coefsEnd.append(0)
+        s.exponentHighSizes.append(0)
+    }
+    let crit = wmaWmaCriticalFreqs
+    for k in 0..s.nbBlockSizes {
+        let blockLen = s.frameLen >> k
+        if version == 1 {
+            // (ffmpeg keeps these in the first size's row for every size.)
+            var lpos = 0
+            var i = 0
+            while i < 25 {
+                let a = crit[i]
+                var pos = (blockLen * 2 * a + (rate >> 1)) / rate
+                if pos > blockLen {
+                    pos = blockLen
+                }
+                s.exponentBands[i] = pos - lpos
+                if pos >= blockLen {
+                    i += 1
+                    break
+                }
+                lpos = pos
+                i += 1
+            }
+            s.exponentSizes[0] = i
+        } else {
+            let a = s.frameLenBits - wmaBlockMinBits - k
+            var table: [Int] = []
+            if a < 3 {
+                if rate >= 44100 {
+                    table = wmaExponentBand44100
+                } else if rate >= 32000 {
+                    table = wmaExponentBand32000
+                } else if rate >= 22050 {
+                    table = wmaExponentBand22050
+                }
+            }
+            if !table.isEmpty {
+                let n = table[a * 25]
+                for i in 0..n {
+                    s.exponentBands[k * 25 + i] = table[a * 25 + 1 + i]
+                }
+                s.exponentSizes[k] = n
+            } else {
+                var j = 0
+                var lpos = 0
+                for i in 0..25 {
+                    let fa = crit[i]
+                    var pos = (blockLen * 2 * fa + (rate << 1)) / (4 * rate)
+                    pos = pos << 2
+                    if pos > blockLen {
+                        pos = blockLen
+                    }
+                    if pos > lpos {
+                        s.exponentBands[k * 25 + j] = pos - lpos
+                        j += 1
+                    }
+                    if pos >= blockLen {
+                        break
+                    }
+                    lpos = pos
+                }
+                s.exponentSizes[k] = j
+            }
+        }
+        s.coefsEnd[k] = (s.frameLen - (s.frameLen * 9) / 100) >> k
+        s.highBandStart[k] = Int(wmaF32(wmaF32(Float(blockLen * 2) * highFreq) / Float(rate)) + 0.5)
+        let n = s.exponentSizes[k]
+        var j = 0
+        var pos = 0
+        let row = if version == 1 { 0 } else { k }
+        for i in 0..n {
+            var start = pos
+            pos += s.exponentBands[row * 25 + i]
+            var end = pos
+            if start < s.highBandStart[k] {
+                start = s.highBandStart[k]
+            }
+            if end > s.coefsEnd[k] {
+                end = s.coefsEnd[k]
+            }
+            if end > start && j < wmaHighBandMax {
+                s.exponentHighBands[k * wmaHighBandMax + j] = end - start
+                j += 1
+            }
+        }
+        s.exponentHighSizes[k] = j
+    }
+    // Windows: sine, one per block size.
+    for i in 0..s.nbBlockSizes {
+        s.windows.append(wmaSineWindow(1 << (s.frameLenBits - i)))
+    }
+    // Noise.
+    if s.useNoiseCoding {
+        s.noiseMult = wmaF32(if s.useExpVlc { 0.02 } else { 0.04 })
+        var seed = 1
+        let norm = wmaF32((1.0 / 2147483648.0) * sqrt(3.0) * s.noiseMult)
+        for _ in 0..wmaNoiseSize {
+            seed = (seed * 314159 + 1) & 0xffffffff
+            let signed = if seed >= 0x80000000 { seed - 0x100000000 } else { seed }
+            s.noiseTable.append(wmaF32(wmaF32(Float(signed)) * norm))
+        }
+    }
+    // Coefficient tables by rate and bits per sample.
+    var t = 2
+    if rate >= 32000 {
+        if bps1 < 0.72 {
+            t = 0
+        } else if bps1 < 1.16 {
+            t = 1
+        }
+    }
+    let (v0, r0, l0) = wmaCoefTable(t * 2)
+    let (v1, r1, l1) = wmaCoefTable(t * 2 + 1)
+    s.coefVlc0 = v0
+    s.run0 = r0
+    s.level0 = l0
+    s.coefVlc1 = v1
+    s.run1 = r1
+    s.level1 = l1
+    if s.useNoiseCoding {
+        var lens: [Int] = []
+        var syms: [Int] = []
+        let h = wmaWmaHgainHufftab
+        var i = 0
+        while i + 1 < h.count {
+            syms.append(h[i])
+            lens.append(h[i + 1])
+            i += 2
+        }
+        s.hgainVlc = wmaVlcFromLengths(lens, syms, bits: 9)
+    }
+    if s.useExpVlc {
+        s.expVlc = wmaVlcFromCodes(wmaAacScalefactorCode, wmaAacScalefactorBits, bits: 8)
+    } else {
+        let wdel = pi / Float(s.frameLen)
+        for i in 0..s.frameLen {
+            s.lspCosTable.append(wmaF32(2.0 * cos(wdel * Float(i))))
+        }
+        for i in 0..256 {
+            s.lspPowETable.append(wmaF32(pow(2.0, Float(i - 126) * -0.25)))
+        }
+        for _ in 0..128 {
+            s.lspPowMTable1.append(0.0)
+            s.lspPowMTable2.append(0.0)
+        }
+        var b = 1.0
+        var i = 127
+        while i >= 0 {
+            let m = 128 + i
+            var a = Float(m) * (0.5 / 128.0)
+            a = wmaF32(1.0 / sqrt(sqrt(a)))
+            s.lspPowMTable1[i] = wmaF32(2.0 * a - b)
+            s.lspPowMTable2[i] = wmaF32(b - a)
+            b = a
+            i -= 1
+        }
+    }
+    // pow(10, i / 16) for i in -60..95.
+    for i in 0..156 {
+        s.powTab.append(wmaF32(pow(10.0, Float(i - 60) / 16.0)))
+    }
+    for _ in 0..(2 * wmaBlockMax) {
+        s.exponents.append(0.0)
+        s.coefs1.append(0.0)
+        s.coefs.append(0.0)
+    }
+    for _ in 0..(4 * wmaBlockMax) {
+        s.frameOut.append(0.0)
+    }
+    for _ in 0..(2 * wmaHighBandMax) {
+        s.highBandCoded.append(false)
+        s.highBandValues.append(0)
+    }
+    for _ in 0..wmaHighBandMax {
+        s.expPower.append(0.0)
+    }
+    s.mdct = wmaNewMdct()
+    Result.ok(value: s)
+}
+
+// A coefficient table (0–5): its Huffman table and each code's run and
+// level (codes 0 and 1 are escape and end of block).
+fn wmaCoefTable(_ t: Int) -> ([Int], [Int], [Float]) {
+    let (codes, bits, levels) = match t {
+        0 -> (wmaCoef0Huffcodes, wmaCoef0Huffbits, wmaLevels0)
+        1 -> (wmaCoef1Huffcodes, wmaCoef1Huffbits, wmaLevels1)
+        2 -> (wmaCoef2Huffcodes, wmaCoef2Huffbits, wmaLevels2)
+        3 -> (wmaCoef3Huffcodes, wmaCoef3Huffbits, wmaLevels3)
+        4 -> (wmaCoef4Huffcodes, wmaCoef4Huffbits, wmaLevels4)
+        _ -> (wmaCoef5Huffcodes, wmaCoef5Huffbits, wmaLevels5)
+    }
+    let n = codes.count
+    var run: [Int] = []
+    var level: [Float] = []
+    for _ in 0..n {
+        run.append(0)
+        level.append(0.0)
+    }
+    var i = 2
+    var lv = 1
+    var k = 0
+    while i < n && k < levels.count {
+        let l = levels[k]
+        k += 1
+        for j in 0..l {
+            if i < n {
+                run[i] = j
+                level[i] = Float(lv)
+            }
+            i += 1
+        }
+        lv += 1
+    }
+    (wmaVlcFromCodes(codes, bits, bits: 9), run, level)
+}
+
+// A value rounded to single precision, as ffmpeg's float variables hold it.
+fn wmaF32(_ x: Float) -> Float {
+    let d = Data(bytes: x.bytes(count: 4))
+    d.float32(at: 0)
+}

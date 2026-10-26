@@ -1,0 +1,318 @@
+// AES-128 in CBC mode with PKCS#7 padding, for HLS segments encrypted
+// with METHOD=AES-128 (RFC 8216 §4.3.2.4, §5.2).
+//
+// Written from FIPS-197 (the AES standard): the S-box is computed from its
+// definition (§5.1.1: multiplicative inverse in GF(2^8), then the affine
+// transform), the key expansion follows §5.2, and decryption is the
+// "equivalent inverse cipher" of §5.3.5, with the round transformations
+// folded into four 256-entry tables of 32-bit words (each entry is
+// InvSubBytes followed by one column of InvMixColumns), as §5.3.5 permits.
+// CBC chaining follows NIST SP 800-38A §6.2, padding RFC 5652 §6.3.
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+public struct Aes {
+    sbox: [Int] = []
+    inv: [Int] = []
+    te0: [Int] = []
+    te1: [Int] = []
+    te2: [Int] = []
+    te3: [Int] = []
+    td0: [Int] = []
+    td1: [Int] = []
+    td2: [Int] = []
+    td3: [Int] = []
+    // Encryption round keys (44 words) and decryption round keys in the
+    // order the equivalent inverse cipher uses them.
+    ek: [Int] = []
+    dk: [Int] = []
+    ok: Bool = false
+
+    // Decrypts AES-128-CBC data with PKCS#7 padding. With `padded` false,
+    // no padding is removed. Gives nil when the data isn't whole blocks
+    // or the padding is wrong.
+    fn decryptCbc(_ data: Data, iv: Data, padded: Bool = true) -> Data? {
+        let n = data.count
+        if !ok || n % 16 != 0 || iv.count != 16 {
+            return nil
+        }
+        var out = Data()
+        var p0 = aesWord(iv, 0)
+        var p1 = aesWord(iv, 4)
+        var p2 = aesWord(iv, 8)
+        var p3 = aesWord(iv, 12)
+        let k = dk
+        let t0 = td0
+        let t1 = td1
+        let t2 = td2
+        let t3 = td3
+        let ib = inv
+        var at = 0
+        while at < n {
+            let c0 = aesWord(data, at)
+            let c1 = aesWord(data, at + 4)
+            let c2 = aesWord(data, at + 8)
+            let c3 = aesWord(data, at + 12)
+            var s0 = c0 ^ k[0]
+            var s1 = c1 ^ k[1]
+            var s2 = c2 ^ k[2]
+            var s3 = c3 ^ k[3]
+            var r = 4
+            while r < 40 {
+                let u0 = t0[s0 >> 24] ^ t1[(s3 >> 16) & 255] ^ t2[(s2 >> 8) & 255] ^ t3[s1 & 255] ^ k[r]
+                let u1 = t0[s1 >> 24] ^ t1[(s0 >> 16) & 255] ^ t2[(s3 >> 8) & 255] ^ t3[s2 & 255] ^ k[r + 1]
+                let u2 = t0[s2 >> 24] ^ t1[(s1 >> 16) & 255] ^ t2[(s0 >> 8) & 255] ^ t3[s3 & 255] ^ k[r + 2]
+                let u3 = t0[s3 >> 24] ^ t1[(s2 >> 16) & 255] ^ t2[(s1 >> 8) & 255] ^ t3[s0 & 255] ^ k[r + 3]
+                s0 = u0
+                s1 = u1
+                s2 = u2
+                s3 = u3
+                r += 4
+            }
+            // Last round: InvShiftRows + InvSubBytes + AddRoundKey.
+            let o0 = ((ib[s0 >> 24] << 24) | (ib[(s3 >> 16) & 255] << 16) | (ib[(s2 >> 8) & 255] << 8) | ib[s1 & 255]) ^ k[40] ^ p0
+            let o1 = ((ib[s1 >> 24] << 24) | (ib[(s0 >> 16) & 255] << 16) | (ib[(s3 >> 8) & 255] << 8) | ib[s2 & 255]) ^ k[41] ^ p1
+            let o2 = ((ib[s2 >> 24] << 24) | (ib[(s1 >> 16) & 255] << 16) | (ib[(s0 >> 8) & 255] << 8) | ib[s3 & 255]) ^ k[42] ^ p2
+            let o3 = ((ib[s3 >> 24] << 24) | (ib[(s2 >> 16) & 255] << 16) | (ib[(s1 >> 8) & 255] << 8) | ib[s0 & 255]) ^ k[43] ^ p3
+            aesPut(out, o0)
+            aesPut(out, o1)
+            aesPut(out, o2)
+            aesPut(out, o3)
+            p0 = c0
+            p1 = c1
+            p2 = c2
+            p3 = c3
+            at += 16
+        }
+        if !padded || n == 0 {
+            return out
+        }
+        let pad = out[n - 1]
+        if pad < 1 || pad > 16 {
+            return nil
+        }
+        for i in n - pad..n {
+            if out[i] != pad {
+                return nil
+            }
+        }
+        out.slice(from: 0, to: n - pad)
+    }
+
+    // Encrypts with AES-128-CBC, adding PKCS#7 padding (or none, for
+    // whole blocks, with `padded` false). Used to make test data.
+    fn encryptCbc(_ data: Data, iv: Data, padded: Bool = true) -> Data {
+        var src = data
+        if padded {
+            let pad = 16 - data.count % 16
+            for _ in 0..pad {
+                src.append(byte: pad)
+            }
+        }
+        var out = Data()
+        var p0 = aesWord(iv, 0)
+        var p1 = aesWord(iv, 4)
+        var p2 = aesWord(iv, 8)
+        var p3 = aesWord(iv, 12)
+        let k = ek
+        var at = 0
+        while at + 16 <= src.count {
+            var s0 = aesWord(src, at) ^ p0 ^ k[0]
+            var s1 = aesWord(src, at + 4) ^ p1 ^ k[1]
+            var s2 = aesWord(src, at + 8) ^ p2 ^ k[2]
+            var s3 = aesWord(src, at + 12) ^ p3 ^ k[3]
+            var r = 4
+            while r < 40 {
+                let u0 = te0[s0 >> 24] ^ te1[(s1 >> 16) & 255] ^ te2[(s2 >> 8) & 255] ^ te3[s3 & 255] ^ k[r]
+                let u1 = te0[s1 >> 24] ^ te1[(s2 >> 16) & 255] ^ te2[(s3 >> 8) & 255] ^ te3[s0 & 255] ^ k[r + 1]
+                let u2 = te0[s2 >> 24] ^ te1[(s3 >> 16) & 255] ^ te2[(s0 >> 8) & 255] ^ te3[s1 & 255] ^ k[r + 2]
+                let u3 = te0[s3 >> 24] ^ te1[(s0 >> 16) & 255] ^ te2[(s1 >> 8) & 255] ^ te3[s2 & 255] ^ k[r + 3]
+                s0 = u0
+                s1 = u1
+                s2 = u2
+                s3 = u3
+                r += 4
+            }
+            p0 = ((sbox[s0 >> 24] << 24) | (sbox[(s1 >> 16) & 255] << 16) | (sbox[(s2 >> 8) & 255] << 8) | sbox[s3 & 255]) ^ k[40]
+            p1 = ((sbox[s1 >> 24] << 24) | (sbox[(s2 >> 16) & 255] << 16) | (sbox[(s3 >> 8) & 255] << 8) | sbox[s0 & 255]) ^ k[41]
+            p2 = ((sbox[s2 >> 24] << 24) | (sbox[(s3 >> 16) & 255] << 16) | (sbox[(s0 >> 8) & 255] << 8) | sbox[s1 & 255]) ^ k[42]
+            p3 = ((sbox[s3 >> 24] << 24) | (sbox[(s0 >> 16) & 255] << 16) | (sbox[(s1 >> 8) & 255] << 8) | sbox[s2 & 255]) ^ k[43]
+            aesPut(out, p0)
+            aesPut(out, p1)
+            aesPut(out, p2)
+            aesPut(out, p3)
+            at += 16
+        }
+        out
+    }
+}
+
+// An AES-128 cipher for a 16-byte key (ok is false for other sizes).
+public fn newAes(_ key: Data) -> Aes {
+    var a = Aes()
+    // GF(2^8) with the AES polynomial x^8+x^4+x^3+x+1 (§4.2): powers of
+    // the generator 3 give log/antilog tables for the inverses.
+    var exp = core0(256)
+    var log = core0(256)
+    var x = 1
+    for i in 0..255 {
+        exp[i] = x
+        log[x] = i
+        x = x ^ aesXtime(x)
+    }
+    var sbox = core0(256)
+    var inv = core0(256)
+    for v in 0..256 {
+        let b = if v == 0 { 0 } else { exp[(255 - log[v]) % 255] }
+        // Affine transform (§5.1.1, equation 5.1).
+        var s = b
+        var r = b
+        for _ in 0..4 {
+            r = ((r << 1) | (r >> 7)) & 255
+            s = s ^ r
+        }
+        s = s ^ 0x63
+        sbox[v] = s
+        inv[s] = v
+    }
+    a.sbox = sbox
+    a.inv = inv
+    a.te0 = core0(256)
+    a.te1 = core0(256)
+    a.te2 = core0(256)
+    a.te3 = core0(256)
+    a.td0 = core0(256)
+    a.td1 = core0(256)
+    a.td2 = core0(256)
+    a.td3 = core0(256)
+    for v in 0..256 {
+        let s = sbox[v]
+        let e = (aesMul(s, 2) << 24) | (s << 16) | (s << 8) | aesMul(s, 3)
+        a.te0[v] = e
+        a.te1[v] = aesRot(e, 8)
+        a.te2[v] = aesRot(e, 16)
+        a.te3[v] = aesRot(e, 24)
+        let iv = inv[v]
+        let d = (aesMul(iv, 14) << 24) | (aesMul(iv, 9) << 16) | (aesMul(iv, 13) << 8) | aesMul(iv, 11)
+        a.td0[v] = d
+        a.td1[v] = aesRot(d, 8)
+        a.td2[v] = aesRot(d, 16)
+        a.td3[v] = aesRot(d, 24)
+    }
+    if key.count != 16 {
+        return a
+    }
+    // Key expansion (§5.2), Nk = 4, Nr = 10.
+    var w = core0(44)
+    for i in 0..4 {
+        w[i] = aesWord(key, i * 4)
+    }
+    var rcon = 1
+    for i in 4..44 {
+        var t = w[i - 1]
+        if i % 4 == 0 {
+            t = aesRot(t, 24)
+            t = (sbox[t >> 24] << 24) | (sbox[(t >> 16) & 255] << 16) | (sbox[(t >> 8) & 255] << 8) | sbox[t & 255]
+            t = t ^ (rcon << 24)
+            rcon = aesXtime(rcon)
+        }
+        w[i] = w[i - 4] ^ t
+    }
+    a.ek = w
+    // Equivalent inverse cipher keys (§5.3.5): reversed rounds, with
+    // InvMixColumns applied to rounds 1…9.
+    var d = core0(44)
+    for r in 0..11 {
+        for c in 0..4 {
+            let k = w[(10 - r) * 4 + c]
+            if r == 0 || r == 10 {
+                d[r * 4 + c] = k
+            } else {
+                d[r * 4 + c] = a.td0[sbox[k >> 24]] ^ a.td1[sbox[(k >> 16) & 255]] ^ a.td2[sbox[(k >> 8) & 255]] ^ a.td3[sbox[k & 255]]
+            }
+        }
+    }
+    a.dk = d
+    a.ok = true
+    a
+}
+
+// Decrypts one AES-128-CBC message (PKCS#7 padded).
+public fn aes128CbcDecrypt(_ data: Data, key: Data, iv: Data) -> Data? {
+    newAes(key).decryptCbc(data, iv: iv)
+}
+
+// The 16-byte IV HLS uses when EXT-X-KEY has none: the segment's media
+// sequence number, big-endian (RFC 8216 §5.2).
+public fn sequenceIv(_ sequence: Int) -> Data {
+    var b: [Int] = []
+    for _ in 0..8 {
+        b.append(0)
+    }
+    b += sequence.bytes(count: 8, bigEndian: true)
+    Data(bytes: b)
+}
+
+// A hex IV like "0x9c7db8778570d05c3177c349fd9236aa" (16 bytes; shorter
+// values are padded at the front with zeros).
+public fn hexIv(_ text: String) -> Data {
+    var h = text.trim()
+    if h.hasPrefix("0x") || h.hasPrefix("0X") {
+        h = h.substring(from: 2, to: h.count)
+    }
+    h = h.padStart(32, with: "0")
+    var b: [Int] = []
+    let raw = Data(text: h)
+    var i = 0
+    while i + 1 < raw.count && b.count < 16 {
+        let hi = urlHex(raw[i])
+        let lo = urlHex(raw[i + 1])
+        b.append(if hi < 0 || lo < 0 { 0 } else { hi * 16 + lo })
+        i += 2
+    }
+    Data(bytes: b)
+}
+
+fn core0(_ n: Int) -> [Int] {
+    var l: [Int] = []
+    for _ in 0..n {
+        l.append(0)
+    }
+    l
+}
+
+fn aesXtime(_ x: Int) -> Int {
+    let y = x << 1
+    if (y & 0x100) != 0 { (y ^ 0x11b) & 255 } else { y }
+}
+
+fn aesMul(_ a: Int, _ b: Int) -> Int {
+    var r = 0
+    var x = a
+    var y = b
+    while y > 0 {
+        if (y & 1) != 0 {
+            r = r ^ x
+        }
+        x = aesXtime(x)
+        y = y >> 1
+    }
+    r
+}
+
+// Rotates a 32-bit word right by `n` bits.
+fn aesRot(_ w: Int, _ n: Int) -> Int {
+    ((w >> n) | (w << (32 - n))) & 0xffffffff
+}
+
+fn aesWord(_ d: Data, _ at: Int) -> Int {
+    (d[at] << 24) | (d[at + 1] << 16) | (d[at + 2] << 8) | d[at + 3]
+}
+
+fn aesPut(_ out: bind Data, _ w: Int) {
+    out.append(byte: (w >> 24) & 255)
+    out.append(byte: (w >> 16) & 255)
+    out.append(byte: (w >> 8) & 255)
+    out.append(byte: w & 255)
+}

@@ -1,0 +1,99 @@
+// Tests for the core module: bit and byte readers, packets, pictures.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../../core"
+
+fn main() {
+    var passed = 0
+    var total = 0
+    fn check(_ ok: Bool, _ what: String) {
+        total += 1
+        if ok { passed += 1 } else { print("FAIL: {what}") }
+    }
+
+    // MSB-first bits.
+    var r = core.bitReader(Data(bytes: [0b10110010, 0b01111111, 0xff, 0x01]))
+    check(r.bits(1) == 1 && r.bits(2) == 1 && r.bits(5) == 0b10010, "bits across a byte")
+    check(r.peek(4) == 7 && r.bits(8) == 0x7f, "peek and byte")
+    check(r.position == 16 && r.isByteAligned, "position")
+    check(r.bits(12) == 0xff0 && r.left == 4, "12 bits")
+    check(r.bits(4) == 1 && !r.overrun, "to the end")
+    check(r.bits(3) == 0 && r.overrun, "past the end reads zeros and flags")
+
+    // Exp-Golomb: 1 → 0, 010 → 1, 011 → 2, 00100 → 3, 00111 → 6.
+    var g = core.bitReader(Data(bytes: [0xa6, 0x43, 0x80]))
+    check(g.ue() == 0 && g.ue() == 1 && g.ue() == 2 && g.ue() == 3, "ue")
+    check(g.se() == -3, "se of 6 is -3")
+    var sg = core.bitReader(Data(bytes: [0xf0]))
+    check(sg.signed(4) == -1 && sg.signed(4) == 0, "signed")
+    var lg = core.bitReader(Data(bytes: [1, 2, 3, 4, 5, 6, 7]))
+    check(lg.long(56) == 0x01020304050607, "56 bits")
+    var sk = core.bitReader(Data(bytes: [0, 0, 0, 0, 0, 0x80]))
+    sk.skip(40)
+    check(sk.flag(), "skip 40")
+    sk.seek(toBit: 3)
+    check(sk.position == 3 && sk.bits(5) == 0, "seek")
+
+    // RBSP trailing bits.
+    var mr = core.bitReader(Data(bytes: [0b11010000]))
+    mr.bits(2)
+    check(mr.moreRbspData(), "more data before stop bit")
+    mr.bits(1)
+    check(!mr.moreRbspData(), "stop bit next")
+
+    // LSB-first bits.
+    var l = core.lsbReader(Data(bytes: [0b10110010, 0b00000001]))
+    check(l.bits(1) == 0 && l.bits(3) == 1 && l.bits(4) == 0b1011, "lsb bits")
+    check(l.bits(1) == 1 && l.position == 9, "lsb next byte")
+
+    // Bytes.
+    var b = core.byteReader(Data(bytes: [0x6d, 0x6f, 0x6f, 0x76, 0, 0, 1, 2, 0xff, 0xfe, 1, 2, 3, 4, 5, 6, 7, 8]))
+    check(b.fourcc() == "moov" && b.u32() == 258 && b.i16() == -2, "fourcc u32 i16")
+    check(b.u64() == 0x0102030405060708 && b.left == 0, "u64")
+    check(b.u8() == 0 && b.overrun, "byte overrun")
+    var le = core.byteReader(Data(bytes: [1, 2, 3, 4]))
+    check(le.u24(bigEndian: false) == 0x030201, "u24 le")
+
+    // Emulation prevention.
+    let esc = core.unescapeRbsp(Data(bytes: [9, 0, 0, 3, 1, 0, 0, 3, 0, 3]), from: 0, to: 10)
+    check(esc.bytes == [9, 0, 0, 1, 0, 0, 0, 3], "unescape")
+
+    // Packets.
+    let file = Data(bytes: [10, 11, 12, 13, 14, 15, 16, 17])
+    var media = core.Media()
+    media.tracks.append(core.Track(index: 0, kind: .video, codec: "h264"))
+    media.tracks.append(core.Track(index: 1, kind: .audio, codec: "aac", prefix: Data(bytes: [99])))
+    let p0 = core.PacketRef(track: 0, offset: 2, size: 3)
+    check(core.packetBytes(file, media, p0).bytes == [12, 13, 14], "packet bytes")
+    let p1 = core.PacketRef(track: 1, offset: 0, size: 3, parts: [0, 1, 6, 2])
+    check(core.packetBytes(file, media, p1).bytes == [99, 10, 16, 17], "split packet with prefix")
+    check(core.rescale(3003, from: 30000, to: 90000) == 9009, "rescale")
+    check(core.rescale(86400 * 90000, from: 90000, to: 48000) == 86400 * 48000, "rescale a day")
+    check(core.seconds(48000, 48000) == 1.0 && core.ticks(1.5, 1000) == 1500, "seconds")
+
+    // Pictures.
+    let pic = core.blankPicture(width: 3, height: 3)
+    check(pic.chromaWidth == 2 && pic.u.count == 4 && pic.luma(2, 2) == 16, "blank 4:2:0 picture")
+    let bytes = core.pictureBytes(pic)
+    check(bytes.count == 9 + 4 + 4, "picture bytes")
+    check(core.guessMatrix(width: 1920, height: 1080) == .bt709, "matrix guess")
+    check(core.defaultLayout(6) == ["FL", "FR", "FC", "LFE", "BL", "BR"], "layout")
+
+    // Speed: reading bits.
+    var bytesList: [Int] = []
+    for i in 0..1000000 { bytesList.append((i * 37 + 11) & 255) }
+    var sp = core.bitReader(Data(bytes: bytesList))
+    let t0 = now()
+    var s = 0
+    for i in 0..1000000 { s += sp.bits(5) + sp.bits(3) }
+    print("time 8M bits as bits(5)+bits(3): {Int((now() - t0) * 1000.0)} ms ({s})")
+    var sp2 = core.bitReader(Data(bytes: bytesList))
+    let t1 = now()
+    s = 0
+    for i in 0..1000000 { s += sp2.ue() }
+    print("time 1M ue(): {Int((now() - t1) * 1000.0)} ms ({s})")
+
+    print("core: {passed} of {total} passed")
+}

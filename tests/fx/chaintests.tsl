@@ -1,0 +1,246 @@
+// fx.Chain tests: settings as JSON, pass-through and timing, loudness
+// normalisation (live, scan, ReplayGain), the ceiling, smooth changes
+// across the whole chain, the visualiser, other rates and channel counts,
+// and speed.
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+import "../../fx"
+import "../../core"
+
+// Runs `data` through the chain in blocks of `block` frames, then flush.
+fn runChain(_ ch: bind fx.Chain, _ data: [Float], channels: Int, rate: Int = 48000, block: Int = 1024) -> [Float] {
+    var out: [Float] = []
+    var pos = 0
+    let lay = core.defaultLayout(channels)
+    while pos < data.count {
+        let e = min(data.count, pos + block * channels)
+        let o = ch.process(core.Samples(rate: rate, channels: channels, data: data.slice(from: pos, to: e), layout: lay))
+        out.appendAll(o.data)
+        pos = e
+    }
+    out.appendAll(ch.flush().data)
+    out
+}
+
+fn hasBad(_ d: [Float]) -> Bool {
+    for v in d {
+        if v != v || abs(v) > 1e6 {
+            return true
+        }
+    }
+    false
+}
+
+fn chainTests(_ t: bind Tally) {
+    // Settings save and load as JSON; missing fields take defaults.
+    var s = fx.withPreset(fx.Settings(), "Techno")
+    s.stereoMode = .swap
+    s.normalize = .album
+    s.balance = -0.25
+    let text = toJson(s)
+    let back: fx.Settings? = fromJson(text)
+    t.check(back != nil && back == s, "settings round-trip through JSON")
+    let old: fx.Settings? = fromJson("\{\"eqOn\": true, \"stereoMode\": \"mono\"}")
+    t.check(old != nil && (old ?? fx.Settings()).eqOn && (old ?? fx.Settings()).stereoMode == .mono && (old ?? fx.Settings()).limiterCeiling == -1.0, "old settings files load with defaults")
+
+    // Default chain: the sound comes out unchanged and on time.
+    var c0 = fx.newChain()
+    t.check(c0.latency == 240, "latency is 5 ms (240 frames at 48 kHz)")
+    let prog = lcgProgramme(channels: 2, levels: [-20.0, -24.0, -18.0], seed: 9)
+    let o0 = runChain(c0, prog, channels: 2, block: 1000)
+    t.check(o0 == prog, "a default chain is exact and time-aligned (output frame k = input frame k)")
+    // After reset (a seek) it is aligned again.
+    c0.reset()
+    let o0b = runChain(c0, prog.slice(from: 0, to: 2 * 30000), channels: 2, block: 700)
+    t.check(o0b == prog.slice(from: 0, to: 2 * 30000), "after reset the output is aligned again")
+    // Without alignment the output is late by the latency.
+    var c0c = fx.newChain()
+    c0c.align = false
+    let o0c = runChain(c0c, prog.slice(from: 0, to: 2 * 10000), channels: 2)
+    t.check(o0c.count == 2 * (10000 + 240) && o0c.slice(from: 480, to: o0c.count) == prog.slice(from: 0, to: 2 * 10000), "align off: output is the input, latency frames late")
+
+    // Live normalisation: noise at about −36 LUFS, target −23.
+    let quiet = lcgProgramme(channels: 2, levels: [-30.0, -32.0, -31.0, -30.0, -33.0, -30.0, -31.0, -32.0, -30.0, -31.0, -30.0, -32.0, -31.0, -30.0, -31.0, -30.0, -32.0, -31.0, -30.0, -31.0], seed: 21)
+    let l0 = fx.measure(stereo(quiet)).integrated
+    var s1 = fx.Settings()
+    s1.normalize = .live
+    s1.targetLufs = -23.0
+    var c1 = fx.newChain(s1)
+    let o1 = runChain(c1, quiet, channels: 2)
+    t.near(c1.gainDb, -23.0 - l0, 0.2, "live normalisation reaches target − measured")
+    let tailMeasure = fx.measure(stereo(o1.slice(from: 2 * 48000 * 12, to: o1.count))).integrated
+    t.near(tailMeasure, -23.0, 0.3, "live normalisation: the output is at the target")
+    // Scan: the gain is right from the first block.
+    var s2 = s1
+    s2.normalize = .scan
+    var c2 = fx.newChain(s2)
+    c2.setScan(lufs: l0)
+    let first = c2.process(stereo(quiet.slice(from: 0, to: 2048)))
+    t.near(c2.gainDb, -23.0 - l0, 1e-9, "scan normalisation applies at once")
+    t.check(first.data.count == 2048 - 2 * 240, "the first block is shorter by the latency")
+    let o2 = runChain(c2, quiet.slice(from: 2048, to: quiet.count), channels: 2)
+    let m2 = fx.measure(stereo(o2)).integrated
+    t.near(m2, -23.0, 0.15, "scan normalisation: the output is at the target")
+    // ReplayGain: track gain −3 dB at target −18 → −3 dB; album falls back
+    // to the track gain; −13 target → +2 dB.
+    var s3 = fx.Settings()
+    s3.normalize = .album
+    var c3 = fx.newChain(s3)
+    c3.setTags(["REPLAYGAIN_TRACK_GAIN": "-3.00 dB"])
+    c3.process(stereo(quiet.slice(from: 0, to: 4096)))
+    t.near(c3.gainDb, -3.0, 1e-9, "ReplayGain album mode falls back to the track gain")
+    c3.settings.targetLufs = -13.0
+    c3.process(stereo(quiet.slice(from: 4096, to: 4096 + 192000)))
+    t.near(c3.gainDb, 2.0, 1e-9, "a new target moves the ReplayGain gain (smoothly: 3 dB/s)")
+    // The ceiling holds with a big boost on loud material.
+    var s4 = fx.Settings()
+    s4.normalize = .scan
+    s4.maxBoost = 20.0
+    var c4 = fx.newChain(s4)
+    c4.setScan(lufs: -40.0)
+    let loud = lcgProgramme(channels: 2, levels: [-6.0, 0.0, -12.0], seed: 4)
+    let o4 = runChain(c4, loud, channels: 2)
+    t.check(peakOf(o4) <= pow(10.0, -1.0 / 20.0) + 1e-12, "a +20 dB normalisation never passes the −1 dBFS ceiling")
+    t.near(c4.gainDb, 20.0, 1e-9, "normalisation boost is limited to maxBoost")
+
+    // Smooth changes through the whole chain: a 440 Hz sine on both sides
+    // while the preset, stereo mode, width, balance, crossfeed and
+    // compressor change between blocks.
+    var s5 = fx.withPreset(fx.Settings(), "Rock")
+    s5.limiterOn = false
+    var c5 = fx.newChain(s5)
+    let amp = 0.1
+    let tone = sine(440.0, amp: amp, frames: 48000 * 2)
+    var out5: [Float] = []
+    var pos = 0
+    var blk = 0
+    while pos < tone.count {
+        let e = min(tone.count, pos + 2 * 1024)
+        if blk == 10 {
+            c5.settings = fx.withPreset(c5.settings, "Vocal")
+        }
+        if blk == 20 {
+            c5.settings.stereoMode = .left
+            c5.settings.width = 1.6
+        }
+        if blk == 30 {
+            c5.settings.balance = 0.4
+            c5.settings.crossfeedOn = true
+        }
+        if blk == 40 {
+            c5.settings.compOn = true
+            c5.settings.compThreshold = -30.0
+        }
+        if blk == 50 {
+            c5.settings.eqOn = false
+        }
+        if blk == 60 {
+            c5.settings.eqPreamp = 6.0
+            c5.settings.eqOn = true
+        }
+        let o = c5.process(stereo(tone.slice(from: pos, to: e)))
+        out5.appendAll(o.data)
+        pos = e
+        blk += 1
+    }
+    // (From the second block: the tone's own start is a click.)
+    let k5l = clickiness(channel(out5, 0, 2).dropFirst(2048), 440.0, rate: 48000, amp: amp)
+    let k5r = clickiness(channel(out5, 1, 2).dropFirst(2048), 440.0, rate: 48000, amp: amp)
+    t.check(k5l < 0.01 && k5r < 0.01, "settings changes across the chain don't click (residual {k5l.formatted(decimals: 4)}, {k5r.formatted(decimals: 4)})")
+
+    // Visualiser: a full-scale 1 kHz sine fills the band around 1 kHz.
+    var c6 = fx.newChain()
+    c6.settings.limiterOn = false
+    let full = sine(1000.0, amp: 1.0, frames: 4096)
+    let o6 = c6.process(stereo(full))
+    let bands = c6.bands(24)
+    var top = 0
+    for i in 0..24 {
+        if bands[i] > bands[top] {
+            top = i
+        }
+    }
+    let lo = 30.0 * pow(16000.0 / 30.0, Float(top) / 24.0)
+    let hi = 30.0 * pow(16000.0 / 30.0, Float(top + 1) / 24.0)
+    t.check(bands.count == 24 && bands[top] > 0.97 && lo <= 1030.0 && hi >= 970.0, "visualiser: 1 kHz full scale peaks in its band ({bands[top].formatted(decimals: 3)})")
+    t.check(bands[0] < 0.3 && bands[23] < 0.3, "visualiser: far bands stay low")
+    let wf = c6.waveform(64)
+    t.check(wf.count == 128 && abs(peakOf(wf) - 1.0) < 0.01, "waveform: min/max pairs reach the amplitude")
+    let lv = fx.levels(o6, bands: 24)
+    t.check(lv == bands, "fx.levels of the output gives the same bands")
+
+    // Other rates and channel counts.
+    var s7 = fx.withPreset(fx.Settings(), "Pop")
+    s7.compOn = true
+    s7.crossfeedOn = true
+    s7.normalize = .live
+    var c7 = fx.newChain(s7)
+    let m44 = lcgProgramme(channels: 1, levels: [-20.0, -10.0], seed: 2, rate: 44100)
+    let o7 = runChain(c7, m44, channels: 1, rate: 44100)
+    t.check(o7.count == m44.count && !hasBad(o7), "mono 44.1 kHz through the full chain")
+    var c8 = fx.newChain(s7)
+    let six = lcgProgramme(channels: 6, levels: [-20.0, -10.0], seed: 3)
+    let o8 = runChain(c8, six, channels: 6, block: 1536)
+    t.check(o8.count == six.count && !hasBad(o8) && peakOf(o8) <= pow(10.0, -1.0 / 20.0) + 1e-12, "5.1 through the full chain")
+    var c9 = fx.newChain(s7)
+    let r22 = lcgProgramme(channels: 2, levels: [-20.0], seed: 8, rate: 22050)
+    let o9 = runChain(c9, r22, channels: 2, rate: 22050)
+    t.check(o9.count == r22.count && !hasBad(o9), "22.05 kHz stereo through the full chain")
+    // A rate change mid-stream sets the chain up again.
+    c9.process(stereo(sine(440.0, amp: 0.1, frames: 4800)))
+    t.check(c9.rate == 48000 && c9.latency == 240, "a new rate sets the chain up again")
+}
+
+fn speedTests(_ t: bind Tally) {
+    // Everything on: EQ, normalisation with the meter (true peak),
+    // compressor, width, balance, crossfeed, limiter, visualiser.
+    var s = fx.withPreset(fx.Settings(), "Rock")
+    s.normalize = .live
+    s.compOn = true
+    s.width = 1.3
+    s.balance = 0.1
+    s.crossfeedOn = true
+    var c = fx.newChain(s)
+    let seconds = 20
+    var levels: [Float] = []
+    for i in 0..seconds {
+        levels.append(-30.0 + Float(i % 7) * 4.0)
+    }
+    let prog = lcgProgramme(channels: 2, levels: levels, seed: 13)
+    var blocks: [core.Samples] = []
+    var pos = 0
+    while pos < prog.count {
+        let e = min(prog.count, pos + 2 * 1024)
+        blocks.append(stereo(prog.slice(from: pos, to: e)))
+        pos = e
+    }
+    let t0 = now()
+    var frames = 0
+    for b in blocks {
+        let o = c.process(b)
+        frames += o.frames
+    }
+    let ms = (now() - t0) * 1000.0
+    let times = Float(seconds) * 1000.0 / ms
+    print("time fx full chain, {seconds} s of 48 kHz stereo: {ms.formatted(decimals: 1)} ms ({times.formatted(decimals: 0)}x real time)")
+    c.bands(32)
+    t.check(frames == 48000 * seconds - 240, "speed run made every frame")
+    t.check(times >= 200.0, "full chain runs at least 200x real time ({times.formatted(decimals: 0)}x)")
+    // The default chain (meter + limiter as a delay).
+    var d = fx.newChain()
+    let t1 = now()
+    for b in blocks {
+        d.process(b)
+    }
+    let ms1 = (now() - t1) * 1000.0
+    print("time fx default chain, {seconds} s: {ms1.formatted(decimals: 1)} ms ({(Float(seconds) * 1000.0 / ms1).formatted(decimals: 0)}x real time)")
+    // Visualiser data.
+    let t2 = now()
+    for _ in 0..100 {
+        c.bands(32)
+        c.waveform(256)
+    }
+    print("time fx visualiser bands + waveform: {((now() - t2) * 10.0).formatted(decimals: 3)} ms")
+}

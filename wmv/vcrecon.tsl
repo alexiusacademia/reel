@@ -1,0 +1,2859 @@
+// The VC-1 reconstructor: the second of the decoder's two stages. From a
+// VcParsed (vcparse.tsl) it makes the picture: motion compensation
+// (SMPTE 421M 8.3.6/8.4.6: bicubic quarter-sample luma and bilinear chroma
+// filters, or the half-sample bilinear mode; intensity compensation 8.3.8
+// and range reduction applied to the reference area), the inverse
+// transforms 8×8, 8×4, 4×8 and 4×4 (8.1.4.4, 8.3.7), overlap smoothing of
+// intra blocks (8.5) and the in-loop deblocking filter (8.6).
+//
+// Arithmetic and order follow ffmpeg 8.1 (vc1_mc.c, vc1dsp.c,
+// vc1_loopfilter.c and the put loop of vc1_block.c) exactly, because the
+// order of the overlap and loop filters changes the result: intra blocks
+// are kept in a ring of macroblocks and written one row and one column
+// behind decoding (vc1_put_blocks_clamped), the overlap filter runs on the
+// coefficients in the ring before that, and the loop filter runs over the
+// whole picture afterwards (all horizontal edges, then all vertical edges,
+// each macroblock's blocks in ffmpeg's order — the same result as ffmpeg's
+// delayed per-macroblock filtering).
+//
+// Planes are macroblock aligned (mbw·16 × mbh·16, rows rounded up to an
+// even number of macroblocks for field pictures) without padding; motion
+// compensation copies the reference area it needs into a scratch list,
+// clamping positions to the coded size as ffmpeg's emulated_edge_mc does
+// (each field apart when the reference frame is interlaced).
+//
+// Interlaced pictures (SMPTE 421M 9 and 10): a field picture writes every
+// other row of the frame (a view with a doubled stride and an offset for
+// the bottom field) and is otherwise made like a progressive picture;
+// frame-interlaced macroblocks with FIELDTX put their luma blocks field by
+// field, and their motion compensation follows the parser's list of steps
+// (ffmpeg's ff_vc1_mc_1mv, _4mv_luma, _4mv_chroma, _4mv_chroma4,
+// _interp_mc with field vectors); overlap and loop filters have their
+// interlaced forms (vc1_loopfilter.c).
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../core"
+
+struct VcRecon {
+    warnings: [String] = []
+    mbw: Int = 0
+    // Macroblock rows of the picture being made (a field has half the
+    // frame's), and of the planes (the frame's, rounded up to even).
+    mbh: Int = 0
+    frameMbh: Int = 0
+    // The planes' strides (pys, pcs) and the current picture's view of
+    // them: a field picture's rows are every other row (ys = 2·pys)
+    // starting at row 0 (top field) or 1 (bottom: yo = pys).
+    pys: Int = 0
+    pcs: Int = 0
+    ys: Int = 0
+    cs: Int = 0
+    yo: Int = 0
+    co: Int = 0
+    // Interlaced pictures: field or frame, the field's parity, FIELDTX of
+    // the macroblock being made, and whether each reference frame (and
+    // the frame being made) is interlaced (its fields are clamped apart).
+    fieldMode: Bool = false
+    curField: Int = 0
+    ftx: Int = 0
+    lastIl: Bool = false
+    nextIl: Bool = false
+    curIl: Bool = false
+    // Pictures of this stream are interlaced (seen once, kept); field order.
+    seqIl: Bool = false
+    seqTff: Bool = true
+    frameIsB: Bool = false
+    bs: Int = 0
+    ms: Int = 0
+    // ffmpeg's chroma line size (for its one-sample read past the edge in
+    // 1MV chroma motion compensation).
+    ffCs: Int = 0
+    width: Int = 0
+    height: Int = 0
+    hEdge: Int = 0
+    vEdge: Int = 0
+    profile: Int = 0
+    sarNum: Int = 1
+    sarDen: Int = 1
+    matrix: core.ColorMatrix = .unknown
+
+    // The picture being made (cur), the past (last) and future (next)
+    // references, and a B picture buffer.
+    curY: [Int] = []
+    curU: [Int] = []
+    curV: [Int] = []
+    lastY: [Int] = []
+    lastU: [Int] = []
+    lastV: [Int] = []
+    nextY: [Int] = []
+    nextU: [Int] = []
+    nextV: [Int] = []
+    spareY: [Int] = []
+    spareU: [Int] = []
+    spareV: [Int] = []
+    hasLast: Bool = false
+    hasNext: Bool = false
+    nextPts: Int = core.noTime
+    nextKey: Bool = false
+    lowDelay: Bool = false
+
+    // The frame being reconstructed.
+    pf: VcParsed = VcParsed()
+    rnd: Int = 0
+    mspel: Int = 0
+
+    // Motion compensation scratch: the reference area (up to 19×19) and
+    // the 16-bit intermediate of the bicubic filter.
+    fetch: [Int] = []
+    tmp: [Int] = []
+    // Intra blocks of the ring (ffmpeg's v->block): (mbw + 2) entries of 6
+    // blocks of 64, and the intra flags of the picture's blocks in the
+    // parser's layout (ffmpeg's v->mb_type).
+    ring: [Int] = []
+    ringN: Int = 0
+    curIdx: Int = 0
+    leftIdx: Int = 0
+    topLeftIdx: Int = 0
+    topIdx: Int = 0
+    intra: [Int] = []
+    blk: [Int] = []
+    mbX: Int = 0
+    mbY: Int = 0
+    firstLine: Bool = true
+    endRow: Int = 0
+    putSigned: Bool = true
+    x8: X8Decoder = X8Decoder()
+
+    fn setup(_ p: VcParsed) {
+        mbw = p.mbw
+        frameMbh = max(p.frameMbh, p.mbh)
+        mbh = frameMbh
+        pys = mbw * 16
+        pcs = mbw * 8
+        ys = pys
+        cs = pcs
+        yo = 0
+        co = 0
+        bs = 2 * mbw + 1
+        ms = mbw + 1
+        width = p.width
+        height = p.height
+        hEdge = p.hEdge
+        vEdge = p.vEdge
+        profile = p.profile
+        var w = ((width + 15) >> 4) << 4
+        var cl = (w + 1) >> 1
+        while cl % 16 != 0 {
+            w += w & (-w)
+            cl = (w + 1) >> 1
+        }
+        ffCs = cl
+        let ln = pys * frameMbh * 16
+        let cn = pcs * frameMbh * 8
+        curY = core.filled(ln, 128)
+        curU = core.filled(cn, 128)
+        curV = core.filled(cn, 128)
+        lastY = curY
+        lastU = curU
+        lastV = curV
+        nextY = curY
+        nextU = curU
+        nextV = curV
+        spareY = curY
+        spareU = curU
+        spareV = curV
+        hasLast = false
+        hasNext = false
+        fetch = core.zeros(24 * 24)
+        tmp = core.zeros(19 * 16)
+        ringN = mbw + 2
+        ring = core.zeros(ringN * 6 * 64)
+        blk = core.zeros(64)
+        intra = core.zeros(bs * 2 * (frameMbh + 2) + ms * (2 * frameMbh + 6) + 64)
+        if matrix == .unknown {
+            matrix = core.guessMatrix(width: width, height: height)
+        }
+    }
+
+    fn reset() {
+        hasLast = false
+        hasNext = false
+    }
+
+    // --- Pictures ---
+
+    fn makePicture(_ y: [Int], _ u: [Int], _ v: [Int], pts: Int, key: Bool) -> core.Picture {
+        var p = core.Picture(width: width, height: height)
+        p.y = y
+        p.u = u
+        p.v = v
+        p.yStride = pys
+        p.cStride = pcs
+        p.pts = pts
+        p.key = key
+        p.sarNum = sarNum
+        p.sarDen = sarDen
+        p.matrix = matrix
+        p.interlaced = seqIl
+        p.topFieldFirst = seqTff
+        p
+    }
+
+    // Reconstructs one parsed picture; returns the pictures to show now
+    // (ffmpeg's output order: B pictures at once, I/P pictures when the
+    // next reference arrives, unless the stream has no B pictures).
+    fn reconstruct(_ p: VcParsed) -> [core.Picture] {
+        if p.kind == 0 && p.fieldPart != 2 {
+            return []
+        }
+        if p.mbw != mbw || max(p.frameMbh, p.mbh) != frameMbh || ring.isEmpty {
+            if p.fieldPart == 2 {
+                return []
+            }
+            setup(p)
+        }
+        pf = p
+        rnd = p.rnd
+        mspel = if p.mspel { 1 } else { 0 }
+        var out: [core.Picture] = []
+        if p.fieldPart != 2 {
+            // The frame starts (a whole picture, or a field pair's first).
+            frameIsB = p.ptype == vcTypeB
+            if frameIsB {
+                // The B buffer; the picture shown shares it.
+                curY = spareY
+                curU = spareU
+                curV = spareV
+            } else {
+                // ff_mpv_frame_start: last ← next, the new picture becomes next.
+                let ty = lastY
+                let tu = lastU
+                let tv = lastV
+                lastY = nextY
+                lastU = nextU
+                lastV = nextV
+                hasLast = hasNext
+                lastIl = nextIl
+                curY = ty
+                curU = tu
+                curV = tv
+            }
+            curIl = p.interlacedFrame
+            if p.interlacedFrame {
+                seqIl = true
+                seqTff = p.topFirst
+            }
+        }
+        // The view of the planes this picture writes.
+        mbh = p.mbh
+        fieldMode = p.fcm == 2
+        curField = p.curField
+        if fieldMode {
+            ys = 2 * pys
+            cs = 2 * pcs
+            yo = curField * pys
+            co = curField * pcs
+        } else {
+            ys = pys
+            cs = pcs
+            yo = 0
+            co = 0
+        }
+        ftx = 0
+        if p.kind == 2 {
+            // A skipped P picture: the previous picture again.
+            curY = lastY
+            curU = lastU
+            curV = lastV
+        } else if p.kind == 3 {
+            decodeX8()
+        } else if p.kind == 1 {
+            decodePicture()
+        }
+        if p.fieldPart == 1 {
+            return out
+        }
+        ys = pys
+        cs = pcs
+        yo = 0
+        co = 0
+        if frameIsB {
+            spareY = curY
+            spareU = curU
+            spareV = curV
+            out.append(makePicture(curY, curU, curV, pts: p.pts, key: false))
+            return out
+        }
+        let prevY = nextY
+        let prevU = nextU
+        let prevV = nextV
+        let prevPts = nextPts
+        let prevKey = nextKey
+        let hadNext = hasNext
+        nextY = curY
+        nextU = curU
+        nextV = curV
+        nextIl = curIl
+        nextPts = p.pts
+        nextKey = p.key
+        hasNext = true
+        if lowDelay {
+            out.append(makePicture(curY, curU, curV, pts: p.pts, key: p.key))
+        } else if hadNext {
+            out.append(makePicture(prevY, prevU, prevV, pts: prevPts, key: prevKey))
+        }
+        out
+    }
+
+    // End of stream: the last reference picture, still held.
+    fn flush() -> [core.Picture] {
+        if lowDelay || !hasNext {
+            return []
+        }
+        hasNext = false
+        [makePicture(nextY, nextU, nextV, pts: nextPts, key: nextKey)]
+    }
+
+    // An IntraX8 picture (x8_type, WMV3 "X8" intra pictures): x8.tsl
+    // decodes the whole picture (ff_intrax8_decode_picture).
+    fn decodeX8() {
+        if x8.mbWidth != mbw || x8.mbHeight != mbh {
+            x8.setup(mbWidth: mbw, mbHeight: mbh)
+        }
+        let ty = curY
+        curY = []
+        x8.y = ty
+        let tu = curU
+        curU = []
+        x8.u = tu
+        let tv = curV
+        curV = []
+        x8.v = tv
+        x8.ys = pys
+        x8.cs = pcs
+        x8.yOff = 0
+        x8.cOff = 0
+        var r = core.bitReader(pf.x8Data)
+        r.seek(toBit: pf.x8Bit)
+        x8.br = r
+        let ok = x8.decodePicture(dquant: pf.x8Quant, quantOffset: pf.x8HalfQ, loopFilter: pf.loopFilter)
+        if !ok {
+            warnings.append("vc1: damaged IntraX8 picture")
+        }
+        let ay = x8.y
+        x8.y = []
+        curY = ay
+        let au = x8.u
+        x8.u = []
+        curU = au
+        let av = x8.v
+        x8.v = []
+        curV = av
+    }
+
+    // --- The macroblock loop ---
+
+    fn decodePicture() {
+        let p = pf
+        let isI = p.ptype == vcTypeI || p.bi
+        // The picture's intra flags in ffmpeg's block layout.
+        var mb = 0
+        for y in 0..mbh {
+            for x in 0..mbw {
+                let bits = p.blkIntra[mb]
+                let b0 = bs + 1 + bs * 2 * y + 2 * x
+                intra[b0] = bits & 1
+                intra[b0 + 1] = (bits >> 1) & 1
+                intra[b0 + bs] = (bits >> 2) & 1
+                intra[b0 + bs + 1] = (bits >> 3) & 1
+                intra[bs + 1 + bs * 2 * mbh + ms * (y + 1) + x] = (bits >> 4) & 1
+                intra[bs + 1 + bs * 2 * mbh + ms * (y + mbh + 2) + x] = (bits >> 5) & 1
+                mb += 1
+            }
+        }
+        // Slices.
+        var rows = p.sliceRows
+        rows.append(mbh)
+        for si in 0..(rows.count - 1) {
+            let start = rows[si]
+            let end = min(rows[si + 1], mbh)
+            if end <= start {
+                continue
+            }
+            endRow = end
+            curIdx = 0
+            leftIdx = -1
+            topLeftIdx = 1
+            topIdx = 2
+            firstLine = true
+            mbY = start
+            while mbY < end {
+                mbX = 0
+                while mbX < mbw {
+                    if isI {
+                        iMb()
+                    } else if p.fcm != 0 {
+                        if p.ptype == vcTypeP {
+                            pMbIl()
+                        } else {
+                            bMbIl()
+                        }
+                    } else if p.ptype == vcTypeP {
+                        pMb()
+                    } else {
+                        bMb()
+                    }
+                    if isI || p.ptype == vcTypeP {
+                        curIdx = (curIdx + 1) % ringN
+                        leftIdx = (leftIdx + 1) % ringN
+                        topLeftIdx = (topLeftIdx + 1) % ringN
+                        topIdx = (topIdx + 1) % ringN
+                    }
+                    mbX += 1
+                }
+                firstLine = false
+                mbY += 1
+            }
+        }
+        if p.loopFilter {
+            if p.fcm == 1 {
+                if isI {
+                    iLoopFilterIntfr()
+                } else {
+                    pIntfrLoopFilter()
+                }
+            } else if p.fcm == 2 && p.ptype == vcTypeB && !p.bi {
+                bIntfiLoopFilter()
+            } else if p.ptype == vcTypeP {
+                pLoopFilter()
+            } else {
+                iLoopFilter()
+            }
+        }
+    }
+
+    // The inverse 8×8 transform of an intra block from the coefficient pool
+    // into ring block storage s (block_map order) of the current entry.
+    fn intraToRing(_ mbi: Int, _ i: Int) {
+        let o = pf.blkOff[mbi * 6 + i]
+        for k in 0..64 {
+            blk[k] = pf.coef[o + k]
+        }
+        if profile != 3 && !resFasttxHint {
+            simpleIdct8()
+        } else {
+            invTrans8x8()
+        }
+        let s = vcBlockMap(i)
+        let r = (curIdx * 6 + s) * 64
+        for k in 0..64 {
+            ring[r + k] = blk[k]
+        }
+    }
+
+    // Set by the decoder: Simple/Main streams without RES_FASTTX use the
+    // simple IDCT (ff_simple_idct_int16_8bit) instead of VC-1's transform.
+    resFasttxHint: Bool = true
+    // Destination strides of the motion compensation being done.
+    dys: Int = 0
+    dcs: Int = 0
+
+    fn iMb() {
+        let mb = mbY * mbw + mbX
+        if pf.blk[mb * 6] == 0 {
+            // Concealed after damage: the past picture's macroblock.
+            copyMb()
+            return
+        }
+        for i in 0..6 {
+            intraToRing(mb, i)
+        }
+        let overlapOn = pf.overlap && (pf.pq >= 9 || (profile == 3 && pf.condover != 0))
+        if profile == 3 {
+            if overlapOn {
+                iOverlap()
+            }
+            putSigned = true
+            putBlocks()
+        } else if overlapOn {
+            iOverlap()
+            if pf.rangeredfrm {
+                let r = curIdx * 384
+                for k in 0..384 {
+                    ring[r + k] = ring[r + k] * 2
+                }
+            }
+            putSigned = true
+            putBlocks()
+        } else {
+            if pf.rangeredfrm {
+                let r = curIdx * 384
+                for k in 0..384 {
+                    ring[r + k] = (ring[r + k] - 64) * 2
+                }
+            }
+            putSigned = false
+            putBlocks()
+        }
+    }
+
+    fn pMb() {
+        let mb = mbY * mbw + mbX
+        let mode = pf.mbMode[mb]
+        let bits = pf.blkIntra[mb]
+        if mode == vcMb1mv {
+            mc1mv(0, pf.mvX[mb * 4], pf.mvY[mb * 4], false)
+        } else if mode == vcMb4mv {
+            for n in 0..4 {
+                if (bits >> n) & 1 == 0 {
+                    mc4mvLuma(n, pf.mvX[mb * 4 + n], pf.mvY[mb * 4 + n])
+                }
+            }
+            if pf.cmvOn[mb] == 1 {
+                mc4mvChroma(pf.cmvX[mb], pf.cmvY[mb])
+            }
+        }
+        for i in 0..6 {
+            let info = pf.blk[mb * 6 + i]
+            if info == 1 {
+                intraToRing(mb, i)
+                if pf.rangeredfrm {
+                    let r = (curIdx * 6 + vcBlockMap(i)) * 64
+                    for k in 0..64 {
+                        ring[r + k] = ring[r + k] * 2
+                    }
+                }
+            } else if info != 0 {
+                residual(mb, i, info)
+            }
+        }
+        if pf.overlap && pf.pq >= 9 {
+            pOverlap()
+        }
+        putSigned = true
+        putBlocks()
+    }
+
+    fn bMb() {
+        let mb = mbY * mbw + mbX
+        let mode = pf.mbMode[mb]
+        if mode == vcMb1mv {
+            mc1mv(0, pf.mvX[mb * 4], pf.mvY[mb * 4], false)
+        } else if mode == vcMbBack {
+            mc1mv(1, pf.bmvX[mb], pf.bmvY[mb], false)
+        } else if mode == vcMbInterp {
+            mc1mv(0, pf.mvX[mb * 4], pf.mvY[mb * 4], false)
+            interpMc(pf.bmvX[mb], pf.bmvY[mb])
+        }
+        for i in 0..6 {
+            let info = pf.blk[mb * 6 + i]
+            if info == 1 {
+                let o = pf.blkOff[mb * 6 + i]
+                for k in 0..64 {
+                    blk[k] = pf.coef[o + k]
+                }
+                if profile != 3 && !resFasttxHint {
+                    simpleIdct8()
+                } else {
+                    invTrans8x8()
+                }
+                if pf.rangeredfrm {
+                    for k in 0..64 {
+                        blk[k] = blk[k] * 2
+                    }
+                }
+                putBlk(i, signed: true)
+            } else if info != 0 {
+                residual(mb, i, info)
+            }
+        }
+    }
+
+    fn copyMb() {
+        var d = yo + mbY * 16 * ys + mbX * 16
+        for _ in 0..16 {
+            for c in 0..16 {
+                curY[d + c] = lastY[d + c]
+            }
+            d += ys
+        }
+        d = co + mbY * 8 * cs + mbX * 8
+        for _ in 0..8 {
+            for c in 0..8 {
+                curU[d + c] = lastU[d + c]
+                curV[d + c] = lastV[d + c]
+            }
+            d += cs
+        }
+    }
+
+    // The plane offset of block i of the current macroblock.
+    fn blockOrigin(_ i: Int) -> Int {
+        if i < 4 {
+            if ftx == 1 {
+                // FIELDTX (10.1.4): luma blocks 0, 1 are the top field's
+                // rows, 2, 3 the bottom field's.
+                return yo + mbY * 16 * ys + mbX * 16 + (i & 1) * 8 + (if i > 1 { ys } else { 0 })
+            }
+            return yo + (mbY * 16 + (i >> 1) * 8) * ys + mbX * 16 + (i & 1) * 8
+        }
+        co + (mbY * 8) * cs + mbX * 8
+    }
+
+    // The row stride of block i of the current macroblock.
+    fn blockStride(_ i: Int) -> Int {
+        if i < 4 {
+            return ys << ftx
+        }
+        cs
+    }
+
+    // blk (8×8, raster) put into block i of the current macroblock:
+    // clamped, +128 when signed (put_signed_pixels_clamped).
+    fn putBlk(_ i: Int, signed: Bool) {
+        let add = if signed { 128 } else { 0 }
+        var d = blockOrigin(i)
+        let st = blockStride(i)
+        var s = 0
+        for _ in 0..8 {
+            for c in 0..8 {
+                let v = vcClip8(blk[s + c] + add)
+                if i < 4 {
+                    curY[d + c] = v
+                } else if i == 4 {
+                    curU[d + c] = v
+                } else {
+                    curV[d + c] = v
+                }
+            }
+            d += st
+            s += 8
+        }
+    }
+
+    // A ring block put into plane block at (plane origin d, stride st).
+    fn putRing(_ idx: Int, _ s: Int, _ plane: Int, _ d0: Int, _ st: Int) {
+        let add = if putSigned { 128 } else { 0 }
+        let r = (idx * 6 + s) * 64
+        var d = d0
+        var k = r
+        for _ in 0..8 {
+            for c in 0..8 {
+                let v = vcClip8(ring[k + c] + add)
+                if plane == 0 {
+                    curY[d + c] = v
+                } else if plane == 1 {
+                    curU[d + c] = v
+                } else {
+                    curV[d + c] = v
+                }
+            }
+            d += st
+            k += 8
+        }
+    }
+
+    // The intra flag of block i of macroblock (x, y) (v->mb_type).
+    fn isIntraAt(_ x: Int, _ y: Int, _ i: Int) -> Bool {
+        if x < 0 || y < 0 {
+            return false
+        }
+        if i < 4 {
+            return intra[bs + 1 + bs * 2 * y + 2 * x + (i & 1) + (i >> 1) * bs] != 0
+        }
+        if i == 4 {
+            return intra[bs + 1 + bs * 2 * mbh + ms * (y + 1) + x] != 0
+        }
+        intra[bs + 1 + bs * 2 * mbh + ms * (y + mbh + 2) + x] != 0
+    }
+
+    // Puts the intra blocks of macroblock (x, y) (ring entry idx).
+    fn putMbFrom(_ idx: Int, _ x: Int, _ y: Int) {
+        let ft = if pf.fcm == 1 { pf.fieldTx[y * mbw + x] } else { 0 }
+        for i in 0..6 {
+            if isIntraAt(x, y, i) {
+                let s = vcBlockMap(i)
+                if i < 4 {
+                    if ft == 1 {
+                        putRing(idx, s, 0, yo + y * 16 * ys + x * 16 + (i & 1) * 8 + (if i > 1 { ys } else { 0 }), ys * 2)
+                    } else {
+                        putRing(idx, s, 0, yo + (y * 16 + (i >> 1) * 8) * ys + x * 16 + (i & 1) * 8, ys)
+                    }
+                } else {
+                    putRing(idx, s, i - 3, co + y * 8 * cs + x * 8, cs)
+                }
+            }
+        }
+    }
+
+    // vc1_put_blocks_clamped (progressive): one row and one column behind.
+    fn putBlocks() {
+        if pf.fcm == 1 {
+            // Frame-interlaced pictures need no vertical overlap: one
+            // column behind.
+            if mbX > 0 {
+                putMbFrom(leftIdx, mbX - 1, mbY)
+            }
+            if mbX == mbw - 1 {
+                putMbFrom(curIdx, mbX, mbY)
+            }
+            return
+        }
+        if !firstLine {
+            if mbX > 0 {
+                putMbFrom(topLeftIdx, mbX - 1, mbY - 1)
+            }
+            if mbX == mbw - 1 {
+                putMbFrom(topIdx, mbX, mbY - 1)
+            }
+        }
+        if mbY == endRow - 1 {
+            if mbX > 0 {
+                putMbFrom(leftIdx, mbX - 1, mbY)
+            }
+            if mbX == mbw - 1 {
+                putMbFrom(curIdx, mbX, mbY)
+            }
+        }
+    }
+
+    // --- Overlap smoothing (8.5; vc1_loopfilter.c) ---
+
+    // vc1_h_s_overlap_c between ring blocks (entry, storage) l and r.
+    fn hsOverlap(_ li: Int, _ ls: Int, _ ri: Int, _ rs: Int, _ flags: Int) {
+        var l = (li * 6 + ls) * 64
+        var r = (ri * 6 + rs) * 64
+        var rnd1 = if (flags & 2) != 0 { 3 } else { 4 }
+        var rnd2 = 7 - rnd1
+        for _ in 0..8 {
+            let a = ring[l + 6]
+            let b = ring[l + 7]
+            let c = ring[r]
+            let d = ring[r + 1]
+            let d1 = a - d
+            let d2 = a - d + b - c
+            ring[l + 6] = vcI16((a * 8 - d1 + rnd1) >> 3)
+            ring[l + 7] = vcI16((b * 8 - d2 + rnd2) >> 3)
+            ring[r] = vcI16((c * 8 + d2 + rnd1) >> 3)
+            ring[r + 1] = vcI16((d * 8 + d1 + rnd2) >> 3)
+            r += 8
+            l += 8
+            if (flags & 1) != 0 {
+                rnd2 = 7 - rnd2
+                rnd1 = 7 - rnd1
+            }
+        }
+    }
+
+    // vc1_h_s_overlap_c with ffmpeg's pointer arithmetic: the left and
+    // right columns start at element loff / roff of ring block (entry,
+    // storage) and step lst / rst per row (16 reads every other row,
+    // running into the next block's storage: FIELDTX macroblocks).
+    fn hsOverlapG(_ li: Int, _ ls: Int, _ loff: Int, _ ri: Int, _ rs: Int, _ roff: Int, _ lst: Int, _ rst: Int, _ flags: Int) {
+        var l = (li * 6 + ls) * 64 + loff
+        var r = (ri * 6 + rs) * 64 + roff
+        var rnd1 = if (flags & 2) != 0 { 3 } else { 4 }
+        var rnd2 = 7 - rnd1
+        for _ in 0..8 {
+            let a = ring[l + 6]
+            let b = ring[l + 7]
+            let c = ring[r]
+            let d = ring[r + 1]
+            let d1 = a - d
+            let d2 = a - d + b - c
+            ring[l + 6] = vcI16((a * 8 - d1 + rnd1) >> 3)
+            ring[l + 7] = vcI16((b * 8 - d2 + rnd2) >> 3)
+            ring[r] = vcI16((c * 8 + d2 + rnd1) >> 3)
+            ring[r + 1] = vcI16((d * 8 + d1 + rnd2) >> 3)
+            r += rst
+            l += lst
+            if (flags & 1) != 0 {
+                rnd2 = 7 - rnd2
+                rnd1 = 7 - rnd1
+            }
+        }
+    }
+
+    // vc1_h_overlap_filter with the macroblocks' FIELDTX (frame-interlaced
+    // pictures; lft/rft 0 or 1).
+    fn hOverlapIl(_ left: Int, _ right: Int, _ lft: Int, _ rft: Int, _ n: Int) {
+        let differ = lft != rft
+        let lst = if differ { 16 - 8 * lft } else { 8 }
+        let rst = if differ { 16 - 8 * rft } else { 8 }
+        let either = lft == 1 || rft == 1
+        if n == 0 {
+            hsOverlapG(left, 2, 0, right, 0, 0, lst, rst, if either { 0 } else { 1 })
+        } else if n == 1 {
+            hsOverlapG(right, 0, 0, right, 2, 0, 8, 8, if rft == 1 { 0 } else { 1 })
+        } else if n == 2 {
+            var lb = 3
+            var lo = 0
+            if lft == 0 && rft == 1 {
+                lb = 2
+                lo = 8
+            }
+            var rb = 1
+            var ro = 0
+            if lft == 1 && rft == 0 {
+                rb = 0
+                ro = 8
+            }
+            hsOverlapG(left, lb, lo, right, rb, ro, lst, rst, if either { 2 } else { 1 })
+        } else if n == 3 {
+            hsOverlapG(right, 1, 0, right, 3, 0, 8, 8, if rft == 1 { 2 } else { 1 })
+        } else {
+            hsOverlapG(left, n, 0, right, n, 0, 8, 8, 1)
+        }
+    }
+
+    fn ftxAt(_ x: Int, _ y: Int) -> Int {
+        if pf.fcm != 1 || x < 0 {
+            return 0
+        }
+        pf.fieldTx[y * mbw + x]
+    }
+
+    // vc1_v_s_overlap_c: top block's last two rows with bottom's first two.
+    fn vsOverlap(_ ti: Int, _ ts: Int, _ bi: Int, _ bsx: Int) {
+        var t = (ti * 6 + ts) * 64
+        var b = (bi * 6 + bsx) * 64
+        var rnd1 = 4
+        var rnd2 = 3
+        for _ in 0..8 {
+            let a = ring[t + 48]
+            let bb = ring[t + 56]
+            let c = ring[b]
+            let d = ring[b + 8]
+            let d1 = a - d
+            let d2 = a - d + bb - c
+            ring[t + 48] = vcI16((a * 8 - d1 + rnd1) >> 3)
+            ring[t + 56] = vcI16((bb * 8 - d2 + rnd2) >> 3)
+            ring[b] = vcI16((c * 8 + d2 + rnd1) >> 3)
+            ring[b + 8] = vcI16((d * 8 + d1 + rnd2) >> 3)
+            b += 1
+            t += 1
+            rnd2 = 7 - rnd2
+            rnd1 = 7 - rnd1
+        }
+    }
+
+    // vc1_h_overlap_filter (progressive) for block_num of left/right
+    // entries.
+    fn hOverlap(_ left: Int, _ right: Int, _ n: Int) {
+        if n == 0 {
+            hsOverlap(left, 2, right, 0, 1)
+        } else if n == 1 {
+            hsOverlap(right, 0, right, 2, 1)
+        } else if n == 2 {
+            hsOverlap(left, 3, right, 1, 1)
+        } else if n == 3 {
+            hsOverlap(right, 1, right, 3, 1)
+        } else {
+            hsOverlap(left, n, right, n, 1)
+        }
+    }
+
+    fn vOverlap(_ top: Int, _ bottom: Int, _ n: Int) {
+        if n == 0 {
+            vsOverlap(top, 1, bottom, 0)
+        } else if n == 1 {
+            vsOverlap(top, 3, bottom, 2)
+        } else if n == 2 {
+            vsOverlap(bottom, 0, bottom, 1)
+        } else if n == 3 {
+            vsOverlap(bottom, 2, bottom, 3)
+        } else {
+            vsOverlap(top, n, bottom, n)
+        }
+    }
+
+    fn overFlag(_ x: Int, _ y: Int) -> Bool {
+        if x < 0 || y < 0 {
+            return false
+        }
+        pf.overFlags[y * mbw + x] != 0
+    }
+
+    // ff_vc1_i_overlap_filter (progressive).
+    fn iOverlap() {
+        let all = pf.pq >= 9 || (profile == 3 && pf.condover == 1)
+        let sel = profile == 3 && pf.condover == 2
+        for i in 0..6 {
+            if mbX == 0 && (i & 5) != 1 {
+                continue
+            }
+            if all || (sel && overFlag(mbX, mbY) && ((i & 5) == 1 || overFlag(mbX - 1, mbY))) {
+                if pf.fcm == 1 {
+                    hOverlapIl(if mbX > 0 { leftIdx } else { curIdx }, curIdx, ftxAt(mbX - 1, mbY), ftxAt(mbX, mbY), i)
+                } else {
+                    hOverlap(if mbX > 0 { leftIdx } else { curIdx }, curIdx, i)
+                }
+            }
+        }
+        if pf.fcm == 1 {
+            return
+        }
+        for i in 0..6 {
+            if firstLine && (i & 2) == 0 {
+                continue
+            }
+            if mbX > 0 && (all || (sel && overFlag(mbX - 1, mbY) && ((i & 2) != 0 || overFlag(mbX - 1, mbY - 1)))) {
+                vOverlap(if firstLine { leftIdx } else { topLeftIdx }, leftIdx, i)
+            }
+            if mbX == mbw - 1 && (all || (sel && overFlag(mbX, mbY) && ((i & 2) != 0 || overFlag(mbX, mbY - 1)))) {
+                vOverlap(if firstLine { curIdx } else { topIdx }, curIdx, i)
+            }
+        }
+    }
+
+    // The intra flag at ffmpeg block index (mb_type[block_index[i] + d]).
+    fn intraIdx(_ i: Int, _ x: Int, _ y: Int) -> Int {
+        if i < 4 {
+            return bs + 1 + bs * 2 * y + 2 * x + (i & 1) + (i >> 1) * bs
+        }
+        if i == 4 {
+            return bs + 1 + bs * 2 * mbh + ms * (y + 1) + x
+        }
+        bs + 1 + bs * 2 * mbh + ms * (y + mbh + 2) + x
+    }
+
+    // ff_vc1_p_overlap_filter (progressive).
+    fn pOverlap() {
+        for i in 0..6 {
+            if mbX == 0 && (i & 5) != 1 {
+                continue
+            }
+            let b = intraIdx(i, mbX, mbY)
+            if intra[b] != 0 && intra[b - 1] != 0 {
+                if pf.fcm == 1 {
+                    hOverlapIl(if mbX > 0 { leftIdx } else { curIdx }, curIdx, ftxAt(mbX - 1, mbY), ftxAt(mbX, mbY), i)
+                } else {
+                    hOverlap(if mbX > 0 { leftIdx } else { curIdx }, curIdx, i)
+                }
+            }
+        }
+        if pf.fcm == 1 {
+            return
+        }
+        for i in 0..6 {
+            if firstLine && (i & 2) == 0 {
+                continue
+            }
+            let b = intraIdx(i, mbX, mbY)
+            let wrap = if i < 4 { bs } else { ms }
+            let d = -2 + (if i > 3 { 1 } else { 0 })
+            if mbX > 0 && intra[b + d] != 0 && intra[b - wrap + d] != 0 {
+                vOverlap(if firstLine { leftIdx } else { topLeftIdx }, leftIdx, i)
+            }
+            if mbX == mbw - 1 && intra[b] != 0 && intra[b - wrap] != 0 {
+                vOverlap(if firstLine { curIdx } else { topIdx }, curIdx, i)
+            }
+        }
+    }
+
+    // --- Inverse transforms (vc1dsp.c) ---
+
+    // vc1_inv_trans_8x8_c on blk, in place.
+    fn invTrans8x8() {
+        for i in 0..8 {
+            let s0 = blk[i]
+            let s8 = blk[i + 8]
+            let s16 = blk[i + 16]
+            let s24 = blk[i + 24]
+            let s32 = blk[i + 32]
+            let s40 = blk[i + 40]
+            let s48 = blk[i + 48]
+            let s56 = blk[i + 56]
+            var t1 = 12 * (s0 + s32) + 4
+            var t2 = 12 * (s0 - s32) + 4
+            var t3 = 16 * s16 + 6 * s48
+            var t4 = 6 * s16 - 16 * s48
+            let t5 = t1 + t3
+            let t6 = t2 + t4
+            let t7 = t2 - t4
+            let t8 = t1 - t3
+            t1 = 16 * s8 + 15 * s24 + 9 * s40 + 4 * s56
+            t2 = 15 * s8 - 4 * s24 - 16 * s40 - 9 * s56
+            t3 = 9 * s8 - 16 * s24 + 4 * s40 + 15 * s56
+            t4 = 4 * s8 - 9 * s24 + 15 * s40 - 16 * s56
+            let o = 64 + i * 8
+            tmp[o] = vcI16((t5 + t1) >> 3)
+            tmp[o + 1] = vcI16((t6 + t2) >> 3)
+            tmp[o + 2] = vcI16((t7 + t3) >> 3)
+            tmp[o + 3] = vcI16((t8 + t4) >> 3)
+            tmp[o + 4] = vcI16((t8 - t4) >> 3)
+            tmp[o + 5] = vcI16((t7 - t3) >> 3)
+            tmp[o + 6] = vcI16((t6 - t2) >> 3)
+            tmp[o + 7] = vcI16((t5 - t1) >> 3)
+        }
+        for i in 0..8 {
+            let b = 64 + i
+            let s0 = tmp[b]
+            let s8 = tmp[b + 8]
+            let s16 = tmp[b + 16]
+            let s24 = tmp[b + 24]
+            let s32 = tmp[b + 32]
+            let s40 = tmp[b + 40]
+            let s48 = tmp[b + 48]
+            let s56 = tmp[b + 56]
+            var t1 = 12 * (s0 + s32) + 64
+            var t2 = 12 * (s0 - s32) + 64
+            var t3 = 16 * s16 + 6 * s48
+            var t4 = 6 * s16 - 16 * s48
+            let t5 = t1 + t3
+            let t6 = t2 + t4
+            let t7 = t2 - t4
+            let t8 = t1 - t3
+            t1 = 16 * s8 + 15 * s24 + 9 * s40 + 4 * s56
+            t2 = 15 * s8 - 4 * s24 - 16 * s40 - 9 * s56
+            t3 = 9 * s8 - 16 * s24 + 4 * s40 + 15 * s56
+            t4 = 4 * s8 - 9 * s24 + 15 * s40 - 16 * s56
+            blk[i] = vcI16((t5 + t1) >> 7)
+            blk[i + 8] = vcI16((t6 + t2) >> 7)
+            blk[i + 16] = vcI16((t7 + t3) >> 7)
+            blk[i + 24] = vcI16((t8 + t4) >> 7)
+            blk[i + 32] = vcI16((t8 - t4 + 1) >> 7)
+            blk[i + 40] = vcI16((t7 - t3 + 1) >> 7)
+            blk[i + 48] = vcI16((t6 - t2 + 1) >> 7)
+            blk[i + 56] = vcI16((t5 - t1 + 1) >> 7)
+        }
+    }
+
+    // ff_simple_idct_int16_8bit (C) on blk: the Simple/Main transform
+    // when RES_FASTTX is off.
+    fn simpleIdct8() {
+        for r in 0..8 {
+            vcSimpleRow(blk, r * 8)
+        }
+        for c in 0..8 {
+            vcSimpleCol(blk, c)
+        }
+    }
+
+    // An inter residual (vc1_decode_p_block's transforms) added to block i.
+    fn residual(_ mb: Int, _ i: Int, _ info: Int) {
+        let o = pf.blkOff[mb * 6 + i]
+        let tt = (info >> 2) & 7
+        let notCoded = (info >> 5) & 15
+        let dcOnly = (info >> 9) & 15
+        let plane = if i < 4 { 0 } else { i - 3 }
+        let st = blockStride(i)
+        let d = blockOrigin(i)
+        for k in 0..64 {
+            blk[k] = pf.coef[o + k]
+        }
+        if profile != 3 && !resFasttxHint {
+            // Simple IDCT family (ff_simple_idct*_add).
+            if tt == vcTT8x8 {
+                simpleIdct8()
+                addBlk(plane, d, st, 0, 8, 8)
+            } else if tt == vcTT4x4 {
+                for j in 0..4 {
+                    if (notCoded >> j) & 1 == 0 {
+                        let off = (j & 1) * 4 + (j & 2) * 16
+                        vcSimple44(blk, off)
+                        addBlk(plane, d + (j & 1) * 4 + (j & 2) * 2 * st, st, off, 4, 4)
+                    }
+                }
+            } else if tt == vcTT8x4 {
+                for j in 0..2 {
+                    if (notCoded >> j) & 1 == 0 {
+                        vcSimple84(blk, j * 32)
+                        addBlk(plane, d + j * 4 * st, st, j * 32, 8, 4)
+                    }
+                }
+            } else {
+                for j in 0..2 {
+                    if (notCoded >> j) & 1 == 0 {
+                        vcSimple48(blk, j * 4)
+                        addBlk(plane, d + j * 4, st, j * 4, 4, 8)
+                    }
+                }
+            }
+            return
+        }
+        if tt == vcTT8x8 {
+            if (dcOnly & 1) != 0 {
+                var dc = blk[0]
+                dc = (3 * dc + 1) >> 1
+                dc = (3 * dc + 16) >> 5
+                addDc(plane, d, st, dc, 8, 8)
+            } else {
+                invTrans8x8()
+                addBlk(plane, d, st, 0, 8, 8)
+            }
+        } else if tt == vcTT4x4 {
+            for j in 0..4 {
+                if (notCoded >> j) & 1 != 0 {
+                    continue
+                }
+                let off = (j & 1) * 4 + (j & 2) * 16
+                let dd = d + (j & 1) * 4 + (j & 2) * 2 * st
+                if (dcOnly >> j) & 1 != 0 {
+                    var dc = blk[off]
+                    dc = (17 * dc + 4) >> 3
+                    dc = (17 * dc + 64) >> 7
+                    addDc(plane, dd, st, dc, 4, 4)
+                } else {
+                    inv4x4(plane, dd, st, off)
+                }
+            }
+        } else if tt == vcTT8x4 {
+            for j in 0..2 {
+                if (notCoded >> j) & 1 != 0 {
+                    continue
+                }
+                let dd = d + j * 4 * st
+                if (dcOnly >> j) & 1 != 0 {
+                    var dc = blk[j * 32]
+                    dc = (3 * dc + 1) >> 1
+                    dc = (17 * dc + 64) >> 7
+                    addDc(plane, dd, st, dc, 8, 4)
+                } else {
+                    inv8x4(plane, dd, st, j * 32)
+                }
+            }
+        } else {
+            for j in 0..2 {
+                if (notCoded >> j) & 1 != 0 {
+                    continue
+                }
+                let dd = d + j * 4
+                if (dcOnly >> j) & 1 != 0 {
+                    var dc = blk[j * 4]
+                    dc = (17 * dc + 4) >> 3
+                    dc = (12 * dc + 64) >> 7
+                    addDc(plane, dd, st, dc, 4, 8)
+                } else {
+                    inv4x8(plane, dd, st, j * 4)
+                }
+            }
+        }
+    }
+
+    fn addPx(_ plane: Int, _ at: Int, _ v: Int) {
+        if plane == 0 {
+            curY[at] = vcClip8(curY[at] + v)
+        } else if plane == 1 {
+            curU[at] = vcClip8(curU[at] + v)
+        } else {
+            curV[at] = vcClip8(curV[at] + v)
+        }
+    }
+
+    fn addDc(_ plane: Int, _ d: Int, _ st: Int, _ dc: Int, _ w: Int, _ h: Int) {
+        var at = d
+        for _ in 0..h {
+            for c in 0..w {
+                addPx(plane, at + c, dc)
+            }
+            at += st
+        }
+    }
+
+    // add_pixels_clamped of w×h values of blk from offset off (stride 8).
+    fn addBlk(_ plane: Int, _ d: Int, _ st: Int, _ off: Int, _ w: Int, _ h: Int) {
+        var at = d
+        var s = off
+        for _ in 0..h {
+            for c in 0..w {
+                addPx(plane, at + c, blk[s + c])
+            }
+            at += st
+            s += 8
+        }
+    }
+
+    // vc1_inv_trans_8x4_c: block rows off..off+3 (stride 8), added.
+    fn inv8x4(_ plane: Int, _ d: Int, _ st: Int, _ off: Int) {
+        for r in 0..4 {
+            let s = off + r * 8
+            let s0 = blk[s]
+            let s1 = blk[s + 1]
+            let s2 = blk[s + 2]
+            let s3 = blk[s + 3]
+            let s4 = blk[s + 4]
+            let s5 = blk[s + 5]
+            let s6 = blk[s + 6]
+            let s7 = blk[s + 7]
+            var t1 = 12 * (s0 + s4) + 4
+            var t2 = 12 * (s0 - s4) + 4
+            var t3 = 16 * s2 + 6 * s6
+            var t4 = 6 * s2 - 16 * s6
+            let t5 = t1 + t3
+            let t6 = t2 + t4
+            let t7 = t2 - t4
+            let t8 = t1 - t3
+            t1 = 16 * s1 + 15 * s3 + 9 * s5 + 4 * s7
+            t2 = 15 * s1 - 4 * s3 - 16 * s5 - 9 * s7
+            t3 = 9 * s1 - 16 * s3 + 4 * s5 + 15 * s7
+            t4 = 4 * s1 - 9 * s3 + 15 * s5 - 16 * s7
+            blk[s] = vcI16((t5 + t1) >> 3)
+            blk[s + 1] = vcI16((t6 + t2) >> 3)
+            blk[s + 2] = vcI16((t7 + t3) >> 3)
+            blk[s + 3] = vcI16((t8 + t4) >> 3)
+            blk[s + 4] = vcI16((t8 - t4) >> 3)
+            blk[s + 5] = vcI16((t7 - t3) >> 3)
+            blk[s + 6] = vcI16((t6 - t2) >> 3)
+            blk[s + 7] = vcI16((t5 - t1) >> 3)
+        }
+        for c in 0..8 {
+            let s = off + c
+            let t1 = 17 * (blk[s] + blk[s + 16]) + 64
+            let t2 = 17 * (blk[s] - blk[s + 16]) + 64
+            let t3 = 22 * blk[s + 8] + 10 * blk[s + 24]
+            let t4 = 22 * blk[s + 24] - 10 * blk[s + 8]
+            addPx(plane, d + c, (t1 + t3) >> 7)
+            addPx(plane, d + st + c, (t2 - t4) >> 7)
+            addPx(plane, d + 2 * st + c, (t2 + t4) >> 7)
+            addPx(plane, d + 3 * st + c, (t1 - t3) >> 7)
+        }
+    }
+
+    // vc1_inv_trans_4x8_c: columns off..off+3, 8 rows, added.
+    fn inv4x8(_ plane: Int, _ d: Int, _ st: Int, _ off: Int) {
+        for r in 0..8 {
+            let s = off + r * 8
+            let t1 = 17 * (blk[s] + blk[s + 2]) + 4
+            let t2 = 17 * (blk[s] - blk[s + 2]) + 4
+            let t3 = 22 * blk[s + 1] + 10 * blk[s + 3]
+            let t4 = 22 * blk[s + 3] - 10 * blk[s + 1]
+            blk[s] = vcI16((t1 + t3) >> 3)
+            blk[s + 1] = vcI16((t2 - t4) >> 3)
+            blk[s + 2] = vcI16((t2 + t4) >> 3)
+            blk[s + 3] = vcI16((t1 - t3) >> 3)
+        }
+        for c in 0..4 {
+            let s = off + c
+            let s0 = blk[s]
+            let s8 = blk[s + 8]
+            let s16 = blk[s + 16]
+            let s24 = blk[s + 24]
+            let s32 = blk[s + 32]
+            let s40 = blk[s + 40]
+            let s48 = blk[s + 48]
+            let s56 = blk[s + 56]
+            var t1 = 12 * (s0 + s32) + 64
+            var t2 = 12 * (s0 - s32) + 64
+            var t3 = 16 * s16 + 6 * s48
+            var t4 = 6 * s16 - 16 * s48
+            let t5 = t1 + t3
+            let t6 = t2 + t4
+            let t7 = t2 - t4
+            let t8 = t1 - t3
+            t1 = 16 * s8 + 15 * s24 + 9 * s40 + 4 * s56
+            t2 = 15 * s8 - 4 * s24 - 16 * s40 - 9 * s56
+            t3 = 9 * s8 - 16 * s24 + 4 * s40 + 15 * s56
+            t4 = 4 * s8 - 9 * s24 + 15 * s40 - 16 * s56
+            addPx(plane, d + c, (t5 + t1) >> 7)
+            addPx(plane, d + st + c, (t6 + t2) >> 7)
+            addPx(plane, d + 2 * st + c, (t7 + t3) >> 7)
+            addPx(plane, d + 3 * st + c, (t8 + t4) >> 7)
+            addPx(plane, d + 4 * st + c, (t8 - t4 + 1) >> 7)
+            addPx(plane, d + 5 * st + c, (t7 - t3 + 1) >> 7)
+            addPx(plane, d + 6 * st + c, (t6 - t2 + 1) >> 7)
+            addPx(plane, d + 7 * st + c, (t5 - t1 + 1) >> 7)
+        }
+    }
+
+    // vc1_inv_trans_4x4_c.
+    fn inv4x4(_ plane: Int, _ d: Int, _ st: Int, _ off: Int) {
+        for r in 0..4 {
+            let s = off + r * 8
+            let t1 = 17 * (blk[s] + blk[s + 2]) + 4
+            let t2 = 17 * (blk[s] - blk[s + 2]) + 4
+            let t3 = 22 * blk[s + 1] + 10 * blk[s + 3]
+            let t4 = 22 * blk[s + 3] - 10 * blk[s + 1]
+            blk[s] = vcI16((t1 + t3) >> 3)
+            blk[s + 1] = vcI16((t2 - t4) >> 3)
+            blk[s + 2] = vcI16((t2 + t4) >> 3)
+            blk[s + 3] = vcI16((t1 - t3) >> 3)
+        }
+        for c in 0..4 {
+            let s = off + c
+            let t1 = 17 * (blk[s] + blk[s + 16]) + 64
+            let t2 = 17 * (blk[s] - blk[s + 16]) + 64
+            let t3 = 22 * blk[s + 8] + 10 * blk[s + 24]
+            let t4 = 22 * blk[s + 24] - 10 * blk[s + 8]
+            addPx(plane, d + c, (t1 + t3) >> 7)
+            addPx(plane, d + st + c, (t2 - t4) >> 7)
+            addPx(plane, d + 2 * st + c, (t2 + t4) >> 7)
+            addPx(plane, d + 3 * st + c, (t1 - t3) >> 7)
+        }
+    }
+
+    // --- Motion compensation (vc1_mc.c) ---
+
+    // Copies the w×h reference area at (x, y) of plane `plane` (0 Y, 1 U,
+    // 2 V) of reference `ref` (0 last, 1 next) into fetch (stride w),
+    // positions clamped to the edges ew×eh.
+    fn fetchArea(_ ref: Int, _ plane: Int, _ x: Int, _ y: Int, _ w: Int, _ h: Int, _ ew: Int, _ eh: Int) {
+        let st = if plane == 0 { pys } else { pcs }
+        var o = 0
+        let inside = x >= 0 && y >= 0 && x + w <= ew && y + h <= eh
+        // A progressive picture referring to an interlaced frame clamps
+        // each field apart (ffmpeg's last_interlaced / next_interlaced).
+        let ilace = (ref == 0 && lastIl) || (ref == 1 && nextIl)
+        for r in 0..h {
+            var yy = if inside { y + r } else { min(max(y + r, 0), eh - 1) }
+            if ilace && !inside {
+                let f = min(max((y + r) >> 1, 0), (eh >> 1) - 1)
+                yy = 2 * f + ((y + r) & 1)
+            }
+            let base = yy * st
+            for c in 0..w {
+                let xx = if inside { x + c } else { min(max(x + c, 0), ew - 1) }
+                var v = 0
+                if ref == 0 {
+                    v = if plane == 0 { lastY[base + xx] } else if plane == 1 { lastU[base + xx] } else { lastV[base + xx] }
+                } else {
+                    v = if plane == 0 { nextY[base + xx] } else if plane == 1 { nextU[base + xx] } else { nextV[base + xx] }
+                }
+                fetch[o + c] = v
+            }
+            o += w
+        }
+    }
+
+    // ffmpeg's direct read of a 9×9 chroma area without edge emulation
+    // (the 1MV path when the luma block is inside): one column may lie past
+    // the plane's width, which in ffmpeg's frame is padding (zero) or the
+    // next row.
+    fn fetchChromaDirect(_ ref: Int, _ plane: Int, _ x: Int, _ y: Int) {
+        let rows = mbh * 8
+        var o = 0
+        for r in 0..9 {
+            for c in 0..9 {
+                var xx = x + c
+                var yy = y + r
+                var zero = false
+                if xx >= pcs {
+                    if xx < ffCs {
+                        zero = true
+                    } else {
+                        xx -= ffCs
+                        yy += 1
+                    }
+                }
+                if yy >= rows {
+                    zero = true
+                }
+                var v = 0
+                if !zero {
+                    let at = yy * pcs + xx
+                    if ref == 0 {
+                        v = if plane == 1 { lastU[at] } else { lastV[at] }
+                    } else {
+                        v = if plane == 1 { nextU[at] } else { nextV[at] }
+                    }
+                }
+                fetch[o + c] = v
+            }
+            o += 9
+        }
+    }
+
+    // Range reduction (vc1_scale_luma/chroma) or intensity compensation
+    // (vc1_lut_scale_*) of the k×k area in fetch.
+    fn scaleFetch(_ k: Int, _ ref: Int, _ chroma: Bool, _ firstRowParity: Int) {
+        if pf.rangeredfrm {
+            for i in 0..(k * k) {
+                fetch[i] = ((fetch[i] - 128) >> 1) + 128
+            }
+        }
+        let use = if ref == 0 { pf.useIc0 } else { pf.useIc1 }
+        if use {
+            let lut = if ref == 0 { pf.lut0 } else { pf.lut1 }
+            let base = if chroma { 512 } else { 0 }
+            var o = 0
+            for r in 0..k {
+                let f = (firstRowParity + r) & 1
+                let t = base + f * 256
+                for c in 0..k {
+                    fetch[o + c] = lut[t + fetch[o + c]]
+                }
+                o += k
+            }
+        }
+    }
+
+    // Writes (or averages, avg) the n×n prediction of the luma area in
+    // fetch (stride k, the block's top left at (m, m), m = mspel) into the
+    // current Y plane at d. qpel: the bicubic filters (mspel), else
+    // half-sample bilinear.
+    fn lumaFilter(_ k: Int, _ n: Int, _ mx: Int, _ my: Int, _ d: Int, _ avg: Bool) {
+        if mspel == 1 {
+            mspelMc(k, n, mx & 3, my & 3, d, avg)
+            return
+        }
+        let dxy = (my & 2) | ((mx & 2) >> 1)
+        var s = 0
+        var at = d
+        for _ in 0..n {
+            for c in 0..n {
+                let p = s + c
+                var v = 0
+                if dxy == 0 {
+                    v = fetch[p]
+                } else if dxy == 1 {
+                    v = (fetch[p] + fetch[p + 1] + 1 - rnd) >> 1
+                } else if dxy == 2 {
+                    v = (fetch[p] + fetch[p + k] + 1 - rnd) >> 1
+                } else {
+                    v = (fetch[p] + fetch[p + 1] + fetch[p + k] + fetch[p + k + 1] + 2 - rnd) >> 2
+                }
+                if avg {
+                    v = (curY[at + c] + v + 1) >> 1
+                }
+                curY[at + c] = v
+            }
+            s += k
+            at += dys
+        }
+    }
+
+    // put/avg_vc1_mspel_mc (vc1dsp.c) from fetch (stride k, sample (1, 1)
+    // is the block's top left).
+    fn mspelMc(_ k: Int, _ n: Int, _ hmode: Int, _ vmode: Int, _ d: Int, _ avg: Bool) {
+        // The bicubic taps of the three quarter positions (vc1_mspel_filter):
+        // 1/4 (-4, 53, 18, -3), 1/2 (-1, 9, 9, -1), 3/4 (-3, 18, 53, -4).
+        // (The vertical pass's values stay within 16 bits for 8-bit input.)
+        let org = k + 1
+        if vmode != 0 {
+            let v0 = if vmode == 1 { -4 } else if vmode == 2 { -1 } else { -3 }
+            let v1 = if vmode == 1 { 53 } else if vmode == 2 { 9 } else { 18 }
+            let v2 = if vmode == 1 { 18 } else if vmode == 2 { 9 } else { 53 }
+            let v3 = if vmode == 1 { -3 } else if vmode == 2 { -1 } else { -4 }
+            if hmode != 0 {
+                let shiftV = [0, 5, 1, 5]
+                let shift = (shiftV[hmode] + shiftV[vmode]) >> 1
+                let r0 = (1 << (shift - 1)) + rnd - 1
+                let tw = n + 3
+                var tp = 0
+                var s = org - 1
+                for _ in 0..n {
+                    for i in 0..tw {
+                        let p = s + i
+                        tmp[tp + i] = (v0 * fetch[p - k] + v1 * fetch[p] + v2 * fetch[p + k] + v3 * fetch[p + 2 * k] + r0) >> shift
+                    }
+                    s += k
+                    tp += tw
+                }
+                let h0 = if hmode == 1 { -4 } else if hmode == 2 { -1 } else { -3 }
+                let h1 = if hmode == 1 { 53 } else if hmode == 2 { 9 } else { 18 }
+                let h2 = if hmode == 1 { 18 } else if hmode == 2 { 9 } else { 53 }
+                let h3 = if hmode == 1 { -3 } else if hmode == 2 { -1 } else { -4 }
+                let r = 64 - rnd
+                tp = 1
+                var at = d
+                for _ in 0..n {
+                    if avg {
+                        for i in 0..n {
+                            let p = tp + i
+                            let v = vcClip8((h0 * tmp[p - 1] + h1 * tmp[p] + h2 * tmp[p + 1] + h3 * tmp[p + 2] + r) >> 7)
+                            curY[at + i] = (curY[at + i] + v + 1) >> 1
+                        }
+                    } else {
+                        for i in 0..n {
+                            let p = tp + i
+                            curY[at + i] = vcClip8((h0 * tmp[p - 1] + h1 * tmp[p] + h2 * tmp[p + 1] + h3 * tmp[p + 2] + r) >> 7)
+                        }
+                    }
+                    at += dys
+                    tp += tw
+                }
+                return
+            }
+            let r = 1 - rnd
+            let add = if vmode == 2 { 8 - r } else { 32 - r }
+            let sh = if vmode == 2 { 4 } else { 6 }
+            var s = org
+            var at = d
+            for _ in 0..n {
+                for i in 0..n {
+                    let p = s + i
+                    var v = vcClip8((v0 * fetch[p - k] + v1 * fetch[p] + v2 * fetch[p + k] + v3 * fetch[p + 2 * k] + add) >> sh)
+                    if avg {
+                        v = (curY[at + i] + v + 1) >> 1
+                    }
+                    curY[at + i] = v
+                }
+                s += k
+                at += dys
+            }
+            return
+        }
+        var s = org
+        var at = d
+        if hmode == 0 {
+            for _ in 0..n {
+                if avg {
+                    for i in 0..n {
+                        curY[at + i] = (curY[at + i] + fetch[s + i] + 1) >> 1
+                    }
+                } else {
+                    for i in 0..n {
+                        curY[at + i] = fetch[s + i]
+                    }
+                }
+                s += k
+                at += dys
+            }
+            return
+        }
+        let h0 = if hmode == 1 { -4 } else if hmode == 2 { -1 } else { -3 }
+        let h1 = if hmode == 1 { 53 } else if hmode == 2 { 9 } else { 18 }
+        let h2 = if hmode == 1 { 18 } else if hmode == 2 { 9 } else { 53 }
+        let h3 = if hmode == 1 { -3 } else if hmode == 2 { -1 } else { -4 }
+        let add = if hmode == 2 { 8 - rnd } else { 32 - rnd }
+        let sh = if hmode == 2 { 4 } else { 6 }
+        for _ in 0..n {
+            for i in 0..n {
+                let p = s + i
+                var v = vcClip8((h0 * fetch[p - 1] + h1 * fetch[p] + h2 * fetch[p + 1] + h3 * fetch[p + 2] + add) >> sh)
+                if avg {
+                    v = (curY[at + i] + v + 1) >> 1
+                }
+                curY[at + i] = v
+            }
+            s += k
+            at += dys
+        }
+    }
+
+    // The 8×8 chroma prediction (h264 chroma mc when rnd is 0, VC-1's
+    // no-rounding version otherwise) from fetch (stride 9) into plane at d.
+    fn chromaFilter(_ plane: Int, _ fx: Int, _ fy: Int, _ d: Int, _ avg: Bool) {
+        let a = (8 - fx) * (8 - fy)
+        let b = fx * (8 - fy)
+        let c = (8 - fx) * fy
+        let e = fx * fy
+        let bias = if rnd == 0 { 32 } else { 28 }
+        var s = 0
+        var at = d
+        for _ in 0..8 {
+            for i in 0..8 {
+                let p = s + i
+                var v = (a * fetch[p] + b * fetch[p + 1] + c * fetch[p + 9] + e * fetch[p + 10] + bias) >> 6
+                if plane == 1 {
+                    if avg {
+                        v = (curU[at + i] + v + 1) >> 1
+                    }
+                    curU[at + i] = v
+                } else {
+                    if avg {
+                        v = (curV[at + i] + v + 1) >> 1
+                    }
+                    curV[at + i] = v
+                }
+            }
+            s += 9
+            at += dcs
+        }
+    }
+
+    // ff_vc1_mc_1mv (dir 0 last / 1 next) for the current macroblock.
+    fn mc1mv(_ dir: Int, _ mx: Int, _ my: Int, _ avg: Bool) {
+        if dir == 0 && !hasLast {
+            return
+        }
+        var uvmx = (mx + (if (mx & 3) == 3 { 1 } else { 0 })) >> 1
+        var uvmy = (my + (if (my & 3) == 3 { 1 } else { 0 })) >> 1
+        if pf.fastuvmc {
+            uvmx = uvmx + (if uvmx < 0 { uvmx & 1 } else { -(uvmx & 1) })
+            uvmy = uvmy + (if uvmy < 0 { uvmy & 1 } else { -(uvmy & 1) })
+        }
+        mcBlock16(dir, mx, my, uvmx, uvmy, avg, false)
+    }
+
+    // ff_vc1_interp_mc: the backward prediction averaged in.
+    fn interpMc(_ mx: Int, _ my: Int) {
+        if !hasNext {
+            return
+        }
+        var uvmx = (mx + (if (mx & 3) == 3 { 1 } else { 0 })) >> 1
+        var uvmy = (my + (if (my & 3) == 3 { 1 } else { 0 })) >> 1
+        if pf.fastuvmc {
+            uvmx = uvmx + (if uvmx < 0 { -(uvmx & 1) } else { uvmx & 1 })
+            uvmy = uvmy + (if uvmy < 0 { -(uvmy & 1) } else { uvmy & 1 })
+        }
+        mcBlock16(1, mx, my, uvmx, uvmy, true, true)
+    }
+
+    // The 16×16 luma and two 8×8 chroma predictions of a macroblock.
+    fn mcBlock16(_ dir: Int, _ mx: Int, _ my: Int, _ uvmx: Int, _ uvmy: Int, _ avg: Bool, _ interp: Bool) {
+        var srcX = mbX * 16 + (mx >> 2)
+        var srcY = mbY * 16 + (my >> 2)
+        var uvX = mbX * 8 + (uvmx >> 2)
+        var uvY = mbY * 8 + (uvmy >> 2)
+        if profile != 3 {
+            srcX = min(max(srcX, -16), mbw * 16)
+            srcY = min(max(srcY, -16), mbh * 16)
+            uvX = min(max(uvX, -8), mbw * 8)
+            uvY = min(max(uvY, -8), mbh * 8)
+        } else {
+            srcX = min(max(srcX, -17), width)
+            uvX = min(max(uvX, -8), width >> 1)
+            srcY = min(max(srcY, -18), height + 1)
+            uvY = min(max(uvY, -8), height >> 1)
+        }
+        let useIc = if dir == 0 { pf.useIc0 } else { pf.useIc1 }
+        // ffmpeg's edge emulation test (the luma area is inside when not).
+        var emulate = pf.rangeredfrm || useIc || hEdge < 22 || vEdge < 22
+        let lx = if interp { srcX - 1 } else { srcX - mspel }
+        let limX = if interp { hEdge - (mx & 3) - 16 - 3 } else { hEdge - (mx & 3) - 16 - mspel * 3 }
+        if lx < 0 || lx > limX {
+            emulate = true
+        }
+        if srcY - 1 < 0 || srcY - 1 > vEdge - (my & 3) - 16 - 3 {
+            emulate = true
+        }
+        let k = 17 + mspel * 2
+        fetchArea(dir, 0, srcX - mspel, srcY - mspel, k, k, hEdge, vEdge)
+        if emulate {
+            scaleFetch(k, dir, false, (srcY - mspel) & 1)
+        }
+        let d = yo + mbY * 16 * ys + mbX * 16
+        dys = ys
+        dcs = cs
+        lumaFilter(k, 16, mx, my, d, avg)
+        let fx = (uvmx & 3) << 1
+        let fy = (uvmy & 3) << 1
+        let cd = co + mbY * 8 * cs + mbX * 8
+        for plane in 1..3 {
+            if emulate || interp {
+                fetchArea(dir, plane, uvX, uvY, 9, 9, hEdge >> 1, vEdge >> 1)
+                if emulate {
+                    scaleFetch(9, dir, true, uvY & 1)
+                }
+            } else {
+                fetchChromaDirect(dir, plane, uvX, uvY)
+            }
+            chromaFilter(plane, fx, fy, cd, avg)
+        }
+    }
+
+    // ff_vc1_mc_4mv_luma (progressive, P pictures).
+    fn mc4mvLuma(_ n: Int, _ mx: Int, _ my: Int) {
+        if !hasLast {
+            return
+        }
+        var srcX = mbX * 16 + (n & 1) * 8 + (mx >> 2)
+        var srcY = mbY * 16 + (n & 2) * 4 + (my >> 2)
+        if profile != 3 {
+            srcX = min(max(srcX, -16), mbw * 16)
+            srcY = min(max(srcY, -16), mbh * 16)
+        } else {
+            srcX = min(max(srcX, -17), width)
+            srcY = min(max(srcY, -18), height + 1)
+        }
+        let k = 9 + mspel * 2
+        fetchArea(0, 0, srcX - mspel, srcY - mspel, k, k, hEdge, vEdge)
+        scaleFetch(k, 0, false, (srcY - mspel) & 1)
+        let d = yo + (mbY * 16 + (n & 2) * 4) * ys + mbX * 16 + (n & 1) * 8
+        dys = ys
+        lumaFilter(k, 8, mx, my, d, false)
+    }
+
+    // ff_vc1_mc_4mv_chroma (progressive) with the chroma vector (tx, ty).
+    fn mc4mvChroma(_ tx: Int, _ ty: Int) {
+        if !hasLast {
+            return
+        }
+        var uvmx = (tx + (if (tx & 3) == 3 { 1 } else { 0 })) >> 1
+        var uvmy = (ty + (if (ty & 3) == 3 { 1 } else { 0 })) >> 1
+        if pf.fastuvmc {
+            uvmx = uvmx + (if uvmx < 0 { uvmx & 1 } else { -(uvmx & 1) })
+            uvmy = uvmy + (if uvmy < 0 { uvmy & 1 } else { -(uvmy & 1) })
+        }
+        var uvX = mbX * 8 + (uvmx >> 2)
+        var uvY = mbY * 8 + (uvmy >> 2)
+        if profile != 3 {
+            uvX = min(max(uvX, -8), mbw * 8)
+            uvY = min(max(uvY, -8), mbh * 8)
+        } else {
+            uvX = min(max(uvX, -8), width >> 1)
+            uvY = min(max(uvY, -8), height >> 1)
+        }
+        let fx = (uvmx & 3) << 1
+        let fy = (uvmy & 3) << 1
+        let cd = co + mbY * 8 * cs + mbX * 8
+        dcs = cs
+        for plane in 1..3 {
+            fetchArea(0, plane, uvX, uvY, 9, 9, hEdge >> 1, vEdge >> 1)
+            scaleFetch(9, 0, true, uvY & 1)
+            chromaFilter(plane, fx, fy, cd, false)
+        }
+    }
+
+    // --- The loop filter (8.6; vc1_loopfilter.c, vc1dsp.c) ---
+
+    fn px(_ plane: Int, _ at: Int) -> Int {
+        if plane == 0 {
+            return curY[at]
+        }
+        if plane == 1 { curU[at] } else { curV[at] }
+    }
+
+    fn setPx(_ plane: Int, _ at: Int, _ v: Int) {
+        if plane == 0 {
+            curY[at] = v
+        } else if plane == 1 {
+            curU[at] = v
+        } else {
+            curV[at] = v
+        }
+    }
+
+    // vc1_filter_line: one line across an edge at `at` (pixels at
+    // at - 4·st … at + 3·st); returns whether the other three lines are
+    // filtered.
+    fn filterLine(_ plane: Int, _ at: Int, _ st: Int, _ pq: Int) -> Bool {
+        let pm4 = px(plane, at - 4 * st)
+        let pm3 = px(plane, at - 3 * st)
+        let pm2 = px(plane, at - 2 * st)
+        let pm1 = px(plane, at - st)
+        let p0 = px(plane, at)
+        let p1 = px(plane, at + st)
+        let p2 = px(plane, at + 2 * st)
+        let p3 = px(plane, at + 3 * st)
+        var a0 = (2 * (pm2 - p1) - 5 * (pm1 - p0) + 4) >> 3
+        let a0neg = a0 < 0
+        a0 = abs(a0)
+        if a0 < pq {
+            let a1 = abs((2 * (pm4 - pm1) - 5 * (pm3 - pm2) + 4) >> 3)
+            let a2 = abs((2 * (p0 - p3) - 5 * (p1 - p2) + 4) >> 3)
+            if a1 < a0 || a2 < a0 {
+                var clip = pm1 - p0
+                let clipNeg = clip < 0
+                clip = abs(clip) >> 1
+                if clip != 0 {
+                    let a3 = min(a1, a2)
+                    var dd = 5 * (a3 - a0)
+                    var dNeg = dd < 0
+                    dd = abs(dd) >> 3
+                    dNeg = dNeg != a0neg
+                    if dNeg == clipNeg {
+                        dd = min(dd, clip)
+                        if dNeg {
+                            dd = -dd
+                        }
+                        setPx(plane, at - st, vcClip8(pm1 - dd))
+                        setPx(plane, at, vcClip8(p0 + dd))
+                    }
+                    return true
+                }
+            }
+        }
+        false
+    }
+
+    // vc1_loop_filter: len samples along the edge starting at `at`, step
+    // between them; st across the edge.
+    fn loopFilter(_ plane: Int, _ at0: Int, _ step: Int, _ st: Int, _ len: Int, _ pq: Int) {
+        var at = at0
+        var i = 0
+        while i < len {
+            if filterLine(plane, at + 2 * step, st, pq) {
+                filterLine(plane, at, st, pq)
+                filterLine(plane, at + step, st, pq)
+                filterLine(plane, at + 3 * step, st, pq)
+            }
+            at += step * 4
+            i += 4
+        }
+    }
+
+    // A horizontal edge (vertical filtering) of len samples at `at`.
+    fn vFilter(_ plane: Int, _ at: Int, _ len: Int, _ pq: Int) {
+        let st = if plane == 0 { ys } else { cs }
+        loopFilter(plane, at, 1, st, len, pq)
+    }
+
+    // A vertical edge (horizontal filtering) of len samples at `at`.
+    fn hFilter(_ plane: Int, _ at: Int, _ len: Int, _ pq: Int) {
+        let st = if plane == 0 { ys } else { cs }
+        loopFilter(plane, at, st, 1, len, pq)
+    }
+
+    fn sliceFirstRow(_ y: Int) -> Bool {
+        for r in pf.sliceRows {
+            if r == y {
+                return true
+            }
+        }
+        false
+    }
+
+    fn sliceLastRow(_ y: Int) -> Bool {
+        if y == mbh - 1 {
+            return true
+        }
+        sliceFirstRow(y + 1)
+    }
+
+    // ff_vc1_i_loop_filter over the picture (I, BI and B pictures).
+    fn iLoopFilter() {
+        let pq = pf.pq
+        for y in 0..mbh {
+            let top = sliceFirstRow(y)
+            for x in 0..mbw {
+                let ly = yo + (y * 16) * ys + x * 16
+                let cy = co + (y * 8) * cs + x * 8
+                if !top {
+                    vFilter(0, ly, 16, pq)
+                }
+                vFilter(0, ly + 8 * ys, 16, pq)
+                if !top {
+                    vFilter(1, cy, 8, pq)
+                    vFilter(2, cy, 8, pq)
+                }
+            }
+        }
+        for y in 0..mbh {
+            for x in 0..mbw {
+                let ly = yo + (y * 16) * ys + x * 16
+                let cy = co + (y * 8) * cs + x * 8
+                if x > 0 {
+                    hFilter(0, ly, 16, pq)
+                }
+                hFilter(0, ly + 8, 16, pq)
+                if x > 0 {
+                    hFilter(1, cy, 8, pq)
+                    hFilter(2, cy, 8, pq)
+                }
+            }
+        }
+    }
+
+    fn lfMvX(_ x: Int, _ y: Int, _ n: Int) -> Int {
+        let mb = y * mbw + x
+        if (pf.lfIntra[mb] >> n) & 1 != 0 {
+            return 0
+        }
+        let m = pf.mbMode[mb]
+        if m == vcMb4mv || m == vcMbIlace {
+            return pf.mvX[mb * 4 + n]
+        }
+        if m == vcMb1mv {
+            return pf.mvX[mb * 4]
+        }
+        0
+    }
+
+    fn lfMvY(_ x: Int, _ y: Int, _ n: Int) -> Int {
+        let mb = y * mbw + x
+        if (pf.lfIntra[mb] >> n) & 1 != 0 {
+            return 0
+        }
+        let m = pf.mbMode[mb]
+        if m == vcMb4mv || m == vcMbIlace {
+            return pf.mvY[mb * 4 + n]
+        }
+        if m == vcMb1mv {
+            return pf.mvY[mb * 4]
+        }
+        0
+    }
+
+    // ff_vc1_p_loop_filter over the picture: vc1_p_v_loop_filter of every
+    // macroblock, then vc1_p_h_loop_filter.
+    fn pLoopFilter() {
+        let pq = pf.pq
+        for y in 0..mbh {
+            let bottom = sliceLastRow(y)
+            for x in 0..mbw {
+                let mb = y * mbw + x
+                for n in 0..6 {
+                    let plane = if n < 4 { 0 } else { n - 3 }
+                    let st = if n < 4 { ys } else { cs }
+                    let dst = if n < 4 { yo + (y * 16 + (n & 2) * 4) * ys + x * 16 + (n & 1) * 8 } else { co + y * 8 * cs + x * 8 }
+                    let topCbp = pf.lfCbp[mb] >> (n * 4)
+                    if !bottom || n < 2 {
+                        let topIntra = (pf.lfIntra[mb] >> n) & 1
+                        var botIntra = 0
+                        var botCbp = 0
+                        var differ = false
+                        if n > 3 {
+                            let mb2 = mb + mbw
+                            botIntra = (pf.lfIntra[mb2] >> n) & 1
+                            botCbp = pf.lfCbp[mb2] >> (n * 4)
+                            differ = pf.lfUvX[mb] != pf.lfUvX[mb2] || pf.lfUvY[mb] != pf.lfUvY[mb2]
+                            if fieldMode && pf.lfMvF[mb * 5 + 4] != pf.lfMvF[mb2 * 5 + 4] {
+                                differ = true
+                            }
+                        } else if n < 2 {
+                            botIntra = (pf.lfIntra[mb] >> (n + 2)) & 1
+                            botCbp = pf.lfCbp[mb] >> ((n + 2) * 4)
+                            differ = lfMvX(x, y, n) != lfMvX(x, y, n + 2) || lfMvY(x, y, n) != lfMvY(x, y, n + 2)
+                            if fieldMode && pf.lfMvF[mb * 5 + n] != pf.lfMvF[mb * 5 + n + 2] {
+                                differ = true
+                            }
+                        } else {
+                            botIntra = (pf.lfIntra[mb + mbw] >> (n - 2)) & 1
+                            botCbp = pf.lfCbp[mb + mbw] >> ((n - 2) * 4)
+                            differ = lfMvX(x, y, n) != lfMvX(x, y + 1, n - 2) || lfMvY(x, y, n) != lfMvY(x, y + 1, n - 2)
+                            if fieldMode && pf.lfMvF[mb * 5 + n] != pf.lfMvF[(mb + mbw) * 5 + n - 2] {
+                                differ = true
+                            }
+                        }
+                        if topIntra != 0 || botIntra != 0 || differ {
+                            vFilter(plane, dst + 8 * st, 8, pq)
+                        } else {
+                            let idx = (topCbp | (botCbp >> 2)) & 3
+                            if (idx & 1) != 0 {
+                                vFilter(plane, dst + 8 * st + 4, 4, pq)
+                            }
+                            if (idx & 2) != 0 {
+                                vFilter(plane, dst + 8 * st, 4, pq)
+                            }
+                        }
+                    }
+                    let tt = (pf.lfTt[mb] >> (n * 4)) & 15
+                    if tt == vcTT4x4 || tt == vcTT8x4 {
+                        if (topCbp & 5) != 0 {
+                            vFilter(plane, dst + 4 * st + 4, 4, pq)
+                        }
+                        if (topCbp & 10) != 0 {
+                            vFilter(plane, dst + 4 * st, 4, pq)
+                        }
+                    }
+                }
+            }
+        }
+        for y in 0..mbh {
+            for x in 0..mbw {
+                let mb = y * mbw + x
+                let right = x == mbw - 1
+                for n in 0..6 {
+                    let plane = if n < 4 { 0 } else { n - 3 }
+                    let st = if n < 4 { ys } else { cs }
+                    let dst = if n < 4 { yo + (y * 16 + (n & 2) * 4) * ys + x * 16 + (n & 1) * 8 } else { co + y * 8 * cs + x * 8 }
+                    let leftCbp = pf.lfCbp[mb] >> (n * 4)
+                    if !right || (n & 5) == 0 {
+                        let leftIntra = (pf.lfIntra[mb] >> n) & 1
+                        var rightIntra = 0
+                        var rightCbp = 0
+                        var differ = false
+                        if n > 3 {
+                            rightIntra = (pf.lfIntra[mb + 1] >> n) & 1
+                            rightCbp = pf.lfCbp[mb + 1] >> (n * 4)
+                            differ = pf.lfUvX[mb] != pf.lfUvX[mb + 1] || pf.lfUvY[mb] != pf.lfUvY[mb + 1]
+                            if fieldMode && pf.lfMvF[mb * 5 + 4] != pf.lfMvF[(mb + 1) * 5 + 4] {
+                                differ = true
+                            }
+                        } else if (n & 1) != 0 {
+                            rightIntra = (pf.lfIntra[mb + 1] >> (n - 1)) & 1
+                            rightCbp = pf.lfCbp[mb + 1] >> ((n - 1) * 4)
+                            differ = lfMvX(x, y, n) != lfMvX(x + 1, y, n - 1) || lfMvY(x, y, n) != lfMvY(x + 1, y, n - 1)
+                            if fieldMode && pf.lfMvF[mb * 5 + n] != pf.lfMvF[(mb + 1) * 5 + n - 1] {
+                                differ = true
+                            }
+                        } else {
+                            rightIntra = (pf.lfIntra[mb] >> (n + 1)) & 1
+                            rightCbp = pf.lfCbp[mb] >> ((n + 1) * 4)
+                            differ = lfMvX(x, y, n) != lfMvX(x, y, n + 1) || lfMvY(x, y, n) != lfMvY(x, y, n + 1)
+                            if fieldMode && pf.lfMvF[mb * 5 + n] != pf.lfMvF[mb * 5 + n + 1] {
+                                differ = true
+                            }
+                        }
+                        if leftIntra != 0 || rightIntra != 0 || differ {
+                            hFilter(plane, dst + 8, 8, pq)
+                        } else {
+                            let idx = (leftCbp | (rightCbp >> 1)) & 5
+                            if (idx & 1) != 0 {
+                                hFilter(plane, dst + 4 * st + 8, 4, pq)
+                            }
+                            if (idx & 4) != 0 {
+                                hFilter(plane, dst + 8, 4, pq)
+                            }
+                        }
+                    }
+                    let tt = (pf.lfTt[mb] >> (n * 4)) & 15
+                    if tt == vcTT4x4 || tt == vcTT4x8 {
+                        if (leftCbp & 3) != 0 {
+                            hFilter(plane, dst + 4 * st + 4, 4, pq)
+                        }
+                        if (leftCbp & 12) != 0 {
+                            hFilter(plane, dst + 4, 4, pq)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // --- Interlaced pictures (SMPTE 421M 9 field pictures, 10 frame-
+    // interlaced pictures) ---
+
+    // An inter (or concealed) macroblock of an interlaced P picture.
+    fn pMbIl() {
+        let mb = mbY * mbw + mbX
+        let mode = pf.mbMode[mb]
+        ftx = pf.fieldTx[mb]
+        if mode == vcMbIlace {
+            runOps(mb)
+        } else if mode == vcMb1mv {
+            copyMb()
+        }
+        for i in 0..6 {
+            let info = pf.blk[mb * 6 + i]
+            if info == 1 {
+                intraToRing(mb, i)
+            } else if info != 0 {
+                residual(mb, i, info)
+            }
+        }
+        if pf.overlap && pf.pq >= 9 {
+            pOverlap()
+        }
+        putSigned = true
+        putBlocks()
+        ftx = 0
+    }
+
+    // A macroblock of an interlaced B picture: intra blocks are put at
+    // once (vc1_decode_b_mb_intfr / _intfi).
+    fn bMbIl() {
+        let mb = mbY * mbw + mbX
+        let mode = pf.mbMode[mb]
+        ftx = pf.fieldTx[mb]
+        if mode == vcMbIlace {
+            runOps(mb)
+        } else if mode == vcMb1mv {
+            copyMb()
+        }
+        for i in 0..6 {
+            let info = pf.blk[mb * 6 + i]
+            if info == 1 {
+                let o = pf.blkOff[mb * 6 + i]
+                for k in 0..64 {
+                    blk[k] = pf.coef[o + k]
+                }
+                invTrans8x8()
+                putBlk(i, signed: true)
+            } else if info != 0 {
+                residual(mb, i, info)
+            }
+        }
+        ftx = 0
+    }
+
+    // The macroblock's motion compensation steps (VcParsed.ops).
+    fn runOps(_ mb: Int) {
+        var o = pf.opStart[mb]
+        for _ in 0..pf.opCnt[mb] {
+            let t = pf.ops[o]
+            if t == vcOp1mv {
+                opMc1mv(pf.ops[o + 1], pf.ops[o + 6], pf.ops[o + 7], pf.ops[o + 4])
+            } else if t == vcOpLuma {
+                opLuma(pf.ops[o + 5], pf.ops[o + 1], pf.ops[o + 2] == 1, pf.ops[o + 3], pf.ops[o + 4], pf.ops[o + 6], pf.ops[o + 7])
+            } else if t == vcOpChroma {
+                opChroma(pf.ops[o + 1], pf.ops[o + 6], pf.ops[o + 7], pf.ops[o + 4])
+            } else if t == vcOpChroma4 {
+                opChroma4(o)
+            } else if t == vcOpInterp {
+                opInterp(pf.ops[o + 6], pf.ops[o + 7], pf.ops[o + 4])
+            }
+            o += vcOpSize
+        }
+    }
+
+    fn refAvailable(_ ref: Int) -> Bool {
+        if ref == 0 {
+            return hasLast
+        }
+        if ref == 1 {
+            return hasNext
+        }
+        true
+    }
+
+    // Copies a w×h reference area into fetch (stride w): columns from x,
+    // rows the frame rows y0, y0 + dy, … of plane `plane` of reference
+    // `ref` (0 last, 1 next, 2 the current frame), positions clamped to
+    // the ew × eh frame — field by field when the reference frame is
+    // interlaced (ffmpeg's emulated_edge_mc calls with doubled line
+    // sizes) — then intensity compensated by row parity when the reference
+    // has it (vc1_lut_scale_*).
+    fn fetchIl(_ ref: Int, _ plane: Int, _ x: Int, _ y0: Int, _ dy: Int, _ w: Int, _ h: Int, _ ew: Int, _ eh: Int) {
+        let ilace = if ref == 0 { lastIl } else if ref == 1 { nextIl } else { true }
+        let st = if plane == 0 { pys } else { pcs }
+        let src = if ref == 0 {
+            if plane == 0 { lastY } else if plane == 1 { lastU } else { lastV }
+        } else if ref == 1 {
+            if plane == 0 { nextY } else if plane == 1 { nextU } else { nextV }
+        } else {
+            if plane == 0 { curY } else if plane == 1 { curU } else { curV }
+        }
+        let fh = eh >> 1
+        var o = 0
+        let inside = x >= 0 && x + w <= ew
+        for r in 0..h {
+            var yy = y0 + r * dy
+            if ilace {
+                var f = yy >> 1
+                f = min(max(f, 0), fh - 1)
+                yy = 2 * f + (yy & 1)
+            } else {
+                yy = min(max(yy, 0), eh - 1)
+            }
+            let base = yy * st
+            if inside {
+                let b = base + x
+                for c in 0..w {
+                    fetch[o + c] = src[b + c]
+                }
+            } else {
+                for c in 0..w {
+                    fetch[o + c] = src[base + min(max(x + c, 0), ew - 1)]
+                }
+            }
+            o += w
+        }
+        let use = if ref == 0 { pf.useIc0 } else if ref == 1 { pf.useIc1 } else { pf.useIcCur }
+        if use {
+            let lut = if ref == 0 { pf.lut0 } else if ref == 1 { pf.lut1 } else { pf.lutCur }
+            let tb = if plane == 0 { 0 } else { 512 }
+            o = 0
+            for r in 0..h {
+                let t = tb + ((y0 + r * dy) & 1) * 256
+                for c in 0..w {
+                    fetch[o + c] = lut[t + fetch[o + c]]
+                }
+                o += w
+            }
+        }
+    }
+
+    // A 9×9 chroma area read straight from the reference frame as ffmpeg
+    // does when only the luma decided there's no edge emulation (1MV): a
+    // column past the plane's width is padding (zero) or the next row of
+    // ffmpeg's frame, rows past the plane are zero.
+    fn fetchChromaRaw(_ ref: Int, _ plane: Int, _ x: Int, _ y0: Int, _ dy: Int) {
+        let rows = frameMbh * 8
+        var o = 0
+        for r in 0..9 {
+            for c in 0..9 {
+                var xx = x + c
+                var yy = y0 + r * dy
+                var zero = false
+                if xx >= pcs {
+                    if xx < ffCs {
+                        zero = true
+                    } else {
+                        xx -= ffCs
+                        yy += 1
+                    }
+                }
+                if yy >= rows || yy < 0 || xx < 0 {
+                    zero = true
+                }
+                var v = 0
+                if !zero {
+                    let at = yy * pcs + xx
+                    if ref == 0 {
+                        v = if plane == 1 { lastU[at] } else { lastV[at] }
+                    } else if ref == 1 {
+                        v = if plane == 1 { nextU[at] } else { nextV[at] }
+                    } else {
+                        v = if plane == 1 { curU[at] } else { curV[at] }
+                    }
+                }
+                fetch[o + c] = v
+            }
+            o += 9
+        }
+    }
+
+    // The first frame row and row step of a reference area that starts at
+    // row y of the current picture (field pictures: field row y of the
+    // field with parity rf).
+    fn refRow(_ y: Int, _ rf: Int) -> Int {
+        if fieldMode {
+            return 2 * y + rf
+        }
+        y
+    }
+
+    fn refStep() -> Int {
+        if fieldMode { 2 } else { 1 }
+    }
+
+    // ff_vc1_mc_1mv for interlaced pictures.
+    fn opMc1mv(_ ref: Int, _ mx0: Int, _ my0: Int, _ rf: Int) {
+        if !refAvailable(ref) {
+            return
+        }
+        let mx = mx0
+        var my = my0
+        var uvmx = (mx + (if (mx & 3) == 3 { 1 } else { 0 })) >> 1
+        var uvmy = (my + (if (my & 3) == 3 { 1 } else { 0 })) >> 1
+        if fieldMode && curField != rf {
+            my = my - 2 + 4 * curField
+            uvmy = uvmy - 2 + 4 * curField
+        }
+        if pf.fastuvmc && pf.fcm != 1 {
+            uvmx = uvmx + (if uvmx < 0 { uvmx & 1 } else { -(uvmx & 1) })
+            uvmy = uvmy + (if uvmy < 0 { uvmy & 1 } else { -(uvmy & 1) })
+        }
+        mc16Il(ref, mx, my, uvmx, uvmy, rf, false)
+    }
+
+    // ff_vc1_interp_mc for interlaced pictures (the averaged backward
+    // prediction).
+    fn opInterp(_ mx0: Int, _ my0: Int, _ rf: Int) {
+        if !hasNext {
+            return
+        }
+        let mx = mx0
+        var my = my0
+        var uvmx = (mx + (if (mx & 3) == 3 { 1 } else { 0 })) >> 1
+        var uvmy = (my + (if (my & 3) == 3 { 1 } else { 0 })) >> 1
+        if fieldMode && curField != rf {
+            my = my - 2 + 4 * curField
+            uvmy = uvmy - 2 + 4 * curField
+        }
+        if pf.fastuvmc {
+            uvmx = uvmx + (if uvmx < 0 { -(uvmx & 1) } else { uvmx & 1 })
+            uvmy = uvmy + (if uvmy < 0 { -(uvmy & 1) } else { uvmy & 1 })
+        }
+        mc16Il(1, mx, my, uvmx, uvmy, rf, true)
+    }
+
+    // The 16×16 luma and 8×8 chroma prediction of the current macroblock
+    // (put, or averaged in for interp).
+    fn mc16Il(_ ref: Int, _ mx: Int, _ my: Int, _ uvmx: Int, _ uvmy: Int, _ rf: Int, _ interp: Bool) {
+        var srcX = mbX * 16 + (mx >> 2)
+        var srcY = mbY * 16 + (my >> 2)
+        var uvX = mbX * 8 + (uvmx >> 2)
+        var uvY = mbY * 8 + (uvmy >> 2)
+        srcX = min(max(srcX, -17), width)
+        uvX = min(max(uvX, -8), width >> 1)
+        if pf.fcm == 1 {
+            srcY = min(max(srcY, -18 + (srcY & 1)), height + (srcY & 1))
+            uvY = min(max(uvY, -8 + (uvY & 1)), (height >> 1) + (uvY & 1))
+        } else {
+            srcY = min(max(srcY, -18), height + 1)
+            uvY = min(max(uvY, -8), height >> 1)
+        }
+        let vEdgeF = if fieldMode { vEdge >> 1 } else { vEdge }
+        let useIc = if ref == 0 { pf.useIc0 } else if ref == 1 { pf.useIc1 } else { pf.useIcCur }
+        var emulate = useIc || hEdge < 22 || vEdgeF < 22
+        let lx = if interp { srcX - 1 } else { srcX - mspel }
+        let limX = if interp { hEdge - (mx & 3) - 16 - 3 } else { hEdge - (mx & 3) - 16 - mspel * 3 }
+        if lx < 0 || lx > limX {
+            emulate = true
+        }
+        if srcY - 1 < 0 || srcY - 1 > vEdgeF - (my & 3) - 16 - 3 {
+            emulate = true
+        }
+        let k = 17 + mspel * 2
+        let step = refStep()
+        fetchIl(ref, 0, srcX - mspel, refRow(srcY - mspel, rf), step, k, k, hEdge, vEdge)
+        let d = yo + mbY * 16 * ys + mbX * 16
+        dys = ys
+        dcs = cs
+        lumaFilter(k, 16, mx, my, d, interp)
+        let fx = (uvmx & 3) << 1
+        let fy = (uvmy & 3) << 1
+        let cd = co + mbY * 8 * cs + mbX * 8
+        for plane in 1..3 {
+            if emulate || interp {
+                fetchIl(ref, plane, uvX, refRow(uvY, rf), step, 9, 9, hEdge >> 1, vEdge >> 1)
+            } else {
+                fetchChromaRaw(ref, plane, uvX, refRow(uvY, rf), step)
+            }
+            chromaFilterN(plane, fx, fy, cd, 8, 9, interp)
+        }
+    }
+
+    // ff_vc1_mc_4mv_luma for interlaced pictures: luma block n with vector
+    // (mx, my) (field vectors in frame-interlaced macroblocks: fieldmv).
+    fn opLuma(_ n: Int, _ ref: Int, _ avg: Bool, _ fieldmv: Int, _ rf: Int, _ mx: Int, _ my0: Int) {
+        if !refAvailable(ref) {
+            return
+        }
+        var my = my0
+        if fieldMode && curField != rf {
+            my = my - 2 + 4 * curField
+        }
+        var off = 0
+        if pf.fcm == 1 && fieldmv == 1 {
+            off = (if n > 1 { pys } else { 0 }) + (n & 1) * 8
+        } else {
+            off = ys * 4 * (n & 2) + (n & 1) * 8
+        }
+        var srcX = mbX * 16 + (n & 1) * 8 + (mx >> 2)
+        var srcY = 0
+        if fieldmv == 0 {
+            srcY = mbY * 16 + (n & 2) * 4 + (my >> 2)
+        } else {
+            srcY = mbY * 16 + (if n > 1 { 1 } else { 0 }) + (my >> 2)
+        }
+        srcX = min(max(srcX, -17), width)
+        if pf.fcm == 1 {
+            srcY = min(max(srcY, -18 + (srcY & 1)), height + (srcY & 1))
+        } else {
+            srcY = min(max(srcY, -18), height + 1)
+        }
+        let k = 9 + mspel * 2
+        if fieldMode {
+            fetchIl(ref, 0, srcX - mspel, refRow(srcY - mspel, rf), 2, k, k, hEdge, vEdge)
+        } else {
+            fetchIl(ref, 0, srcX - mspel, srcY - (mspel << fieldmv), 1 << fieldmv, k, k, hEdge, vEdge)
+        }
+        let d = yo + mbY * 16 * ys + mbX * 16 + off
+        dys = ys << fieldmv
+        if mspel == 1 {
+            mspelMc(k, 8, mx & 3, my & 3, d, avg)
+        } else {
+            dys = ys
+            lumaFilter(k, 8, mx, my, d, false)
+        }
+    }
+
+    // ff_vc1_mc_4mv_chroma for field pictures (the chroma vector derived by
+    // the parser).
+    fn opChroma(_ ref: Int, _ tx: Int, _ ty: Int, _ chromaRef: Int) {
+        if !refAvailable(ref) {
+            return
+        }
+        var uvmx = (tx + (if (tx & 3) == 3 { 1 } else { 0 })) >> 1
+        var uvmy = (ty + (if (ty & 3) == 3 { 1 } else { 0 })) >> 1
+        if pf.fastuvmc {
+            uvmx = uvmx + (if uvmx < 0 { uvmx & 1 } else { -(uvmx & 1) })
+            uvmy = uvmy + (if uvmy < 0 { uvmy & 1 } else { -(uvmy & 1) })
+        }
+        if fieldMode && curField != chromaRef {
+            uvmy += 2 - 4 * chromaRef
+        }
+        var uvX = mbX * 8 + (uvmx >> 2)
+        var uvY = mbY * 8 + (uvmy >> 2)
+        uvX = min(max(uvX, -8), width >> 1)
+        uvY = min(max(uvY, -8), height >> 1)
+        let fx = (uvmx & 3) << 1
+        let fy = (uvmy & 3) << 1
+        let cd = co + mbY * 8 * cs + mbX * 8
+        let rf = if fieldMode { chromaRef } else { 0 }
+        dcs = cs
+        for plane in 1..3 {
+            fetchIl(ref, plane, uvX, refRow(uvY, rf), refStep(), 9, 9, hEdge >> 1, vEdge >> 1)
+            chromaFilterN(plane, fx, fy, cd, 8, 9, false)
+        }
+    }
+
+    // ff_vc1_mc_4mv_chroma4: the four 4×4 chroma blocks of a frame-
+    // interlaced 4MV or 2MV-field macroblock, from the op at o.
+    fn opChroma4(_ o: Int) {
+        let dir = pf.ops[o + 1]
+        let avg = pf.ops[o + 2] == 1
+        let fieldmv = pf.ops[o + 3]
+        let dir2 = pf.ops[o + 14]
+        let rndField = [0, 0, 1, 2, 4, 4, 5, 6, 2, 2, 3, 8, 6, 6, 7, 12]
+        let vDist = if fieldmv == 1 { 1 } else { 4 }
+        for i in 0..4 {
+            let ref = if i < 2 { dir } else { dir2 }
+            if !refAvailable(ref) {
+                return
+            }
+        }
+        for i in 0..4 {
+            let ref = if i < 2 { dir } else { dir2 }
+            let tx = pf.ops[o + 6 + 2 * i]
+            let ty = pf.ops[o + 7 + 2 * i]
+            let uvmx = (tx + (if (tx & 3) == 3 { 1 } else { 0 })) >> 1
+            var uvmy = 0
+            if fieldmv == 1 {
+                uvmy = (ty >> 4) * 8 + rndField[ty & 15]
+            } else {
+                uvmy = (ty + (if (ty & 3) == 3 { 1 } else { 0 })) >> 1
+            }
+            let off = (i & 1) * 4 + (if (i & 2) != 0 { vDist * cs } else { 0 })
+            var uvX = mbX * 8 + (i & 1) * 4 + (uvmx >> 2)
+            var uvY = mbY * 8 + (if (i & 2) != 0 { vDist } else { 0 }) + (uvmy >> 2)
+            uvX = min(max(uvX, -8), width >> 1)
+            if pf.fcm == 1 {
+                uvY = min(max(uvY, -8 + (uvY & 1)), (height >> 1) + (uvY & 1))
+            } else {
+                uvY = min(max(uvY, -8), height >> 1)
+            }
+            let fx = (uvmx & 3) << 1
+            let fy = (uvmy & 3) << 1
+            let cd = co + mbY * 8 * cs + mbX * 8 + off
+            dcs = cs << fieldmv
+            for plane in 1..3 {
+                fetchIl(ref, plane, uvX, uvY, 1 << fieldmv, 5, 5, hEdge >> 1, vEdge >> 1)
+                chromaFilterN(plane, fx, fy, cd, 4, 5, avg)
+            }
+        }
+    }
+
+    // The n×n chroma prediction (h264 chroma mc when rnd is 0, VC-1's
+    // no-rounding version otherwise) from fetch (stride fs) into plane at
+    // d (rows dcs apart), put or averaged.
+    fn chromaFilterN(_ plane: Int, _ fx: Int, _ fy: Int, _ d: Int, _ n: Int, _ fs: Int, _ avg: Bool) {
+        let a = (8 - fx) * (8 - fy)
+        let b = fx * (8 - fy)
+        let c = (8 - fx) * fy
+        let e = fx * fy
+        let bias = if rnd == 0 { 32 } else { 28 }
+        var s = 0
+        var at = d
+        for _ in 0..n {
+            if plane == 1 {
+                for i in 0..n {
+                    let p = s + i
+                    let v = (a * fetch[p] + b * fetch[p + 1] + c * fetch[p + fs] + e * fetch[p + fs + 1] + bias) >> 6
+                    curU[at + i] = if avg { (curU[at + i] + v + 1) >> 1 } else { v }
+                }
+            } else {
+                for i in 0..n {
+                    let p = s + i
+                    let v = (a * fetch[p] + b * fetch[p + 1] + c * fetch[p + fs] + e * fetch[p + fs + 1] + bias) >> 6
+                    curV[at + i] = if avg { (curV[at + i] + v + 1) >> 1 } else { v }
+                }
+            }
+            s += fs
+            at += dcs
+        }
+    }
+
+    // --- Interlaced loop filters (vc1_loopfilter.c), over the whole
+    // picture: every horizontal edge first, then every vertical one, which
+    // is what ffmpeg's macroblock-delayed order amounts to. ---
+
+    // vc1_v_loop_filterN / vc1_h_loop_filterN with an explicit stride.
+    fn vFilterS(_ plane: Int, _ at: Int, _ len: Int, _ st: Int, _ pq: Int) {
+        loopFilter(plane, at, 1, st, len, pq)
+    }
+
+    fn hFilterS(_ plane: Int, _ at: Int, _ len: Int, _ st: Int, _ pq: Int) {
+        loopFilter(plane, at, st, 1, len, pq)
+    }
+
+    // ff_vc1_i_loop_filter for frame-interlaced I (and BI) pictures.
+    fn iLoopFilterIntfr() {
+        let pq = pf.pq
+        let ls = pys
+        let uls = pcs
+        for y in 0..mbh {
+            let top = sliceFirstRow(y)
+            for x in 0..mbw {
+                let ft = pf.fieldTx[y * mbw + x]
+                let dest = (y * 16) * ls + x * 16
+                let cdst = (y * 8) * uls + x * 8
+                for i in 0..6 {
+                    if (i & 5) == 1 {
+                        continue
+                    }
+                    if top && (i & 2) == 0 {
+                        continue
+                    }
+                    if i > 3 {
+                        vFilterS(i - 3, cdst, 8, 2 * uls, pq)
+                        vFilterS(i - 3, cdst + uls, 8, 2 * uls, pq)
+                    } else if i < 2 || ft == 0 {
+                        let dst = dest + (i & 2) * 4 * ls + (i & 1) * 8
+                        vFilterS(0, dst, 16, 2 * ls, pq)
+                        vFilterS(0, dst + ls, 16, 2 * ls, pq)
+                    }
+                }
+            }
+        }
+        for y in 0..mbh {
+            for x in 0..mbw {
+                let dest = (y * 16) * ls + x * 16
+                let cdst = (y * 8) * uls + x * 8
+                for i in 0..6 {
+                    if (i & 2) != 0 {
+                        continue
+                    }
+                    if x == 0 && (i & 5) != 1 {
+                        continue
+                    }
+                    if i > 3 {
+                        hFilterS(i - 3, cdst, 4, 2 * uls, pq)
+                        hFilterS(i - 3, cdst + uls, 4, 2 * uls, pq)
+                    } else {
+                        let dst = dest + (i & 1) * 8
+                        hFilterS(0, dst, 8, 2 * ls, pq)
+                        hFilterS(0, dst + ls, 8, 2 * ls, pq)
+                    }
+                }
+            }
+        }
+    }
+
+    // ff_vc1_p_intfr_loop_filter for frame-interlaced P and B pictures.
+    fn pIntfrLoopFilter() {
+        let pq = pf.pq
+        let ls = pys
+        let uls = pcs
+        for y in 0..mbh {
+            let top = sliceFirstRow(y)
+            let bottom = sliceLastRow(y)
+            for x in 0..mbw {
+                let mb = y * mbw + x
+                let ft = pf.fieldTx[mb]
+                let tts = pf.lfTt[mb]
+                let dest = (y * 16) * ls + x * 16
+                let cdst = (y * 8) * uls + x * 8
+                for i in 0..6 {
+                    let tt = (tts >> (i * 4)) & 15
+                    let t48 = tt == vcTT4x4 || tt == vcTT8x4
+                    if i < 4 {
+                        let dst = dest + (i & 2) * 4 * ls + (i & 1) * 8
+                        if ft == 1 {
+                            if i < 2 {
+                                if t48 {
+                                    vFilterS(0, dst + 8 * ls, 8, 2 * ls, pq)
+                                }
+                                if !bottom {
+                                    vFilterS(0, dst + 16 * ls, 8, 2 * ls, pq)
+                                }
+                            } else {
+                                if t48 {
+                                    vFilterS(0, dst + ls, 8, 2 * ls, pq)
+                                }
+                                if !bottom {
+                                    vFilterS(0, dst + 9 * ls, 8, 2 * ls, pq)
+                                }
+                            }
+                        } else {
+                            if i < 2 {
+                                if !top && t48 {
+                                    vFilterS(0, dst + 4 * ls, 8, 2 * ls, pq)
+                                    vFilterS(0, dst + 5 * ls, 8, 2 * ls, pq)
+                                }
+                                vFilterS(0, dst + 8 * ls, 8, 2 * ls, pq)
+                                vFilterS(0, dst + 9 * ls, 8, 2 * ls, pq)
+                            } else if !bottom {
+                                if t48 {
+                                    vFilterS(0, dst + 4 * ls, 8, 2 * ls, pq)
+                                    vFilterS(0, dst + 5 * ls, 8, 2 * ls, pq)
+                                }
+                                vFilterS(0, dst + 8 * ls, 8, 2 * ls, pq)
+                                vFilterS(0, dst + 9 * ls, 8, 2 * ls, pq)
+                            }
+                        }
+                    } else if !bottom {
+                        if !top && t48 {
+                            vFilterS(i - 3, cdst + 4 * uls, 8, 2 * uls, pq)
+                            vFilterS(i - 3, cdst + 5 * uls, 8, 2 * uls, pq)
+                        }
+                        vFilterS(i - 3, cdst + 8 * uls, 8, 2 * uls, pq)
+                        vFilterS(i - 3, cdst + 9 * uls, 8, 2 * uls, pq)
+                    }
+                }
+            }
+        }
+        for y in 0..mbh {
+            for x in 0..mbw {
+                let mb = y * mbw + x
+                let right = x == mbw - 1
+                let ft = pf.fieldTx[mb]
+                let tts = pf.lfTt[mb]
+                let dest = (y * 16) * ls + x * 16
+                let cdst = (y * 8) * uls + x * 8
+                for i in 0..6 {
+                    let tt = (tts >> (i * 4)) & 15
+                    let t48 = tt == vcTT4x4 || tt == vcTT4x8
+                    if i < 4 {
+                        let dst = dest + (i & 2) * 4 * ls + (i & 1) * 8
+                        if ft == 1 {
+                            if i < 2 {
+                                if t48 {
+                                    hFilterS(0, dst + 4, 8, 2 * ls, pq)
+                                }
+                                if !right || i == 0 {
+                                    hFilterS(0, dst + 8, 8, 2 * ls, pq)
+                                }
+                            } else {
+                                if t48 {
+                                    hFilterS(0, dst - 7 * ls + 4, 8, 2 * ls, pq)
+                                }
+                                if !right || i == 2 {
+                                    hFilterS(0, dst - 7 * ls + 8, 8, 2 * ls, pq)
+                                }
+                            }
+                        } else {
+                            if t48 {
+                                hFilterS(0, dst + 4, 4, 2 * ls, pq)
+                                hFilterS(0, dst + ls + 4, 4, 2 * ls, pq)
+                            }
+                            if !right || (i & 5) == 0 {
+                                hFilterS(0, dst + 8, 4, 2 * ls, pq)
+                                hFilterS(0, dst + ls + 8, 4, 2 * ls, pq)
+                            }
+                        }
+                    } else {
+                        if t48 {
+                            hFilterS(i - 3, cdst + 4, 4, 2 * uls, pq)
+                            hFilterS(i - 3, cdst + uls + 4, 4, 2 * uls, pq)
+                        }
+                        if !right {
+                            hFilterS(i - 3, cdst + 8, 4, 2 * uls, pq)
+                            hFilterS(i - 3, cdst + uls + 8, 4, 2 * uls, pq)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ff_vc1_b_intfi_loop_filter for B field pictures.
+    fn bIntfiLoopFilter() {
+        let pq = pf.pq
+        for y in 0..mbh {
+            let bottom = sliceLastRow(y)
+            for x in 0..mbw {
+                let mb = y * mbw + x
+                for i in 0..6 {
+                    let plane = if i < 4 { 0 } else { i - 3 }
+                    let st = if i < 4 { ys } else { cs }
+                    let dst = if i < 4 { yo + (y * 16 + (i & 2) * 4) * ys + x * 16 + (i & 1) * 8 } else { co + y * 8 * cs + x * 8 }
+                    let bcbp = pf.lfCbp[mb] >> (i * 4)
+                    if !bottom || i < 2 {
+                        vFilterS(plane, dst + 8 * st, 8, st, pq)
+                    }
+                    let tt = (pf.lfTt[mb] >> (i * 4)) & 15
+                    if tt == vcTT4x4 || tt == vcTT8x4 {
+                        let idx = (bcbp | (bcbp >> 2)) & 3
+                        if (idx & 1) != 0 {
+                            vFilterS(plane, dst + 4 * st + 4, 4, st, pq)
+                        }
+                        if (idx & 2) != 0 {
+                            vFilterS(plane, dst + 4 * st, 4, st, pq)
+                        }
+                    }
+                }
+            }
+        }
+        for y in 0..mbh {
+            for x in 0..mbw {
+                let mb = y * mbw + x
+                let right = x == mbw - 1
+                for i in 0..6 {
+                    let plane = if i < 4 { 0 } else { i - 3 }
+                    let st = if i < 4 { ys } else { cs }
+                    let dst = if i < 4 { yo + (y * 16 + (i & 2) * 4) * ys + x * 16 + (i & 1) * 8 } else { co + y * 8 * cs + x * 8 }
+                    let bcbp = pf.lfCbp[mb] >> (i * 4)
+                    if !right || (i & 5) == 0 {
+                        hFilterS(plane, dst + 8, 8, st, pq)
+                    }
+                    let tt = (pf.lfTt[mb] >> (i * 4)) & 15
+                    if tt == vcTT4x4 || tt == vcTT4x8 {
+                        let idx = (bcbp | (bcbp >> 1)) & 5
+                        if (idx & 1) != 0 {
+                            hFilterS(plane, dst + 4 * st + 4, 4, st, pq)
+                        }
+                        if (idx & 4) != 0 {
+                            hFilterS(plane, dst + 4, 4, st, pq)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// block_map: luma blocks 1 and 2 swap places in ffmpeg's block storage.
+fn vcBlockMap(_ i: Int) -> Int {
+    if i == 1 {
+        return 2
+    }
+    if i == 2 {
+        return 1
+    }
+    i
+}
+
+// A 16-bit signed wrap (ffmpeg's int16_t stores).
+fn vcI16(_ v: Int) -> Int {
+    ((v + 32768) & 65535) - 32768
+}
+
+// vc1_mspel_ver_filter_16bits (and the 16-bit horizontal one) at p.
+fn vcMspelV(_ src: [Int], _ p: Int, _ st: Int, _ mode: Int) -> Int {
+    if mode == 1 {
+        return -4 * src[p - st] + 53 * src[p] + 18 * src[p + st] - 3 * src[p + 2 * st]
+    }
+    if mode == 2 {
+        return -1 * src[p - st] + 9 * src[p] + 9 * src[p + st] - src[p + 2 * st]
+    }
+    -3 * src[p - st] + 18 * src[p] + 53 * src[p + st] - 4 * src[p + 2 * st]
+}
+
+// vc1_mspel_filter.
+fn vcMspelFilter(_ src: [Int], _ p: Int, _ st: Int, _ mode: Int, _ r: Int) -> Int {
+    if mode == 1 {
+        return (-4 * src[p - st] + 53 * src[p] + 18 * src[p + st] - 3 * src[p + 2 * st] + 32 - r) >> 6
+    }
+    if mode == 2 {
+        return (-1 * src[p - st] + 9 * src[p] + 9 * src[p + st] - src[p + 2 * st] + 8 - r) >> 4
+    }
+    (-3 * src[p - st] + 18 * src[p] + 53 * src[p + st] - 4 * src[p + 2 * st] + 32 - r) >> 6
+}
+
+// --- ffmpeg's simple IDCT (simple_idct_template.c, 8-bit, C) for WMV3
+// streams without RES_FASTTX: rows with W·x + (1 << 10) >> 11 (DC-only rows
+// shortcut to x · 8), columns >> 20. ---
+
+let vcW1 = 22725
+let vcW2 = 21407
+let vcW3 = 19266
+let vcW4 = 16383
+let vcW5 = 12873
+let vcW6 = 8867
+let vcW7 = 4520
+
+fn vcSimpleRow(_ b: bind [Int], _ o: Int) {
+    if (b[o + 1] | b[o + 2] | b[o + 3] | b[o + 4] | b[o + 5] | b[o + 6] | b[o + 7]) == 0 {
+        let dc = vcI16(b[o] * 8)
+        for k in 0..8 {
+            b[o + k] = dc
+        }
+        return
+    }
+    var a0 = vcW4 * b[o] + (1 << 10)
+    var a1 = a0
+    var a2 = a0
+    var a3 = a0
+    a0 += vcW2 * b[o + 2]
+    a1 += vcW6 * b[o + 2]
+    a2 -= vcW6 * b[o + 2]
+    a3 -= vcW2 * b[o + 2]
+    var b0 = vcW1 * b[o + 1] + vcW3 * b[o + 3]
+    var b1 = vcW3 * b[o + 1] - vcW7 * b[o + 3]
+    var b2 = vcW5 * b[o + 1] - vcW1 * b[o + 3]
+    var b3 = vcW7 * b[o + 1] - vcW5 * b[o + 3]
+    if (b[o + 4] | b[o + 5] | b[o + 6] | b[o + 7]) != 0 {
+        a0 += vcW4 * b[o + 4] + vcW6 * b[o + 6]
+        a1 += -vcW4 * b[o + 4] - vcW2 * b[o + 6]
+        a2 += -vcW4 * b[o + 4] + vcW2 * b[o + 6]
+        a3 += vcW4 * b[o + 4] - vcW6 * b[o + 6]
+        b0 += vcW5 * b[o + 5] + vcW7 * b[o + 7]
+        b1 += -vcW1 * b[o + 5] - vcW5 * b[o + 7]
+        b2 += vcW7 * b[o + 5] + vcW3 * b[o + 7]
+        b3 += vcW3 * b[o + 5] - vcW1 * b[o + 7]
+    }
+    b[o] = vcI16((a0 + b0) >> 11)
+    b[o + 7] = vcI16((a0 - b0) >> 11)
+    b[o + 1] = vcI16((a1 + b1) >> 11)
+    b[o + 6] = vcI16((a1 - b1) >> 11)
+    b[o + 2] = vcI16((a2 + b2) >> 11)
+    b[o + 5] = vcI16((a2 - b2) >> 11)
+    b[o + 3] = vcI16((a3 + b3) >> 11)
+    b[o + 4] = vcI16((a3 - b3) >> 11)
+}
+
+fn vcSimpleCol(_ b: bind [Int], _ c: Int) {
+    var a0 = vcW4 * (b[c] + ((1 << 19) / vcW4))
+    var a1 = a0
+    var a2 = a0
+    var a3 = a0
+    a0 += vcW2 * b[c + 16]
+    a1 += vcW6 * b[c + 16]
+    a2 -= vcW6 * b[c + 16]
+    a3 -= vcW2 * b[c + 16]
+    var b0 = vcW1 * b[c + 8] + vcW3 * b[c + 24]
+    var b1 = vcW3 * b[c + 8] - vcW7 * b[c + 24]
+    var b2 = vcW5 * b[c + 8] - vcW1 * b[c + 24]
+    var b3 = vcW7 * b[c + 8] - vcW5 * b[c + 24]
+    if b[c + 32] != 0 {
+        a0 += vcW4 * b[c + 32]
+        a1 -= vcW4 * b[c + 32]
+        a2 -= vcW4 * b[c + 32]
+        a3 += vcW4 * b[c + 32]
+    }
+    if b[c + 40] != 0 {
+        b0 += vcW5 * b[c + 40]
+        b1 -= vcW1 * b[c + 40]
+        b2 += vcW7 * b[c + 40]
+        b3 += vcW3 * b[c + 40]
+    }
+    if b[c + 48] != 0 {
+        a0 += vcW6 * b[c + 48]
+        a1 -= vcW2 * b[c + 48]
+        a2 += vcW2 * b[c + 48]
+        a3 -= vcW6 * b[c + 48]
+    }
+    if b[c + 56] != 0 {
+        b0 += vcW7 * b[c + 56]
+        b1 -= vcW5 * b[c + 56]
+        b2 += vcW3 * b[c + 56]
+        b3 -= vcW1 * b[c + 56]
+    }
+    b[c] = vcI16((a0 + b0) >> 20)
+    b[c + 8] = vcI16((a1 + b1) >> 20)
+    b[c + 16] = vcI16((a2 + b2) >> 20)
+    b[c + 24] = vcI16((a3 + b3) >> 20)
+    b[c + 32] = vcI16((a3 - b3) >> 20)
+    b[c + 40] = vcI16((a2 - b2) >> 20)
+    b[c + 48] = vcI16((a1 - b1) >> 20)
+    b[c + 56] = vcI16((a0 - b0) >> 20)
+}
+
+// The 4-point transforms of ffmpeg's simple_idct.c (idct4row and
+// idct4col_add with √2-scaled constants), for ff_simple_idct84_add,
+// ff_simple_idct48_add and ff_simple_idct44_add; results are left in the
+// block (the caller adds them to the picture).
+fn vcIdct4Col(_ b: bind [Int], _ o: Int) {
+    let a0 = b[o]
+    let a1 = b[o + 8]
+    let a2 = b[o + 16]
+    let a3 = b[o + 24]
+    let c0 = (a0 + a2) * 2896 + (1 << 16)
+    let c2 = (a0 - a2) * 2896 + (1 << 16)
+    let c1 = a1 * 3784 + a3 * 1567
+    let c3 = a1 * 1567 - a3 * 3784
+    b[o] = (c0 + c1) >> 17
+    b[o + 8] = (c2 + c3) >> 17
+    b[o + 16] = (c2 - c3) >> 17
+    b[o + 24] = (c0 - c1) >> 17
+}
+
+fn vcIdct4Row(_ b: bind [Int], _ o: Int) {
+    let a0 = b[o]
+    let a1 = b[o + 1]
+    let a2 = b[o + 2]
+    let a3 = b[o + 3]
+    let c0 = (a0 + a2) * 23170 + (1 << 10)
+    let c2 = (a0 - a2) * 23170 + (1 << 10)
+    let c1 = a1 * 30274 + a3 * 12540
+    let c3 = a1 * 12540 - a3 * 30274
+    b[o] = vcI16((c0 + c1) >> 11)
+    b[o + 1] = vcI16((c2 + c3) >> 11)
+    b[o + 2] = vcI16((c2 - c3) >> 11)
+    b[o + 3] = vcI16((c0 - c1) >> 11)
+}
+
+fn vcSimple84(_ b: bind [Int], _ off: Int) {
+    for i in 0..4 {
+        vcSimpleRow(b, off + i * 8)
+    }
+    for i in 0..8 {
+        vcIdct4Col(b, off + i)
+    }
+}
+
+fn vcSimple48(_ b: bind [Int], _ off: Int) {
+    for i in 0..8 {
+        vcIdct4Row(b, off + i * 8)
+    }
+    for i in 0..4 {
+        vcSimpleCol(b, off + i)
+    }
+}
+
+fn vcSimple44(_ b: bind [Int], _ off: Int) {
+    for i in 0..4 {
+        vcIdct4Row(b, off + i * 8)
+    }
+    for i in 0..4 {
+        vcIdct4Col(b, off + i)
+    }
+}

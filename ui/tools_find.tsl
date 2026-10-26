@@ -1,0 +1,337 @@
+// Find in dialogue and the transcript: two panels over a subs.DialogueIndex
+// (every text subtitle track of the file, see subs/search.tsl).
+//
+// FindPanel: a search field, which subtitles to look in, and the results
+// with their times, the match highlighted and the lines around it. Enter
+// in the field searches (subs' search runs over every line, so it doesn't
+// run on each key press; the hint says when the results are older than
+// the text); Enter again, or Down / Up while the panel has the keyboard,
+// goes to the next / previous result and seeks there.
+//
+// TranscriptPanel: every line of one source with its time, the line
+// showing at `position` highlighted and kept in view while "Follow" is
+// on; a click on a line seeks to it.
+//
+// Both build only the rows that show (LazyVStack), so a film's 2,000
+// lines cost nothing while playing.
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+import "../subs"
+
+// ---- helpers (public for tests) ----
+
+// The result `delta` steps from `selected` among `count`, going round
+// at the ends; -1 when there are none. From nothing selected, +1 is the
+// first and -1 the last.
+public fn findStep(count: Int, selected: Int, delta: Int) -> Int {
+    if count <= 0 {
+        return -1
+    }
+    if selected < 0 || selected >= count {
+        return if delta >= 0 { 0 } else { count - 1 }
+    }
+    var i = (selected + delta) % count
+    if i < 0 {
+        i += count
+    }
+    i
+}
+
+// A result line cut into what's before the match, the match and what's
+// after, with the part before shortened to `keep` characters ("…" in
+// front) so the match shows in a narrow panel.
+public fn findPieces(_ text: String, from: Int, to: Int, keep: Int = 30) -> (String, String, String) {
+    let n = text.count
+    let a = max(0, min(from, n))
+    let b = max(a, min(to, n))
+    var before = text.substring(from: 0, to: a)
+    if before.count > keep {
+        before = "…" + before.substring(from: before.count - keep, to: before.count).trimStart()
+    }
+    (before, text.substring(from: a, to: b), text.substring(from: b, to: n))
+}
+
+// The key of a search: what was asked, where, and over which index.
+public fn findKey(_ query: String, source: Int, lines: Int) -> String {
+    "{source}|{lines}|{query.trim()}"
+}
+
+// "12 results", "1 result", "No results", "" before a search.
+public fn findCountText(_ count: Int, searched: Bool, limit: Int = 300) -> String {
+    if !searched {
+        return ""
+    }
+    if count == 0 {
+        return "No results"
+    }
+    if count >= limit {
+        return "First {limit} results"
+    }
+    if count == 1 { "1 result" } else { "{count} results" }
+}
+
+// The row (within the source's lines) of the line at a time, or -1.
+public fn transcriptRow(_ index: subs.DialogueIndex, source: Int, at: Float) -> Int {
+    if source < 0 || source >= index.sources.count {
+        return -1
+    }
+    let k = index.lineAt(source: source, at: at)
+    if k < 0 { -1 } else { k - index.from[source] }
+}
+
+let toolsFindLimit = 300
+
+// ---- Find in dialogue ----
+
+// `index`: the file's dialogue; `position`: the playback time (the
+// result nearest after it is picked first); `onSeek(t)`: go to t seconds;
+// `onOtherKey(e)`: keys the panel doesn't use while it has the keyboard
+// (pass the player's key handler so Space and the rest still work).
+public view FindPanel(index: subs.DialogueIndex, position: Float = 0.0, dark: Bool = true, onOtherKey: fn(KeyEvent) = { e in }, onSeek: fn(Float)) {
+    state query = ""
+    state source = -1
+    state hits: [subs.DialogueHit] = []
+    state searchedKey = ""
+    state selected = -1
+
+    fn currentKey() -> String {
+        findKey(query, source: source, lines: index.lines.count)
+    }
+
+    fn search() {
+        hits = index.search(query, source: source, limit: toolsFindLimit)
+        searchedKey = currentKey()
+        selected = -1
+        // Start from the first result at or after the playback time.
+        for (i, h) in hits.enumerated() {
+            if selected < 0 && h.start >= position - 0.5 {
+                selected = i
+            }
+        }
+        if selected < 0 && !hits.isEmpty {
+            selected = 0
+        }
+        if selected >= 0 {
+            scrollTo(selected, align: .center)
+        }
+    }
+
+    fn submit() {
+        if query.trim().isEmpty {
+            hits = []
+            searchedKey = ""
+            selected = -1
+            return
+        }
+        if currentKey() == searchedKey && !hits.isEmpty {
+            move(1)
+        } else {
+            search()
+            if selected >= 0 {
+                onSeek(hits[selected].start)
+            }
+        }
+    }
+
+    fn move(_ delta: Int) {
+        selected = findStep(count: hits.count, selected: selected, delta: delta)
+        if selected >= 0 {
+            scrollTo(selected, align: .nearest)
+            onSeek(hits[selected].start)
+        }
+    }
+
+    fn pick(_ i: Int) {
+        selected = i
+        onSeek(hits[i].start)
+    }
+
+    fn setSource(_ s: Int) {
+        source = s
+        if !query.trim().isEmpty {
+            search()
+        }
+    }
+
+    fn sourceName(_ s: Int) -> String {
+        if s >= 0 && s < index.sources.count { index.sources[s] } else { "" }
+    }
+
+    VStack(spacing: 6, alignment: .leading) {
+        HStack {
+            Text("Find in dialogue").font(size: 13, weight: .bold).color(toolsText(dark))
+            Spacer()
+            Text(findCountText(hits.count, searched: !searchedKey.isEmpty, limit: toolsFindLimit))
+                .font(size: 11)
+                .color(toolsDim(dark))
+        }
+        SearchField("Words or \"a phrase\"", text: query)
+            .onSubmit { submit() }
+            .accessibilityLabel("Find in dialogue")
+        if index.sources.count > 1 {
+            Scroll(.horizontal) {
+                HStack(spacing: 4) {
+                    ToolsChip(label: "All", on: source < 0, dark: dark) { setSource(-1) }
+                    for (i, name) in index.sources.enumerated() {
+                        ToolsChip(label: name, on: source == i, dark: dark) { setSource(i) }
+                    }
+                }
+            }
+            .frame(height: 28)
+        }
+        if !query.trim().isEmpty && currentKey() != searchedKey {
+            Text("Press Enter to search").font(size: 11).color(toolsDim(dark))
+        }
+        if index.lines.isEmpty {
+            Text("This file has no text subtitles to search.").font(size: 12).color(toolsDim(dark))
+        }
+        Scroll {
+            LazyVStack(count: hits.count, rowHeight: 62) { i in
+                ToolsFindRow(hit: hits[i], source: if index.sources.count > 1 { sourceName(hits[i].source) } else { "" }, on: i == selected, dark: dark) { pick(i) }
+            }
+        }
+        .frame(maxHeight: .infinity)
+    }
+    .padding(8)
+    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    .background(toolsPanel(dark))
+    .onKeyEvent { e in
+        // Without results every key is the player's.
+        let key = if hits.isEmpty || e.command { "" } else { e.key }
+        match key {
+            "down" -> move(1)
+            "up" -> move(-1)
+            "enter" -> {
+                if e.shift { move(-1) } else { move(1) }
+            }
+            "home" -> {
+                if !hits.isEmpty {
+                    selected = 0
+                    scrollTo(0)
+                }
+            }
+            _ -> onOtherKey(e)
+        }
+    }
+}
+
+// One result: time, the line before, the line with the match marked, the
+// line after.
+view ToolsFindRow(hit: subs.DialogueHit, source: String, on: Bool, dark: Bool, action: fn()) {
+    let (before, marked, after) = findPieces(hit.text, from: hit.matchFrom, to: hit.matchTo)
+    HStack(spacing: 8, alignment: .top) {
+        VStack(spacing: 2, alignment: .leading) {
+            Text(formatClock(hit.start)).font(size: 11, weight: .semibold).color(if on { toolsAccent } else { toolsDim(dark) })
+            if !source.isEmpty {
+                Text(source).font(size: 9).color(toolsDim(dark)).lineLimit(1)
+            }
+        }
+        .frame(width: 58, alignment: .topLeading)
+        VStack(spacing: 1, alignment: .leading) {
+            Text(if hit.before.isEmpty { " " } else { hit.before }).font(size: 11).color(toolsDim(dark)).lineLimit(1)
+            HStack(spacing: 0) {
+                // Text drops spaces at its ends, so they're gaps here.
+                Text(before.trimEnd()).lineLimit(1)
+                if before.hasSuffix(" ") {
+                    Spacer().frame(width: 4)
+                }
+                Text(marked).font(weight: .bold).color(.black).padding(horizontal: 1).background(toolsAccent, radius: 2).lineLimit(1)
+                if after.hasPrefix(" ") {
+                    Spacer().frame(width: 4)
+                }
+                Text(after.trimStart()).lineLimit(1)
+            }
+            .font(size: 13)
+            .color(toolsText(dark))
+            Text(if hit.after.isEmpty { " " } else { hit.after }).font(size: 11).color(toolsDim(dark)).lineLimit(1)
+        }
+        Spacer()
+    }
+    .padding(horizontal: 6, vertical: 4)
+    .background(if on { toolsSelected() } else { .clear }, radius: 4)
+    .hoverBackground(toolsRowHover(dark), radius: 4)
+    .onTap { action() }
+    .accessibilityLabel("{formatClock(hit.start)}: {hit.text}")
+}
+
+// A choice among a few, as a small button that shows when it's chosen.
+view ToolsChip(label: String, on: Bool, dark: Bool, action: fn()) {
+    Button(label) { action() }
+        .font(size: 11)
+        .color(if on { .white } else { toolsText(dark) })
+        .background(if on { toolsAccent } else { toolsRowHover(dark) })
+}
+
+// ---- Transcript ----
+
+// `source`: which subtitles (an index of index.sources; the app usually
+// passes the one showing); `position`: the playback time; `onSeek(t)`.
+public view TranscriptPanel(index: subs.DialogueIndex, source: bind Int, position: Float, dark: Bool = true, onSeek: fn(Float)) {
+    state follow = true
+
+    let s = if source >= 0 && source < index.sources.count { source } else { if index.sources.isEmpty { -1 } else { 0 } }
+    let first = if s >= 0 { index.from[s] } else { 0 }
+    let count = if s >= 0 { index.to[s] - index.from[s] } else { 0 }
+    let cur = transcriptRow(index, source: s, at: position)
+
+    VStack(spacing: 6, alignment: .leading) {
+        HStack {
+            Text("Transcript").font(size: 13, weight: .bold).color(toolsText(dark))
+            Spacer()
+            Toggle("Follow", isOn: follow).font(size: 11).color(toolsDim(dark))
+        }
+        if index.sources.count > 1 {
+            Scroll(.horizontal) {
+                HStack(spacing: 4) {
+                    for (i, name) in index.sources.enumerated() {
+                        ToolsChip(label: name, on: s == i, dark: dark) { source = i }
+                    }
+                }
+            }
+            .frame(height: 28)
+        }
+        if count == 0 {
+            Text("No text subtitles.").font(size: 12).color(toolsDim(dark))
+        }
+        Scroll {
+            LazyVStack(count: count, rowHeight: 44) { i in
+                ToolsTranscriptRow(line: index.lines[first + i], current: i == cur, showing: index.lines[first + i].start <= position && position < index.lines[first + i].end, dark: dark) {
+                    onSeek(index.lines[first + i].start)
+                }
+            }
+        }
+        .frame(maxHeight: .infinity)
+        // A marker whose identity changes with the current line: its
+        // onAppear runs once per new line and scrolls it into view.
+        if follow && cur >= 0 {
+            Spacer()
+                .frame(width: 0, height: 0)
+                .id("transcript-at-{s}-{cur}")
+                .onAppear { scrollTo(cur, align: .center) }
+        }
+    }
+    .padding(8)
+    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    .background(toolsPanel(dark))
+}
+
+view ToolsTranscriptRow(line: subs.DialogueLine, current: Bool, showing: Bool, dark: Bool, action: fn()) {
+    HStack(spacing: 8, alignment: .top) {
+        Text(formatClock(line.start))
+            .font(size: 11, weight: if current { .semibold } else { .regular })
+            .color(if current { toolsAccent } else { toolsDim(dark) })
+            .frame(width: 52, alignment: .topLeading)
+        Text(line.text)
+            .font(size: 13, weight: if showing { .semibold } else { .regular })
+            .color(if current || showing { toolsText(dark) } else { toolsDim(dark) })
+            .lineLimit(2)
+        Spacer()
+    }
+    .padding(horizontal: 6, vertical: 3)
+    .background(if showing { toolsSelected() } else { .clear }, radius: 4)
+    .hoverBackground(toolsRowHover(dark), radius: 4)
+    .onTap { action() }
+    .accessibilityLabel("{formatClock(line.start)}: {line.text}")
+}

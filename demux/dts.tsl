@@ -1,0 +1,148 @@
+// Raw DTS streams: .dts files (core frames, optionally each followed by
+// a DTS-HD extension substream; any of the 16-bit/14-bit, big/little-
+// endian forms) and .dtshd files, whose stream sits in the STRMDATA chunk
+// of a "DTSHDHDR" chunk container (each chunk: an 8-byte name and a
+// 64-bit big-endian size, then its bytes).
+//
+// Each packet is one core frame together with its extension substream
+// (or a substream alone in core-less DTS-HD streams). Frames are found by
+// their sync word and checked against the next frame's sync word
+// (dts.syncFramesIn). pts counts samples of the core rate (the track's
+// timescale). A .dtshd file's AUPR-HDR chunk gives the encoder's
+// initial padding and the trailing padding, in samples, as the tags
+// "delay" and "padding" (as for MP3s' LAME tags). The track's rate,
+// channels and bit depth are what the decoder will output (the DTS-HD
+// asset's when there is one).
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../core"
+import "../dts"
+
+public fn dtsOpen(_ file: Data) -> Result<core.Media> {
+    var m = core.Media(format: "dts")
+    var start = 0
+    var end = file.count
+    // DTS-HD file container: find STRMDATA.
+    if file.count >= 16 && file.slice(from: 0, to: 8).latin1 == "DTSHDHDR" {
+        m.format = "dtshd"
+        var p = 0
+        var found = false
+        while p + 16 <= file.count {
+            let name = file.slice(from: p, to: p + 8).latin1
+            let size = dtsChunkSize(file, p + 8)
+            if name == "AUPR-HDR" && size >= 21 && p + 16 + 21 <= file.count {
+                // Audio presentation header: rate, frames × samples per
+                // frame, original sample count, speaker mask, and the
+                // encoder's initial padding (to drop at the start).
+                let q = p + 16
+                let frames = file.uint32(at: q + 6, bigEndian: true)
+                let perFrame = file.uint16(at: q + 10, bigEndian: true)
+                let orig = (file.uint32(at: q + 12, bigEndian: true) << 8) | file[q + 16]
+                let padding = file.uint16(at: q + 19, bigEndian: true)
+                m.tags["delay"] = "{padding}"
+                m.tags["padding"] = "{max(frames * perFrame - orig - padding, 0)}"
+            }
+            if name == "STRMDATA" {
+                start = p + 16
+                end = min(file.count, p + 16 + size)
+                found = true
+                break
+            }
+            if size < 0 || p + 16 + size > file.count {
+                break
+            }
+            p += 16 + size
+        }
+        if !found {
+            return Result.failure(error: Error("this DTS-HD file has no STRMDATA chunk"))
+        }
+    }
+    dtsFrames(file, start, end, m)
+}
+
+// Adds a DTS track whose packets are the frames found in file[start…end]
+// to `m` (also used for DTS inside WAV and similar raw carriers).
+public fn dtsFrames(_ file: Data, _ start: Int, _ end: Int, _ media: core.Media) -> Result<core.Media> {
+    var m = media
+    let starts = dts.syncFramesIn(file, from: start, to: end)
+    if starts.isEmpty {
+        return Result.failure(error: Error("no DTS frames found"))
+    }
+    if starts[0] > start {
+        m.warnings.append("skipped {starts[0] - start} bytes before the first DTS frame")
+    }
+    let first = dts.frameInfo(file, at: starts[0], end: end)
+    var t = core.Track(index: 0, kind: .audio, codec: "dts")
+    // The clock: the core's rate (or, without a core, the substream's).
+    let clock = if first.rate > 0 { first.rate } else { 48000 }
+    t.timescale = clock
+    t.sampleRate = if first.hdRate > 0 { first.hdRate } else { first.rate }
+    t.channels = if first.hdChannels > 0 { first.hdChannels } else { first.channels }
+    if first.hdChannels == 0 && first.coreExtension == "XCh" {
+        // XCh adds the rear centre.
+        t.channels += 1
+    }
+    t.bitsPerSample = if first.hdBits > 0 { first.hdBits } else { 0 }
+    t.tag = dtsKindOf(first)
+    if first.bitrate > 0 && first.exssSize == 0 {
+        t.bitrate = first.bitrate
+    }
+    var pts = 0
+    var skipped = 0
+    var prevEnd = starts[0]
+    for (i, at) in starts.enumerated() {
+        let next = if i + 1 < starts.count { starts[i + 1] } else { end }
+        let info = dts.frameInfo(file, at: at, end: end)
+        // Samples on the track's clock: the core's, or the substream's
+        // scaled to it.
+        var dur = info.samples
+        if info.form == 4 && info.hdRate > 0 && info.hdSamples > 0 {
+            dur = info.hdSamples * clock / info.hdRate
+        }
+        if at > prevEnd {
+            skipped += 1
+        }
+        prevEnd = at + info.size + (if info.form == 2 || info.form == 3 { 64 } else { 0 })
+        m.packets.append(core.PacketRef(track: 0, pts: pts, dts: pts, duration: dur, key: true, offset: at, size: next - at))
+        pts += dur
+    }
+    if skipped > 0 {
+        m.warnings.append("{skipped} damaged stretches between DTS frames skipped")
+    }
+    t.duration = pts
+    m.tracks.append(t)
+    m.duration = Float(pts) / Float(clock)
+    Result.ok(value: m)
+}
+
+// A chunk's 64-bit big-endian size (−1 when it's too big to be real).
+fn dtsChunkSize(_ file: Data, _ p: Int) -> Int {
+    let hi = file.uint32(at: p, bigEndian: true)
+    let lo = file.uint32(at: p + 4, bigEndian: true)
+    if hi >= 0x40000000 {
+        return -1
+    }
+    (hi << 32) | lo
+}
+
+// What kind of DTS a frame is, for the media info window.
+fn dtsKindOf(_ info: dts.FrameInfo) -> String {
+    if info.xll {
+        return "DTS-HD MA"
+    }
+    if info.lbr {
+        return "DTS Express"
+    }
+    if info.exssSize > 0 {
+        return "DTS-HD HRA"
+    }
+    if info.coreExtension == "XCh" || info.coreExtension == "XXCH" {
+        return "DTS-ES"
+    }
+    if info.coreExtension == "X96" {
+        return "DTS 96/24"
+    }
+    "DTS"
+}

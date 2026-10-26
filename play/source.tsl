@@ -1,0 +1,111 @@
+// Opening something to play: reading the file, finding what's in it, and
+// choosing the tracks to start with (the default or first video and audio
+// tracks Reel can decode, and the default or forced subtitle track).
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../core"
+import "../demux"
+
+public struct Source {
+    path: String
+    file: Data
+    media: core.Media
+    // Chosen tracks (indexes into media.tracks), -1 for none.
+    video: Int = -1
+    audio: Int = -1
+    subtitle: Int = -1
+    // Milliseconds it took to read and to open.
+    readMs: Float = 0.0
+    openMs: Float = 0.0
+}
+
+// Reads and opens a file (run it in background work: big files take time).
+public fn openSource(_ path: String) -> Result<Source> {
+    let t0 = now()
+    let file = readData(path) ?? Data()
+    if file.isEmpty {
+        return Result.failure(error: Error("can't read {path}"))
+    }
+    let t1 = now()
+    let media = try demux.open(file, name: path)
+    let t2 = now()
+    var s = Source(path: path, file: file, media: media)
+    s.readMs = (t1 - t0) * 1000.0
+    s.openMs = (t2 - t1) * 1000.0
+    s.video = pickTrack(media, .video, playable: { c in canDecodeVideo(c) })
+    s.audio = pickTrack(media, .audio, playable: { c in canDecodeAudio(c) })
+    s.subtitle = pickSubtitle(media)
+    Result.ok(value: s)
+}
+
+// The default track of a kind Reel can play, else the first one it can.
+public fn pickTrack(_ media: core.Media, _ kind: core.TrackKind, playable: fn(String) -> Bool) -> Int {
+    var first = -1
+    for t in media.tracks {
+        if t.kind != kind || !playable(t.codec) {
+            continue
+        }
+        if hasPackets(media, t.index) {
+            if t.isDefault {
+                return t.index
+            }
+            if first < 0 {
+                first = t.index
+            }
+        }
+    }
+    first
+}
+
+// Subtitles start off unless a track is marked forced.
+public fn pickSubtitle(_ media: core.Media) -> Int {
+    for t in media.tracks {
+        if t.kind == .subtitle && t.isForced {
+            return t.index
+        }
+    }
+    -1
+}
+
+fn hasPackets(_ media: core.Media, _ track: Int) -> Bool {
+    media.packets.any(where: { p in p.track == track })
+}
+
+// A short name for a track, for menus: "English — Commentary (AAC 5.1)".
+public fn trackLabel(_ t: core.Track) -> String {
+    var parts: [String] = []
+    if !t.language.isEmpty {
+        parts.append(languageName(t.language))
+    }
+    if !t.title.isEmpty {
+        parts.append(t.title)
+    }
+    var what = t.codec.uppercase()
+    if t.kind == .audio && t.channels > 0 {
+        what += " " + channelName(t.channels)
+    }
+    if t.kind == .video && t.width > 0 {
+        what += " {t.width}×{t.height}"
+    }
+    if parts.isEmpty {
+        return "Track {t.index + 1} ({what})"
+    }
+    "{parts.joined(separator: " — ")} ({what})"
+}
+
+public fn channelName(_ n: Int) -> String {
+    match n {
+        1 -> "mono"
+        2 -> "stereo"
+        6 -> "5.1"
+        8 -> "7.1"
+        _ -> "{n} ch"
+    }
+}
+
+public fn languageName(_ code: String) -> String {
+    let names = ["eng": "English", "en": "English", "fre": "French", "fra": "French", "fr": "French", "ger": "German", "deu": "German", "de": "German", "spa": "Spanish", "es": "Spanish", "ita": "Italian", "it": "Italian", "jpn": "Japanese", "ja": "Japanese", "chi": "Chinese", "zho": "Chinese", "zh": "Chinese", "kor": "Korean", "ko": "Korean", "por": "Portuguese", "pt": "Portuguese", "rus": "Russian", "ru": "Russian", "dut": "Dutch", "nld": "Dutch", "swe": "Swedish", "nor": "Norwegian", "dan": "Danish", "fin": "Finnish", "pol": "Polish", "tur": "Turkish", "ara": "Arabic", "heb": "Hebrew", "hin": "Hindi", "tha": "Thai", "vie": "Vietnamese", "ind": "Indonesian", "fil": "Filipino", "tgl": "Tagalog", "gre": "Greek", "ell": "Greek", "cze": "Czech", "ces": "Czech", "hun": "Hungarian", "rum": "Romanian", "ukr": "Ukrainian"]
+    names[code.lowercase()] ?? code
+}

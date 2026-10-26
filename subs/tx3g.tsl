@@ -1,0 +1,175 @@
+// 3GPP timed text ("tx3g", MP4's mov_text), after 3GPP TS 26.245 §5:
+// each sample is a 16-bit text length, the text (UTF-8, or UTF-16 with a
+// BOM), then modifier boxes: 'styl' (style runs by character), 'hlit' and
+// 'hclr' (highlighted characters and their colour); 'krok', 'dlay',
+// 'href', 'tbox', 'blnk' and 'twrp' are read past. The sample entry (the
+// track's `extra`, TS 26.245 §5.16) gives the default style, the
+// justification and the font table ('ftab').
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+public struct Tx3gSetup {
+    // Numpad alignment from the horizontal/vertical justification.
+    align: Int = 2
+    // The default style record: font id, face flags, size, colour.
+    fontId: Int = 1
+    face: Int = 0
+    size: Int = 18
+    color: Int = 0xFFFFFFFF
+    background: Int = 0x00000000
+    fonts: [Int: String] = [:]
+}
+
+fn tx3gSigned8(_ b: Int) -> Int {
+    if b >= 128 { b - 256 } else { b }
+}
+
+// The sample entry fields after the SampleEntry header (TS 26.245 §5.16:
+// displayFlags, justification, background colour, BoxRecord, StyleRecord,
+// FontTableBox).
+public fn parseTx3gSetup(_ extra: Data) -> Tx3gSetup {
+    var s = Tx3gSetup()
+    if extra.count < 30 {
+        return s
+    }
+    let h = tx3gSigned8(extra[4])
+    let v = tx3gSigned8(extra[5])
+    let col = if h == 0 { 0 } else if h < 0 { 2 } else { 1 }
+    let row = if v == 0 { 2 } else if v < 0 { 0 } else { 1 }
+    s.align = row * 3 + col + 1
+    s.background = extra.uint32(at: 6, bigEndian: true)
+    // StyleRecord at 18: startChar, endChar, font-ID, face, size, rgba.
+    s.fontId = extra.uint16(at: 22, bigEndian: true)
+    s.face = extra[24]
+    s.size = max(1, extra[25])
+    s.color = extra.uint32(at: 26, bigEndian: true)
+    var at = 30
+    while at + 8 <= extra.count {
+        let size = extra.uint32(at: at, bigEndian: true)
+        let kind = extra.slice(from: at + 4, to: at + 8).latin1
+        if size < 8 || at + size > extra.count {
+            break
+        }
+        if kind == "ftab" && at + 10 <= extra.count {
+            let n = extra.uint16(at: at + 8, bigEndian: true)
+            var p = at + 10
+            for _ in 0..n {
+                if p + 3 > at + size {
+                    break
+                }
+                let id = extra.uint16(at: p, bigEndian: true)
+                let len = extra[p + 2]
+                s.fonts[id] = decodeText(extra.slice(from: p + 3, to: p + 3 + len))
+                p += 3 + len
+            }
+        }
+        at += size
+    }
+    s
+}
+
+struct Tx3gStyle {
+    from: Int
+    to: Int
+    fontId: Int
+    face: Int
+    size: Int
+    color: Int
+}
+
+fn tx3gCue(_ setup: Tx3gSetup, _ data: Data, start: Float, end: Float) -> Cue? {
+    if data.count < 2 {
+        return nil
+    }
+    let len = data.uint16(at: 0, bigEndian: true)
+    if len == 0 || 2 + len > data.count {
+        return nil
+    }
+    let raw = data.slice(from: 2, to: 2 + len)
+    let text = if raw.count >= 2 && raw[0] == 0xFE && raw[1] == 0xFF { decodeText(raw) } else { raw.text ?? decodeText(raw) }
+    var styles: [Tx3gStyle] = []
+    var hlFrom = -1
+    var hlTo = -1
+    var hlColor = 0xFFFF00FF
+    var at = 2 + len
+    while at + 8 <= data.count {
+        let size = data.uint32(at: at, bigEndian: true)
+        let kind = data.slice(from: at + 4, to: at + 8).latin1
+        if size < 8 || at + size > data.count {
+            break
+        }
+        if kind == "styl" && size >= 10 {
+            let n = data.uint16(at: at + 8, bigEndian: true)
+            var p = at + 10
+            for _ in 0..n {
+                if p + 12 > at + size {
+                    break
+                }
+                styles.append(Tx3gStyle(from: data.uint16(at: p, bigEndian: true), to: data.uint16(at: p + 2, bigEndian: true), fontId: data.uint16(at: p + 4, bigEndian: true), face: data[p + 6], size: data[p + 7], color: data.uint32(at: p + 8, bigEndian: true)))
+                p += 12
+            }
+        } else if kind == "hlit" && size >= 12 {
+            hlFrom = data.uint16(at: at + 8, bigEndian: true)
+            hlTo = data.uint16(at: at + 10, bigEndian: true)
+        } else if kind == "hclr" && size >= 12 {
+            hlColor = data.uint32(at: at + 8, bigEndian: true)
+        }
+        at += size
+    }
+    var cue = Cue(start: start, end: end)
+    cue.align = setup.align
+    cue.fontSize = Float(setup.size) / 288.0
+    var base = Span(text: "")
+    base.bold = setup.face & 1 != 0
+    base.italic = setup.face & 2 != 0
+    base.underline = setup.face & 4 != 0
+    base.color = setup.color
+    base.font = setup.fonts[setup.fontId] ?? ""
+    let chars = text.replace("\r\n", with: "\n").characters
+    var out: [Span] = []
+    var run = ""
+    var runStyle = base
+    for (i, c) in chars.enumerated() {
+        var st = base
+        for r in styles {
+            if i >= r.from && i < r.to {
+                st.bold = r.face & 1 != 0
+                st.italic = r.face & 2 != 0
+                st.underline = r.face & 4 != 0
+                st.color = r.color
+                st.size = Float(max(1, r.size)) / Float(setup.size)
+                st.font = setup.fonts[r.fontId] ?? base.font
+            }
+        }
+        if i >= hlFrom && i < hlTo {
+            st.color = hlColor
+        }
+        if c == "\n" || st != runStyle {
+            if !run.isEmpty {
+                var s = runStyle
+                s.text = run
+                out.append(s)
+                run = ""
+            }
+            runStyle = st
+        }
+        if c == "\n" {
+            var s = st
+            s.text = "\n"
+            out.append(s)
+        } else {
+            run += c
+        }
+    }
+    if !run.isEmpty {
+        var s = runStyle
+        s.text = run
+        out.append(s)
+    }
+    cue.spans = out
+    if out.isEmpty {
+        return nil
+    }
+    cue
+}

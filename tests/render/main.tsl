@@ -1,0 +1,38 @@
+// Tests for the render module: colour conversion against ffmpeg's swscale
+// (tests/render/fixtures, made by make_refs.sh) and against the exact
+// formulas, scaling quality, rotation, deinterlacing, the mixer's
+// coefficients and resampler quality, the tempo stretcher, WAV writing,
+// gain/peak and the spectrum, and render.View (view_tests.tsl: picture
+// adjustments, crop, zoom, aspect, flips against ffmpeg's filters).
+// Prints timings of the hot paths.
+//
+// The checks are split into functions by subject (checks.tsl has the
+// helpers); each returns its (passed, total).
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../../render"
+import "../../core"
+import "../../testkit"
+
+fn main() {
+    var tally = Tally()
+    let m2 = testkit.referenceYuv("mpeg2.mpg", width: 320, height: 240)
+    let mj = testkit.referenceYuv("mjpeg422.avi", width: 320, height: 240, chroma: .yuv422)
+    tally.check(m2.count > 0 && mj.count > 0, "fixture pictures load")
+    if m2.count > 0 && mj.count > 0 {
+        colourTests(tally, m2[0], mj[0])
+        scalingTests(tally, m2[0])
+        transformTests(tally, m2[0])
+        viewTests(tally, m2[0])
+        mixerTests(tally)
+        resamplerTests(tally)
+        stretcherTests(tally)
+        wavTests(tally)
+        spectrumTests(tally)
+        speedTests(tally, m2[0])
+        viewSpeedTests(tally, m2[0])
+    }
+    print("render: {tally.passed} of {tally.total} passed")
+}

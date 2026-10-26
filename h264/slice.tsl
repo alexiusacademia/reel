@@ -1,0 +1,282 @@
+// The slice header (ITU-T H.264 7.3.3): slice type, frame number, picture
+// order count fields, reference list sizes and modifications (7.3.3.1),
+// prediction weight tables (7.3.3.2), decoded reference picture marking
+// (7.3.3.3), CABAC init, QP and deblocking controls.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../core"
+
+// Slice types after taking them modulo 5 (Table 7-6).
+let sliceP = 0
+let sliceB = 1
+let sliceI = 2
+let sliceSP = 3
+let sliceSI = 4
+
+public struct SliceHeader {
+    nalType: Int = 1
+    nalRefIdc: Int = 0
+    firstMb: Int = 0
+    sliceType: Int = 2
+    ppsId: Int = 0
+    frameNum: Int = 0
+    fieldPic: Bool = false
+    bottomField: Bool = false
+    idrPicId: Int = 0
+    pocLsb: Int = 0
+    deltaPocBottom: Int = 0
+    deltaPoc0: Int = 0
+    deltaPoc1: Int = 0
+    redundantPicCnt: Int = 0
+    directSpatial: Bool = false
+    numRefIdx0: Int = 0
+    numRefIdx1: Int = 0
+    // ref_pic_list_modification: (idc, value) pairs, list 0 then list 1.
+    mods0: [Int] = []
+    mods1: [Int] = []
+    // pred_weight_table: per list 32 entries; luma weight/offset, chroma
+    // Cb weight/offset, Cr weight/offset.
+    hasWeights: Bool = false
+    lumaLog2: Int = 0
+    chromaLog2: Int = 0
+    lumaW: [Int] = []
+    lumaO: [Int] = []
+    chromaW: [Int] = []
+    chromaO: [Int] = []
+    // dec_ref_pic_marking.
+    noOutputOfPriorPics: Bool = false
+    longTermReference: Bool = false
+    adaptiveMarking: Bool = false
+    // MMCO operations as triples: opcode, difference_of_pic_nums_minus1 or
+    // long_term_pic_num, long_term_frame_idx or max_long_term_frame_idx+1.
+    mmco: [Int] = []
+    cabacInitIdc: Int = 0
+    sliceQpDelta: Int = 0
+    // SP and SI slices: sp_for_switch_flag, slice_qs_delta.
+    spForSwitch: Bool = false
+    sliceQsDelta: Int = 0
+    disableDeblock: Int = 0
+    // slice_group_change_cycle (FMO map types 3 to 5).
+    sliceGroupChangeCycle: Int = 0
+    alphaOffset: Int = 0
+    betaOffset: Int = 0
+    // Bit position where slice_data() starts (in the unescaped RBSP).
+    dataBit: Int = 0
+    ok: Bool = false
+
+    isIdr: Bool { nalType == 5 }
+}
+
+// Reads just first_mb_in_slice, slice_type and pic_parameter_set_id.
+fn h264PeekSlice(_ rbsp: Data) -> (Int, Int, Int) {
+    var r = core.bitReader(rbsp)
+    let first = r.ue()
+    let st = r.ue() % 5
+    let pps = r.ue()
+    (first, st, pps)
+}
+
+// slice_header() (7.3.3) of an unescaped slice NAL (rbsp starts after the
+// NAL header byte).
+fn h264ParseSliceHeader(_ rbsp: Data, nalType: Int, nalRefIdc: Int, spsList: [Sps], ppsList: [Pps]) -> SliceHeader {
+    var r = core.bitReader(rbsp)
+    var h = SliceHeader(nalType: nalType, nalRefIdc: nalRefIdc)
+    h.firstMb = r.ue()
+    h.sliceType = r.ue() % 5
+    h.ppsId = r.ue()
+    if h.ppsId > 255 || !ppsList[h.ppsId].valid {
+        return h
+    }
+    let pps = ppsList[h.ppsId]
+    let sps = spsList[pps.spsId]
+    if !sps.valid {
+        return h
+    }
+    if sps.separateColourPlane {
+        r.bits(2)
+    }
+    h.frameNum = r.bits(sps.log2MaxFrameNum)
+    if !sps.frameMbsOnly {
+        h.fieldPic = r.flag()
+        if h.fieldPic {
+            h.bottomField = r.flag()
+        }
+    }
+    if nalType == 5 {
+        h.idrPicId = r.ue()
+    }
+    if sps.pocType == 0 {
+        h.pocLsb = r.bits(sps.log2MaxPocLsb)
+        if pps.bottomFieldPicOrderInFramePresent && !h.fieldPic {
+            h.deltaPocBottom = r.se()
+        }
+    }
+    if sps.pocType == 1 && !sps.deltaPicOrderAlwaysZero {
+        h.deltaPoc0 = r.se()
+        if pps.bottomFieldPicOrderInFramePresent && !h.fieldPic {
+            h.deltaPoc1 = r.se()
+        }
+    }
+    if pps.redundantPicCntPresent {
+        h.redundantPicCnt = r.ue()
+    }
+    let st = h.sliceType
+    if st == sliceB {
+        h.directSpatial = r.flag()
+    }
+    if st == sliceP || st == sliceSP || st == sliceB {
+        h.numRefIdx0 = pps.numRefIdxDefault0
+        h.numRefIdx1 = pps.numRefIdxDefault1
+        if r.flag() {
+            h.numRefIdx0 = r.ue() + 1
+            if st == sliceB {
+                h.numRefIdx1 = r.ue() + 1
+            }
+        }
+        if st != sliceB {
+            h.numRefIdx1 = 0
+        }
+        let maxRefs = if h.fieldPic { 32 } else { 16 }
+        if h.numRefIdx0 > maxRefs || h.numRefIdx1 > maxRefs {
+            return h
+        }
+    }
+    // ref_pic_list_modification() (7.3.3.1); nal_unit_type 20/21 (MVC)
+    // never reach here.
+    if st != sliceI && st != sliceSI {
+        if r.flag() {
+            var n = 0
+            while n < 33 {
+                let idc = r.ue()
+                if idc == 3 || r.overrun {
+                    break
+                }
+                h.mods0.append(idc)
+                h.mods0.append(r.ue())
+                n += 1
+            }
+        }
+    }
+    if st == sliceB {
+        if r.flag() {
+            var n = 0
+            while n < 33 {
+                let idc = r.ue()
+                if idc == 3 || r.overrun {
+                    break
+                }
+                h.mods1.append(idc)
+                h.mods1.append(r.ue())
+                n += 1
+            }
+        }
+    }
+    if (pps.weightedPred && (st == sliceP || st == sliceSP)) || (pps.weightedBipredIdc == 1 && st == sliceB) {
+        // pred_weight_table() (7.3.3.2).
+        h.hasWeights = true
+        h.lumaLog2 = min(r.ue(), 7)
+        if sps.chromaFormatIdc != 0 {
+            h.chromaLog2 = min(r.ue(), 7)
+        }
+        h.lumaW = core.filled(64, 1 << h.lumaLog2)
+        h.lumaO = core.zeros(64)
+        h.chromaW = core.filled(128, 1 << h.chromaLog2)
+        h.chromaO = core.zeros(128)
+        let lists = if st == sliceB { 2 } else { 1 }
+        for l in 0..lists {
+            let n = if l == 0 { h.numRefIdx0 } else { h.numRefIdx1 }
+            for i in 0..n {
+                if r.flag() {
+                    h.lumaW[l * 32 + i] = r.se()
+                    h.lumaO[l * 32 + i] = r.se()
+                }
+                if sps.chromaFormatIdc != 0 {
+                    if r.flag() {
+                        for c in 0..2 {
+                            h.chromaW[(l * 32 + i) * 2 + c] = r.se()
+                            h.chromaO[(l * 32 + i) * 2 + c] = r.se()
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if nalRefIdc != 0 {
+        // dec_ref_pic_marking() (7.3.3.3).
+        if nalType == 5 {
+            h.noOutputOfPriorPics = r.flag()
+            h.longTermReference = r.flag()
+        } else {
+            h.adaptiveMarking = r.flag()
+            if h.adaptiveMarking {
+                var n = 0
+                while n < 66 {
+                    let op = r.ue()
+                    if op == 0 || r.overrun {
+                        break
+                    }
+                    var a = 0
+                    var b = 0
+                    if op == 1 || op == 3 {
+                        a = r.ue()
+                    }
+                    if op == 2 {
+                        a = r.ue()
+                    }
+                    if op == 3 || op == 6 {
+                        b = r.ue()
+                    }
+                    if op == 4 {
+                        b = r.ue()
+                    }
+                    h.mmco.append(op)
+                    h.mmco.append(a)
+                    h.mmco.append(b)
+                    n += 1
+                }
+            }
+        }
+    }
+    if pps.cabac && st != sliceI && st != sliceSI {
+        h.cabacInitIdc = r.ue()
+        if h.cabacInitIdc > 2 {
+            return h
+        }
+    }
+    h.sliceQpDelta = r.se()
+    if st == sliceSP || st == sliceSI {
+        if st == sliceSP {
+            h.spForSwitch = r.flag()
+        }
+        h.sliceQsDelta = r.se()
+    }
+    if pps.deblockingFilterControlPresent {
+        h.disableDeblock = r.ue()
+        if h.disableDeblock > 2 {
+            return h
+        }
+        if h.disableDeblock != 1 {
+            h.alphaOffset = r.se() * 2
+            h.betaOffset = r.se() * 2
+        }
+    }
+    if pps.numSliceGroups > 1 && pps.sliceGroupMapType >= 3 && pps.sliceGroupMapType <= 5 {
+        // Ceil(Log2(PicSizeInMapUnits / SliceGroupChangeRate + 1)) bits (7.4.3).
+        let mapUnits = sps.mbWidth * (if sps.frameMbsOnly { sps.mbHeight } else { sps.mbHeight / 2 })
+        let n = (mapUnits + pps.changeRate - 1) / pps.changeRate + 1
+        var bits = 0
+        while (1 << bits) < n {
+            bits += 1
+        }
+        h.sliceGroupChangeCycle = r.bits(bits)
+    }
+    let qp = pps.picInitQp + h.sliceQpDelta
+    if qp < 0 || qp > 51 || r.overrun {
+        return h
+    }
+    h.dataBit = r.position
+    h.ok = true
+    h
+}

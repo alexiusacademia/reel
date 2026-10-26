@@ -1,0 +1,388 @@
+// TrueHD and MLP stream headers: the access unit header, the major sync
+// (the stream's "keyframe" header: rate, channel arrangement, number of
+// substreams), its checksums, the channel layouts, and `streamInfo` for
+// the media info window.
+//
+// MLP (Meridian Lossless Packing, DVD-Audio) and Dolby TrueHD (Blu-ray,
+// a development of MLP) share one bitstream. An access unit (AU) is:
+//   4 bytes   check nibble (parity), 12-bit length in 16-bit words,
+//             16-bit input timing
+//   major sync (only in some AUs, at least every 128): F8726FBA for
+//             TrueHD, F8726FBB for MLP, then the format fields, ending
+//             with a CRC-16
+//   substream directory: 2 bytes per substream (+2 when "extra word"),
+//             each giving where that substream's data ends
+//   the substreams' data
+// Each AU holds 40 samples per channel at 44.1/48 kHz (80 at 88.2/96,
+// 160 at 176.4/192).
+//
+// TrueHD layouts are given by a "channel map" of speaker pairs (13 bits,
+// mlp_parse.h thd_layout); MLP's by a 5-bit "channel arrangement".
+// Channel masks here use FFmpeg's AV_CH_* bit numbers, whose order is the
+// WAV order: FL 0, FR 1, FC 2, LFE 3, BL 4, BR 5, FLC 6, FRC 7, BC 8,
+// SL 9, SR 10, TC 11, TFL 12, TFC 13, TFR 14, TBL 15, TBC 16, TBR 17,
+// then DL 29, DR 30, WL 31, WR 32, SDL 33, SDR 34, LFE2 35.
+//
+// The checks follow FFmpeg's mlp.c / mlp_parse.c (the MLP specification
+// isn't public), so that what passes and what fails is the same.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../core"
+
+public let thdSyncTrueHD = 0xba
+public let thdSyncMlp = 0xbb
+
+// Channel bits (AV_CH_* numbers).
+let thdChFL = 1
+let thdChFR = 2
+let thdChFC = 4
+let thdChLFE = 8
+let thdChBL = 16
+let thdChBR = 32
+let thdChBC = 256
+
+// Names of the channel bits, WAV order; "" for bits never used.
+let thdChannelNames: [String] = ["FL", "FR", "FC", "LFE", "BL", "BR", "FLC", "FRC", "BC", "SL", "SR", "TC", "TFL", "TFC", "TFR", "TBL", "TBC", "TBR", "", "", "", "", "", "", "", "", "", "", "", "DL", "DR", "WL", "WR", "SDL", "SDR", "LFE2"]
+
+// TrueHD channel map bit → channel bits (thd_layout): LR, C, LFE, LRs,
+// LRvh, LRc, LRrs, Cs, Ts, LRsd, LRw, Cvh, LFE2.
+let thdMapLayout: [Int] = [3, 4, 8, (1 << 9) | (1 << 10), (1 << 12) | (1 << 14), (1 << 6) | (1 << 7), (1 << 4) | (1 << 5), 1 << 8, 1 << 11, (1 << 33) | (1 << 34), (1 << 31) | (1 << 32), 1 << 13, 1 << 35]
+
+// The order TrueHD numbers the channels of a layout in (thd_channel_order),
+// as channel bit numbers.
+let thdChannelOrder: [Int] = [0, 1, 2, 3, 9, 10, 12, 14, 6, 7, 4, 5, 8, 11, 33, 34, 31, 32, 13, 35]
+
+// MLP channel arrangement → channel bits (mlp_layout).
+let thdMlpStereo = 3
+let thdMlp21 = 3 | 256
+let thdMlpQuad = 3 | 16 | 32
+let thdMlpSurround = 3 | 4
+let thdMlp40 = 3 | 4 | 256
+let thdMlp50Back = 3 | 4 | 16 | 32
+let thdMlpLayouts: [Int] = [4, 3, 3 | 256, 3 | 16 | 32, 3 | 8, 3 | 256 | 8, 3 | 16 | 32 | 8, 3 | 4, 3 | 4 | 256, 3 | 4 | 16 | 32, 3 | 4 | 8, 3 | 4 | 256 | 8, 3 | 4 | 16 | 32 | 8, 3 | 4 | 256, 3 | 4 | 16 | 32, 3 | 4 | 8, 3 | 4 | 256 | 8, 3 | 4 | 16 | 32 | 8, 3 | 16 | 32 | 8, 3 | 4 | 16 | 32, 3 | 4 | 16 | 32 | 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+let thdMlpQuants: [Int] = [16, 20, 24, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+
+// Number of channels in a channel mask.
+public fn thdPopCount(_ mask: Int) -> Int {
+    var n = 0
+    var m = mask
+    while m != 0 {
+        n += m & 1
+        m = m >> 1
+    }
+    n
+}
+
+// The WAV-order names of a channel mask.
+public fn thdLayoutNames(_ mask: Int) -> [String] {
+    var out: [String] = []
+    let names = thdChannelNames
+    for b in 0..36 {
+        if (mask >> b) & 1 == 1 {
+            out.append(names[b])
+        }
+    }
+    out
+}
+
+// Channel bits of a TrueHD channel map (truehd_layout).
+public fn thdMapToMask(_ chanmap: Int) -> Int {
+    var mask = 0
+    let t = thdMapLayout
+    for i in 0..13 {
+        if (chanmap >> i) & 1 == 1 {
+            mask = mask | t[i]
+        }
+    }
+    mask
+}
+
+fn thdMlpRate(_ code: Int) -> Int {
+    if code == 0xf {
+        return 0
+    }
+    let base = if (code & 8) != 0 { 44100 } else { 48000 }
+    base << (code & 7)
+}
+
+// What a major sync says (MLPHeaderInfo).
+public struct ThdMajorSync {
+    ok: Bool = false
+    problem: String = ""
+    // thdSyncTrueHD or thdSyncMlp.
+    streamType: Int = 0
+    // Bytes of the major sync (28, or more with TrueHD extensions).
+    headerSize: Int = 0
+    group1Bits: Int = 0
+    group2Bits: Int = 0
+    group1Rate: Int = 0
+    group2Rate: Int = 0
+    channelArrangement: Int = 0
+    modifier0: Int = 0
+    modifier1: Int = 0
+    modifier2: Int = 0
+    // MLP: the layout. TrueHD: the 6-channel (stream 1) and 8-channel
+    // (stream 2) presentations.
+    mlpMask: Int = 0
+    mask1: Int = 0
+    mask2: Int = 0
+    channels1: Int = 0
+    channels2: Int = 0
+    // Samples per channel in each access unit, and the power of two above.
+    auSize: Int = 0
+    auSizePow2: Int = 0
+    vbr: Bool = false
+    peakBitrate: Int = 0
+    substreams: Int = 0
+    extendedSubstreamInfo: Int = 0
+    substreamInfo: Int = 0
+
+    // The layout a decoder outputs by default (the biggest presentation).
+    mask: Int {
+        if streamType == thdSyncMlp { mlpMask } else if channels2 > 0 { mask2 } else { mask1 }
+    }
+
+    // Atmos: a fourth substream carrying the 16-channel presentation.
+    atmos: Bool {
+        streamType == thdSyncTrueHD && substreams == 4 && (substreamInfo >> 7) == 1
+    }
+}
+
+// CRC-16 with polynomial 0x2D, most significant bit first, from 0.
+fn thdCrc16(_ data: Data, from: Int, to: Int) -> Int {
+    var crc = 0
+    var i = from
+    while i < to {
+        crc = crc ^ (data[i] << 8)
+        for _ in 0..8 {
+            crc = if (crc & 0x8000) != 0 { ((crc << 1) ^ 0x2d) & 0xffff } else { (crc << 1) & 0xffff }
+        }
+        i += 1
+    }
+    crc
+}
+
+// An 8-bit CRC, most significant bit first (poly without its x^8 term).
+fn thdCrc8(_ data: Data, from: Int, to: Int, poly: Int, start: Int) -> Int {
+    var crc = start
+    var i = from
+    while i < to {
+        crc = crc ^ data[i]
+        for _ in 0..8 {
+            crc = if (crc & 0x80) != 0 { ((crc << 1) ^ poly) & 0xff } else { (crc << 1) & 0xff }
+        }
+        i += 1
+    }
+    crc
+}
+
+// ff_mlp_checksum16 over data[from…from+size): CRC of all but the last two
+// bytes, xored with them. (FFmpeg keeps big-endian CRCs byte-swapped and
+// reads the bytes little-endian; it comes to the same as big-endian.)
+fn thdChecksum16(_ data: Data, _ from: Int, _ size: Int) -> Int {
+    let crc = thdCrc16(data, from: from, to: from + size - 2)
+    crc ^ ((data[from + size - 2] << 8) | data[from + size - 1])
+}
+
+// ff_mlp_checksum8: CRC (poly 0x63, from 0x3c) of all but the last byte,
+// xored with it.
+fn thdChecksum8(_ data: Data, _ from: Int, _ size: Int) -> Int {
+    thdCrc8(data, from: from, to: from + size - 1, poly: 0x63, start: 0x3c) ^ data[from + size - 1]
+}
+
+// ff_mlp_restart_checksum: CRC-8 (poly 0x1D) over the restart header's
+// bits, which start 2 bits into data[from].
+fn thdRestartChecksum(_ data: Data, _ from: Int, _ bitSize: Int) -> Int {
+    let numBytes = (bitSize + 2) / 8
+    var crc = thdCrc8(data, from: from, to: from + numBytes - 1, poly: 0x1d, start: data[from] & 0xc0)
+    crc = crc ^ data[from + numBytes - 1]
+    let rest = (bitSize + 2) & 7
+    for i in 0..rest {
+        crc = crc << 1
+        if (crc & 0x100) != 0 {
+            crc = crc ^ 0x11d
+        }
+        let b = if from + numBytes < data.count { data[from + numBytes] } else { 0 }
+        crc = crc ^ ((b >> (7 - i)) & 1)
+    }
+    crc
+}
+
+// XOR of bytes.
+fn thdParity(_ data: Data, _ from: Int, _ size: Int) -> Int {
+    var p = 0
+    var i = from
+    let end = from + size
+    while i < end {
+        p = p ^ data[i]
+        i += 1
+    }
+    p
+}
+
+// Whether data[at…] starts a major sync (F8726FBA or F8726FBB).
+public fn thdIsMajorSync(_ data: Data, _ at: Int) -> Bool {
+    at >= 0 && at + 4 <= data.count && data[at] == 0xf8 && data[at + 1] == 0x72 && data[at + 2] == 0x6f && (data[at + 3] == 0xba || data[at + 3] == 0xbb)
+}
+
+// Reads the major sync at data[at…] (ff_mlp_read_major_sync), checking
+// its CRC.
+public fn thdReadMajorSync(_ data: Data, _ at: Int) -> ThdMajorSync {
+    var mh = ThdMajorSync()
+    if at + 28 > data.count {
+        mh.problem = "major sync cut off"
+        return mh
+    }
+    if !thdIsMajorSync(data, at) {
+        mh.problem = "no major sync"
+        return mh
+    }
+    var size = 28
+    if data[at + 3] == 0xba && (data[at + 25] & 1) != 0 {
+        size += 2 + (data[at + 26] >> 4) * 2
+    }
+    if at + size > data.count {
+        mh.problem = "major sync cut off"
+        return mh
+    }
+    let sum = thdChecksum16(data, at, size - 2)
+    if sum != ((data[at + size - 2] << 8) | data[at + size - 1]) {
+        mh.problem = "major sync checksum error"
+        return mh
+    }
+    var br = core.bitReaderRange(data, from: at, to: at + size)
+    br.skip(24)
+    mh.streamType = br.bits(8)
+    mh.headerSize = size
+    var ratebits = 0
+    if mh.streamType == thdSyncMlp {
+        mh.group1Bits = thdMlpQuants[br.bits(4)]
+        mh.group2Bits = thdMlpQuants[br.bits(4)]
+        ratebits = br.bits(4)
+        mh.group1Rate = thdMlpRate(ratebits)
+        mh.group2Rate = thdMlpRate(br.bits(4))
+        br.skip(11)
+        mh.channelArrangement = br.bits(5)
+        mh.mlpMask = thdMlpLayouts[mh.channelArrangement]
+    } else if mh.streamType == thdSyncTrueHD {
+        mh.group1Bits = 24
+        ratebits = br.bits(4)
+        mh.group1Rate = thdMlpRate(ratebits)
+        br.skip(4)
+        mh.modifier0 = br.bits(2)
+        mh.modifier1 = br.bits(2)
+        mh.channelArrangement = br.bits(5)
+        mh.mask1 = thdMapToMask(mh.channelArrangement)
+        mh.channels1 = thdPopCount(mh.mask1)
+        mh.modifier2 = br.bits(2)
+        let map2 = br.bits(13)
+        mh.mask2 = thdMapToMask(map2)
+        mh.channels2 = thdPopCount(mh.mask2)
+    } else {
+        mh.problem = "unknown stream type"
+        return mh
+    }
+    mh.auSize = 40 << (ratebits & 7)
+    mh.auSizePow2 = 64 << (ratebits & 7)
+    br.skip(48)
+    mh.vbr = br.flag()
+    mh.peakBitrate = (br.bits(15) * mh.group1Rate + 8) >> 4
+    mh.substreams = br.bits(4)
+    br.skip(2)
+    mh.extendedSubstreamInfo = br.bits(2)
+    mh.substreamInfo = br.bits(8)
+    mh.ok = true
+    mh
+}
+
+// The length in bytes of the access unit at data[at…] (from its header),
+// or 0 when it's too short to be one.
+public fn thdAccessUnitLength(_ data: Data, _ at: Int) -> Int {
+    if at + 4 > data.count {
+        return 0
+    }
+    let len = (((data[at] << 8) | data[at + 1]) & 0xfff) * 2
+    if len < 4 { 0 } else { len }
+}
+
+// The size of an AC-3 syncframe at data[at…] (frames interleaved with
+// TrueHD on Blu-ray), or 0 when it isn't one. AC-3 only (bsid ≤ 8).
+public fn thdAc3FrameSize(_ data: Data, _ at: Int) -> Int {
+    if at + 6 > data.count || data[at] != 0x0b || data[at + 1] != 0x77 {
+        return 0
+    }
+    let fscod = data[at + 4] >> 6
+    let frmsizecod = data[at + 4] & 0x3f
+    let bsid = data[at + 5] >> 3
+    if fscod == 3 || frmsizecod > 37 || bsid > 8 {
+        return 0
+    }
+    let rates: [Int] = [32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384, 448, 512, 576, 640]
+    let kbps = rates[frmsizecod >> 1]
+    let words = if fscod == 0 { 2 * kbps } else if fscod == 2 { 3 * kbps } else { kbps * 320 / 147 + (frmsizecod & 1) }
+    words * 2
+}
+
+// A description for the media info window, e.g. "TrueHD 7.1 (Atmos),
+// 48 kHz, 24-bit". Uses the track's first packet when given as `extra`
+// is empty; `firstUnit` may be any bytes starting with an access unit.
+public fn streamInfo(_ track: core.Track, firstUnit: Data = Data()) -> String {
+    var kind = if track.codec == "mlp" { "MLP" } else { "TrueHD" }
+    var rate = track.sampleRate
+    var channels = track.channels
+    var mask = 0
+    var bits = track.bitsPerSample
+    var atmos = false
+    var unit = firstUnit
+    if unit.isEmpty {
+        unit = track.extra
+    }
+    if unit.count >= 32 && thdIsMajorSync(unit, 4) {
+        let mh = thdReadMajorSync(unit, 4)
+        if mh.ok {
+            kind = if mh.streamType == thdSyncMlp { "MLP" } else { "TrueHD" }
+            rate = mh.group1Rate
+            mask = mh.mask
+            channels = thdPopCount(mask)
+            bits = mh.group1Bits
+            atmos = mh.atmos
+        }
+    }
+    var text = kind
+    let layout = thdLayoutText(mask, channels)
+    if !layout.isEmpty {
+        text += " " + layout
+    }
+    if atmos {
+        text += " (Atmos)"
+    }
+    if rate > 0 {
+        let khz = if rate % 1000 == 0 { "{rate / 1000}" } else { "{rate / 1000}.{(rate % 1000) / 100}" }
+        text += ", {khz} kHz"
+    }
+    if bits > 0 {
+        text += ", {bits}-bit"
+    }
+    text
+}
+
+fn thdLayoutText(_ mask: Int, _ channels: Int) -> String {
+    if mask == 0 {
+        return if channels == 1 { "mono" } else if channels == 2 { "stereo" } else if channels > 0 { "{channels} channels" } else { "" }
+    }
+    let n = thdPopCount(mask)
+    let lfe = (mask & (thdChLFE | (1 << 35))) != 0
+    if n == 1 {
+        return "mono"
+    }
+    if n == 2 && !lfe {
+        return "stereo"
+    }
+    if lfe {
+        let l2 = if (mask & (1 << 35)) != 0 { 2 } else { 1 }
+        return "{n - l2}.{l2}"
+    }
+    "{n}.0"
+}

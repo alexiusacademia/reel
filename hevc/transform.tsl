@@ -1,0 +1,365 @@
+// The inverse transforms of HEVC residuals (ITU-T H.265 8.6.4): scaled
+// coefficients to residual samples. The DCTs (4x4 to 32x32) use the even /
+// odd (partial butterfly) decomposition and skip the zero rows and columns
+// past the last non-zero coefficient; 4x4 intra luma blocks use the DST;
+// transform skip and transquant bypass blocks are scaled or copied.
+//
+// The parser runs these (they don't need reconstructed samples), so the
+// reconstruction stage only adds residuals to predictions.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+struct HevcTransform {
+    bitDepth: Int = 8
+    trans: [Int] = []
+    dst4: [Int] = []
+    // Butterfly scratch: odd sums of every level, even parts.
+    bfO: [Int] = []
+    bfE: [Int] = []
+    bfE2: [Int] = []
+    bfIn: [Int] = []
+    bfEO: [Int] = []
+    bfEEO: [Int] = []
+    bfEE: [Int] = []
+    // Areas of work: coefficients at 0, the first stage at 1024, the
+    // residual (raster, size n) at 2048.
+    work: [Int] = []
+    // The residual when every sample is the same (DC-only DCT blocks).
+    dcValue: Int = 0
+
+    fn setup() {
+        if trans.count > 0 {
+            return
+        }
+        trans = hevcMakeTransMatrix()
+        dst4 = [29, 55, 74, 84, 74, 74, 0, -74, 84, -29, -74, 55, 55, -84, 74, -29]
+        bfO = hevcFilled(64, 0)
+        bfE = hevcFilled(32, 0)
+        bfE2 = hevcFilled(32, 0)
+        bfIn = hevcFilled(32, 0)
+        bfEO = hevcFilled(16, 0)
+        bfEEO = hevcFilled(8, 0)
+        bfEE = hevcFilled(16, 0)
+        work = hevcFilled(3 * 1024, 0)
+    }
+
+    // The residual of coefficients c (raster, n = 1 << log2) into
+    // work[2048...]; kind 0 DCT, 1 DST, 2 transform skip, 3 bypass. maxX /
+    // maxY bound the non-zero coefficients. True when it is the constant
+    // dcValue instead (nothing written).
+    fn compute(_ c: [Int], _ log2: Int, _ kind: Int, _ maxX: Int, _ maxY: Int) -> Bool {
+        let n = 1 << log2
+        let bdShift = 20 - bitDepth
+        let rnd = 1 << (bdShift - 1)
+        let nn = n * n
+        if kind == 3 {
+            for i in 0..nn {
+                work[2048 + i] = c[i]
+            }
+            return false
+        }
+        if kind == 2 {
+            let ts = 5 + log2
+            for i in 0..nn {
+                work[2048 + i] = ((c[i] << ts) + rnd) >> bdShift
+            }
+            return false
+        }
+        if kind == 0 && maxX == 0 && maxY == 0 {
+            let g = max(-32768, min(32767, (64 * c[0] + 64) >> 7))
+            dcValue = (64 * g + rnd) >> bdShift
+            return true
+        }
+        if kind == 1 {
+            // 4x4 DST (8.6.4.2, transMatrix of 8-317).
+            for x in 0..4 {
+                let a0 = c[x]
+                let a1 = c[x + 4]
+                let a2 = c[x + 8]
+                let a3 = c[x + 12]
+                for k in 0..4 {
+                    let g = (dst4[k] * a0 + dst4[4 + k] * a1 + dst4[8 + k] * a2 + dst4[12 + k] * a3 + 64) >> 7
+                    work[1024 + x + k * 4] = max(-32768, min(32767, g))
+                }
+            }
+            for yy in 0..4 {
+                let b = 1024 + yy * 4
+                let a0 = work[b]
+                let a1 = work[b + 1]
+                let a2 = work[b + 2]
+                let a3 = work[b + 3]
+                for k in 0..4 {
+                    work[2048 + yy * 4 + k] = (dst4[k] * a0 + dst4[4 + k] * a1 + dst4[8 + k] * a2 + dst4[12 + k] * a3 + rnd) >> bdShift
+                }
+            }
+            return false
+        }
+        // First stage: columns x <= maxX, inputs c[x + j * n] for j <= maxY,
+        // into work[1024...] (row-major); clipped to 16 bits after >> 7.
+        // Second stage: rows, inputs j <= maxX, then >> (20 - bitDepth).
+        // (The 4- and 8-point forms read all their inputs, so they get all
+        // coefficients and every column.)
+        let rows = if n <= 8 { n } else { maxY + 1 }
+        for i in 0..(rows * n) {
+            work[i] = c[i]
+        }
+        if n == 4 {
+            for x in 0..4 {
+                idct4(x, 4, 1024 + x, 4, 7, true)
+            }
+            for yy in 0..4 {
+                idct4(1024 + yy * 4, 1, 2048 + yy * 4, 1, bdShift, false)
+            }
+        } else if n == 8 {
+            // Two columns / two rows at a time (two lanes per Int).
+            var x = 0
+            while x < 8 {
+                idct8(x, 8, 1, 1024 + x, 8, 1, 7, true)
+                x += 2
+            }
+            var yy = 0
+            while yy < 8 {
+                idct8(1024 + yy * 8, 1, 8, 2048 + yy * 8, 1, 8, bdShift, false)
+                yy += 2
+            }
+        } else {
+            // Columns in pairs (an odd last one with the zero column next
+            // to it), then rows in pairs.
+            var x = 0
+            while x <= maxX {
+                idctBig(n, x, n, 1, maxY, 1024 + x, n, 1, 7, true)
+                x += 2
+            }
+            var yy = 0
+            while yy < n {
+                idctBig(n, 1024 + yy * n, 1, n, maxX, 2048 + yy * n, 1, n, bdShift, false)
+                yy += 2
+            }
+        }
+        false
+    }
+
+    // 4-point inverse DCT (rows 0, 8, 16, 24 of the 32-point matrix).
+    fn idct4(_ inB: Int, _ inS: Int, _ outB: Int, _ outS: Int, _ shift: Int, _ clip16: Bool) {
+        let s0 = work[inB]
+        let s1 = work[inB + inS]
+        let s2 = work[inB + 2 * inS]
+        let s3 = work[inB + 3 * inS]
+        let o0 = 83 * s1 + 36 * s3
+        let o1 = 36 * s1 - 83 * s3
+        let e0 = 64 * (s0 + s2)
+        let e1 = 64 * (s0 - s2)
+        let add = 1 << (shift - 1)
+        let r0 = (e0 + o0 + add) >> shift
+        let r1 = (e1 + o1 + add) >> shift
+        let r2 = (e1 - o1 + add) >> shift
+        let r3 = (e0 - o0 + add) >> shift
+        if clip16 {
+            work[outB] = max(-32768, min(32767, r0))
+            work[outB + outS] = max(-32768, min(32767, r1))
+            work[outB + 2 * outS] = max(-32768, min(32767, r2))
+            work[outB + 3 * outS] = max(-32768, min(32767, r3))
+        } else {
+            work[outB] = r0
+            work[outB + outS] = r1
+            work[outB + 2 * outS] = r2
+            work[outB + 3 * outS] = r3
+        }
+    }
+
+    // 8-point inverse DCT, straight-line even / odd form.
+    // Two transforms at once: inputs work[inB + k * inS] (low lane) and
+    // work[inB + k * inS + pair] (high lane) packed as lo + hi * 2^32; all
+    // the butterfly's operations are linear, so the packed results hold
+    // both, and the halves are separated (sign extension) before rounding.
+    // Every lane value stays below 2^31, every packed one below 2^62.
+    fn idct8(_ inB: Int, _ inS: Int, _ pair: Int, _ outB: Int, _ outS: Int, _ outPair: Int, _ shift: Int, _ clip16: Bool) {
+        let s0 = work[inB] + (work[inB + pair] << 32)
+        let s1 = work[inB + inS] + (work[inB + inS + pair] << 32)
+        let s2 = work[inB + 2 * inS] + (work[inB + 2 * inS + pair] << 32)
+        let s3 = work[inB + 3 * inS] + (work[inB + 3 * inS + pair] << 32)
+        let s4 = work[inB + 4 * inS] + (work[inB + 4 * inS + pair] << 32)
+        let s5 = work[inB + 5 * inS] + (work[inB + 5 * inS + pair] << 32)
+        let s6 = work[inB + 6 * inS] + (work[inB + 6 * inS + pair] << 32)
+        let s7 = work[inB + 7 * inS] + (work[inB + 7 * inS + pair] << 32)
+        let o0 = 89 * s1 + 75 * s3 + 50 * s5 + 18 * s7
+        let o1 = 75 * s1 - 18 * s3 - 89 * s5 - 50 * s7
+        let o2 = 50 * s1 - 89 * s3 + 18 * s5 + 75 * s7
+        let o3 = 18 * s1 - 50 * s3 + 75 * s5 - 89 * s7
+        let eo0 = 83 * s2 + 36 * s6
+        let eo1 = 36 * s2 - 83 * s6
+        let ee0 = 64 * (s0 + s4)
+        let ee1 = 64 * (s0 - s4)
+        let e0 = ee0 + eo0
+        let e3 = ee0 - eo0
+        let e1 = ee1 + eo1
+        let e2 = ee1 - eo1
+        let add = 1 << (shift - 1)
+        bfE2[0] = e0 + o0
+        bfE2[1] = e1 + o1
+        bfE2[2] = e2 + o2
+        bfE2[3] = e3 + o3
+        bfE2[4] = e3 - o3
+        bfE2[5] = e2 - o2
+        bfE2[6] = e1 - o1
+        bfE2[7] = e0 - o0
+        var at = outB
+        for k in 0..8 {
+            let v = bfE2[k]
+            let lo = ((v & 0xFFFFFFFF) ^ 0x80000000) - 0x80000000
+            let hi = (v - lo) >> 32
+            if clip16 {
+                work[at] = max(-32768, min(32767, (lo + add) >> shift))
+                work[at + outPair] = max(-32768, min(32767, (hi + add) >> shift))
+            } else {
+                work[at] = (lo + add) >> shift
+                work[at + outPair] = (hi + add) >> shift
+            }
+            at += outS
+        }
+    }
+
+    // 16- and 32-point inverse DCTs: inputs gathered (zeros past `last`),
+    // the odd half's sums per output, the even half by the next smaller
+    // transform's structure (8.6.4.2 matrix rows).
+    fn idctBig(_ n: Int, _ inB: Int, _ inS: Int, _ pair: Int, _ last: Int, _ outB: Int, _ outS: Int, _ outPair: Int, _ shift: Int, _ clip16: Bool) {
+        for i in 0..n {
+            let a = inB + i * inS
+            bfIn[i] = if i <= last { work[a] + (work[a + pair] << 32) } else { 0 }
+        }
+        let half = n >> 1
+        let step = 32 / n
+        if n == 16 {
+            let x1 = bfIn[1]
+            let x3 = bfIn[3]
+            let x5 = bfIn[5]
+            let x7 = bfIn[7]
+            let x9 = bfIn[9]
+            let x11 = bfIn[11]
+            let x13 = bfIn[13]
+            let x15 = bfIn[15]
+            if last < 8 {
+                for k in 0..8 {
+                    bfO[k] = trans[64 + k] * x1 + trans[192 + k] * x3 + trans[320 + k] * x5 + trans[448 + k] * x7
+                }
+            } else {
+                for k in 0..8 {
+                    bfO[k] = trans[64 + k] * x1 + trans[192 + k] * x3 + trans[320 + k] * x5 + trans[448 + k] * x7 + trans[576 + k] * x9 + trans[704 + k] * x11 + trans[832 + k] * x13 + trans[960 + k] * x15
+                }
+            }
+        } else {
+            let x1 = bfIn[1]
+            let x3 = bfIn[3]
+            let x5 = bfIn[5]
+            let x7 = bfIn[7]
+            let x9 = bfIn[9]
+            let x11 = bfIn[11]
+            let x13 = bfIn[13]
+            let x15 = bfIn[15]
+            if last < 8 {
+                for k in 0..16 {
+                    bfO[k] = trans[32 + k] * x1 + trans[96 + k] * x3 + trans[160 + k] * x5 + trans[224 + k] * x7
+                }
+            } else if last < 16 {
+                for k in 0..16 {
+                    bfO[k] = trans[32 + k] * x1 + trans[96 + k] * x3 + trans[160 + k] * x5 + trans[224 + k] * x7 + trans[288 + k] * x9 + trans[352 + k] * x11 + trans[416 + k] * x13 + trans[480 + k] * x15
+                }
+            } else {
+                let x17 = bfIn[17]
+                let x19 = bfIn[19]
+                let x21 = bfIn[21]
+                let x23 = bfIn[23]
+                let x25 = bfIn[25]
+                let x27 = bfIn[27]
+                let x29 = bfIn[29]
+                let x31 = bfIn[31]
+                for k in 0..16 {
+                    bfO[k] = trans[32 + k] * x1 + trans[96 + k] * x3 + trans[160 + k] * x5 + trans[224 + k] * x7 + trans[288 + k] * x9 + trans[352 + k] * x11 + trans[416 + k] * x13 + trans[480 + k] * x15 + trans[544 + k] * x17 + trans[608 + k] * x19 + trans[672 + k] * x21 + trans[736 + k] * x23 + trans[800 + k] * x25 + trans[864 + k] * x27 + trans[928 + k] * x29 + trans[992 + k] * x31
+                }
+            }
+        }
+        // Even part: the n/2-point odd sums (EO) and n/4-point (EEO).
+        let q = half >> 1
+        let step2 = step * 2
+        for k in 0..q {
+            var sum = 0
+            var i = 1
+            while i < half && 2 * i <= last {
+                sum += trans[i * step2 * 32 + k] * bfIn[2 * i]
+                i += 2
+            }
+            bfEO[k] = sum
+        }
+        let r = q >> 1
+        let step4 = step * 4
+        for k in 0..r {
+            var sum = 0
+            var i = 1
+            while i < q && 4 * i <= last {
+                sum += trans[i * step4 * 32 + k] * bfIn[4 * i]
+                i += 2
+            }
+            bfEEO[k] = sum
+        }
+        // The rest (n/8 points: 2 for n = 16, 4 for n = 32) as 4x4 / 2x2.
+        if n == 16 {
+            // EEE from in[0] and in[8] (rows 0 and 16 of the 32-point matrix).
+            let a = 64 * bfIn[0]
+            let b = 64 * bfIn[8]
+            bfEE[0] = a + b + bfEEO[0]
+            bfEE[1] = a - b + bfEEO[1]
+            bfEE[2] = a - b - bfEEO[1]
+            bfEE[3] = a + b - bfEEO[0]
+        } else {
+            // EEEO from in[8], in[24]; EEEE from in[0], in[16].
+            let s8 = bfIn[8]
+            let s24 = bfIn[24]
+            let eeeo0 = 83 * s8 + 36 * s24
+            let eeeo1 = 36 * s8 - 83 * s24
+            let eeee0 = 64 * (bfIn[0] + bfIn[16])
+            let eeee1 = 64 * (bfIn[0] - bfIn[16])
+            let eee0 = eeee0 + eeeo0
+            let eee1 = eeee1 + eeeo1
+            let eee2 = eeee1 - eeeo1
+            let eee3 = eeee0 - eeeo0
+            bfEE[0] = eee0 + bfEEO[0]
+            bfEE[1] = eee1 + bfEEO[1]
+            bfEE[2] = eee2 + bfEEO[2]
+            bfEE[3] = eee3 + bfEEO[3]
+            bfEE[4] = eee3 - bfEEO[3]
+            bfEE[5] = eee2 - bfEEO[2]
+            bfEE[6] = eee1 - bfEEO[1]
+            bfEE[7] = eee0 - bfEEO[0]
+        }
+        for k in 0..q {
+            bfE[k] = bfEE[k] + bfEO[k]
+            bfE[half - 1 - k] = bfEE[k] - bfEO[k]
+        }
+        let add = 1 << (shift - 1)
+        var at = outB
+        var at2 = outB + (n - 1) * outS
+        for k in 0..half {
+            let v1 = bfE[k] + bfO[k]
+            let v2 = bfE[k] - bfO[k]
+            let lo1 = ((v1 & 0xFFFFFFFF) ^ 0x80000000) - 0x80000000
+            let hi1 = (v1 - lo1) >> 32
+            let lo2 = ((v2 & 0xFFFFFFFF) ^ 0x80000000) - 0x80000000
+            let hi2 = (v2 - lo2) >> 32
+            if clip16 {
+                work[at] = max(-32768, min(32767, (lo1 + add) >> shift))
+                work[at + outPair] = max(-32768, min(32767, (hi1 + add) >> shift))
+                work[at2] = max(-32768, min(32767, (lo2 + add) >> shift))
+                work[at2 + outPair] = max(-32768, min(32767, (hi2 + add) >> shift))
+            } else {
+                work[at] = (lo1 + add) >> shift
+                work[at + outPair] = (hi1 + add) >> shift
+                work[at2] = (lo2 + add) >> shift
+                work[at2 + outPair] = (hi2 + add) >> shift
+            }
+            at += outS
+            at2 -= outS
+        }
+    }
+
+}

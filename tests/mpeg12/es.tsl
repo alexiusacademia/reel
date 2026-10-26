@@ -1,0 +1,179 @@
+// Test helpers for the MPEG-1/2 video decoder: pulls the video
+// elementary stream out of an MPEG program stream (.mpg/.vob) or
+// transport stream (.ts) — the demuxers are tested on their own — and
+// cuts an elementary stream into one packet per frame (a picture with the
+// headers before it; two field pictures of a frame stay together).
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+// The payload of the first video stream (PES stream ids 0xE0-0xEF) of a
+// program stream (ISO/IEC 13818-1 2.5.3; MPEG-1 packs and PES headers as
+// in ISO/IEC 11172-1).
+fn psVideo(_ f: Data) -> Data {
+    var out = Data()
+    let n = f.count
+    var i = 0
+    var stream = -1
+    while i + 6 <= n {
+        if f[i] != 0 || f[i + 1] != 0 || f[i + 2] != 1 {
+            i += 1
+            continue
+        }
+        let code = f[i + 3]
+        if code == 0xBA {
+            if f[i + 4] & 0xC0 == 0x40 {
+                i += 14 + (f[i + 13] & 7)
+            } else {
+                i += 12
+            }
+            continue
+        }
+        if code < 0xBB {
+            i += 4
+            continue
+        }
+        let len = f.uint16(at: i + 4, bigEndian: true)
+        let body = i + 6
+        let end = min(body + len, n)
+        if code >= 0xE0 && code <= 0xEF && (stream < 0 || stream == code) {
+            stream = code
+            var p = body
+            if f[p] & 0xC0 == 0x80 {
+                p += 3 + f[p + 2]
+            } else {
+                while p < end && f[p] == 0xFF {
+                    p += 1
+                }
+                if f[p] & 0xC0 == 0x40 {
+                    p += 2
+                }
+                if f[p] & 0xF0 == 0x20 {
+                    p += 5
+                } else if f[p] & 0xF0 == 0x30 {
+                    p += 10
+                } else {
+                    p += 1
+                }
+            }
+            out += f.slice(from: p, to: end)
+        }
+        i = end
+    }
+    out
+}
+
+// The payload of the first video PES stream of a transport stream
+// (188-byte packets, ISO/IEC 13818-1 2.4.3).
+fn tsVideo(_ f: Data) -> Data {
+    var out = Data()
+    var pid = -1
+    var k = 0
+    while k + 188 <= f.count {
+        if f[k] != 0x47 {
+            k += 1
+            continue
+        }
+        let start = f[k + 1] & 0x40 != 0
+        let p = ((f[k + 1] & 0x1F) << 8) | f[k + 2]
+        let afc = (f[k + 3] >> 4) & 3
+        var payload = k + 4
+        if afc & 2 != 0 {
+            payload += 1 + f[k + 4]
+        }
+        if afc & 1 != 0 && payload < k + 188 {
+            if start && payload + 9 <= k + 188 && f[payload] == 0 && f[payload + 1] == 0 && f[payload + 2] == 1 && f[payload + 3] >= 0xE0 && f[payload + 3] <= 0xEF {
+                if pid < 0 {
+                    pid = p
+                }
+                if p == pid {
+                    payload += 9 + f[payload + 8]
+                }
+            }
+            if p == pid {
+                out += f.slice(from: payload, to: k + 188)
+            }
+        }
+        k += 188
+    }
+    out
+}
+
+// Cuts an elementary stream into frames: [offset, size] pairs. Headers
+// go with the picture after them.
+fn splitFrames(_ es: Data, pairFields: Bool = true) -> [Int] {
+    var cuts: [Int] = []
+    let n = es.count
+    var i = 0
+    var packetStart = 0
+    var inFrame = false
+    var needSecond = false
+    var isSecond = false
+    var headerStart = -1
+    while i + 3 < n {
+        if es[i] != 0 || es[i + 1] != 0 || es[i + 2] != 1 {
+            i += 1
+            continue
+        }
+        let code = es[i + 3]
+        if code == 0xB3 || code == 0xB8 || code == 0x00 {
+            if inFrame && !needSecond {
+                let at = if headerStart >= 0 { headerStart } else { i }
+                cuts.append(packetStart)
+                cuts.append(at - packetStart)
+                packetStart = at
+                inFrame = false
+                headerStart = -1
+            }
+            if code == 0x00 {
+                isSecond = needSecond
+                needSecond = false
+                inFrame = true
+                headerStart = -1
+            } else if headerStart < 0 {
+                headerStart = i
+            }
+        } else if code == 0xB5 && inFrame && i + 7 < n && (es[i + 4] >> 4) == 8 {
+            // A field picture's frame waits for the second field.
+            let structure = es[i + 6] & 3
+            if structure != 3 && !isSecond && pairFields {
+                needSecond = true
+            }
+        }
+        i += 3
+    }
+    cuts.append(packetStart)
+    cuts.append(n - packetStart)
+    cuts
+}
+
+// Cuts every packet in two at a slice start code near its middle, as a
+// demuxer may hand over a picture in pieces.
+fn splitHalves(_ es: Data, _ cuts: [Int]) -> [Int] {
+    var out: [Int] = []
+    var k = 0
+    while k + 1 < cuts.count {
+        let from = cuts[k]
+        let to = from + cuts[k + 1]
+        var mid = -1
+        var i = from + (to - from) / 2
+        while i + 3 < to {
+            if es[i] == 0 && es[i + 1] == 0 && es[i + 2] == 1 && es[i + 3] >= 1 && es[i + 3] <= 0xAF {
+                mid = i
+                break
+            }
+            i += 1
+        }
+        if mid < 0 {
+            out.append(from)
+            out.append(to - from)
+        } else {
+            out.append(from)
+            out.append(mid - from)
+            out.append(mid)
+            out.append(to - mid)
+        }
+        k += 2
+    }
+    out
+}

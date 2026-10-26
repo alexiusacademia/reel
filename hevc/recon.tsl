@@ -1,0 +1,906 @@
+// Sample reconstruction of the picture being decoded (ITU-T H.265 8.4.4
+// and 8.5.3, 8.6): intra prediction with reference sample substitution and
+// filtering (8.4.4.2.1 to 8.4.4.2.6), scaled-coefficient inverse transforms
+// (DCT 4x4 to 32x32 by partial butterflies and the 4x4 DST, 8.6.4),
+// transform skip and bypass residuals, and inter prediction: luma 8-tap and
+// chroma 4-tap fractional interpolation (8.5.3.3.3) with default and
+// explicit weighted sample prediction (8.5.3.3.4).
+//
+// The planes live in this struct while the picture is decoded. The plane
+// being worked on is moved into `dst` (usePlane; a move of a list is O(1)
+// and keeps it unshared, so writes stay in place), which lets every loop
+// write one list without per-sample branches on the colour.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+struct HevcRecon {
+    y: [Int] = []
+    u: [Int] = []
+    v: [Int] = []
+    // The selected plane (cur 0, 1, 2; -1 none) and its row stride.
+    dst: [Int] = []
+    cur: Int = -1
+    stride: Int = 0
+    // Coded size in luma samples, chroma plane size (0 for 4:0:0).
+    width: Int = 0
+    height: Int = 0
+    cw: Int = 0
+    ch: Int = 0
+    bitDepth: Int = 8
+    maxVal: Int = 255
+    // Rounding of uni- and bi-prediction (8.5.3.3.4.2) for the bit depth.
+    uniSh: Int = 6
+    uniOff: Int = 32
+    biSh: Int = 7
+    biOff: Int = 64
+    // Reference samples of an intra block: ref[0] is the bottom of the
+    // left column p[-1][2N-1], ref[2N - 1] is p[-1][0], ref[2N] the corner
+    // p[-1][-1], ref[2N + 1 + x] is p[x][-1]. avail marks which ones the
+    // parser found available, one flag per unit of `unit` samples.
+    ref: [Int] = []
+    filt: [Int] = []
+    avail: [Int] = []
+    // Scratch for angular prediction (reference row with negative part).
+    angRef: [Int] = []
+    angle: [Int] = []
+    invAngle: [Int] = []
+    // Inter prediction: 14-bit predictions of list 0 and 1 (rows of 64, list
+    // 1 at 4096), the horizontal pass, and edge-extended reference blocks.
+    pred: [Int] = []
+    mcTmp: [Int] = []
+    emu: [Int] = []
+    lumaF: [Int] = []
+    chromaF: [Int] = []
+
+    fn setup() {
+        if ref.count > 0 {
+            return
+        }
+        ref = hevcFilled(4 * 64 + 2, 0)
+        filt = hevcFilled(4 * 64 + 2, 0)
+        avail = hevcFilled(4 * 64 + 2, 0)
+        angRef = hevcFilled(3 * 64 + 2, 0)
+        angle = hevcIntraAngle
+        invAngle = hevcInvAngle
+        pred = hevcFilled(2 * 64 * 64, 0)
+        mcTmp = hevcFilled(71 * 64, 0)
+        emu = hevcFilled(80 * 80, 0)
+        lumaF = hevcLumaFilter
+        chromaF = hevcChromaFilter
+    }
+
+    fn setDepth(_ bd: Int) {
+        bitDepth = bd
+        maxVal = (1 << bd) - 1
+        uniSh = 14 - bd
+        uniOff = 1 << (uniSh - 1)
+        biSh = 15 - bd
+        biOff = 1 << (biSh - 1)
+    }
+
+    // Selects plane c (0 Y, 1 Cb, 2 Cr) as dst; -1 puts it back.
+    fn usePlane(_ c: Int) {
+        if c == cur {
+            return
+        }
+        if cur == 0 {
+            y = dst
+        } else if cur == 1 {
+            u = dst
+        } else if cur == 2 {
+            v = dst
+        }
+        dst = []
+        cur = c
+        if c == 0 {
+            dst = y
+            y = []
+            stride = width
+        } else if c == 1 {
+            dst = u
+            u = []
+            stride = cw
+        } else if c == 2 {
+            dst = v
+            v = []
+            stride = cw
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Intra prediction (8.4.4.2) on the selected plane.
+
+    // Gathers the reference samples of an n x n block at (x0, y0) of the
+    // selected plane, substituting unavailable ones (8.4.4.2.2). avail[k]
+    // is the flag of reference unit k (units of `unit` samples, in ref
+    // order; the corner is unit 2n / unit).
+    fn gatherRefs(_ x0: Int, _ y0: Int, _ n: Int, _ unit: Int) {
+        let total = 4 * n + 1
+        let half = 2 * n
+        let units = half / unit
+        var any = false
+        for k in 0..(2 * units + 1) {
+            if avail[k] == 1 {
+                any = true
+                break
+            }
+        }
+        if !any {
+            let mid = 1 << (bitDepth - 1)
+            for i in 0..total {
+                ref[i] = mid
+            }
+            return
+        }
+        let s = stride
+        // Left column, bottom to top: ref[i] = p[-1][2n - 1 - i].
+        for k in 0..units {
+            if avail[k] == 1 {
+                var i = k * unit
+                let iEnd = i + unit
+                var at = (y0 + half - 1 - i) * s + x0 - 1
+                while i < iEnd {
+                    ref[i] = dst[at]
+                    at -= s
+                    i += 1
+                }
+            }
+        }
+        if avail[units] == 1 {
+            ref[half] = dst[(y0 - 1) * s + x0 - 1]
+        }
+        for k in 0..units {
+            if avail[units + 1 + k] == 1 {
+                let i0 = half + 1 + k * unit
+                let at = (y0 - 1) * s + x0 + k * unit
+                for j in 0..unit {
+                    ref[i0 + j] = dst[at + j]
+                }
+            }
+        }
+        // Substitution: everything before the first available sample takes
+        // its value; later unavailable ones copy the one before.
+        var firstUnit = 0
+        while avail[firstUnit] == 0 {
+            firstUnit += 1
+        }
+        let firstSample = if firstUnit < units { firstUnit * unit } else if firstUnit == units { half } else { half + 1 + (firstUnit - units - 1) * unit }
+        let fv = ref[firstSample]
+        for i in 0..firstSample {
+            ref[i] = fv
+        }
+        for k in (firstUnit + 1)..(2 * units + 1) {
+            if avail[k] == 0 {
+                let s0 = if k < units { k * unit } else if k == units { half } else { half + 1 + (k - units - 1) * unit }
+                let cnt = if k == units { 1 } else { unit }
+                let pv = ref[s0 - 1]
+                for j in 0..cnt {
+                    ref[s0 + j] = pv
+                }
+            }
+        }
+    }
+
+    // Predicts a (1 << log2) block at (x0, y0) of the selected plane (luma
+    // when isLuma) with intra mode `mode`; the references must have been
+    // gathered. strong: strong_intra_smoothing_enabled_flag.
+    fn predictIntra(_ isLuma: Bool, _ x0: Int, _ y0: Int, _ log2: Int, _ mode: Int, strong: Bool) {
+        let n = 1 << log2
+        let half = 2 * n
+        let total = 4 * n + 1
+        // Filtering of neighbouring samples (8.4.4.2.3), luma only in 4:2:0.
+        var useFilt = false
+        if isLuma && mode != 1 && n != 4 {
+            let d = min(abs(mode - 26), abs(mode - 10))
+            let thres = if n == 8 { 7 } else if n == 16 { 1 } else { 0 }
+            if d > thres {
+                useFilt = true
+            }
+        }
+        if useFilt {
+            let corner = ref[half]
+            let bottom = ref[0]
+            let right = ref[total - 1]
+            let limit = 1 << (bitDepth - 5)
+            if strong && n == 32 && abs(corner + right - 2 * ref[half + n]) < limit && abs(corner + bottom - 2 * ref[half - n]) < limit {
+                // Bi-linear interpolation between the corner and the ends.
+                filt[half] = corner
+                for i in 0..63 {
+                    filt[half - 1 - i] = ((63 - i) * corner + (i + 1) * bottom + 32) >> 6
+                    filt[half + 1 + i] = ((63 - i) * corner + (i + 1) * right + 32) >> 6
+                }
+                filt[0] = bottom
+                filt[total - 1] = right
+            } else {
+                filt[0] = ref[0]
+                filt[total - 1] = ref[total - 1]
+                for i in 1..(total - 1) {
+                    filt[i] = (ref[i - 1] + 2 * ref[i] + ref[i + 1] + 2) >> 2
+                }
+            }
+            for i in 0..total {
+                ref[i] = filt[i]
+            }
+        }
+        let s = stride
+        let base = y0 * s + x0
+        let boundary = isLuma && n < 32
+        if mode == 0 {
+            // Planar (8.4.4.2.5).
+            let topRight = ref[half + 1 + n]
+            let bottomLeft = ref[half - 1 - n]
+            let shift = log2 + 1
+            for yy in 0..n {
+                let left = ref[half - 1 - yy]
+                var at = base + yy * s
+                let wy = (n - 1 - yy)
+                let by = (yy + 1) * bottomLeft + n
+                for xx in 0..n {
+                    dst[at] = ((n - 1 - xx) * left + (xx + 1) * topRight + wy * ref[half + 1 + xx] + by) >> shift
+                    at += 1
+                }
+            }
+            return
+        }
+        if mode == 1 {
+            // DC (8.4.4.2.6 with the edge filter of luma blocks below 32).
+            var sum = n
+            for i in 0..n {
+                sum += ref[half + 1 + i] + ref[half - 1 - i]
+            }
+            let dc = sum >> (log2 + 1)
+            for yy in 0..n {
+                var at = base + yy * s
+                for _ in 0..n {
+                    dst[at] = dc
+                    at += 1
+                }
+            }
+            if boundary {
+                dst[base] = (ref[half - 1] + 2 * dc + ref[half + 1] + 2) >> 2
+                for xx in 1..n {
+                    dst[base + xx] = (ref[half + 1 + xx] + 3 * dc + 2) >> 2
+                }
+                for yy in 1..n {
+                    dst[base + yy * s] = (ref[half - 1 - yy] + 3 * dc + 2) >> 2
+                }
+            }
+            return
+        }
+        // Angular (8.4.4.2.6). angRef[n + k] is ref[k] of the spec, k from
+        // -n to 2n.
+        let a = angle[mode]
+        let o = n
+        if mode >= 18 {
+            // Vertical modes: ref[x] = p[-1 + x][-1].
+            for x in 0..(n + 1) {
+                angRef[o + x] = ref[half + x]
+            }
+            if a < 0 {
+                let last = (n * a) >> 5
+                if last < -1 {
+                    let inv = invAngle[mode - 11]
+                    var x = last
+                    while x <= -1 {
+                        let yy = -1 + ((x * inv + 128) >> 8)
+                        angRef[o + x] = ref[half - 1 - yy]
+                        x += 1
+                    }
+                }
+            } else {
+                for x in (n + 1)..(2 * n + 1) {
+                    angRef[o + x] = ref[half + x]
+                }
+            }
+            for yy in 0..n {
+                let pos = (yy + 1) * a
+                let fact = pos & 31
+                var at = base + yy * s
+                var r = o + (pos >> 5) + 1
+                if fact != 0 {
+                    let f0 = 32 - fact
+                    for _ in 0..n {
+                        dst[at] = (f0 * angRef[r] + fact * angRef[r + 1] + 16) >> 5
+                        at += 1
+                        r += 1
+                    }
+                } else {
+                    for _ in 0..n {
+                        dst[at] = angRef[r]
+                        at += 1
+                        r += 1
+                    }
+                }
+            }
+            if mode == 26 && boundary {
+                let corner = ref[half]
+                let top0 = ref[half + 1]
+                let mv = maxVal
+                for yy in 0..n {
+                    dst[base + yy * s] = max(0, min(mv, top0 + ((ref[half - 1 - yy] - corner) >> 1)))
+                }
+            }
+        } else {
+            // Horizontal modes: ref[x] = p[-1][-1 + x].
+            for x in 0..(n + 1) {
+                angRef[o + x] = ref[half - x]
+            }
+            if a < 0 {
+                let last = (n * a) >> 5
+                if last < -1 {
+                    let inv = invAngle[mode - 11]
+                    var x = last
+                    while x <= -1 {
+                        let xx = -1 + ((x * inv + 128) >> 8)
+                        angRef[o + x] = ref[half + 1 + xx]
+                        x += 1
+                    }
+                }
+            } else {
+                for x in (n + 1)..(2 * n + 1) {
+                    angRef[o + x] = ref[half - x]
+                }
+            }
+            for xx in 0..n {
+                let pos = (xx + 1) * a
+                let fact = pos & 31
+                var r = o + (pos >> 5) + 1
+                var at = base + xx
+                if fact != 0 {
+                    let f0 = 32 - fact
+                    for _ in 0..n {
+                        dst[at] = (f0 * angRef[r] + fact * angRef[r + 1] + 16) >> 5
+                        at += s
+                        r += 1
+                    }
+                } else {
+                    for _ in 0..n {
+                        dst[at] = angRef[r]
+                        at += s
+                        r += 1
+                    }
+                }
+            }
+            if mode == 10 && boundary {
+                let corner = ref[half]
+                let left0 = ref[half - 1]
+                let mv = maxVal
+                for xx in 0..n {
+                    dst[base + xx] = max(0, min(mv, left0 + ((ref[half + 1 + xx] - corner) >> 1)))
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Residuals (8.6.2, 8.6.4), added to the selected plane.
+
+    // Adds the residual samples of a (1 << log2) block at (x0, y0) from a
+    // residual plane laid out like the selected one.
+    fn addPlane(_ r: [Int], _ x0: Int, _ y0: Int, _ log2: Int) {
+        let n = 1 << log2
+        let s = stride
+        var at = y0 * s + x0
+        let mv = maxVal
+        for _ in 0..n {
+            for xx in 0..n {
+                dst[at + xx] = max(0, min(mv, dst[at + xx] + r[at + xx]))
+            }
+            at += s
+        }
+    }
+
+    fn addConstant(_ x0: Int, _ y0: Int, _ n: Int, _ r: Int) {
+        if r == 0 {
+            return
+        }
+        let s = stride
+        var at = y0 * s + x0
+        let mv = maxVal
+        for _ in 0..n {
+            for xx in 0..n {
+                dst[at + xx] = max(0, min(mv, dst[at + xx] + r))
+            }
+            at += s
+        }
+    }
+
+    // A sample of the selected plane (PCM samples, concealment).
+    fn setSample(_ xx: Int, _ yy: Int, _ s: Int) {
+        dst[yy * stride + xx] = s
+    }
+
+    // ------------------------------------------------------------------
+    // Inter prediction (8.5.3.3).
+    //
+    // mode of the luma / chroma interpolation: 0 keep the 14-bit
+    // prediction in pred (list 0), 1 in pred at 4096 (list 1), 2 write the
+    // uni-predicted samples to the selected plane (default weighting), 3
+    // write the average with the list 0 prediction in pred (bi-prediction).
+
+    // Edge-extended copy of the w x h block at (xi, yi) of refp with `l`
+    // samples left / above and `r` right / below into emu; returns its row
+    // stride.
+    fn fillEmu(_ refp: [Int], _ pw: Int, _ ph: Int, _ xi: Int, _ yi: Int, _ w: Int, _ h: Int, _ l: Int, _ r: Int) -> Int {
+        let ew = w + l + r
+        let eh = h + l + r
+        for j in 0..eh {
+            let sy = max(0, min(ph - 1, yi - l + j))
+            let rowAt = sy * pw
+            let o = j * ew
+            for i in 0..ew {
+                emu[o + i] = refp[rowAt + max(0, min(pw - 1, xi - l + i))]
+            }
+        }
+        ew
+    }
+
+    // The interpolation kernels work on two horizontally adjacent samples
+    // at once: P = a + b * 2^32 packs them, and sum c_k * P_k holds both
+    // filter results (low half and high half; a negative low half is
+    // recovered by sign extension: lo = sext32(S), hi = (S - lo) >> 32).
+    // All values stay far below 2^31 per half, so nothing overflows.
+
+    // Final store of the two results of a pair (14-bit precision) per
+    // mode: o is the position in pred, at in the selected plane.
+    fn finPair(_ mode: Int, _ o: Int, _ at: Int, _ lo: Int, _ hi: Int) {
+        if mode == 2 {
+            dst[at] = max(0, min(maxVal, (lo + uniOff) >> uniSh))
+            dst[at + 1] = max(0, min(maxVal, (hi + uniOff) >> uniSh))
+        } else if mode == 3 {
+            dst[at] = max(0, min(maxVal, (pred[o] + lo + biOff) >> biSh))
+            dst[at + 1] = max(0, min(maxVal, (pred[o + 1] + hi + biOff) >> biSh))
+        } else {
+            let po = mode * 4096 + o
+            pred[po] = lo
+            pred[po + 1] = hi
+        }
+    }
+
+    // Luma prediction of a w x h block at (x0, y0) from reference plane
+    // refp with motion vector (mvx, mvy) in quarter samples.
+    fn mcLuma(_ refp: [Int], _ x0: Int, _ y0: Int, _ w: Int, _ h: Int, _ mvx: Int, _ mvy: Int, _ mode: Int) {
+        let fx = mvx & 3
+        let fy = mvy & 3
+        let xi = x0 + (mvx >> 2)
+        let yi = y0 + (mvy >> 2)
+        let pw = width
+        let ph = height
+        // Source: the plane itself when the block and its filter taps are
+        // inside, else an edge-extended copy in emu.
+        let inside = xi - 3 >= 0 && yi - 3 >= 0 && xi + w + 5 <= pw && yi + h + 4 <= ph
+        var src = refp
+        var base = 0
+        var ss = pw
+        if !inside {
+            ss = fillEmu(refp, pw, ph, xi, yi, w, h, 3, 5)
+            src = emu
+            base = 3 * ss + 3
+        } else {
+            base = yi * pw + xi
+        }
+        let s = stride
+        if fx == 0 && fy == 0 {
+            let sh3 = 14 - bitDepth
+            if mode == 2 {
+                // Uni-prediction at an integer position is a copy.
+                for j in 0..h {
+                    let q = base + j * ss
+                    let at = (y0 + j) * s + x0
+                    for i in 0..w {
+                        dst[at + i] = src[q + i]
+                    }
+                }
+                return
+            }
+            if mode == 3 {
+                let mv = maxVal
+                for j in 0..h {
+                    let q = base + j * ss
+                    let o = j * 64
+                    let at = (y0 + j) * s + x0
+                    for i in 0..w {
+                        dst[at + i] = max(0, min(mv, (pred[o + i] + (src[q + i] << sh3) + biOff) >> biSh))
+                    }
+                }
+                return
+            }
+            for j in 0..h {
+                let q = base + j * ss
+                let o = j * 64
+                let at = (y0 + j) * s + x0
+                var i = 0
+                while i < w {
+                    finPair(mode, o + i, at + i, src[q + i] << sh3, src[q + i + 1] << sh3)
+                    i += 2
+                }
+            }
+            return
+        }
+        let f = lumaF
+        let shift1 = bitDepth - 8
+        if fy == 0 {
+            let c0 = f[fx * 8]
+            let c1 = f[fx * 8 + 1]
+            let c2 = f[fx * 8 + 2]
+            let c3 = f[fx * 8 + 3]
+            let c4 = f[fx * 8 + 4]
+            let c5 = f[fx * 8 + 5]
+            let c6 = f[fx * 8 + 6]
+            let c7 = f[fx * 8 + 7]
+            for j in 0..h {
+                let q = base + j * ss - 3
+                let o = j * 64
+                let at = (y0 + j) * s + x0
+                var p0 = src[q] + (src[q + 1] << 32)
+                var p1 = src[q + 1] + (src[q + 2] << 32)
+                var p2 = src[q + 2] + (src[q + 3] << 32)
+                var p3 = src[q + 3] + (src[q + 4] << 32)
+                var p4 = src[q + 4] + (src[q + 5] << 32)
+                var p5 = src[q + 5] + (src[q + 6] << 32)
+                var nxt = src[q + 6]
+                var i = 0
+                while i < w {
+                    let a = src[q + 7 + i]
+                    let b = src[q + 8 + i]
+                    let p6 = nxt + (a << 32)
+                    let p7 = a + (b << 32)
+                    let t = c0 * p0 + c1 * p1 + c2 * p2 + c3 * p3 + c4 * p4 + c5 * p5 + c6 * p6 + c7 * p7
+                    let lo = ((t & 0xFFFFFFFF) ^ 0x80000000) - 0x80000000
+                    finPair(mode, o + i, at + i, lo >> shift1, (t - lo) >> (32 + shift1))
+                    p0 = p2
+                    p1 = p3
+                    p2 = p4
+                    p3 = p5
+                    p4 = p6
+                    p5 = p7
+                    nxt = b
+                    i += 2
+                }
+            }
+            return
+        }
+        let d0 = f[fy * 8]
+        let d1 = f[fy * 8 + 1]
+        let d2 = f[fy * 8 + 2]
+        let d3 = f[fy * 8 + 3]
+        let d4 = f[fy * 8 + 4]
+        let d5 = f[fy * 8 + 5]
+        let d6 = f[fy * 8 + 6]
+        let d7 = f[fy * 8 + 7]
+        if fx == 0 {
+            // Vertical only: down each column pair with a sliding window.
+            var i = 0
+            while i < w {
+                var q = base - 3 * ss + i
+                var r0 = src[q] + (src[q + 1] << 32)
+                q += ss
+                var r1 = src[q] + (src[q + 1] << 32)
+                q += ss
+                var r2 = src[q] + (src[q + 1] << 32)
+                q += ss
+                var r3 = src[q] + (src[q + 1] << 32)
+                q += ss
+                var r4 = src[q] + (src[q + 1] << 32)
+                q += ss
+                var r5 = src[q] + (src[q + 1] << 32)
+                q += ss
+                var r6 = src[q] + (src[q + 1] << 32)
+                q += ss
+                var at = y0 * s + x0 + i
+                var o = i
+                for _ in 0..h {
+                    let r7 = src[q] + (src[q + 1] << 32)
+                    q += ss
+                    let t = d0 * r0 + d1 * r1 + d2 * r2 + d3 * r3 + d4 * r4 + d5 * r5 + d6 * r6 + d7 * r7
+                    let lo = ((t & 0xFFFFFFFF) ^ 0x80000000) - 0x80000000
+                    finPair(mode, o, at, lo >> shift1, (t - lo) >> (32 + shift1))
+                    r0 = r1
+                    r1 = r2
+                    r2 = r3
+                    r3 = r4
+                    r4 = r5
+                    r5 = r6
+                    r6 = r7
+                    at += s
+                    o += 64
+                }
+                i += 2
+            }
+            return
+        }
+        // Both: the horizontal pass over h + 7 rows into mcTmp as packed
+        // pairs (rows of 32 pairs), then the vertical pass down the pairs.
+        let c0 = f[fx * 8]
+        let c1 = f[fx * 8 + 1]
+        let c2 = f[fx * 8 + 2]
+        let c3 = f[fx * 8 + 3]
+        let c4 = f[fx * 8 + 4]
+        let c5 = f[fx * 8 + 5]
+        let c6 = f[fx * 8 + 6]
+        let c7 = f[fx * 8 + 7]
+        for j in 0..(h + 7) {
+            let q = base + (j - 3) * ss - 3
+            var o = j * 32
+            var p0 = src[q] + (src[q + 1] << 32)
+            var p1 = src[q + 1] + (src[q + 2] << 32)
+            var p2 = src[q + 2] + (src[q + 3] << 32)
+            var p3 = src[q + 3] + (src[q + 4] << 32)
+            var p4 = src[q + 4] + (src[q + 5] << 32)
+            var p5 = src[q + 5] + (src[q + 6] << 32)
+            var nxt = src[q + 6]
+            var i = 0
+            while i < w {
+                let a = src[q + 7 + i]
+                let b = src[q + 8 + i]
+                let p6 = nxt + (a << 32)
+                let p7 = a + (b << 32)
+                let t = c0 * p0 + c1 * p1 + c2 * p2 + c3 * p3 + c4 * p4 + c5 * p5 + c6 * p6 + c7 * p7
+                if shift1 == 0 {
+                    mcTmp[o] = t
+                } else {
+                    let lo = ((t & 0xFFFFFFFF) ^ 0x80000000) - 0x80000000
+                    mcTmp[o] = (lo >> shift1) + (((t - lo) >> (32 + shift1)) << 32)
+                }
+                p0 = p2
+                p1 = p3
+                p2 = p4
+                p3 = p5
+                p4 = p6
+                p5 = p7
+                nxt = b
+                o += 1
+                i += 2
+            }
+        }
+        var i = 0
+        while i < w {
+            var q = i >> 1
+            var r0 = mcTmp[q]
+            var r1 = mcTmp[q + 32]
+            var r2 = mcTmp[q + 64]
+            var r3 = mcTmp[q + 96]
+            var r4 = mcTmp[q + 128]
+            var r5 = mcTmp[q + 160]
+            var r6 = mcTmp[q + 192]
+            q += 224
+            var at = y0 * s + x0 + i
+            var o = i
+            let mv = maxVal
+            for _ in 0..h {
+                let r7 = mcTmp[q]
+                q += 32
+                let t = d0 * r0 + d1 * r1 + d2 * r2 + d3 * r3 + d4 * r4 + d5 * r5 + d6 * r6 + d7 * r7
+                let lo = ((t & 0xFFFFFFFF) ^ 0x80000000) - 0x80000000
+                if mode == 3 {
+                    dst[at] = max(0, min(mv, (pred[o] + (lo >> 6) + biOff) >> biSh))
+                    dst[at + 1] = max(0, min(mv, (pred[o + 1] + ((t - lo) >> 38) + biOff) >> biSh))
+                } else if mode == 2 {
+                    dst[at] = max(0, min(mv, ((lo >> 6) + uniOff) >> uniSh))
+                    dst[at + 1] = max(0, min(mv, (((t - lo) >> 38) + uniOff) >> uniSh))
+                } else {
+                    finPair(mode, o, at, lo >> 6, (t - lo) >> 38)
+                }
+                r0 = r1
+                r1 = r2
+                r2 = r3
+                r3 = r4
+                r4 = r5
+                r5 = r6
+                r6 = r7
+                at += s
+                o += 64
+            }
+            i += 2
+        }
+    }
+
+    // Chroma prediction of a w x h block at (x0, y0) in chroma samples,
+    // motion vector in 1/8 chroma samples (4:2:0); same scheme, 4 taps.
+    fn mcChroma(_ refp: [Int], _ x0: Int, _ y0: Int, _ w: Int, _ h: Int, _ mvx: Int, _ mvy: Int, _ mode: Int) {
+        let fx = mvx & 7
+        let fy = mvy & 7
+        let xi = x0 + (mvx >> 3)
+        let yi = y0 + (mvy >> 3)
+        let pw = cw
+        let ph = ch
+        let inside = xi - 1 >= 0 && yi - 1 >= 0 && xi + w + 3 <= pw && yi + h + 2 <= ph
+        var src = refp
+        var base = 0
+        var ss = pw
+        if !inside {
+            ss = fillEmu(refp, pw, ph, xi, yi, w, h, 1, 3)
+            src = emu
+            base = ss + 1
+        } else {
+            base = yi * pw + xi
+        }
+        let s = stride
+        if fx == 0 && fy == 0 {
+            let sh3 = 14 - bitDepth
+            if mode == 2 {
+                // Uni-prediction at an integer position is a copy.
+                for j in 0..h {
+                    let q = base + j * ss
+                    let at = (y0 + j) * s + x0
+                    for i in 0..w {
+                        dst[at + i] = src[q + i]
+                    }
+                }
+                return
+            }
+            if mode == 3 {
+                let mv = maxVal
+                for j in 0..h {
+                    let q = base + j * ss
+                    let o = j * 64
+                    let at = (y0 + j) * s + x0
+                    for i in 0..w {
+                        dst[at + i] = max(0, min(mv, (pred[o + i] + (src[q + i] << sh3) + biOff) >> biSh))
+                    }
+                }
+                return
+            }
+            for j in 0..h {
+                let q = base + j * ss
+                let o = j * 64
+                let at = (y0 + j) * s + x0
+                var i = 0
+                while i < w {
+                    finPair(mode, o + i, at + i, src[q + i] << sh3, src[q + i + 1] << sh3)
+                    i += 2
+                }
+            }
+            return
+        }
+        let f = chromaF
+        let shift1 = bitDepth - 8
+        let c0 = f[fx * 4]
+        let c1 = f[fx * 4 + 1]
+        let c2 = f[fx * 4 + 2]
+        let c3 = f[fx * 4 + 3]
+        let d0 = f[fy * 4]
+        let d1 = f[fy * 4 + 1]
+        let d2 = f[fy * 4 + 2]
+        let d3 = f[fy * 4 + 3]
+        if fy == 0 {
+            for j in 0..h {
+                let q = base + j * ss - 1
+                let o = j * 64
+                let at = (y0 + j) * s + x0
+                var p0 = src[q] + (src[q + 1] << 32)
+                var p1 = src[q + 1] + (src[q + 2] << 32)
+                var nxt = src[q + 2]
+                var i = 0
+                while i < w {
+                    let a = src[q + 3 + i]
+                    let b = src[q + 4 + i]
+                    let p2 = nxt + (a << 32)
+                    let p3 = a + (b << 32)
+                    let t = c0 * p0 + c1 * p1 + c2 * p2 + c3 * p3
+                    let lo = ((t & 0xFFFFFFFF) ^ 0x80000000) - 0x80000000
+                    finPair(mode, o + i, at + i, lo >> shift1, (t - lo) >> (32 + shift1))
+                    p0 = p2
+                    p1 = p3
+                    nxt = b
+                    i += 2
+                }
+            }
+            return
+        }
+        if fx == 0 {
+            var i = 0
+            while i < w {
+                var q = base - ss + i
+                var r0 = src[q] + (src[q + 1] << 32)
+                q += ss
+                var r1 = src[q] + (src[q + 1] << 32)
+                q += ss
+                var r2 = src[q] + (src[q + 1] << 32)
+                q += ss
+                var at = y0 * s + x0 + i
+                var o = i
+                for _ in 0..h {
+                    let r3 = src[q] + (src[q + 1] << 32)
+                    q += ss
+                    let t = d0 * r0 + d1 * r1 + d2 * r2 + d3 * r3
+                    let lo = ((t & 0xFFFFFFFF) ^ 0x80000000) - 0x80000000
+                    finPair(mode, o, at, lo >> shift1, (t - lo) >> (32 + shift1))
+                    r0 = r1
+                    r1 = r2
+                    r2 = r3
+                    at += s
+                    o += 64
+                }
+                i += 2
+            }
+            return
+        }
+        for j in 0..(h + 3) {
+            let q = base + (j - 1) * ss - 1
+            var o = j * 32
+            var p0 = src[q] + (src[q + 1] << 32)
+            var p1 = src[q + 1] + (src[q + 2] << 32)
+            var nxt = src[q + 2]
+            var i = 0
+            while i < w {
+                let a = src[q + 3 + i]
+                let b = src[q + 4 + i]
+                let p2 = nxt + (a << 32)
+                let p3 = a + (b << 32)
+                let t = c0 * p0 + c1 * p1 + c2 * p2 + c3 * p3
+                if shift1 == 0 {
+                    mcTmp[o] = t
+                } else {
+                    let lo = ((t & 0xFFFFFFFF) ^ 0x80000000) - 0x80000000
+                    mcTmp[o] = (lo >> shift1) + (((t - lo) >> (32 + shift1)) << 32)
+                }
+                p0 = p2
+                p1 = p3
+                nxt = b
+                o += 1
+                i += 2
+            }
+        }
+        var i = 0
+        while i < w {
+            var q = i >> 1
+            var r0 = mcTmp[q]
+            var r1 = mcTmp[q + 32]
+            var r2 = mcTmp[q + 64]
+            q += 96
+            var at = y0 * s + x0 + i
+            var o = i
+            for _ in 0..h {
+                let r3 = mcTmp[q]
+                q += 32
+                let t = d0 * r0 + d1 * r1 + d2 * r2 + d3 * r3
+                let lo = ((t & 0xFFFFFFFF) ^ 0x80000000) - 0x80000000
+                finPair(mode, o, at, lo >> 6, (t - lo) >> 38)
+                r0 = r1
+                r1 = r2
+                r2 = r3
+                at += s
+                o += 64
+            }
+            i += 2
+        }
+    }
+
+    // Explicit weighted prediction (8.5.3.3.4.3) from pred (list 0 at 0,
+    // list 1 at 4096): weights w0 / w1 and offsets o0 / o1 (scaled to the
+    // bit depth), log2 denominator.
+    fn putPredWeighted(_ x0: Int, _ y0: Int, _ w: Int, _ h: Int, _ use0: Bool, _ use1: Bool, _ denom: Int, _ w0: Int, _ o0: Int, _ w1: Int, _ o1: Int) {
+        let s = stride
+        let mv = maxVal
+        let shift1 = 14 - bitDepth
+        let log2Wd = denom + shift1
+        if use0 && use1 {
+            let add = (o0 + o1 + 1) << log2Wd
+            for j in 0..h {
+                let o = j * 64
+                var at = (y0 + j) * s + x0
+                for i in 0..w {
+                    dst[at] = max(0, min(mv, (pred[o + i] * w0 + pred[4096 + o + i] * w1 + add) >> (log2Wd + 1)))
+                    at += 1
+                }
+            }
+            return
+        }
+        let wt = if use0 { w0 } else { w1 }
+        let off = if use0 { o0 } else { o1 }
+        let po = if use0 { 0 } else { 4096 }
+        let rnd = if log2Wd >= 1 { 1 << (log2Wd - 1) } else { 0 }
+        for j in 0..h {
+            let o = po + j * 64
+            var at = (y0 + j) * s + x0
+            for i in 0..w {
+                let p = pred[o + i]
+                let r = if log2Wd >= 1 { ((p * wt + rnd) >> log2Wd) + off } else { p * wt + off }
+                dst[at] = max(0, min(mv, r))
+                at += 1
+            }
+        }
+    }
+}

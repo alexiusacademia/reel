@@ -1,0 +1,29 @@
+# Reel's project file: the version of Tessel it's built with, and what the
+# app says about itself.
+#
+# Author: Alexius Academia
+# Date: 2026-10-25
+
+tessel = "0.15.0"
+
+[app]
+name = "Reel"
+id = "dev.syncster.reel"
+version = "0.1.0"
+build = "1"
+description = "A media player written entirely in Tessel"
+author = "Alexius Academia"
+copyright = "© 2026 Alexius Academia"
+category = "video"
+
+[[app.documents]]
+name = "Video"
+extensions = ["mp4", "m4v", "mov", "mkv", "webm", "avi", "ts", "m2ts", "mts", "mpg", "mpeg", "vob", "ogv", "wmv", "asf", "ivf"]
+
+[[app.documents]]
+name = "Audio"
+extensions = ["mp3", "m4a", "aac", "flac", "ogg", "oga", "opus", "wav", "mka", "wma", "ac3", "eac3", "dts", "dtshd", "thd", "mlp", "aiff"]
+
+[[app.documents]]
+name = "Subtitles"
+extensions = ["srt", "vtt", "ass", "ssa"]

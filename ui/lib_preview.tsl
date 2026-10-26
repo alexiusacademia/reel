@@ -1,0 +1,205 @@
+// Seeing into a file without playing it: the seek preview (`SeekPreview`,
+// the floating picture with its time and chapter above the seek bar
+// while the pointer is over it), the scene strip (`SceneStrip`, a row of
+// scene pictures with their times; a click goes there, the scene playing
+// is marked and kept in view while it's near what shows), and the chapters menu (`ChaptersMenu` /
+// `ChapterMenuItems`, with the chapter playing checked). Pictures and
+// times come from the app (vfx.thumbnail, vfx.sceneCuts, the thumbnail
+// cache). Dark, like the player.
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+import "../core"
+
+// A number that changes with the picture (the canvas's redraw key).
+public fn libThumbKey(_ t: LibThumb) -> Int {
+    let n = t.pixels.count
+    if n == 0 {
+        return 0
+    }
+    let a = t.pixels[0] % 1_000_003
+    let b = t.pixels[n / 2] % 1_000_033
+    let c = t.pixels[n - 1] % 1_000_037
+    let d = t.pixels[n / 3] % 999_983
+    ((a * 31 + b) * 31 + c) * 7 + d + t.width * 13 + n
+}
+
+// The preview over the seek bar: `thumb` (none: only the time) of the
+// picture at `time`, centred on the pointer at `x` (points from the bar's
+// left edge) and kept inside a bar `barWidth` wide. Put it at the bottom
+// leading corner of a ZStack over the picture, just above the bar.
+public view SeekPreview(thumb: LibThumb, time: Float, x: Float, barWidth: Float, width: Float = 160, chapter: String = "") {
+    let h = if thumb.isEmpty { 0.0 } else { floor(width * Float(thumb.height) / Float(max(thumb.width, 1))) }
+    let box = if thumb.isEmpty { 64.0 } else { width + 8.0 }
+    VStack(spacing: 3) {
+        if !thumb.isEmpty {
+            LibThumbView(thumb: thumb, placeholder: svgFilm(), width: width, height: h, key: libThumbKey(thumb), back: .black, radius: 4)
+        }
+        if !chapter.isEmpty {
+            Text(chapter)
+                .font(size: 11)
+                .color(libDarkDim)
+                .lineLimit(1)
+                .frame(width: box - 8.0)
+        }
+        Text(libDurationText(time))
+            .font(size: 12, weight: .semibold)
+            .color(.white)
+    }
+    .padding(4)
+    .frame(width: box)
+    .background(.rgba(20, 20, 20, 0.92), radius: 7)
+    .border(.rgb(70, 70, 70), width: 1, radius: 7)
+    .offset(x: libPreviewLeft(x: x, barWidth: barWidth, box: box))
+    .accessibilityLabel("Preview at {libDurationText(time)}")
+}
+
+// A scene of the strip: where it starts, its picture, and a title
+// (a chapter's) if it has one.
+public struct SceneThumb {
+    time: Float
+    thumb: LibThumb = LibThumb()
+    title: String = ""
+}
+
+// The scene strip: scenes in time order; `current` is the playing time.
+public view SceneStrip(scenes: [SceneThumb], current: Float, onSeek: fn(Float), height: Float = 78) {
+    let cur = libSceneIndex(scenes, at: current)
+    let th = max(20.0, height - 32.0)
+    let tw = floor(th * 16.0 / 9.0)
+    VStack(spacing: 0) {
+        Scroll(.horizontal) {
+            // One canvas per scene (the player window rebuilds often, so
+            // each scene is a single view; a lazy list can't be scrolled
+            // to by its own ids).
+            HStack(spacing: 4) {
+                for i in 0..scenes.count {
+                    ssCell(i, tw: tw, th: th, cur: cur)
+                }
+            }
+            .padding(horizontal: 4, vertical: 4)
+        }
+        .frame(height: height)
+        // Keeps the scene playing in view as it changes.
+        Spacer()
+            .frame(width: 0, height: 0)
+            .id("libscenecur{cur}")
+            .onAppear {
+                if cur >= 0 {
+                    scrollTo("libscene{cur}")
+                }
+            }
+    }
+    .background(libDarkBar)
+
+    fn ssCell(_ i: Int, tw: Float, th: Float, cur: Int) -> View {
+        let s = scenes[i]
+        let on = i == cur
+        let label = if s.title.isEmpty { libDurationText(s.time) } else { "{libDurationText(s.time)} {s.title}" }
+        Canvas(redraw: (libThumbKey(s.thumb) % 1_000_000_007) * 4 + (if on { 1 } else { 0 }) + i * 8) { g in
+            let x = 3.0
+            let y = 3.0
+            g.fillRect(x: x, y: y, width: tw, height: th, color: libDarkCard, radius: 4)
+            let t = s.thumb
+            if t.isEmpty {
+                let side = th * 0.45
+                g.svg(text: svgFilm(), x: x + (tw - side) / 2.0, y: y + (th - side) / 2.0, width: side, height: side, color: .rgb(102, 102, 102))
+            } else {
+                g.save()
+                g.beginPath()
+                g.rect(x: x, y: y, width: tw, height: th, radius: 4)
+                g.clipPath()
+                let k = max(tw / Float(t.width), th / Float(t.height))
+                let w = Float(t.width) * k
+                let h = Float(t.height) * k
+                g.image(pixels: t.pixels, pixelWidth: t.width, pixelHeight: t.height, x: x + (tw - w) / 2.0, y: y + (th - h) / 2.0, width: w, height: h)
+                g.restore()
+            }
+            if on {
+                g.strokeRect(x: 1.0, y: 1.0, width: g.width - 2.0, height: g.height - 2.0, color: libAccent, lineWidth: 2, radius: 5)
+            }
+            g.save()
+            g.clip(x: 0, y: 0, width: g.width, height: g.height)
+            g.text(label, x: g.width / 2.0, y: y + th + 2.0, size: 10, color: if on { libAccent } else { libDarkDim }, weight: if on { .semibold } else { .regular }, align: .top)
+            g.restore()
+        }
+        .frame(width: tw + 6.0, height: th + 20.0)
+        .onTap { onSeek(s.time) }
+        .tooltip("Go to {label}")
+        .accessibilityLabel("Scene at {label}{if on { ", playing" } else { "" }}")
+        .id("libscene{i}")
+    }
+}
+
+// The scene playing at `t` (−1 before the first).
+public fn libSceneIndex(_ scenes: [SceneThumb], at: Float) -> Int {
+    var starts: [Float] = []
+    for s in scenes {
+        starts.append(s.time)
+    }
+    libCurrentIndex(starts, at: at)
+}
+
+// The chapter playing at `t` (−1 before the first or with none).
+public fn libChapterIndex(_ chapters: [core.Chapter], at: Float) -> Int {
+    var starts: [Float] = []
+    for c in chapters {
+        starts.append(c.start)
+    }
+    libCurrentIndex(starts, at: at)
+}
+
+// Where the next (or, going back, the previous) chapter starts from `t`,
+// or −1 when there's none. Going back within the first 3 seconds of a
+// chapter goes to the one before, else to the start of this one.
+public fn libChapterStep(_ chapters: [core.Chapter], at: Float, forward: Bool) -> Float {
+    let i = libChapterIndex(chapters, at: at)
+    if forward {
+        let n = i + 1
+        return if n < chapters.count { chapters[n].start } else { -1.0 }
+    }
+    if i < 0 {
+        return -1.0
+    }
+    if at - chapters[i].start > 3.0 {
+        return chapters[i].start
+    }
+    if i > 0 { chapters[i - 1].start } else { chapters[0].start }
+}
+
+// The chapters as menu items ("Opening  0:00"), the playing one checked:
+// for a context menu or a Menu of the app's own.
+public view ChapterMenuItems(chapters: [core.Chapter], current: Float, onSeek: fn(Float)) {
+    let cur = libChapterIndex(chapters, at: current)
+    for (i, c) in chapters.enumerated() {
+        MenuItem("{libChapterTitle(c, index: i)}   {libDurationText(c.start)}", checked: i == cur) { onSeek(c.start) }
+    }
+    if chapters.isEmpty {
+        MenuItem("No Chapters") {}
+            .disabled(true)
+    }
+}
+
+// A "Chapters" submenu (for the menu bar's Playback menu or a context
+// menu), with Previous / Next Chapter.
+public view ChaptersMenu(chapters: [core.Chapter], current: Float, onSeek: fn(Float), title: String = "Chapters") {
+    Menu(title) {
+        MenuItem("Previous Chapter") {
+            let t = libChapterStep(chapters, at: current, forward: false)
+            if t >= 0.0 {
+                onSeek(t)
+            }
+        }
+        .disabled(chapters.isEmpty)
+        MenuItem("Next Chapter") {
+            let t = libChapterStep(chapters, at: current, forward: true)
+            if t >= 0.0 {
+                onSeek(t)
+            }
+        }
+        .disabled(libChapterStep(chapters, at: current, forward: true) < 0.0)
+        MenuDivider()
+        ChapterMenuItems(chapters: chapters, current: current, onSeek: onSeek)
+    }
+}

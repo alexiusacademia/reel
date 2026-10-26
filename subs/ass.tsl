@@ -1,0 +1,332 @@
+// ASS (Advanced SubStation Alpha, "v4.00+") and SSA ("v4.00") scripts:
+// the [Script Info] section (PlayResX/PlayResY, WrapStyle), the
+// [V4+ Styles] / [V4 Styles] style lines, and the [Events] Dialogue lines,
+// following the SSA v4.00+ format description (the "ass-specs" document
+// that ships with Aegisub) and libass's behaviour where it differs.
+//
+// Also the event lines inside Matroska ASS tracks (Matroska's subtitle
+// spec, "SSA/ASS"): "ReadOrder,Layer,Style,Name,MarginL,MarginR,MarginV,
+// Effect,Text", whose times come from the block and whose script header
+// is the track's CodecPrivate (core.Track.extra).
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../core"
+
+public struct AssScript {
+    styles: [AssStyle] = []
+    resX: Int = 384
+    resY: Int = 288
+    wrapStyle: Int = 0
+    // An SSA (v4.00) script: legacy alignment numbers, "Marked" field.
+    ssa: Bool = false
+    // The [Events] Format line's field names, lower case.
+    eventFormat: [String] = ["layer", "start", "end", "style", "name", "marginl", "marginr", "marginv", "effect", "text"]
+}
+
+let assStyleFormat = ["name", "fontname", "fontsize", "primarycolour", "secondarycolour", "outlinecolour", "backcolour", "bold", "italic", "underline", "strikeout", "scalex", "scaley", "spacing", "angle", "borderstyle", "outline", "shadow", "alignment", "marginl", "marginr", "marginv", "encoding"]
+
+let mkvAssFormat = ["readorder", "layer", "style", "name", "marginl", "marginr", "marginv", "effect", "text"]
+
+// Splits "a,b,c" into at most `count` fields; the last gets the rest
+// (event text may contain commas).
+fn assSplit(_ s: String, _ count: Int) -> [String] {
+    let parts = s.split(",")
+    if parts.count <= count || count <= 0 {
+        return parts
+    }
+    var out = parts.prefix(count - 1)
+    out.append(parts.dropFirst(count - 1).joined(separator: ","))
+    out
+}
+
+fn assBool(_ s: String) -> Bool {
+    let v = Int(s.trim()) ?? 0
+    v != 0
+}
+
+fn assFloat(_ s: String, _ fallback: Float) -> Float {
+    Float(s.trim()) ?? fallback
+}
+
+// The header of a script: everything but the events (and a Matroska
+// track's CodecPrivate, which is exactly that).
+public fn parseAssHeader(_ text: String) -> AssScript {
+    var sc = AssScript()
+    var section = ""
+    var styleFormat = assStyleFormat
+    var resX = 0
+    var resY = 0
+    for raw in text.lines() {
+        let line = raw.trim()
+        if line.isEmpty || line.hasPrefix(";") || line.hasPrefix("!:") {
+            continue
+        }
+        if line.hasPrefix("[") {
+            section = line.lowercase()
+            if section == "[v4 styles]" {
+                sc.ssa = true
+            }
+            continue
+        }
+        let colon = line.find(":") ?? -1
+        if colon < 0 {
+            continue
+        }
+        let key = line.substring(from: 0, to: colon).trim().lowercase()
+        let value = line.substring(from: colon + 1, to: line.count).trim()
+        if section == "[script info]" {
+            if key == "playresx" {
+                resX = Int(value) ?? 0
+            } else if key == "playresy" {
+                resY = Int(value) ?? 0
+            } else if key == "wrapstyle" {
+                sc.wrapStyle = Int(value) ?? 0
+            } else if key == "scripttype" {
+                let v = value.lowercase()
+                if v == "v4.00" || v == "v4" {
+                    sc.ssa = true
+                }
+            }
+        } else if section.hasSuffix("styles]") {
+            if key == "format" {
+                styleFormat = value.split(",").map { f in f.trim().lowercase() }
+            } else if key == "style" {
+                sc.styles.append(assStyleLine(value, styleFormat, ssa: sc.ssa))
+            }
+        } else if section == "[events]" {
+            if key == "format" {
+                sc.eventFormat = value.split(",").map { f in f.trim().lowercase() }
+            }
+        }
+    }
+    // PlayRes defaults as libass has them.
+    if resX <= 0 && resY <= 0 {
+        resX = 384
+        resY = 288
+    } else if resY <= 0 {
+        resY = if resX == 1280 { 1024 } else { max(1, resX * 3 / 4) }
+    } else if resX <= 0 {
+        resX = if resY == 1024 { 1280 } else { max(1, resY * 4 / 3) }
+    }
+    sc.resX = resX
+    sc.resY = resY
+    if sc.ssa {
+        sc.eventFormat = sc.eventFormat.map { f in if f == "marked" { "layer" } else { f } }
+    }
+    sc
+}
+
+// One "Style:" line's values in the order of the Format line.
+fn assStyleLine(_ value: String, _ format: [String], ssa: Bool) -> AssStyle {
+    var st = AssStyle()
+    let vals = assSplit(value, format.count)
+    var ssaAlpha = -1
+    for (i, f) in format.enumerated() {
+        if i >= vals.count {
+            break
+        }
+        let v = vals[i].trim()
+        match f {
+            "name" -> {
+                // Some scripts write "*Default".
+                st.name = if v.hasPrefix("*") { v.substring(from: 1, to: v.count) } else { v }
+            }
+            "fontname" -> { st.font = v }
+            "fontsize" -> { st.size = assFloat(v, 16.0) }
+            "primarycolour" -> {
+                let c = assColorValue(v)
+                if c >= 0 { st.primary = assColor(c) }
+            }
+            "secondarycolour" -> {
+                let c = assColorValue(v)
+                if c >= 0 { st.secondary = assColor(c) }
+            }
+            "outlinecolour", "tertiarycolour" -> {
+                let c = assColorValue(v)
+                if c >= 0 { st.outlineColor = assColor(c) }
+            }
+            "backcolour" -> {
+                let c = assColorValue(v)
+                if c >= 0 { st.back = assColor(c) }
+            }
+            "bold" -> { st.bold = assBool(v) }
+            "italic" -> { st.italic = assBool(v) }
+            "underline" -> { st.underline = assBool(v) }
+            "strikeout" -> { st.strike = assBool(v) }
+            "scalex" -> { st.scaleX = assFloat(v, 100.0) }
+            "scaley" -> { st.scaleY = assFloat(v, 100.0) }
+            "spacing" -> { st.spacing = assFloat(v, 0.0) }
+            "angle" -> { st.angle = assFloat(v, 0.0) }
+            "borderstyle" -> { st.borderStyle = Int(v) ?? 1 }
+            "outline" -> { st.outline = max(0.0, assFloat(v, 1.0)) }
+            "shadow" -> { st.shadow = max(0.0, assFloat(v, 0.0)) }
+            "alignment" -> {
+                let a = Int(v) ?? 2
+                st.align = if ssa { ssaAlign(a) } else { if a >= 1 && a <= 9 { a } else { 2 } }
+            }
+            "marginl" -> { st.marginL = assFloat(v, 10.0) }
+            "marginr" -> { st.marginR = assFloat(v, 10.0) }
+            "marginv" -> { st.marginV = assFloat(v, 10.0) }
+            "alphalevel" -> { ssaAlpha = Int(v) ?? 0 }
+            _ -> {}
+        }
+    }
+    // SSA's AlphaLevel applies to every colour (the colours themselves are
+    // decimal BGR without alpha there).
+    if ssa && ssaAlpha > 0 {
+        let a = 255 - (ssaAlpha & 255)
+        st.primary = subsWithAlpha(st.primary, a)
+        st.secondary = subsWithAlpha(st.secondary, a)
+        st.outlineColor = subsWithAlpha(st.outlineColor, a)
+    }
+    st
+}
+
+// The style of an event: by name, else "Default", else the first, else
+// the built-in default.
+public fn assStyleNamed(_ sc: AssScript, _ name: String) -> AssStyle {
+    let want = if name.hasPrefix("*") { name.substring(from: 1, to: name.count) } else { name }
+    for st in sc.styles {
+        if st.name == want {
+            return st
+        }
+    }
+    for st in sc.styles {
+        if st.name.lowercase() == want.lowercase() {
+            return st
+        }
+    }
+    for st in sc.styles {
+        if st.name == "Default" {
+            return st
+        }
+    }
+    if !sc.styles.isEmpty {
+        return sc.styles[0]
+    }
+    AssStyle()
+}
+
+// A cue from an event's fields (named as in `format`) and its times.
+fn assEvent(_ sc: AssScript, _ fields: [String], _ format: [String], start: Float, end: Float) -> Cue {
+    var styleName = "Default"
+    var layer = 0
+    var mL = 0.0
+    var mR = 0.0
+    var mV = 0.0
+    var text = ""
+    for (i, f) in format.enumerated() {
+        if i >= fields.count {
+            break
+        }
+        let v = fields[i]
+        match f {
+            "style" -> { styleName = v.trim() }
+            "layer" -> { layer = Int(v.trim()) ?? 0 }
+            "marginl" -> { mL = assFloat(v, 0.0) }
+            "marginr" -> { mR = assFloat(v, 0.0) }
+            "marginv" -> { mV = assFloat(v, 0.0) }
+            "text" -> { text = v }
+            _ -> {}
+        }
+    }
+    let st = assStyleNamed(sc, styleName)
+    let rx = Float(sc.resX)
+    let ry = Float(sc.resY)
+    var cue = Cue(start: start, end: end)
+    cue.style = st.name
+    cue.layer = layer
+    cue.align = st.align
+    cue.marginL = (if mL > 0.0 { mL } else { st.marginL }) / rx
+    cue.marginR = (if mR > 0.0 { mR } else { st.marginR }) / rx
+    cue.marginV = (if mV > 0.0 { mV } else { st.marginV }) / ry
+    cue.fontSize = st.size / ry
+    cue.borderStyle = st.borderStyle
+    cue.angle = st.angle
+    cue.wrapStyle = sc.wrapStyle
+    let base = assSpanOf(st, resY: ry)
+    var b = SubsBuilder(cue: cue, cur: base, base: base)
+    b.styles = sc.styles
+    b.resX = rx
+    b.resY = ry
+    b.styleSize = if st.size > 0.0 { st.size } else { 16.0 }
+    b = subsAssText(b, text)
+    b.finish()
+}
+
+// A whole .ass / .ssa file.
+fn parseAss(_ text: String) -> SubTrack {
+    let sc = parseAssHeader(text)
+    var track = SubTrack(format: if sc.ssa { "ssa" } else { "ass" })
+    track.playResX = sc.resX
+    track.playResY = sc.resY
+    var section = ""
+    var format = sc.eventFormat
+    var order = 0
+    var withOrder: [(Int, Cue)] = []
+    for raw in text.lines() {
+        let line = raw.trim()
+        if line.hasPrefix("[") {
+            section = line.lowercase()
+            continue
+        }
+        if section != "[events]" {
+            continue
+        }
+        if line.hasPrefix("Format:") {
+            format = line.substring(from: 7, to: line.count).split(",").map { f in
+                let t = f.trim().lowercase()
+                if t == "marked" { "layer" } else { t }
+            }
+            continue
+        }
+        if !line.hasPrefix("Dialogue:") {
+            continue
+        }
+        let body = raw.trimStart().substring(from: 9, to: raw.trimStart().count).trimStart()
+        let fields = assSplit(body, format.count)
+        var start = -1.0
+        var end = -1.0
+        for (i, f) in format.enumerated() {
+            if i < fields.count {
+                if f == "start" {
+                    start = subsClock(fields[i])
+                } else if f == "end" {
+                    end = subsClock(fields[i])
+                }
+            }
+        }
+        if start < 0.0 || end < 0.0 {
+            track.warnings.append("bad event times: {line}")
+            continue
+        }
+        var cue = assEvent(sc, fields, format, start: start, end: end)
+        if cue.spans.isEmpty {
+            order += 1
+            continue
+        }
+        cue.id = order + 1
+        withOrder.append((order, cue))
+        order += 1
+    }
+    // Files are usually in time order but needn't be.
+    let sorted = withOrder.sorted(by: { a, b in a.1.start < b.1.start || (a.1.start == b.1.start && a.0 < b.0) })
+    track.cues = sorted.map { p in p.1 }
+    track
+}
+
+// One Matroska ASS block: "ReadOrder,Layer,Style,Name,MarginL,MarginR,
+// MarginV,Effect,Text". (ffmpeg also accepts full "Dialogue:" lines in
+// old files; so do we.)
+fn assPacket(_ sc: AssScript, _ text: String, start: Float, end: Float) -> Cue {
+    let t = text.trim()
+    if t.hasPrefix("Dialogue:") {
+        let body = t.substring(from: 9, to: t.count).trimStart()
+        let fields = assSplit(body, sc.eventFormat.count)
+        return assEvent(sc, fields, sc.eventFormat, start: start, end: end)
+    }
+    let fields = assSplit(text, mkvAssFormat.count)
+    assEvent(sc, fields, mkvAssFormat, start: start, end: end)
+}

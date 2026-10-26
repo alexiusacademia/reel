@@ -1,0 +1,141 @@
+// The decoder for subtitle tracks inside containers (Matroska, MP4,
+// MPEG-TS): it turns each packet into the cues it shows. Text codecs give
+// one cue per packet; PGS and DVD subtitles give a cue when a picture is
+// shown and send it again (same id) with its real end when the next one
+// replaces or clears it — keep cues with replaceCues.
+//
+// decodeTrack runs a decoder over a whole track at once (subtitle tracks
+// are small), for the player to show them like a subtitle file.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../core"
+
+public struct Decoder {
+    codec: String
+    script: AssScript = AssScript()
+    tx3g: Tx3gSetup = Tx3gSetup()
+    pgs: PgsState = PgsState()
+    dvd: DvdState = DvdState()
+    nextId: Int = 1
+    warnings: [String] = []
+
+    // The cues a packet shows, from `start` for `duration` seconds (a
+    // duration of 0 or less: not known).
+    fn decode(_ packet: Data, start: Float, duration: Float) -> [Cue] {
+        var out: [Cue] = []
+        let end = if duration > 0.0 { start + duration } else { start + 5.0 }
+        match codec {
+            "srt", "text" -> {
+                let cue = srtCue(subsPacketText(packet), start: start, end: end)
+                if !cue.spans.isEmpty {
+                    out.append(cue)
+                }
+            }
+            "ass", "ssa" -> {
+                let cue = assPacket(script, subsPacketText(packet), start: start, end: end)
+                if !cue.spans.isEmpty {
+                    out.append(cue)
+                }
+            }
+            "webvtt" -> {
+                out = vttPacket(packet, start: start, end: end)
+            }
+            "tx3g" -> {
+                if let cue = tx3gCue(tx3g, packet, start: start, end: end) {
+                    out.append(cue)
+                }
+            }
+            "pgs" -> {
+                let cues = pgs.packet(packet, time: start, duration: duration)
+                while warnings.count < 50 && pgs.warnings.count > 0 {
+                    warnings.append(pgs.warnings.removeFirst())
+                }
+                return cues
+            }
+            "dvdsub" -> {
+                let cues = dvd.spu(packet, time: start, duration: duration)
+                return cues
+            }
+            _ -> {}
+        }
+        // Text cues get ids of their own, so replaceCues keeps them all.
+        for c in out {
+            c.id = nextId
+            nextId += 1
+        }
+        out
+    }
+
+    // After a seek: forget pictures on screen (the PGS objects stay until
+    // the next epoch, as they would on a disc player).
+    fn reset() {
+        pgs.showing = []
+        pgs.havePcs = false
+        dvd.showing = []
+    }
+}
+
+// A decoder for a subtitle track: "srt" "ass" "ssa" "webvtt" "tx3g" "text"
+// "pgs" "dvdsub".
+public fn newDecoder(_ track: core.Track) -> Result<Decoder> {
+    let c = track.codec
+    var d = Decoder(codec: c)
+    match c {
+        "srt", "text", "webvtt" -> {}
+        "ass", "ssa" -> {
+            d.script = parseAssHeader(decodeText(track.extra))
+        }
+        "tx3g" -> {
+            d.tx3g = parseTx3gSetup(track.extra)
+        }
+        "pgs" -> {
+            if track.width > 0 && track.height > 0 {
+                d.pgs.width = track.width
+                d.pgs.height = track.height
+            }
+        }
+        "dvdsub" -> {
+            d.dvd.setup = parseIdx(decodeText(track.extra))
+            if !d.dvd.setup.hasPalette {
+                d.warnings.append("no DVD subtitle palette in the track: using greys")
+            }
+            if track.width > 0 && track.height > 0 && track.extra.isEmpty {
+                d.dvd.setup.width = track.width
+                d.dvd.setup.height = track.height
+            }
+        }
+        _ -> {
+            return .failure(error: Error("subtitles in \"{c}\" can't be shown"))
+        }
+    }
+    Result.ok(value: d)
+}
+
+// Every cue of a subtitle track in a container, as one SubTrack.
+public fn decodeTrack(_ file: Data, _ media: core.Media, track: Int) -> Result<SubTrack> {
+    if track < 0 || track >= media.tracks.count {
+        return .failure(error: Error("there's no track {track}"))
+    }
+    let t = media.tracks[track]
+    var dec = try newDecoder(t)
+    var cues: [Cue] = []
+    for p in media.packets {
+        if p.track != track {
+            continue
+        }
+        let bytes = core.packetBytes(file, media, p)
+        let start = core.seconds(p.pts, t.timescale)
+        let dur = core.seconds(p.duration, t.timescale)
+        cues = replaceCues(cues, dec.decode(bytes, start: start, duration: dur))
+    }
+    var out = SubTrack(format: t.codec)
+    if t.codec == "ass" || t.codec == "ssa" {
+        out.playResX = dec.script.resX
+        out.playResY = dec.script.resY
+    }
+    out.cues = cues.sorted(by: { a, b in a.start < b.start })
+    out.warnings = dec.warnings
+    Result.ok(value: out)
+}

@@ -1,0 +1,346 @@
+// Library tests: the SQLite media library, history and per-file memory,
+// track choice by language, the legacy import, and the thumbnail cache.
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+import "../../library"
+import "../../demux"
+import "../../core"
+
+let fixtures = "tests/fixtures"
+
+fn put(_ path: String, bytes: Int) {
+    createFolder(path.folder)
+    var d = Data()
+    for i in 0..bytes {
+        d.append(byte: i & 255)
+    }
+    writeData(path: path, data: d)
+}
+
+fn fixture(_ name: String, to: String) {
+    createFolder(to.folder)
+    copyFile(from: joinPath(fixtures, name), to: to)
+}
+
+fn mediaOf(_ path: String) -> core.Media {
+    demux.open(readData(path) ?? Data(), name: path).valueOr(core.Media())
+}
+
+fn testLibrary(_ c: bind Checker, _ root: String) {
+    var opened: [library.Library] = []
+    match library.openLibrary(joinPath(root, "library.db")) {
+        .ok(l) -> opened.append(l)
+        .failure(e) -> c.check(false, "open library: {e.message}")
+    }
+    if opened.isEmpty {
+        return
+    }
+    var lib = opened[0]
+    let movies = joinPath(root, "Movies")
+    let tv = joinPath(root, "TV")
+    let music = joinPath(root, "Music")
+    fixture("h264_baseline.mp4", to: joinPath(movies, "Amélie (2001).mp4"))
+    put(joinPath(movies, "Blade.Runner.2049.2017.1080p.mkv"), bytes: 3000)
+    put(joinPath(movies, "Extras/.hidden.mkv"), bytes: 10)
+    put(joinPath(movies, "Extras/readme.txt"), bytes: 10)
+    put(joinPath(tv, "Mr Robot/Season 1/Mr.Robot.S01E02.mkv"), bytes: 2002)
+    put(joinPath(tv, "Mr Robot/Season 1/Mr.Robot.S01E01.mkv"), bytes: 2001)
+    put(joinPath(tv, "Mr Robot/Season 1/Mr.Robot.S01E10.mkv"), bytes: 2010)
+    put(joinPath(tv, "Mr Robot/Season 2/mr robot - 2x01.mkv"), bytes: 2101)
+    put(joinPath(tv, "Café Society S01E01.mp4"), bytes: 1500)
+    fixture("mp3_cbr.mp3", to: joinPath(music, "Reel/Tones/01 tone.mp3"))
+    fixture("flac.flac", to: joinPath(music, "Reel/Tones/02 tone.flac"))
+    fixture("cover.mp3", to: joinPath(music, "Various/cover.mp3"))
+    c.check(lib.addFolder(movies) == nil && lib.addFolder(tv + "/") == nil && lib.addFolder(music) == nil, "add folders")
+    lib.addFolder(movies)
+    c.sameInt(lib.folders().count, 3, "folders (a repeat is ignored, a trailing / dropped)")
+
+    let r = lib.scan()
+    c.sameInt(r.added, 10, "scan added")
+    c.sameInt(r.tagged, 3, "scan read the audio files' tags")
+    print("time first scan of {r.files} files: {Int(r.ms)} ms")
+    let g = lib.groupCounts()
+    c.check(g["movies"] == 2 && g["tv"] == 5 && g["music"] == 3, "groups: {g["movies"] ?? -1} movies, {g["tv"] ?? -1} tv, {g["music"] ?? -1} music")
+    c.sameInt(lib.count(), 10, "count")
+    // Tags from the scan.
+    if let tone = lib.item(joinPath(music, "Reel/Tones/01 tone.mp3")) {
+        c.same(tone.title, "Test Tone", "mp3 title tag")
+        c.same(tone.artist, "Reel", "mp3 artist tag")
+        c.near(tone.duration, 3.0, "mp3 duration", tol: 0.1)
+        c.check(tone.codecs.hasPrefix("mp3"), "mp3 codecs: {tone.codecs}")
+        c.sameInt(tone.details, 1, "details from the scan")
+    } else {
+        c.check(false, "the mp3 is in the library")
+    }
+    // Search: case and accents ignored; title, artist and file names.
+    c.sameInt(lib.search("amelie").count, 1, "search without the accent")
+    c.sameInt(lib.search("CAFÉ").count, 1, "search in capitals with the accent")
+    c.sameInt(lib.search("robot").count, 4, "search the show name")
+    c.sameInt(lib.search("tone reel").count, 1, "search title + artist words")
+    c.sameInt(lib.search("TONE").count, 2, "search titles")
+    c.sameInt(lib.search("tone", group: "tv").count, 0, "search within a group")
+    c.sameInt(lib.search("100%").count, 0, "LIKE characters are literal")
+    c.sameInt(lib.search("").count, 10, "empty search lists everything")
+    // Shows and episodes.
+    let shows = lib.shows()
+    c.sameInt(shows.count, 2, "two shows")
+    if let robot = shows.first(where: { s in s.key == "mr robot" }) {
+        c.check(robot.seasons == [1, 2] && robot.episodes == 4 && robot.unwatched == 4, "Mr Robot: seasons {robot.seasons.count}, {robot.episodes} episodes")
+    } else {
+        c.check(false, "Mr Robot show")
+    }
+    let eps = lib.episodes(key: "mr robot")
+    c.same(eps.map({ i in i.name }).joined(separator: ","), "Mr.Robot.S01E01.mkv,Mr.Robot.S01E02.mkv,Mr.Robot.S01E10.mkv,mr robot - 2x01.mkv", "episodes in order")
+    c.sameInt(lib.episodes(key: "mr robot", season: 1).count, 3, "one season")
+    c.same(lib.nextEpisodeOf(joinPath(tv, "Mr Robot/Season 1/Mr.Robot.S01E10.mkv")), joinPath(tv, "Mr Robot/Season 2/mr robot - 2x01.mkv"), "next episode from the library, across folders")
+    // Music.
+    c.check(lib.artists().contains("Reel"), "artists")
+    let albums = lib.albums()
+    c.check(albums.any(where: { a in a.album == "Reel Album" }), "albums (cover.mp3's album tag)")
+    // Sorting.
+    let byName = lib.items(group: "movies", sort: "name")
+    c.same(byName.first?.name ?? "", "Amélie (2001).mp4", "sort by name")
+    let bySize = lib.items(sort: "size", descending: true)
+    c.check(bySize.first?.name == "Amélie (2001).mp4", "sort by size, largest first")
+    let movieItem = lib.item(joinPath(movies, "Blade.Runner.2049.2017.1080p.mkv"))
+    c.sameInt(movieItem?.year ?? 0, 2017, "movie year from the name")
+
+    // The player reports what it found in a file.
+    let am = joinPath(movies, "Amélie (2001).mp4")
+    let amSize = fileSize(am) ?? 0
+    lib.reportPlayed(am, size: amSize, media: mediaOf(am))
+    if let it = lib.item(am) {
+        c.check(it.duration > 0.0 && it.codecs.contains("h264") && it.width > 0, "report fills duration, codecs, size ({it.codecs})")
+        c.sameInt(it.details, 2, "details from the player")
+        c.same(it.group, "other", "a short clip moves to Other once its duration is known")
+    }
+
+    // Rescan: one file removed, one changed, one added.
+    deleteFile(path: joinPath(tv, "Café Society S01E01.mp4"))
+    put(joinPath(movies, "Blade.Runner.2049.2017.1080p.mkv"), bytes: 4000)
+    put(joinPath(movies, "New Film (2024).mkv"), bytes: 100)
+    let r2 = lib.scan()
+    c.check(r2.removed == 1 && r2.changed == 1 && r2.added == 1 && r2.unchanged == 8, "rescan: +{r2.added} ~{r2.changed} -{r2.removed} ={r2.unchanged}")
+    let t0 = now()
+    let r3 = lib.scan()
+    c.check(r3.added == 0 && r3.changed == 0 && r3.removed == 0, "a rescan with no changes changes nothing")
+    print("time rescan of {r3.files} files: {Int((now() - t0) * 1000.0)} ms")
+    // Single files and small reads.
+    let loose = joinPath(root, "loose/clip.mkv")
+    put(loose, bytes: 10)
+    c.check(lib.addFile(loose) == nil && lib.item(loose)?.group == "movies", "addFile")
+    c.check(lib.addFile(joinPath(root, "nope.mkv")) != nil, "addFile of a missing file fails")
+    c.check(library.readMediaReport(am, maxBytes: 100) == nil, "readMediaReport skips big files")
+    c.same(library.sniffContainer(readData(am) ?? Data(), name: am), "mp4", "sniffContainer")
+    c.sameInt(lib.filesNeedingTags().count, 0, "no audio waits for tags")
+    lib.removeFolder(music)
+    c.sameInt(lib.groupCounts()["music"] ?? -1, 0, "removing a folder drops its files")
+
+    testHistory(c, lib, root, tv)
+    testTracks(c)
+    testBigScan(c, root)
+    lib.close()
+}
+
+fn testHistory(_ c: bind Checker, _ lib: library.Library, _ root: String, _ tv: String) {
+    let ep = joinPath(tv, "Mr Robot/Season 1/Mr.Robot.S01E01.mkv")
+    let size = fileSize(ep) ?? 0
+    c.near(lib.resumePosition(ep, size: size), -1.0, "nothing to resume yet")
+    lib.startedPlaying(ep, size: size, duration: 3000.0)
+    lib.startedPlaying(ep, size: size)
+    c.check(!lib.savePosition(ep, size: size, position: 1234.5, duration: 3000.0), "a position in the middle isn't finished")
+    c.near(lib.resumePosition(ep, size: size), 1234.5, "resume position")
+    c.near(lib.resumePosition(ep, size: size, minSeconds: 2000.0), -1.0, "under the minimum isn't offered")
+    if let rec = lib.record(ep, size: size) {
+        c.sameInt(rec.playCount, 2, "play count")
+        c.check(rec.lastPlayed > 0.0, "last played")
+        c.near(rec.duration, 3000.0, "duration kept")
+    }
+    c.check(lib.items(group: "tv").first(where: { i in i.path == ep })?.position == 1234.5, "items carry the history")
+    c.check(lib.savePosition(ep, size: size, position: 2990.0, duration: 3000.0), "near the end is finished")
+    c.near(lib.resumePosition(ep, size: size), -1.0, "a finished file isn't resumed")
+    c.sameInt(lib.shows().first(where: { s in s.key == "mr robot" })?.unwatched ?? -1, 3, "unwatched count after finishing one")
+    c.same(lib.nextUnwatched(key: "mr robot")?.name ?? "", "Mr.Robot.S01E02.mkv", "continue with the first unwatched")
+    c.check(lib.savePosition(ep, size: size, position: 2900.0, duration: 3000.0), "past 95% is finished")
+    lib.setFinished(ep, size: size, false)
+    c.check(!(lib.record(ep, size: size)?.finished ?? true), "mark unfinished")
+
+    // Per-file settings.
+    var s = lib.fileSettings(ep, size: size)
+    c.check(s == library.FileSettings(), "default settings")
+    s.volume = 0.4
+    s.speed = 1.5
+    s.subtitleDelay = -0.3
+    s.aspect = "16:9"
+    s.equalizer = "Rock"
+    s.audio = library.TrackChoice(chosen: true, language: "jpn", codec: "opus")
+    s = library.addBookmark(s, time: 600.0, name: "Fight")
+    s = library.addBookmark(s, time: 125.0)
+    s = library.cycleABLoop(s, at: 30.0)
+    s = library.cycleABLoop(s, at: 45.0)
+    c.check(lib.saveFileSettings(ep, size: size, s) == nil, "save settings")
+    let back = lib.fileSettings(ep, size: size)
+    c.check(back == s, "settings round trip")
+    c.check(back.bookmarks.count == 2 && back.bookmarks[0].name == "2:05" && back.bookmarks[1].name == "Fight", "bookmarks sorted, named by time")
+    c.check(library.hasABLoop(back) && library.abLoopTime(back, at: 46.0) == 30.0 && library.abLoopTime(back, at: 40.0) == 40.0, "A-B loop")
+    c.near(library.nextBookmark(back, after: 130.0)?.time ?? -1.0, 600.0, "next bookmark")
+    c.near(library.nextBookmark(back, after: 130.0, forward: false)?.time ?? -1.0, 125.0, "previous bookmark")
+    let cleared = library.cycleABLoop(back, at: 50.0)
+    c.check(!library.hasABLoop(cleared) && cleared.abStart < 0.0, "third press clears the loop")
+    let renamed = library.renameBookmark(library.removeBookmark(back, index: 1), index: 0, name: "Intro")
+    c.check(renamed.bookmarks.count == 1 && renamed.bookmarks[0].name == "Intro", "remove and rename bookmarks")
+    let upd = lib.updateFileSettings(ep, size: size) { x in
+        var y = x
+        y.zoom = 2.0
+        y
+    }
+    c.check(upd.zoom == 2.0 && lib.fileSettings(ep, size: size).zoom == 2.0 && lib.fileSettings(ep, size: size).volume == 0.4, "updateFileSettings")
+    c.check(lib.fileSettings(ep, size: size + 1) == library.FileSettings(), "a different size is a different file")
+
+    // A moved file is found again by its name and size.
+    let moved = joinPath(root, "Moved/Mr.Robot.S01E01.mkv")
+    createFolder(moved.folder)
+    renameFile(from: ep, to: moved)
+    c.near(lib.fileSettings(moved, size: size).volume, 0.4, "moved file keeps its settings")
+    c.check(lib.record(moved, size: size)?.path == moved, "the record follows the file")
+    renameFile(from: moved, to: ep)
+
+    // History and recent files.
+    let other = joinPath(tv, "Mr Robot/Season 1/Mr.Robot.S01E02.mkv")
+    lib.startedPlaying(other, size: fileSize(other) ?? 0)
+    lib.startedPlaying("https://example.com/live.m3u8", size: 0)
+    let h = lib.history(limit: 10)
+    c.check(h.count >= 3 && h[0].path == "https://example.com/live.m3u8" && h[1].path == other, "history newest first")
+    let recent = lib.recentPaths(limit: 5)
+    c.check(recent.contains("https://example.com/live.m3u8") && !recent.contains(joinPath(root, "Moved/Mr.Robot.S01E01.mkv")), "recent paths (URLs kept, gone files dropped)")
+
+    // The older recent.json and positions.json.
+    let legacy = joinPath(root, "legacy")
+    createFolder(legacy)
+    let a = joinPath(legacy, "a.mkv")
+    let b = joinPath(legacy, "b.mkv")
+    put(a, bytes: 50)
+    put(b, bytes: 60)
+    writeFile(path: joinPath(legacy, "recent.json"), text: toJson([b, a]))
+    writeFile(path: joinPath(legacy, "positions.json"), text: toJson(["{a}": 77.0]))
+    let n = lib.migrateLegacyFiles(folder: legacy)
+    c.sameInt(n, 2, "legacy files taken in")
+    c.near(lib.resumePosition(a, size: 50), 77.0, "legacy position")
+    let hist = lib.history(limit: 20).map { x in x.path }
+    let ia = hist.index(of: a) ?? -1
+    let ib = hist.index(of: b) ?? -1
+    c.check(ib >= 0 && ia > ib, "legacy recent order kept")
+    c.check(fileExists(joinPath(legacy, "recent.json.imported")) && !fileExists(joinPath(legacy, "recent.json")), "legacy files renamed")
+    c.sameInt(lib.migrateLegacyFiles(folder: legacy), 0, "migration runs once")
+
+    lib.forget(a, size: 50)
+    c.check(lib.record(a, size: 50) == nil, "forget")
+    lib.clearHistory()
+    c.sameInt(lib.history().count, 0, "clear history")
+    c.near(lib.fileSettings(ep, size: size).volume, 0.4, "clearing history keeps settings")
+}
+
+fn testTracks(_ c: bind Checker) {
+    let m = mediaOf(joinPath(fixtures, "multi.mkv"))
+    let audio = core.tracksOf(m, .audio)
+    if audio.count != 2 {
+        c.check(false, "multi.mkv has two audio tracks")
+        return
+    }
+    c.same(library.languageCode("en"), "eng", "639-1 to 639-2")
+    c.same(library.languageCode("deu"), "ger", "639-2/T to /B")
+    c.same(library.languageCode("pt-BR"), "por", "BCP 47")
+    c.same(library.languageCode("Japanese"), "jpn", "English name")
+    c.same(library.languageCode("und"), "", "undetermined")
+    c.same(library.languageName("fre"), "French", "language name")
+    c.check(library.sameLanguage("fr", "fra"), "sameLanguage")
+    let jp = audio.first(where: { t in t.language == "jpn" })?.index ?? -1
+    let en = audio.first(where: { t in t.language == "eng" })?.index ?? -1
+    let choice = library.rememberTrack(m, index: jp, kind: .audio)
+    c.check(choice.chosen && choice.language == "jpn" && choice.codec == "opus", "remember a track by language and codec")
+    c.check(library.chooseTrack(choice, m, kind: .audio) == jp, "choose it again")
+    // The same choice in a file where the tracks come in another order.
+    var swapped = m
+    swapped.tracks[en].language = "jpn"
+    swapped.tracks[en].codec = "opus"
+    swapped.tracks[jp].language = "eng"
+    swapped.tracks[jp].codec = "aac"
+    swapped.tracks[jp].title = ""
+    swapped.tracks[en].title = ""
+    c.check(library.chooseTrack(choice, swapped, kind: .audio) == en, "the choice follows the language, not the index")
+    c.check(library.chooseTrack(library.TrackChoice(), m, kind: .audio) == nil, "no memory: nil")
+    c.check(library.chooseTrack(library.TrackChoice(chosen: true, off: true), m, kind: .audio) == -1, "remembered off")
+    c.check(library.chooseTrack(library.TrackChoice(chosen: true, language: "jpn", codec: "aac"), m, kind: .audio) == jp, "language alone when the codec differs")
+    c.check(library.chooseTrack(library.TrackChoice(chosen: true, language: "kor", codec: "aac"), m, kind: .audio) == nil, "nothing fits: nil")
+    c.sameInt(library.preferredTrack(m, kind: .audio, languages: ["ja", "en"]), jp, "preferred audio language")
+    c.sameInt(library.preferredTrack(m, kind: .audio, languages: ["ko"]), audio.first(where: { t in t.isDefault })?.index ?? audio[0].index, "no preferred: the default track")
+    c.sameInt(library.preferredTrack(m, kind: .audio, languages: ["ja"], canUse: { t in t.codec != "opus" }), en, "tracks that can't be used are skipped")
+    let sm = mediaOf(joinPath(fixtures, "subs_srt.mkv"))
+    let au = core.tracksOf(sm, .audio).first?.index ?? -1
+    let st = core.tracksOf(sm, .subtitle).first?.index ?? -1
+    c.sameInt(library.preferredSubtitle(sm, audioIndex: au, mode: "always", languages: ["fr"]), st, "subtitles always, preferred language")
+    c.sameInt(library.preferredSubtitle(sm, audioIndex: au, mode: "never", languages: ["fr"]), -1, "subtitles never")
+    c.check(library.rememberTrack(sm, index: -1, kind: .subtitle).off, "remember subtitles off")
+}
+
+// A scan of 2,000 files in 20 folders, for timing.
+fn testBigScan(_ c: bind Checker, _ root: String) {
+    let big = joinPath(root, "Big")
+    for f in 0..20 {
+        for i in 0..100 {
+            put(joinPath(big, "Show {f}/Show {f} S01E{i}.mkv"), bytes: 1)
+        }
+    }
+    match library.openLibrary(":memory:") {
+        .ok(l) -> {
+            var lib = l
+            lib.addFolder(big)
+            let r = lib.scan(readTags: false)
+            c.sameInt(r.added, 2000, "big scan added")
+            print("time scan of 2000 new files: {Int(r.ms)} ms")
+            let t0 = now()
+            let found = lib.search("show 7")
+            print("time search in 2000 files: {Int((now() - t0) * 1000.0)} ms")
+            c.check(found.count >= 100 && found.all(where: { i in library.matchesSearch(i.name + " " + i.series, query: "show 7") }), "search in a big library ({found.count} found)")
+            let t1 = now()
+            let shows = lib.shows()
+            c.sameInt(shows.count, 20, "20 shows")
+            print("time shows of 2000 files: {Int((now() - t1) * 1000.0)} ms")
+            let r2 = lib.scan(readTags: false)
+            c.sameInt(r2.unchanged, 2000, "big rescan unchanged")
+            print("time rescan of 2000 files: {Int(r2.ms)} ms")
+        }
+        .failure(e) -> c.check(false, "memory library: {e.message}")
+    }
+}
+
+fn testThumbs(_ c: bind Checker, _ root: String) {
+    let cache = library.thumbCache(joinPath(root, "thumbs"), maxMB: 1)
+    var px: [Int] = []
+    for y in 0..36 {
+        for x in 0..64 {
+            px.append((x * 4) << 24 | (y * 7) << 16 | 128 << 8 | 255)
+        }
+    }
+    let p = cache.store("/m/film.mkv", size: 1234, width: 64, height: 36, pixels: px)
+    c.check(!p.isEmpty && fileExists(p), "store a poster")
+    c.check(p.contains("/thumbs/") && p.fileName.count == 20, "poster path layout: {p}")
+    if let (w, h, back) = cache.load("/m/film.mkv", size: 1234) {
+        c.check(w == 64 && h == 36 && back == px, "poster round trip")
+    } else {
+        c.check(false, "load the poster")
+    }
+    for t in [10.0, 20.5, 5.0] {
+        cache.store("/m/film.mkv", size: 1234, time: t, width: 64, height: 36, pixels: px)
+    }
+    c.check(cache.times("/m/film.mkv", size: 1234) == [5.0, 10.0, 20.5], "times listed in order")
+    c.near(cache.nearestTime("/m/film.mkv", size: 1234, to: 16.0), 20.5, "nearest time")
+    c.check(!cache.has("/m/film.mkv", size: 1235), "another size has no thumbnails")
+    let small = library.ThumbCache(folder: cache.folder, maxBytes: cache.totalBytes() - 1)
+    c.sameInt(small.trim(), 1, "trim deletes the oldest picture first")
+    c.check(small.has("/m/film.mkv", size: 1234), "the poster stays")
+    c.sameInt(cache.remove("/m/film.mkv", size: 1234), 3, "remove a file's thumbnails")
+    c.sameInt(cache.totalBytes(), 0, "empty again")
+}

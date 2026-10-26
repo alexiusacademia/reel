@@ -1,0 +1,303 @@
+// The plain data the AV1 parser hands the reconstructor (the contract
+// between the two stages of the decoder):
+//
+//   Av1Hdr       everything the reconstruction needs from the sequence
+//                header and frame header (AV1 spec 5.5, 5.9), with the
+//                values the spec derives from them (7.2 …)
+//   Av1Grain     the film grain parameters (5.9.30) of a shown frame
+//   ParsedFrame  one frame as parsed: its header, a list of operation
+//                records in decoding order (what predict_intra,
+//                predict_inter, predict_palette and reconstruct are called
+//                with in the spec's syntax tables 5.11), the dequantised
+//                coefficients, palettes, and the mode info the loop filter,
+//                CDEF, loop restoration and OBMC read (per 4x4 block grids)
+//   Av1Ref       a reference frame as the inter predictor sees it
+//
+// Operation records (ParsedFrame.ops, back to back; the first Int is the
+// kind, and each kind has a fixed size):
+//
+//   opBlock (34)   a new block (decode_block): its mode info, used by the
+//                  opInter records that follow it.
+//      1 MiRow  2 MiCol  3 MiSize  4 is_inter  5 use_intrabc  6 YMode
+//      7 UVMode  8 motion_mode (0 SIMPLE, 1 OBMC, 2 LOCALWARP)
+//      9 compound_type (0 WEDGE, 1 DIFFWTD, 2 AVERAGE, 3 INTRA, 4 DISTANCE)
+//      10 wedge_index  11 wedge_sign  12 mask_type
+//      13 IsInterIntra (is_inter && RefFrame[1] == INTRA_FRAME)
+//      14 interintra_mode  15 wedge_interintra
+//      16 LocalValid (warp estimation succeeded and setup shear is valid)
+//      17..22 LocalWarpParams[0..5]
+//      23 AvailU  24 AvailL  25 AvailUChroma  26 AvailLChroma
+//      27 HasChroma  28 segment_id  29 skip  30 Lossless
+//      31 RefFrame[0]  32 RefFrame[1]  33 interp_filter[0] * 4 + interp_filter[1]
+//   opIntra (18)   predict_intra (7.11.2) of one region, inputs resolved:
+//      1 plane  2 x  3 y (sample position in the plane)  4 log2W  5 log2H
+//      6 mode (the intra mode to apply; DC_PRED for CFL blocks)
+//      7 angleDelta (AngleDeltaY or AngleDeltaUV; 0 for interintra)
+//      8 haveLeft  9 haveAbove  10 haveAboveRight  11 haveBelowLeft
+//      12 filter_intra_mode, or -1 when use_filter_intra is 0 (always -1
+//         for chroma and interintra)
+//      13 filterType (7.11.2.8, worked out by the parser)
+//      14 CFL alpha for this plane (CflAlphaU or CflAlphaV)
+//      15 isCfl: 1 when predict_chroma_from_luma (7.11.5) follows
+//      16 MaxLumaW  17 MaxLumaH (for CFL)
+//   opPalette (9)  predict_palette (7.11.4):
+//      1 plane  2 startX  3 startY  4 log2 of the transform width
+//      5 log2 of the transform height  6 offset in ParsedFrame.palette of
+//      this block's data for the plane: [n, mapStride, color 0 … n-1,
+//      then the color index map, mapStride entries per row]
+//      7 x  8 y (the transform block's position in the block, in units of
+//      4 samples of the plane, as transform_block's x and y)
+//   opInter (8)    predict_inter (7.11.3) for the latest opBlock:
+//      1 plane  2 x  3 y  4 w  5 h  6 candRow  7 candCol
+//   opResidual (9) reconstruct (7.12.3) of one transform block:
+//      1 plane  2 x  3 y  4 txSz  5 PlaneTxType  6 offset in
+//      ParsedFrame.coefs  7 eob  8 Lossless
+//      coefs[offset] = n, then n entries value * 1024 + pos for the
+//      non-zero dequantised coefficients (Dequant[ i ][ j ] of 7.12.3
+//      step 1, already clipped), pos = i * tw + j with tw = Min(32, w).
+//
+// Mode info grids (one Int per 4x4 luma block, row stride miStride ==
+// MiCols, MiRows rows), written by decode_block for every 4x4 block the
+// block covers (inside the frame):
+//   gInfo  bits 0-4 MiSize, 5-8 RefFrame[0] + 1, 9-12 RefFrame[1] + 1,
+//          13-17 YMode, 18 skip, 19 is_inter, 20-22 segment_id,
+//          23-24 InterpFilters[0], 25-26 InterpFilters[1],
+//          27-31 LoopfilterTxSizes[0] (luma), 32-35 UVMode
+//   gMv    Mvs[0] row in bits 0-15, col 16-31, Mvs[1] row 32-47, col 48-63
+//          (each a signed 16-bit value; read with av1MvPart)
+//   gTxUV  LoopfilterTxSizes[1] (== [2]) at chroma 4x4 position
+//          (row >> subY) * miStride + (col >> subX)
+//   gDeltaLF  DeltaLFs[0..3], 7 bits each (value + 64), bits 7*i…;
+//          empty when delta_lf_present is 0 (all zero then)
+//   cdefIdx   cdef_idx per 64x64 block, stride cdefStride (-1 = off)
+//   lrData    per plane from lrOff[plane], lrRows[plane] * lrCols[plane]
+//             units of 10 Ints: LrType, LrSgrSet, LrSgrXqd[0..1],
+//             LrWiener[pass 0][0..2], LrWiener[pass 1][0..2]
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+let opBlock = 1
+let opIntra = 2
+let opPalette = 3
+let opInter = 4
+let opResidual = 5
+let opBlockSize = 34
+let opIntraSize = 18
+let opPaletteSize = 9
+let opInterSize = 8
+let opResidualSize = 9
+
+// The film grain parameters of film_grain_params (5.9.30), as read
+// (the ar_coeffs keep their +128 bias, as the syntax elements do).
+public struct Av1Grain {
+    applyGrain: Bool = false
+    grainSeed: Int = 0
+    updateGrain: Bool = false
+    numYPoints: Int = 0
+    pointYValue: [Int] = []
+    pointYScaling: [Int] = []
+    chromaScalingFromLuma: Bool = false
+    numCbPoints: Int = 0
+    pointCbValue: [Int] = []
+    pointCbScaling: [Int] = []
+    numCrPoints: Int = 0
+    pointCrValue: [Int] = []
+    pointCrScaling: [Int] = []
+    grainScalingMinus8: Int = 0
+    arCoeffLag: Int = 0
+    arCoeffsYPlus128: [Int] = []
+    arCoeffsCbPlus128: [Int] = []
+    arCoeffsCrPlus128: [Int] = []
+    arCoeffShiftMinus6: Int = 0
+    grainScaleShift: Int = 0
+    cbMult: Int = 0
+    cbLumaMult: Int = 0
+    cbOffset: Int = 0
+    crMult: Int = 0
+    crLumaMult: Int = 0
+    crOffset: Int = 0
+    overlapFlag: Bool = false
+    clipToRestrictedRange: Bool = false
+}
+
+// The sequence and frame header values the reconstruction uses.
+public struct Av1Hdr {
+    // Sequence header (5.5).
+    profile: Int = 0
+    bitDepth: Int = 8
+    monochrome: Bool = false
+    numPlanes: Int = 3
+    subX: Int = 1
+    subY: Int = 1
+    colorPrimaries: Int = 2
+    transferCharacteristics: Int = 2
+    matrixCoefficients: Int = 2
+    fullRange: Bool = false
+    use128: Bool = false
+    enableFilterIntra: Bool = false
+    enableIntraEdgeFilter: Bool = false
+    enableOrderHint: Bool = false
+    orderHintBits: Int = 0
+    enableSuperres: Bool = false
+    enableCdef: Bool = false
+    enableRestoration: Bool = false
+    filmGrainParamsPresent: Bool = false
+
+    // Frame header (5.9).
+    frameType: Int = 0
+    showFrame: Bool = true
+    showableFrame: Bool = false
+    showExistingFrame: Bool = false
+    frameToShowMapIdx: Int = 0
+    refreshFrameFlags: Int = 0
+    errorResilientMode: Bool = false
+    frameWidth: Int = 0
+    frameHeight: Int = 0
+    upscaledWidth: Int = 0
+    renderWidth: Int = 0
+    renderHeight: Int = 0
+    useSuperres: Bool = false
+    superresDenom: Int = 8
+    miCols: Int = 0
+    miRows: Int = 0
+    orderHint: Int = 0
+    // OrderHints[ refFrame ] for refFrame LAST_FRAME (1) … ALTREF_FRAME (7).
+    orderHints: [Int] = [0, 0, 0, 0, 0, 0, 0, 0]
+    // ref_frame_idx[ 0 … 6 ].
+    refFrameIdx: [Int] = [0, 0, 0, 0, 0, 0, 0]
+    allowIntrabc: Bool = false
+    forceIntegerMv: Bool = false
+    allowHighPrecisionMv: Bool = false
+    allowWarpedMotion: Bool = false
+    // GmType[ ref ] and gm_params[ ref ][ i ] at ref * 6 + i, ref 0 … 7.
+    gmType: [Int] = [0, 0, 0, 0, 0, 0, 0, 0]
+    gmParams: [Int] = []
+    codedLossless: Bool = false
+    allLossless: Bool = false
+    // Loop filter (5.9.11) and its deltas.
+    loopFilterLevel: [Int] = [0, 0, 0, 0]
+    loopFilterSharpness: Int = 0
+    loopFilterDeltaEnabled: Bool = false
+    loopFilterRefDeltas: [Int] = [1, 0, 0, 0, -1, 0, -1, -1]
+    loopFilterModeDeltas: [Int] = [0, 0]
+    deltaLfPresent: Bool = false
+    deltaLfMulti: Bool = false
+    // Segmentation: FeatureEnabled / FeatureData [ segment * 8 + feature ].
+    segmentationEnabled: Bool = false
+    featureEnabled: [Int] = []
+    featureData: [Int] = []
+    // CDEF (5.9.19).
+    cdefDamping: Int = 3
+    cdefBits: Int = 0
+    cdefYPriStrength: [Int] = [0, 0, 0, 0, 0, 0, 0, 0]
+    cdefYSecStrength: [Int] = [0, 0, 0, 0, 0, 0, 0, 0]
+    cdefUVPriStrength: [Int] = [0, 0, 0, 0, 0, 0, 0, 0]
+    cdefUVSecStrength: [Int] = [0, 0, 0, 0, 0, 0, 0, 0]
+    // Loop restoration (5.9.20): FrameRestorationType, LoopRestorationSize.
+    frameRestorationType: [Int] = [0, 0, 0]
+    loopRestorationSize: [Int] = [256, 256, 256]
+    usesLr: Bool = false
+    // TileCols etc. are parser matters; MiColStart/End of the tile only
+    // matter for intra block copy and are handled by the parser.
+    grain: Av1Grain = Av1Grain()
+}
+
+// One frame of the stream as parsed.
+//   kind 0  a coded frame to reconstruct (shown when hdr.showFrame)
+//        1  show_existing_frame: show slot hdr.frameToShowMapIdx again
+//           (and, for a key frame, refresh every slot with it)
+//        2  damaged: show the last picture again (no reference changes)
+//        3  parsed but not needed (skipNonReference, or nothing to show)
+public struct ParsedFrame {
+    kind: Int = 0
+    hdr: Av1Hdr = Av1Hdr()
+    pts: Int = -9223372036854775807
+    key: Bool = false
+    ops: [Int] = []
+    coefs: [Int] = []
+    palette: [Int] = []
+    miStride: Int = 0
+    gInfo: [Int] = []
+    gMv: [Int] = []
+    gTxUV: [Int] = []
+    gDeltaLF: [Int] = []
+    cdefIdx: [Int] = []
+    cdefStride: Int = 0
+    lrData: [Int] = []
+    lrOff: [Int] = [0, 0, 0]
+    lrRows: [Int] = [0, 0, 0]
+    lrCols: [Int] = [0, 0, 0]
+}
+
+// A reference frame as inter prediction reads it: its planes after all
+// filtering and upscaling, their strides, and RefUpscaledWidth /
+// RefFrameHeight (7.20). `ok` is false for an empty slot.
+public struct Av1Ref {
+    ok: Bool = false
+    y: [Int] = []
+    u: [Int] = []
+    v: [Int] = []
+    yStride: Int = 0
+    cStride: Int = 0
+    upscaledWidth: Int = 0
+    frameHeight: Int = 0
+    miCols: Int = 0
+    miRows: Int = 0
+}
+
+// The parts of the packed mode info.
+fn av1InfoMiSize(_ g: Int) -> Int {
+    g & 31
+}
+
+fn av1InfoRef0(_ g: Int) -> Int {
+    ((g >> 5) & 15) - 1
+}
+
+fn av1InfoRef1(_ g: Int) -> Int {
+    ((g >> 9) & 15) - 1
+}
+
+fn av1InfoYMode(_ g: Int) -> Int {
+    (g >> 13) & 31
+}
+
+fn av1InfoSkip(_ g: Int) -> Int {
+    (g >> 18) & 1
+}
+
+fn av1InfoIsInter(_ g: Int) -> Int {
+    (g >> 19) & 1
+}
+
+fn av1InfoSegment(_ g: Int) -> Int {
+    (g >> 20) & 7
+}
+
+fn av1InfoFilter(_ g: Int, _ dir: Int) -> Int {
+    (g >> (23 + 2 * dir)) & 3
+}
+
+fn av1InfoTxY(_ g: Int) -> Int {
+    (g >> 27) & 31
+}
+
+fn av1InfoUVMode(_ g: Int) -> Int {
+    (g >> 32) & 15
+}
+
+// Component k of a packed motion vector pair: 0 Mvs[0][0] (row),
+// 1 Mvs[0][1] (col), 2 Mvs[1][0], 3 Mvs[1][1].
+fn av1MvPart(_ m: Int, _ k: Int) -> Int {
+    (((m >> (16 * k)) & 0xffff) ^ 0x8000) - 0x8000
+}
+
+fn av1MvPack(_ r0: Int, _ c0: Int, _ r1: Int, _ c1: Int) -> Int {
+    (r0 & 0xffff) | ((c0 & 0xffff) << 16) | ((r1 & 0xffff) << 32) | ((c1 & 0xffff) << 48)
+}
+
+// DeltaLFs[ i ] of a packed gDeltaLF entry.
+fn av1DeltaLF(_ d: Int, _ i: Int) -> Int {
+    ((d >> (7 * i)) & 127) - 64
+}

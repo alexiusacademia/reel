@@ -1,0 +1,452 @@
+// ALAC decoding (Apple Lossless, as in Apple's open-source reference
+// "ALAC" codec: ALACDecoder.cpp, ag_dec.c, dp_dec.c, matrix_dec.c).
+//
+// The magic cookie (ALACSpecificConfig) gives the frame length, bit depth
+// and the adaptive Golomb parameters. A packet is a list of elements (SCE
+// one channel, CPE a channel pair, LFE, END), each either uncompressed or
+// coded as: adaptive Golomb residuals → adaptive FIR prediction ("dynamic
+// predictor") → for pairs, stereo un-mixing → extra low bits for 20/24/32
+// bit audio ("shift buffer"). The arithmetic is 32-bit like the reference
+// (and like ffmpeg's alac.c, which we match bit for bit), so values wrap
+// at 32 bits where it does.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../core"
+
+// Wraps to a signed 32-bit value, as C's int arithmetic does.
+fn alacI32(_ v: Int) -> Int {
+    (v << 32) >> 32
+}
+
+// The low `bits` bits of v, sign-extended.
+fn alacSignExtend(_ v: Int, _ bits: Int) -> Int {
+    (v << (64 - bits)) >> (64 - bits)
+}
+
+// floor(log2(v)), 0 for v <= 1 (ffmpeg's av_log2).
+fn alacLog2(_ v: Int) -> Int {
+    var n = 0
+    var x = v
+    while x > 1 {
+        x = x >> 1
+        n += 1
+    }
+    n
+}
+
+fn alacSign(_ v: Int) -> Int {
+    if v > 0 { 1 } else if v < 0 { -1 } else { 0 }
+}
+
+// ALACSpecificConfig (the 24-byte magic cookie).
+public struct AlacConfig {
+    frameLength: Int = 4096
+    bitDepth: Int = 16
+    pb: Int = 40
+    mb: Int = 10
+    kb: Int = 14
+    channels: Int = 2
+    maxRun: Int = 255
+    maxFrameBytes: Int = 0
+    avgBitRate: Int = 0
+    rate: Int = 0
+}
+
+// Reads the cookie, bare or inside its 'alac' atom (size, "alac", version
+// first: 36 bytes, as MP4's stsd entry carries it), possibly after a
+// QuickTime 'frma' atom.
+public fn parseAlacConfig(_ extra: Data) -> AlacConfig? {
+    var at = 0
+    // Look for an "alac" atom header within the first bytes.
+    var i = 0
+    while i + 8 <= extra.count && i <= 24 {
+        if extra.slice(from: i + 4, to: i + 8).latin1 == "alac" && i + 12 + 24 <= extra.count {
+            at = i + 12
+            break
+        }
+        i += 4
+    }
+    if at + 24 > extra.count {
+        return nil
+    }
+    var r = core.byteReaderRange(extra, from: at, to: at + 24)
+    var c = AlacConfig()
+    c.frameLength = r.u32()
+    r.skip(1)
+    c.bitDepth = r.u8()
+    c.pb = r.u8()
+    c.mb = r.u8()
+    c.kb = r.u8()
+    c.channels = r.u8()
+    c.maxRun = r.u16()
+    c.maxFrameBytes = r.u32()
+    c.avgBitRate = r.u32()
+    c.rate = r.u32()
+    if c.frameLength <= 0 || c.frameLength > 4096 * 4096 || c.channels < 1 || c.channels > 8 {
+        return nil
+    }
+    if c.bitDepth != 16 && c.bitDepth != 20 && c.bitDepth != 24 && c.bitDepth != 32 {
+        return nil
+    }
+    c
+}
+
+// Where each element's channels go in the output (WAV order), for 1–8
+// channels: ALAC stores C L R … and the output wants L R C ….
+let alacOffsets = [
+    [0], [0, 1], [2, 0, 1], [2, 0, 1, 3], [2, 0, 1, 3, 4], [2, 0, 1, 4, 5, 3],
+    [2, 0, 1, 4, 5, 6, 3], [2, 6, 7, 0, 1, 4, 5, 3],
+]
+
+public fn alacLayout(_ channels: Int) -> [String] {
+    match channels {
+        1 -> ["FC"]
+        2 -> ["FL", "FR"]
+        3 -> ["FL", "FR", "FC"]
+        4 -> ["FL", "FR", "FC", "BC"]
+        5 -> ["FL", "FR", "FC", "BL", "BR"]
+        6 -> ["FL", "FR", "FC", "LFE", "BL", "BR"]
+        7 -> ["FL", "FR", "FC", "LFE", "BL", "BR", "BC"]
+        8 -> ["FL", "FR", "FC", "LFE", "BL", "BR", "FLC", "FRC"]
+        _ -> core.defaultLayout(channels)
+    }
+}
+
+public struct AlacDecoder {
+    config: AlacConfig = AlacConfig()
+    br: core.BitReader = core.bitReader(Data())
+    // Decoded samples of the packet: channel c at c * frameLength.
+    out: [Int] = []
+    // Per element scratch: prediction errors and extra bits, two channels.
+    err: [Int] = []
+    extraBuf: [Int] = []
+    coefs: [Int] = []
+    // Frames in the last decoded packet.
+    frames: Int = 0
+    problem: String = ""
+
+    fn setup(_ c: AlacConfig) {
+        config = c
+        out = []
+        let n = c.frameLength
+        for _ in 0..(n * c.channels) {
+            out.append(0)
+        }
+        err = []
+        extraBuf = []
+        for _ in 0..(2 * n) {
+            err.append(0)
+            extraBuf.append(0)
+        }
+        coefs = []
+        for _ in 0..64 {
+            coefs.append(0)
+        }
+    }
+
+    // Decodes a packet into `out`; false on damage (with `problem` set).
+    fn decodePacket(_ d: Data) -> Bool {
+        problem = ""
+        frames = 0
+        br = core.bitReader(d)
+        var ch = 0
+        var gotEnd = false
+        while br.left >= 3 {
+            let element = br.bits(3)
+            if element == 7 {
+                gotEnd = true
+                break
+            }
+            // SCE 0, CPE 1, LFE 3; the others (CCE, DSE, PCE, FIL) don't
+            // occur in ALAC streams Apple's encoder makes.
+            if element > 1 && element != 3 {
+                problem = "ALAC element {element} not supported"
+                return false
+            }
+            let n = if element == 1 { 2 } else { 1 }
+            if ch + n > config.channels {
+                problem = "ALAC element has too many channels"
+                return false
+            }
+            let offs = alacOffsets[config.channels - 1]
+            if !decodeElement(offs, ch, n) {
+                if problem == "" {
+                    problem = "damaged ALAC element"
+                }
+                return false
+            }
+            ch += n
+        }
+        if !gotEnd {
+            problem = "ALAC packet has no end element"
+            return false
+        }
+        if ch != config.channels || frames == 0 {
+            problem = "ALAC packet missing channels"
+            return false
+        }
+        true
+    }
+
+    // Adaptive Golomb scalar (ag_dec.c dyn_get_32bit): a unary prefix of
+    // up to 9 ones; 9 means the value follows in `bps` raw bits.
+    fn scalar(_ k: Int, _ bps: Int) -> Int {
+        var x = 0
+        while x < 9 && br.bits(1) == 1 {
+            x += 1
+        }
+        if x > 8 {
+            return if bps > 32 { br.long(bps) } else { br.bits(bps) }
+        }
+        if k != 1 {
+            let extra = br.peek(k)
+            x = (x << k) - x
+            if extra > 1 {
+                x += extra - 1
+                br.skip(k)
+            } else {
+                br.skip(k - 1)
+            }
+        }
+        x
+    }
+
+    // Residuals of one channel into err[base ..< base + count].
+    fn rice(_ base: Int, _ count: Int, _ bps: Int, _ mult: Int) -> Bool {
+        var history = config.mb
+        var signMod = 0
+        var i = 0
+        while i < count {
+            if br.left <= 0 {
+                problem = "ALAC residuals cut short"
+                return false
+            }
+            var k = alacLog2((history >> 9) + 3)
+            k = min(k, config.kb)
+            var x = scalar(k, bps) + signMod
+            x = x & 0xffffffff
+            signMod = 0
+            err[base + i] = alacI32((x >> 1) ^ -(x & 1))
+            if x > 0xffff {
+                history = 0xffff
+            } else {
+                history = history + x * mult - ((history * mult) >> 9)
+            }
+            // A run of zeros may follow a quiet stretch.
+            if history < 128 && i + 1 < count {
+                var k2 = 7 - alacLog2(history) + ((history + 16) >> 6)
+                k2 = min(k2, config.kb)
+                var block = scalar(k2, 16)
+                if block > 0 {
+                    if block >= count - i {
+                        block = count - i - 1
+                    }
+                    for j in 0..block {
+                        err[base + i + 1 + j] = 0
+                    }
+                    i += block
+                }
+                if block <= 0xffff {
+                    signMod = 1
+                }
+                history = 0
+            }
+            i += 1
+        }
+        true
+    }
+
+    // The adaptive FIR predictor (dp_dec.c unpc_block) from err[eb…] into
+    // out[ob…]. order 31 is the simple first-order case.
+    fn predict(_ eb: Int, _ ob: Int, _ count: Int, _ bps: Int, _ cb: Int, _ order: Int, _ quant: Int, toErr: Bool) {
+        // Writes go to `out` or back into `err` (prediction type 15's
+        // first pass works in place).
+        if count <= 0 {
+            return
+        }
+        setOut(ob, err[eb], toErr)
+        if count <= 1 {
+            return
+        }
+        if order == 0 {
+            for i in 1..count {
+                setOut(ob + i, err[eb + i], toErr)
+            }
+            return
+        }
+        if order == 31 {
+            for i in 1..count {
+                setOut(ob + i, alacSignExtend(getOut(ob + i - 1, toErr) + err[eb + i], bps), toErr)
+            }
+            return
+        }
+        var i = 1
+        while i <= order && i < count {
+            setOut(ob + i, alacSignExtend(getOut(ob + i - 1, toErr) + err[eb + i], bps), toErr)
+            i += 1
+        }
+        while i < count {
+            // pred[j] = out[i - order + j], d = out[i - order - 1].
+            let p0 = ob + i - order
+            let d = getOut(p0 - 1, toErr)
+            var errVal = err[eb + i]
+            var sum = 0
+            for j in 0..order {
+                sum += (getOut(p0 + j, toErr) - d) * coefs[cb + j]
+            }
+            var val = alacI32(sum)
+            val = (val + (1 << (quant - 1))) >> quant
+            val = val + d + errVal
+            setOut(ob + i, alacSignExtend(val, bps), toErr)
+            // Adapt the coefficients toward the sign of the error.
+            let errSign = alacSign(errVal)
+            if errSign != 0 {
+                var j = 0
+                while j < order && alacI32(errVal * errSign) > 0 {
+                    var v = alacI32(d - getOut(p0 + j, toErr))
+                    let sign = alacSign(v) * errSign
+                    coefs[cb + j] = coefs[cb + j] - sign
+                    v = alacI32(v * sign)
+                    errVal = alacI32(errVal - (v >> quant) * (j + 1))
+                    j += 1
+                }
+            }
+            i += 1
+        }
+    }
+
+    fn getOut(_ i: Int, _ toErr: Bool) -> Int {
+        if toErr { err[i] } else { out[i] }
+    }
+
+    fn setOut(_ i: Int, _ v: Int, _ toErr: Bool) {
+        if toErr {
+            err[i] = v
+        } else {
+            out[i] = v
+        }
+    }
+
+    // One SCE/CPE/LFE element: `n` channels, the first of them channel
+    // `first` in ALAC's order.
+    fn decodeElement(_ offs: [Int], _ first: Int, _ n: Int) -> Bool {
+        br.skip(4)
+        br.skip(12)
+        let hasSize = br.bits(1) == 1
+        let extraBits = br.bits(2) << 3
+        let bps = config.bitDepth - extraBits + n - 1
+        if bps > 32 || bps < 1 {
+            problem = "bad ALAC sample size"
+            return false
+        }
+        let compressed = br.bits(1) == 0
+        var count = config.frameLength
+        if hasSize {
+            count = br.bits(32)
+        }
+        if count <= 0 || count > config.frameLength {
+            problem = "bad ALAC frame length {count}"
+            return false
+        }
+        if frames == 0 {
+            frames = count
+        } else if frames != count {
+            problem = "ALAC elements disagree on frame length"
+            return false
+        }
+        let fl = config.frameLength
+        let o0 = offs[first] * fl
+        let o1 = if n == 2 { offs[first + 1] * fl } else { 0 }
+        var shift = 0
+        var weight = 0
+        var usedExtra = extraBits
+        if compressed {
+            shift = br.bits(8)
+            weight = br.bits(8)
+            if n == 2 && weight != 0 && shift > 31 {
+                return false
+            }
+            var ptype = [0, 0]
+            var quant = [0, 0]
+            var mults = [0, 0]
+            var orders = [0, 0]
+            for c in 0..n {
+                ptype[c] = br.bits(4)
+                quant[c] = br.bits(4)
+                mults[c] = br.bits(3)
+                orders[c] = br.bits(5)
+                if orders[c] >= config.frameLength || quant[c] == 0 {
+                    problem = "bad ALAC predictor"
+                    return false
+                }
+                // Coefficients are stored newest first.
+                var j = orders[c] - 1
+                while j >= 0 {
+                    coefs[c * 32 + j] = br.signed(16)
+                    j -= 1
+                }
+            }
+            if extraBits > 0 {
+                for i in 0..count {
+                    for c in 0..n {
+                        extraBuf[c * fl + i] = br.bits(extraBits)
+                    }
+                }
+            }
+            for c in 0..n {
+                if !rice(c * fl, count, bps, mults[c] * config.pb / 4) {
+                    return false
+                }
+                if ptype[c] == 15 {
+                    predict(c * fl, c * fl, count, bps, c * 32, 31, 0, toErr: true)
+                }
+                let ob = if c == 0 { o0 } else { o1 }
+                predict(c * fl, ob, count, bps, c * 32, orders[c], quant[c], toErr: false)
+            }
+        } else {
+            let size = config.bitDepth
+            for i in 0..count {
+                for c in 0..n {
+                    let ob = if c == 0 { o0 } else { o1 }
+                    out[ob + i] = if size > 32 { br.long(size) } else { br.signed(size) }
+                }
+            }
+            usedExtra = 0
+        }
+        if br.overrun {
+            problem = "ALAC element cut short"
+            return false
+        }
+        if n == 2 && weight != 0 {
+            // Stereo un-mixing (matrix_dec.c unmix).
+            for i in 0..count {
+                var a = out[o0 + i]
+                var b = out[o1 + i]
+                a = alacI32(a - (alacI32(b * weight) >> shift))
+                b = alacI32(b + a)
+                out[o0 + i] = b
+                out[o1 + i] = a
+            }
+        }
+        if usedExtra > 0 {
+            for c in 0..n {
+                let ob = if c == 0 { o0 } else { o1 }
+                for i in 0..count {
+                    out[ob + i] = alacI32((out[ob + i] << usedExtra) | extraBuf[c * fl + i])
+                }
+            }
+        }
+        if config.bitDepth == 16 {
+            // Stored as 16-bit samples.
+            for c in 0..n {
+                let ob = if c == 0 { o0 } else { o1 }
+                for i in 0..count {
+                    out[ob + i] = alacSignExtend(out[ob + i], 16)
+                }
+            }
+        }
+        true
+    }
+}

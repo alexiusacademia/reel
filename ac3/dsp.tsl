@@ -1,0 +1,164 @@
+// Signal processing for the AC-3 decoder: the inverse transform (A/52
+// 7.9.4), the KBD window (7.9.4, alpha 5) and the dither generator (7.3.4).
+//
+// The transform. A/52 builds each block's 256 new samples from a 512-point
+// inverse MDCT (or two 256-point ones when the block is switched to short
+// transforms), windowed and overlapped with half of the previous block.
+// We compute the half of the inverse MDCT that isn't redundant, which is
+// the type-IV DCT of the coefficients read backwards:
+//     h[i] = c[L-1-i],  c[m] = Σ_k X[k] cos(π/L (m + ½)(k + ½)),
+// and do the DCT-IV with an L/2-point complex FFT (pre-twiddle, FFT,
+// post-twiddle). This is the same transform FFmpeg's decoder uses (its
+// av_tx inverse MDCT with scale 1), so samples agree to rounding.
+//
+// The dither. Mantissas with no bits (bap 0) are filled with noise when
+// the stream asks for dither. A/52 leaves the generator to the decoder;
+// we use the same lagged Fibonacci generator FFmpeg uses (seeded with MD5
+// sums of 0), so dithered output matches FFmpeg's sample for sample
+// instead of differing by noise.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+// The 256-point KBD window, alpha 5 (A/52 Table 7.33's values).
+let ac3Window: [Float] = ac3MakeWindow()
+
+fn ac3MakeWindow() -> [Float] {
+    // w[n] = sqrt(Σ_{j≤n} K[j] / Σ_{j≤N/2} K[j]), K the Kaiser-Bessel kernel
+    // I0(π α sqrt(1 - (2j/N - 1)²)) over N = 256 (FFmpeg's ff_kbd_window_init).
+    let n = 256
+    let alpha = 5.0
+    let alpha2 = 4.0 * (alpha * pi / Float(n)) * (alpha * pi / Float(n))
+    var temp: [Float] = []
+    var scale = 0.0
+    for i in 0..(n / 2 + 1) {
+        let t = Float(i * (n - i)) * alpha2
+        let v = ac3BesselI0(sqrt(t))
+        temp.append(v)
+        scale += v * (if i > 0 && i < n / 2 { 2.0 } else { 1.0 })
+    }
+    scale = 1.0 / (scale + 1.0)
+    var out: [Float] = []
+    var sum = 0.0
+    for i in 0..n {
+        if i <= n / 2 {
+            sum += temp[i]
+        } else {
+            sum += temp[n - i]
+        }
+        out.append(sqrt(sum * scale))
+    }
+    out
+}
+
+// The modified Bessel function of the first kind, order 0, by its series.
+fn ac3BesselI0(_ x: Float) -> Float {
+    var sum = 1.0
+    var term = 1.0
+    let q = x * x / 4.0
+    var k = 1
+    while k < 500 {
+        term = term * q / Float(k * k)
+        sum += term
+        if term < sum * 1e-17 {
+            break
+        }
+        k += 1
+    }
+    sum
+}
+
+// Twiddles for an L-coefficient half inverse MDCT (L = 256 or 128):
+// cos/sin of the pre-twiddle π(4n+1)/(4L) and post-twiddle πk/L for the
+// L/2 complex points, then the FFT's own roots and bit reversal.
+struct Ac3Tx {
+    len: Int
+    preCos: [Float]
+    preSin: [Float]
+    postCos: [Float]
+    postSin: [Float]
+    rootCos: [Float]
+    rootSin: [Float]
+    reverse: [Int]
+}
+
+fn ac3MakeTx(_ len: Int) -> Ac3Tx {
+    let m = len / 2
+    var tx = Ac3Tx(len: len, preCos: [], preSin: [], postCos: [], postSin: [], rootCos: [], rootSin: [], reverse: [])
+    for i in 0..m {
+        let a = pi * Float(4 * i + 1) / Float(4 * len)
+        tx.preCos.append(cos(a))
+        tx.preSin.append(sin(a))
+        let b = pi * Float(i) / Float(len)
+        tx.postCos.append(cos(b))
+        tx.postSin.append(sin(b))
+    }
+    for i in 0..(m / 2) {
+        let a = 2.0 * pi * Float(i) / Float(m)
+        tx.rootCos.append(cos(a))
+        tx.rootSin.append(sin(a))
+    }
+    var bits = 0
+    while (1 << bits) < m {
+        bits += 1
+    }
+    for i in 0..m {
+        var r = 0
+        for b in 0..bits {
+            if (i >> b) & 1 == 1 {
+                r = r | (1 << (bits - 1 - b))
+            }
+        }
+        tx.reverse.append(r)
+    }
+    tx
+}
+
+let ac3Tx256: Ac3Tx = ac3MakeTx(256)
+let ac3Tx128: Ac3Tx = ac3MakeTx(128)
+
+// FFmpeg's av_lfg (libavutil/lfg.c): regs[i] = regs[i-24] + regs[i-55]
+// mod 2^32, seeded by MD5 sums.
+public struct Ac3Dither {
+    regs: [Int] = []
+    index: Int = 0
+
+    fn seed(_ seed: Int) {
+        regs = []
+        for _ in 0..64 {
+            regs.append(0)
+        }
+        var tmp: [Int] = []
+        for _ in 0..16 {
+            tmp.append(0)
+        }
+        var i = 8
+        while i < 64 {
+            tmp[0] = seed & 0xff
+            tmp[1] = (seed >> 8) & 0xff
+            tmp[2] = (seed >> 16) & 0xff
+            tmp[3] = (seed >> 24) & 0xff
+            tmp[4] = i
+            tmp = Data(bytes: tmp).hash("md5").bytes
+            for w in 0..4 {
+                regs[i + w] = tmp[4 * w] | (tmp[4 * w + 1] << 8) | (tmp[4 * w + 2] << 16) | (tmp[4 * w + 3] << 24)
+            }
+            i += 4
+        }
+        index = 0
+    }
+
+    // The next 32-bit number (0 … 2^32 − 1).
+    fn next() -> Int {
+        let a = (regs[(index - 24) & 63] + regs[(index - 55) & 63]) & 0xffffffff
+        regs[index & 63] = a
+        index = (index + 1) & 63
+        a
+    }
+}
+
+public fn newDither() -> Ac3Dither {
+    var d = Ac3Dither()
+    d.seed(0)
+    d
+}

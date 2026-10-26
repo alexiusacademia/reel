@@ -1,0 +1,1204 @@
+// Text encodings of subtitle files: decoding UTF-8, UTF-16, the Windows
+// code pages 1250…1258 and 874, ISO 8859-1…16, KOI8-R/U and the CJK
+// encodings Shift_JIS, EUC-JP, GBK/GB18030, Big5 and EUC-KR; and guessing
+// which one a file is in, with a confidence.
+//
+// The CJK decoders follow the decoder algorithms of the WHATWG Encoding
+// Standard (https://encoding.spec.whatwg.org/, §10–13) step by step, with
+// its index tables (enctables.tsl, generated from the published index files).
+// UTF-8 decoding replaces each bad sequence with U+FFFD as that standard's
+// UTF-8 decoder does (§8.1.1).
+//
+// Detection is our own design. A byte order mark settles it. Otherwise
+// bytes that are valid UTF-8 are UTF-8. Otherwise every legacy encoding is
+// scored against the languages written in it: each non-ASCII character it
+// decodes to gets a weight (a frequent letter of that language 1, another
+// letter of its alphabet 0.4 or 0.1, capitals less, common punctuation 0.5,
+// unlikely symbols −0.7, control codes and bad sequences −3). Single-byte
+// encodings are scored from a histogram of the bytes, so no decoding is
+// needed, with the byte's neighbours as context: a letter of a non-Latin
+// alphabet glued to ASCII letters is improbable, and so is a run of three
+// accented Latin letters. Multi-byte encodings are scored on their decoded
+// characters (kana for Japanese, the most frequent hanzi of Simplified or
+// Traditional Chinese, the most frequent Hangul syllables for Korean), with
+// a bonus when every sequence is valid. The best score wins; the confidence
+// says how clearly. A language hint (the subtitle file's `.ru.srt` tag or the
+// preferred language) breaks ties toward its encodings.
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+// What detectEncoding found.
+public struct EncodingGuess {
+    // A name of encodingList: "utf-8", "windows-1251", "shift_jis" …
+    name: String
+    // How sure: 1 for a byte order mark or valid UTF-8 with non-ASCII
+    // text, around 0.5 or less when two encodings fit about as well.
+    confidence: Float = 0.0
+    // The language whose letters fit best ("ru", "ja", …), "" if unknown.
+    language: String = ""
+    // Whether the file starts with a byte order mark.
+    bom: Bool = false
+    // The raw score (for debugging and tests).
+    score: Float = 0.0
+}
+
+// Every encoding decodeAs reads, in menu order.
+public let encodingList = [
+    "utf-8", "utf-16le", "utf-16be",
+    "windows-1252", "iso-8859-1", "iso-8859-15",
+    "windows-1250", "iso-8859-2", "iso-8859-16",
+    "windows-1251", "koi8-r", "koi8-u", "iso-8859-5",
+    "windows-1253", "iso-8859-7",
+    "windows-1254", "iso-8859-9",
+    "windows-1255", "iso-8859-8",
+    "windows-1256", "iso-8859-6",
+    "windows-1257", "iso-8859-13", "iso-8859-4",
+    "windows-1258", "windows-874", "iso-8859-11",
+    "iso-8859-3", "iso-8859-10", "iso-8859-14",
+    "shift_jis", "euc-jp", "gbk", "gb18030", "big5", "euc-kr",
+]
+
+// A name to show for an encoding, e.g. "Cyrillic (Windows-1251)".
+public fn encodingTitle(_ name: String) -> String {
+    match name {
+        "utf-8" -> "Unicode (UTF-8)"
+        "utf-16le" -> "Unicode (UTF-16 LE)"
+        "utf-16be" -> "Unicode (UTF-16 BE)"
+        "windows-1252" -> "Western (Windows-1252)"
+        "iso-8859-1" -> "Western (ISO 8859-1)"
+        "iso-8859-15" -> "Western (ISO 8859-15)"
+        "windows-1250" -> "Central European (Windows-1250)"
+        "iso-8859-2" -> "Central European (ISO 8859-2)"
+        "iso-8859-16" -> "South-Eastern European (ISO 8859-16)"
+        "windows-1251" -> "Cyrillic (Windows-1251)"
+        "koi8-r" -> "Cyrillic (KOI8-R)"
+        "koi8-u" -> "Cyrillic (KOI8-U)"
+        "iso-8859-5" -> "Cyrillic (ISO 8859-5)"
+        "windows-1253" -> "Greek (Windows-1253)"
+        "iso-8859-7" -> "Greek (ISO 8859-7)"
+        "windows-1254" -> "Turkish (Windows-1254)"
+        "iso-8859-9" -> "Turkish (ISO 8859-9)"
+        "windows-1255" -> "Hebrew (Windows-1255)"
+        "iso-8859-8" -> "Hebrew (ISO 8859-8)"
+        "windows-1256" -> "Arabic (Windows-1256)"
+        "iso-8859-6" -> "Arabic (ISO 8859-6)"
+        "windows-1257" -> "Baltic (Windows-1257)"
+        "iso-8859-13" -> "Baltic (ISO 8859-13)"
+        "iso-8859-4" -> "Baltic (ISO 8859-4)"
+        "windows-1258" -> "Vietnamese (Windows-1258)"
+        "windows-874" -> "Thai (Windows-874)"
+        "iso-8859-11" -> "Thai (ISO 8859-11)"
+        "iso-8859-3" -> "South European (ISO 8859-3)"
+        "iso-8859-10" -> "Nordic (ISO 8859-10)"
+        "iso-8859-14" -> "Celtic (ISO 8859-14)"
+        "shift_jis" -> "Japanese (Shift_JIS)"
+        "euc-jp" -> "Japanese (EUC-JP)"
+        "gbk" -> "Chinese Simplified (GBK)"
+        "gb18030" -> "Chinese Simplified (GB18030)"
+        "big5" -> "Chinese Traditional (Big5)"
+        "euc-kr" -> "Korean (EUC-KR)"
+        _ -> name
+    }
+}
+
+// An encoding label as people and files write it ("cp1251", "Shift-JIS",
+// "latin1", "GB2312", "ks_c_5601-1987" …) as a name of encodingList; ""
+// if it isn't one we know. "auto" and "" stay "auto".
+public fn encodingName(_ label: String) -> String {
+    var l = label.trim().lowercase().replace("_", with: "-").replace(" ", with: "-")
+    if l == "" || l == "auto" {
+        return "auto"
+    }
+    if l.hasPrefix("cp125") && l.count == 6 {
+        l = "windows-" + l.substring(from: 2, to: 6)
+    }
+    if l.hasPrefix("windows125") && l.count == 11 {
+        l = "windows-" + l.substring(from: 7, to: 11)
+    }
+    if l.hasPrefix("iso8859-") {
+        l = "iso-8859-" + l.substring(from: 8, to: l.count)
+    }
+    if l.hasPrefix("iso-8859") && !l.hasPrefix("iso-8859-") {
+        l = "iso-8859-" + l.substring(from: 8, to: l.count)
+    }
+    if l.hasPrefix("latin") && l.count <= 7 {
+        let n = Int(l.substring(from: 5, to: l.count)) ?? 0
+        let byLatin = ["", "iso-8859-1", "iso-8859-2", "iso-8859-3", "iso-8859-4", "iso-8859-9", "iso-8859-10", "iso-8859-13", "iso-8859-14", "iso-8859-15", "iso-8859-16"]
+        if n >= 1 && n <= 10 {
+            return byLatin[n]
+        }
+        if l == "latin" {
+            return "iso-8859-1"
+        }
+    }
+    match l {
+        "utf8", "unicode-1-1-utf-8", "utf-8" -> "utf-8"
+        "utf-16", "utf16", "utf-16le", "utf16le", "ucs-2", "unicode" -> "utf-16le"
+        "utf-16be", "utf16be" -> "utf-16be"
+        "ascii", "us-ascii", "l1", "iso-ir-100", "ibm819", "cp819" -> "iso-8859-1"
+        "cp874", "tis-620", "tis620", "windows-874" -> "windows-874"
+        "koi8r", "koi8-r", "koi8", "cskoi8r" -> "koi8-r"
+        "koi8u", "koi8-u", "koi8-ru" -> "koi8-u"
+        "shift-jis", "sjis", "shiftjis", "ms932", "cp932", "windows-31j", "x-sjis", "ms-kanji", "csshiftjis" -> "shift_jis"
+        "euc-jp", "eucjp", "x-euc-jp", "cseucpkdfmtjapanese" -> "euc-jp"
+        "gbk", "cp936", "ms936", "windows-936", "gb2312", "gb-2312", "euc-cn", "euccn", "x-gbk", "csgb2312", "chinese", "iso-ir-58" -> "gbk"
+        "gb18030", "gb-18030" -> "gb18030"
+        "big5", "big-5", "cp950", "ms950", "big5-hkscs", "cn-big5", "x-x-big5", "csbig5" -> "big5"
+        "euc-kr", "euckr", "cp949", "ms949", "windows-949", "uhc", "ks-c-5601-1987", "ks-c-5601-1989", "ksc5601", "ksc-5601", "korean", "iso-ir-149", "cseuckr" -> "euc-kr"
+        _ -> {
+            for n in encodingList {
+                if n == l {
+                    return n
+                }
+            }
+            ""
+        }
+    }
+}
+
+// ---- decoding ----
+
+// The bytes as text in an encoding of encodingList (or a label
+// encodingName knows); "auto" or "" detects it (detectEncoding). Bytes
+// that don't decode become U+FFFD. A byte order mark at the start is
+// dropped.
+public fn decodeAs(_ bytes: Data, encoding: String) -> String {
+    var name = encodingName(encoding)
+    if name == "auto" || name == "" {
+        name = detectEncoding(bytes).name
+    }
+    let n = bytes.count
+    var from = 0
+    if name == "utf-8" && n >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF {
+        from = 3
+    }
+    if name == "utf-16le" || name == "utf-16be" {
+        let be = name == "utf-16be"
+        if n >= 2 && ((be && bytes[0] == 0xFE && bytes[1] == 0xFF) || (!be && bytes[0] == 0xFF && bytes[1] == 0xFE)) {
+            from = 2
+        }
+        return encString(encUtf16(bytes, from: from, bigEndian: be))
+    }
+    if name == "utf-8" {
+        let body = if from > 0 { bytes.slice(from: from, to: n) } else { bytes }
+        if let t = body.text {
+            return t
+        }
+    }
+    let (cps, _) = encCodePoints(bytes, from: from, to: n, encoding: name)
+    encString(cps)
+}
+
+// Code points as text (UTF-8 encoding, RFC 3629 §3); code points that
+// can't be in text become U+FFFD.
+fn encString(_ cps: [Int]) -> String {
+    var d = Data()
+    for c0 in cps {
+        var c = c0
+        if c < 0 || c > 0x10FFFF || (c >= 0xD800 && c < 0xE000) {
+            c = 0xFFFD
+        }
+        if c < 0x80 {
+            d.append(byte: c)
+        } else if c < 0x800 {
+            d.append(byte: 0xC0 | c >> 6)
+            d.append(byte: 0x80 | c & 0x3F)
+        } else if c < 0x10000 {
+            d.append(byte: 0xE0 | c >> 12)
+            d.append(byte: 0x80 | c >> 6 & 0x3F)
+            d.append(byte: 0x80 | c & 0x3F)
+        } else {
+            d.append(byte: 0xF0 | c >> 18)
+            d.append(byte: 0x80 | c >> 12 & 0x3F)
+            d.append(byte: 0x80 | c >> 6 & 0x3F)
+            d.append(byte: 0x80 | c & 0x3F)
+        }
+    }
+    d.text ?? ""
+}
+
+// The code points of UTF-8 text (one-character strings included).
+fn encCodePointsOf(_ s: String) -> [Int] {
+    let d = Data(text: s)
+    let (cps, _) = encUtf8(d, from: 0, to: d.count)
+    cps
+}
+
+// The code points of bytes in an encoding, and how many bad sequences
+// there were (each became U+FFFD).
+fn encCodePoints(_ bytes: Data, from: Int, to: Int, encoding: String) -> ([Int], Int) {
+    match encoding {
+        "utf-8" -> encUtf8(bytes, from: from, to: to)
+        "utf-16le" -> (encUtf16(bytes.slice(from: from, to: to), from: 0, bigEndian: false), 0)
+        "utf-16be" -> (encUtf16(bytes.slice(from: from, to: to), from: 0, bigEndian: true), 0)
+        "shift_jis" -> encShiftJis(bytes, from: from, to: to, encTable("jis0208"))
+        "euc-jp" -> encEucJp(bytes, from: from, to: to, encTable("jis0208"), encTable("jis0212"))
+        "gbk", "gb18030" -> encGb18030(bytes, from: from, to: to, encTable("gb18030"), encGbRanges())
+        "big5" -> encBig5(bytes, from: from, to: to, encTable("big5"))
+        "euc-kr" -> encEucKr(bytes, from: from, to: to, encTable("euc-kr"))
+        _ -> {
+            let map = encSingleMap(encoding)
+            var out: [Int] = []
+            var bad = 0
+            var i = from
+            while i < to {
+                let b = bytes[i]
+                if b < 0x80 {
+                    out.append(b)
+                } else {
+                    let c = map[b - 0x80]
+                    if c == 0 {
+                        out.append(0xFFFD)
+                        bad += 1
+                    } else {
+                        out.append(c)
+                    }
+                }
+                i += 1
+            }
+            (out, bad)
+        }
+    }
+}
+
+// A table of enctables.tsl as bytes.
+fn encTable(_ name: String) -> Data {
+    let text = match name {
+        "jis0208" -> encJis0208Text
+        "jis0212" -> encJis0212Text
+        "gb18030" -> encGb18030Text
+        "big5" -> encBig5Text
+        "euc-kr" -> encEucKrText
+        _ -> ""
+    }
+    decodeBase64(text) ?? Data()
+}
+
+// The 128 code points of bytes 0x80…0xFF of a single-byte encoding
+// (Latin-1 for an unknown name).
+fn encSingleMap(_ name: String) -> [Int] {
+    let all = decodeBase64(encSingleTables) ?? Data()
+    var k = -1
+    for (i, n) in encSingleNames.enumerated() {
+        if n == name {
+            k = i
+        }
+    }
+    var out: [Int] = []
+    for b in 0..128 {
+        if k < 0 || (k + 1) * 256 > all.count {
+            out.append(0x80 + b)
+        } else {
+            out.append(all.uint16(at: k * 256 + b * 2))
+        }
+    }
+    out
+}
+
+// The code point at an index of a uint16 table (0 = none).
+fn encAt16(_ t: Data, _ pointer: Int) -> Int {
+    if pointer < 0 || pointer * 2 + 2 > t.count {
+        return 0
+    }
+    t.uint16(at: pointer * 2)
+}
+
+// UTF-8 per the WHATWG UTF-8 decoder (Encoding Standard §8.1.1): each
+// maximal bad subpart is one U+FFFD.
+fn encUtf8(_ bytes: Data, from: Int, to: Int) -> ([Int], Int) {
+    var out: [Int] = []
+    var bad = 0
+    var i = from
+    while i < to {
+        let b = bytes[i]
+        if b < 0x80 {
+            out.append(b)
+            i += 1
+            continue
+        }
+        var need = 0
+        var cp = 0
+        var lo = 0x80
+        var hi = 0xBF
+        if b >= 0xC2 && b <= 0xDF {
+            need = 1
+            cp = b & 0x1F
+        } else if b >= 0xE0 && b <= 0xEF {
+            if b == 0xE0 { lo = 0xA0 }
+            if b == 0xED { hi = 0x9F }
+            need = 2
+            cp = b & 0xF
+        } else if b >= 0xF0 && b <= 0xF4 {
+            if b == 0xF0 { lo = 0x90 }
+            if b == 0xF4 { hi = 0x8F }
+            need = 3
+            cp = b & 0x7
+        } else {
+            out.append(0xFFFD)
+            bad += 1
+            i += 1
+            continue
+        }
+        var j = i + 1
+        var ok = true
+        var k = 0
+        while k < need {
+            if j >= to {
+                ok = false
+                break
+            }
+            let c = bytes[j]
+            if c < lo || c > hi {
+                ok = false
+                break
+            }
+            lo = 0x80
+            hi = 0xBF
+            cp = cp << 6 | (c & 0x3F)
+            j += 1
+            k += 1
+        }
+        if ok {
+            out.append(cp)
+        } else {
+            out.append(0xFFFD)
+            bad += 1
+        }
+        i = j
+    }
+    (out, bad)
+}
+
+// UTF-16 (RFC 2781) with surrogate pairs; lone surrogates become U+FFFD.
+fn encUtf16(_ bytes: Data, from: Int, bigEndian: Bool) -> [Int] {
+    var out: [Int] = []
+    var i = from
+    let n = bytes.count
+    while i + 1 < n {
+        let u = bytes.uint16(at: i, bigEndian: bigEndian)
+        i += 2
+        if u >= 0xD800 && u < 0xDC00 && i + 1 < n {
+            let lo = bytes.uint16(at: i, bigEndian: bigEndian)
+            if lo >= 0xDC00 && lo < 0xE000 {
+                i += 2
+                out.append(0x10000 + ((u - 0xD800) << 10) + (lo - 0xDC00))
+                continue
+            }
+        }
+        if u >= 0xD800 && u < 0xE000 {
+            out.append(0xFFFD)
+        } else {
+            out.append(u)
+        }
+    }
+    out
+}
+
+// Shift_JIS decoder (Encoding Standard §12.3.1).
+fn encShiftJis(_ bytes: Data, from: Int, to: Int, _ jis: Data) -> ([Int], Int) {
+    var out: [Int] = []
+    var bad = 0
+    var i = from
+    while i < to {
+        let b = bytes[i]
+        if b <= 0x80 {
+            out.append(b)
+            i += 1
+            continue
+        }
+        if b >= 0xA1 && b <= 0xDF {
+            out.append(0xFF61 - 0xA1 + b)
+            i += 1
+            continue
+        }
+        if !((b >= 0x81 && b <= 0x9F) || (b >= 0xE0 && b <= 0xFC)) {
+            out.append(0xFFFD)
+            bad += 1
+            i += 1
+            continue
+        }
+        if i + 1 >= to {
+            out.append(0xFFFD)
+            bad += 1
+            break
+        }
+        let t = bytes[i + 1]
+        let offset = if t < 0x7F { 0x40 } else { 0x41 }
+        let leadOffset = if b < 0xA0 { 0x81 } else { 0xC1 }
+        var cp = 0
+        if (t >= 0x40 && t <= 0x7E) || (t >= 0x80 && t <= 0xFC) {
+            let p = (b - leadOffset) * 188 + t - offset
+            if p >= 8836 && p <= 10715 {
+                cp = 0xE000 - 8836 + p
+            } else {
+                cp = encAt16(jis, p)
+            }
+        }
+        if cp > 0 {
+            out.append(cp)
+            i += 2
+        } else {
+            out.append(0xFFFD)
+            bad += 1
+            // An ASCII trail byte is read again on its own.
+            i += if t < 0x80 { 1 } else { 2 }
+        }
+    }
+    (out, bad)
+}
+
+// EUC-JP decoder (Encoding Standard §12.1.1).
+fn encEucJp(_ bytes: Data, from: Int, to: Int, _ jis: Data, _ jis212: Data) -> ([Int], Int) {
+    var out: [Int] = []
+    var bad = 0
+    var i = from
+    while i < to {
+        let b = bytes[i]
+        if b < 0x80 {
+            out.append(b)
+            i += 1
+            continue
+        }
+        if !(b == 0x8E || b == 0x8F || (b >= 0xA1 && b <= 0xFE)) {
+            out.append(0xFFFD)
+            bad += 1
+            i += 1
+            continue
+        }
+        if i + 1 >= to {
+            out.append(0xFFFD)
+            bad += 1
+            break
+        }
+        let t = bytes[i + 1]
+        if b == 0x8E && t >= 0xA1 && t <= 0xDF {
+            out.append(0xFF61 - 0xA1 + t)
+            i += 2
+            continue
+        }
+        var lead = b
+        var trail = t
+        var len = 2
+        var use212 = false
+        if b == 0x8F && t >= 0xA1 && t <= 0xFE {
+            if i + 2 >= to {
+                out.append(0xFFFD)
+                bad += 1
+                break
+            }
+            use212 = true
+            lead = t
+            trail = bytes[i + 2]
+            len = 3
+        }
+        var cp = 0
+        if lead >= 0xA1 && lead <= 0xFE && trail >= 0xA1 && trail <= 0xFE {
+            let p = (lead - 0xA1) * 94 + trail - 0xA1
+            cp = if use212 { encAt16(jis212, p) } else { encAt16(jis, p) }
+        }
+        if cp > 0 {
+            out.append(cp)
+            i += len
+        } else {
+            out.append(0xFFFD)
+            bad += 1
+            i += if trail < 0x80 { len - 1 } else { len }
+        }
+    }
+    (out, bad)
+}
+
+// The (pointer, code point) pairs of the gb18030 ranges index.
+fn encGbRanges() -> [Int] {
+    let d = decodeBase64(encGbRangesText) ?? Data()
+    var out: [Int] = []
+    var i = 0
+    while i + 8 <= d.count {
+        out.append(d.uint32(at: i))
+        out.append(d.uint32(at: i + 4))
+        i += 8
+    }
+    out
+}
+
+// The index gb18030 ranges code point for a four-byte pointer
+// (Encoding Standard §5, "index gb18030 ranges code point"); 0 = none.
+fn encGbRangeCp(_ ranges: [Int], _ p: Int) -> Int {
+    if (p > 39419 && p < 189000) || p > 1237575 {
+        return 0
+    }
+    if p == 7457 {
+        return 0xE7C7
+    }
+    var k = 0
+    var i = 0
+    while i + 1 < ranges.count {
+        if ranges[i] <= p {
+            k = i
+        } else {
+            break
+        }
+        i += 2
+    }
+    ranges[k + 1] + p - ranges[k]
+}
+
+// gb18030 decoder (Encoding Standard §10.2.1); GBK uses the same one.
+fn encGb18030(_ bytes: Data, from: Int, to: Int, _ gb: Data, _ ranges: [Int]) -> ([Int], Int) {
+    var out: [Int] = []
+    var bad = 0
+    var i = from
+    while i < to {
+        let b = bytes[i]
+        if b < 0x80 {
+            out.append(b)
+            i += 1
+            continue
+        }
+        if b == 0x80 {
+            out.append(0x20AC)
+            i += 1
+            continue
+        }
+        if b == 0xFF {
+            out.append(0xFFFD)
+            bad += 1
+            i += 1
+            continue
+        }
+        if i + 1 >= to {
+            out.append(0xFFFD)
+            bad += 1
+            break
+        }
+        let b2 = bytes[i + 1]
+        if b2 >= 0x30 && b2 <= 0x39 {
+            // Four bytes: first 0x81–0xFE, 0x30–0x39, 0x81–0xFE, 0x30–0x39.
+            if i + 3 < to && bytes[i + 2] >= 0x81 && bytes[i + 2] <= 0xFE && bytes[i + 3] >= 0x30 && bytes[i + 3] <= 0x39 {
+                let p = (b - 0x81) * 12600 + (b2 - 0x30) * 1260 + (bytes[i + 2] - 0x81) * 10 + bytes[i + 3] - 0x30
+                let cp = encGbRangeCp(ranges, p)
+                if cp > 0 {
+                    out.append(cp)
+                } else {
+                    out.append(0xFFFD)
+                    bad += 1
+                }
+                i += 4
+            } else {
+                // Restore the second byte (and what follows) to the queue.
+                out.append(0xFFFD)
+                bad += 1
+                i += 1
+            }
+            continue
+        }
+        var cp = 0
+        if (b2 >= 0x40 && b2 <= 0x7E) || (b2 >= 0x80 && b2 <= 0xFE) {
+            let offset = if b2 < 0x7F { 0x40 } else { 0x41 }
+            cp = encAt16(gb, (b - 0x81) * 190 + b2 - offset)
+        }
+        if cp > 0 {
+            out.append(cp)
+            i += 2
+        } else {
+            out.append(0xFFFD)
+            bad += 1
+            i += if b2 < 0x80 { 1 } else { 2 }
+        }
+    }
+    (out, bad)
+}
+
+// Big5 decoder (Encoding Standard §11.1.1), with its four pointers that
+// decode to two code points.
+fn encBig5(_ bytes: Data, from: Int, to: Int, _ big5: Data) -> ([Int], Int) {
+    var out: [Int] = []
+    var bad = 0
+    var i = from
+    while i < to {
+        let b = bytes[i]
+        if b < 0x80 {
+            out.append(b)
+            i += 1
+            continue
+        }
+        if b < 0x81 || b > 0xFE {
+            out.append(0xFFFD)
+            bad += 1
+            i += 1
+            continue
+        }
+        if i + 1 >= to {
+            out.append(0xFFFD)
+            bad += 1
+            break
+        }
+        let t = bytes[i + 1]
+        var cp = 0
+        var p = -1
+        if (t >= 0x40 && t <= 0x7E) || (t >= 0xA1 && t <= 0xFE) {
+            let offset = if t < 0x7F { 0x40 } else { 0x62 }
+            p = (b - 0x81) * 157 + t - offset
+        }
+        if p == 1133 || p == 1135 || p == 1164 || p == 1166 {
+            out.append(if p < 1150 { 0x00CA } else { 0x00EA })
+            out.append(if p == 1133 || p == 1164 { 0x0304 } else { 0x030C })
+            i += 2
+            continue
+        }
+        if p >= 0 && p * 3 + 3 <= big5.count {
+            cp = big5[p * 3] | big5[p * 3 + 1] << 8 | big5[p * 3 + 2] << 16
+        }
+        if cp > 0 {
+            out.append(cp)
+            i += 2
+        } else {
+            out.append(0xFFFD)
+            bad += 1
+            i += if t < 0x80 { 1 } else { 2 }
+        }
+    }
+    (out, bad)
+}
+
+// EUC-KR decoder (Encoding Standard §13.1.1): KS X 1001 plus the Unified
+// Hangul Code extension (Windows code page 949).
+fn encEucKr(_ bytes: Data, from: Int, to: Int, _ kr: Data) -> ([Int], Int) {
+    var out: [Int] = []
+    var bad = 0
+    var i = from
+    while i < to {
+        let b = bytes[i]
+        if b < 0x80 {
+            out.append(b)
+            i += 1
+            continue
+        }
+        if b < 0x81 || b > 0xFE {
+            out.append(0xFFFD)
+            bad += 1
+            i += 1
+            continue
+        }
+        if i + 1 >= to {
+            out.append(0xFFFD)
+            bad += 1
+            break
+        }
+        let t = bytes[i + 1]
+        var cp = 0
+        if t >= 0x41 && t <= 0xFE {
+            cp = encAt16(kr, (b - 0x81) * 190 + t - 0x41)
+        }
+        if cp > 0 {
+            out.append(cp)
+            i += 2
+        } else {
+            out.append(0xFFFD)
+            bad += 1
+            i += if t < 0x80 { 1 } else { 2 }
+        }
+    }
+    (out, bad)
+}
+
+// ---- detection ----
+
+// A language for detection: its frequent letters (weight 1), the rest of
+// its alphabet (0.4), whether it's written in Latin letters, and the
+// encodings it's written in.
+struct EncLang {
+    code: String
+    frequent: String
+    others: String = ""
+    latin: Bool = true
+    encodings: [String]
+}
+
+fn encLanguages() -> [EncLang] {
+    let west = ["windows-1252", "iso-8859-1", "iso-8859-15"]
+    let central = ["windows-1250", "iso-8859-2"]
+    let baltic = ["windows-1257", "iso-8859-13", "iso-8859-4"]
+    [
+        EncLang(code: "en", frequent: "", encodings: west),
+        EncLang(code: "fr", frequent: "éèàçêâôûîùëïœ", encodings: west),
+        EncLang(code: "de", frequent: "äöüß", encodings: west),
+        EncLang(code: "es", frequent: "áéíóúñü", encodings: west),
+        EncLang(code: "pt", frequent: "áâãàçéêíóôõú", encodings: west),
+        EncLang(code: "it", frequent: "àèéìòù", encodings: west),
+        EncLang(code: "nl", frequent: "éëïóè", encodings: west),
+        EncLang(code: "sv", frequent: "åäöé", encodings: west + ["iso-8859-10"]),
+        EncLang(code: "da", frequent: "æøåé", encodings: west + ["iso-8859-10"]),
+        EncLang(code: "no", frequent: "æøåé", encodings: west + ["iso-8859-10"]),
+        EncLang(code: "fi", frequent: "äöå", encodings: west + ["iso-8859-10"]),
+        EncLang(code: "is", frequent: "áéíóúýþðæö", encodings: west + ["iso-8859-10"]),
+        EncLang(code: "ca", frequent: "àèéíïòóúç·", encodings: west),
+        EncLang(code: "sq", frequent: "ëç", encodings: west),
+        EncLang(code: "cs", frequent: "áčďéěíňóřšťúůýž", encodings: central),
+        EncLang(code: "sk", frequent: "áäčďéíĺľňóôŕšťúýž", encodings: central),
+        EncLang(code: "pl", frequent: "ąćęłńóśźż", encodings: central + ["iso-8859-16"]),
+        EncLang(code: "hu", frequent: "áéíóöőúüű", encodings: central + ["iso-8859-16"]),
+        EncLang(code: "sl", frequent: "čšž", encodings: central),
+        EncLang(code: "hr", frequent: "čćđšž", encodings: central + ["iso-8859-16"]),
+        EncLang(code: "ro", frequent: "ăâîșşțţ", encodings: central + ["iso-8859-16"]),
+        EncLang(code: "tr", frequent: "çğışöüİâ", encodings: ["windows-1254", "iso-8859-9"]),
+        EncLang(code: "lt", frequent: "ąčęėįšųūž", encodings: baltic),
+        EncLang(code: "lv", frequent: "āčēģīķļņšūž", encodings: baltic),
+        EncLang(code: "et", frequent: "äõöüšž", encodings: baltic + ["windows-1252"]),
+        EncLang(code: "vi", frequent: "ăâđêôơư" + charOf(0x300) + charOf(0x301) + charOf(0x303) + charOf(0x309) + charOf(0x323), others: "àáèéìíòóùúýãõ", encodings: ["windows-1258"]),
+        EncLang(code: "mt", frequent: "ċġħżàèìòù", encodings: ["iso-8859-3"]),
+        EncLang(code: "eo", frequent: "ĉĝĥĵŝŭ", encodings: ["iso-8859-3"]),
+        EncLang(code: "cy", frequent: "ŵŷâêîôûẁẃẅỳ", encodings: ["iso-8859-14"]),
+        EncLang(code: "ga", frequent: "áéíóú", others: "ḃċḋḟġṁṗṡṫ", encodings: ["iso-8859-14", "windows-1252"]),
+        EncLang(code: "ru", frequent: "оеаинтсрвлкмдпу", others: "бгжзйфхцчшщъыьэюяё", latin: false, encodings: ["windows-1251", "koi8-r", "iso-8859-5"]),
+        EncLang(code: "uk", frequent: "оанівтеирксдлмпу", others: "бгґжзйфхцчшщьюяєї", latin: false, encodings: ["windows-1251", "koi8-u", "iso-8859-5"]),
+        EncLang(code: "bg", frequent: "оаеинтрсвлкдпм", others: "бгжзйуфхцчшщъьюя", latin: false, encodings: ["windows-1251", "iso-8859-5"]),
+        EncLang(code: "sr", frequent: "аоеиснрјтлвдкупм", others: "бгђжзљњћфхцчџшѓѕќ", latin: false, encodings: ["windows-1251", "iso-8859-5"]),
+        EncLang(code: "be", frequent: "аоенісртлвкмдпуы", others: "бгжзйўфхцчшьэюяё", latin: false, encodings: ["windows-1251"]),
+        EncLang(code: "el", frequent: "αοειτνσςηυρκμπλ", others: "βγδζθξφχψωάέήίόύώϊϋΐΰ", latin: false, encodings: ["windows-1253", "iso-8859-7"]),
+        EncLang(code: "he", frequent: "יוהאלמבתרנשעכד", others: "גזחטךםןסףפץצק", latin: false, encodings: ["windows-1255", "iso-8859-8"]),
+        EncLang(code: "ar", frequent: "اليمنوهبرتعدكف", others: "ءآأؤإئةثجحخذزسشصضطظغقىپچژگکی", latin: false, encodings: ["windows-1256", "iso-8859-6"]),
+        EncLang(code: "th", frequent: "านอรกมงเทดยลสวบปหคข่้ัิีุู", others: "ฃฅฆจฉชซฌญฎฏฐฑฒณตถธผฝพฟภศษฬฮฯะาำึืฺเแโใไๅๆ็์ํ๊๋", latin: false, encodings: ["windows-874", "iso-8859-11"]),
+    ]
+}
+
+// Punctuation that subtitle text uses.
+let encPunctuation = "“”‘’„‚–—…«»¡¿€°•·‹›™©®"
+
+// A small prior per encoding: which to choose when two fit equally.
+fn encPrior(_ name: String) -> Float {
+    match name {
+        "windows-1252" -> 0.03
+        "windows-1250", "windows-1251" -> 0.02
+        "windows-1253", "windows-1254", "windows-1255", "windows-1256", "windows-1257", "windows-1258", "windows-874" -> 0.01
+        "koi8-r", "koi8-u" -> 0.005
+        "gbk", "shift_jis", "big5", "euc-kr" -> 0.01
+        // Rarely used for subtitles.
+        "iso-8859-3", "iso-8859-4", "iso-8859-10", "iso-8859-14", "iso-8859-16" -> -0.03
+        _ -> 0.0
+    }
+}
+
+// Weights of the letters of a language, by code point.
+fn encLetterWeights(_ l: EncLang) -> [Int: Float] {
+    var w: [Int: Float] = [:]
+    for (k, set) in [l.frequent, l.others].enumerated() {
+        let base = if k == 0 { 1.0 } else { 0.4 }
+        for c in set.characters {
+            let cps = encCodePointsOf(c)
+            if cps.count == 1 && w[cps[0]] == nil {
+                w[cps[0]] = base
+            }
+            let up = encCodePointsOf(c.uppercase())
+            if up.count == 1 && up[0] >= 0x80 && w[up[0]] == nil {
+                w[up[0]] = base * 0.6
+            }
+        }
+    }
+    for c in encPunctuation.characters {
+        let cps = encCodePointsOf(c)
+        if cps.count == 1 && w[cps[0]] == nil {
+            w[cps[0]] = 0.5
+        }
+    }
+    w[0xA0] = 0.3
+    w
+}
+
+// For each byte 0x80…0xFF of a single-byte table: 1 if it's a small
+// letter, 2 a capital, 0 neither.
+fn encCases(_ map: [Int]) -> [Int] {
+    var out: [Int] = []
+    for cp in map {
+        if cp < 0xC0 || cp == 0xFFFD {
+            out.append(0)
+            continue
+        }
+        let c = charOf(cp)
+        let lo = c.lowercase()
+        let up = c.uppercase()
+        if c == lo && c != up {
+            out.append(1)
+        } else if c == up && c != lo {
+            out.append(2)
+        } else {
+            out.append(0)
+        }
+    }
+    out
+}
+
+// Whether a code point is a letter of the Latin alphabet with marks.
+fn encIsLatinLetter(_ c: Int) -> Bool {
+    (c >= 0xC0 && c <= 0x24F && c != 0xD7 && c != 0xF7) || (c >= 0x1E00 && c <= 0x1EFF)
+}
+
+// The weight of one decoded non-ASCII character for a single-byte
+// language.
+fn encWeight(_ w: [Int: Float], _ latin: Bool, _ c: Int) -> Float {
+    if c == 0 || c == 0xFFFD || (c >= 0x80 && c < 0xA0) {
+        return -3.0
+    }
+    if let v = w[c] {
+        return v
+    }
+    if latin && encIsLatinLetter(c) {
+        return 0.1
+    }
+    -0.7
+}
+
+fn encIsAsciiLetter(_ b: Int) -> Bool {
+    (b >= 0x41 && b <= 0x5A) || (b >= 0x61 && b <= 0x7A)
+}
+
+// Simplified and Traditional Chinese characters that make up a large
+// part of any text, Japanese kanji that are common in dialogue, and
+// frequent Hangul syllables (our own selections).
+let encZhHans = "的一是不了在人有我他这个们中来上大为和国地到以说时要就出会可也你对生能而子那得于着下自之年过发后作里用道行所然家种事成方多经么去法学如都同现当没动面起看定天分还进好小部其些主样理心她本前开但因只从想实吗吧呢啊什怎谁哪儿走做知话没谢请再见对不起爸妈先生"
+let encZhHant = "的一是不了在人有我他這個們中來上大為和國地到以說時要就出會可也你對生能而子那得於著下自之年過發後作裡用道行所然家種事成方多經麼去法學如都同現當沒動面起看定天分還進好小部其些主樣理心她本前開但因只從想實嗎吧呢啊什怎誰哪兒走做知話謝請再見對不起爸媽先生"
+let encJaKanji = "日一人年大十二本中長出三時行見月後前生五間上東四今金九入学高円子外八六下来気小七山話女北午百書先名川千水半男西電校語土木聞食車何南万毎白天母火右読友左休父雨私彼思言分事自手方物当心様帰待誰君僕俺達本当今日"
+let encKoSyllables = "이다는의에가을고하지서한기로사나도를어요니아자리그수대해있시습게일것들구우보내전정인거만라면주상제마국연무장부소저비원성스문개알오생경래실위세동신여계데말진적했화까야네죠잖봐왜뭐너안좀잘못없감합녕괜찮응예런렇게겠"
+
+// Weights of the frequent characters of a CJK language.
+fn encSetOf(_ s: String) -> [Int: Bool] {
+    var out: [Int: Bool] = [:]
+    for c in encCodePointsOf(s) {
+        out[c] = true
+    }
+    out
+}
+
+fn encIsIdeograph(_ c: Int) -> Bool {
+    (c >= 0x4E00 && c <= 0x9FFF) || (c >= 0x3400 && c <= 0x4DBF) || (c >= 0xF900 && c <= 0xFAFF) || (c >= 0x20000 && c <= 0x2FFFF)
+}
+
+fn encIsCjkPunct(_ c: Int) -> Bool {
+    (c >= 0x3000 && c <= 0x303F) || (c >= 0xFF01 && c <= 0xFF60) || c == 0x30FB || c == 0x30FC || (c >= 0x2010 && c <= 0x2026)
+}
+
+// The score of decoded CJK text for a language: "ja", "zh-hans",
+// "zh-hant" or "ko".
+fn encCjkScore(_ cps: [Int], bad: Int, lang: String, frequent: [Int: Bool]) -> Float {
+    var sum = 0.0
+    var n = 0
+    var kana = 0
+    for c in cps {
+        if c < 0x80 {
+            continue
+        }
+        n += 1
+        if c == 0xFFFD {
+            sum -= 3.0
+            continue
+        }
+        if c >= 0xE000 && c <= 0xF8FF {
+            sum -= 1.5
+            continue
+        }
+        let isKana = c >= 0x3041 && c <= 0x30FA
+        if isKana {
+            kana += 1
+        }
+        if encIsCjkPunct(c) {
+            sum += 0.6
+            continue
+        }
+        if lang == "ja" {
+            if isKana || frequent[c] != nil {
+                sum += 1.0
+            } else if encIsIdeograph(c) {
+                sum += 0.25
+            } else if c >= 0xFF61 && c <= 0xFF9F {
+                sum += 0.2
+            } else {
+                sum -= 0.5
+            }
+        } else if lang == "ko" {
+            if frequent[c] != nil {
+                sum += 1.0
+            } else if c >= 0xAC00 && c <= 0xD7A3 {
+                sum += 0.3
+            } else if encIsIdeograph(c) {
+                sum += 0.1
+            } else {
+                sum -= 0.5
+            }
+        } else {
+            if frequent[c] != nil {
+                sum += 1.0
+            } else if encIsIdeograph(c) {
+                sum += 0.2
+            } else if isKana {
+                sum -= 0.3
+            } else {
+                sum -= 0.5
+            }
+        }
+    }
+    if n == 0 {
+        return -10.0
+    }
+    var s = sum / Float(n)
+    // Every sequence valid: CJK text decoded by the wrong single-byte table
+    // has no such structure to keep.
+    if bad == 0 && n >= 4 {
+        s += 0.3
+    }
+    // Japanese text practically always has kana.
+    if lang == "ja" && kana * 20 < n {
+        s -= 0.3
+    }
+    s
+}
+
+// The ISO 639-1 part of a language tag ("pt-BR" → "pt"), lower case;
+// 3-letter codes and English names that languageCode knows become 2
+// letters.
+fn encLangKey(_ tag: String) -> String {
+    let t = tag.trim().lowercase()
+    if t.hasPrefix("zh") {
+        if t.contains("hant") || t.contains("tw") || t.contains("hk") || t == "cht" {
+            return "zh-hant"
+        }
+        return "zh"
+    }
+    let code = languageCode(t)
+    if code.isEmpty { t } else { code }
+}
+
+// Candidate encodings for bytes, best first, with their confidences (see
+// the file comment). `language` is a hint (ISO 639 code like "ru" or "pt-BR").
+public fn encodingGuesses(_ bytes: Data, language: String = "") -> [EncodingGuess] {
+    let n = bytes.count
+    if n >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF {
+        return [EncodingGuess(name: "utf-8", confidence: 1.0, bom: true, score: 1.0)]
+    }
+    if n >= 2 && bytes[0] == 0xFF && bytes[1] == 0xFE {
+        return [EncodingGuess(name: "utf-16le", confidence: 1.0, bom: true, score: 1.0)]
+    }
+    if n >= 2 && bytes[0] == 0xFE && bytes[1] == 0xFF {
+        return [EncodingGuess(name: "utf-16be", confidence: 1.0, bom: true, score: 1.0)]
+    }
+    // UTF-16 without a BOM: in Latin text every other byte is zero.
+    if n >= 4 {
+        var evenZero = 0
+        var oddZero = 0
+        let m = min(n, 400)
+        var i = 0
+        while i + 1 < m {
+            if bytes[i] == 0 { evenZero += 1 }
+            if bytes[i + 1] == 0 { oddZero += 1 }
+            i += 2
+        }
+        let pairs = m / 2
+        if oddZero * 10 > pairs * 7 && evenZero * 10 < pairs {
+            return [EncodingGuess(name: "utf-16le", confidence: 0.9, score: 0.9)]
+        }
+        if evenZero * 10 > pairs * 7 && oddZero * 10 < pairs {
+            return [EncodingGuess(name: "utf-16be", confidence: 0.9, score: 0.9)]
+        }
+    }
+    // The sample: the first 64 KB, cut at a line break so the last
+    // character is whole.
+    var to = min(n, 65536)
+    if to < n {
+        var k = to - 1
+        while k > to - 512 && k > 0 && bytes[k] != 0x0A {
+            k -= 1
+        }
+        if bytes[k] == 0x0A {
+            to = k + 1
+        }
+    }
+    let (u8, u8bad) = encUtf8(bytes, from: 0, to: to)
+    var multi = 0
+    for c in u8 {
+        if c >= 0x80 && c != 0xFFFD {
+            multi += 1
+        }
+    }
+    if u8bad == 0 {
+        return [EncodingGuess(name: "utf-8", confidence: 1.0, score: 1.0)]
+    }
+    let mostlyUtf8 = multi >= 8 * u8bad && multi >= 8
+    // Byte histograms of the non-ASCII bytes by context: glued to an
+    // ASCII letter, inside a run of non-ASCII bytes, or neither.
+    var glued: [Int] = []
+    var inRun: [Int] = []
+    var alone: [Int] = []
+    // Also: followed by an ASCII capital, or after an ASCII small letter
+    // (a small letter before a capital, or a capital after a small letter,
+    // inside one word is improbable: "¿Dónde" read as "żDónde").
+    var beforeCap: [Int] = []
+    var afterSmall: [Int] = []
+    for _ in 0..128 {
+        glued.append(0)
+        inRun.append(0)
+        alone.append(0)
+        beforeCap.append(0)
+        afterSmall.append(0)
+    }
+    var high = 0
+    for i in 0..to {
+        let b = bytes[i]
+        if b < 0x80 {
+            continue
+        }
+        high += 1
+        let prev = if i > 0 { bytes[i - 1] } else { 0x20 }
+        let next = if i + 1 < to { bytes[i + 1] } else { 0x20 }
+        if next >= 0x41 && next <= 0x5A {
+            beforeCap[b - 0x80] += 1
+        }
+        if prev >= 0x61 && prev <= 0x7A {
+            afterSmall[b - 0x80] += 1
+        }
+        if encIsAsciiLetter(prev) || encIsAsciiLetter(next) {
+            glued[b - 0x80] += 1
+        } else if prev >= 0x80 && next >= 0x80 {
+            inRun[b - 0x80] += 1
+        } else {
+            alone[b - 0x80] += 1
+        }
+    }
+    let hint = encLangKey(language)
+    var names: [String] = []
+    var scores: [Float] = []
+    var langs: [String] = []
+    // Single-byte encodings, per language.
+    var maps: [String: [Int]] = [:]
+    var cases: [String: [Int]] = [:]
+    for l in encLanguages() {
+        let w = encLetterWeights(l)
+        for e in l.encodings {
+            if maps[e] == nil {
+                let m = encSingleMap(e)
+                maps[e] = m
+                cases[e] = encCases(m)
+            }
+            let map = maps[e] ?? []
+            let cs = cases[e] ?? []
+            var sum = 0.0
+            for b in 0..128 {
+                let total = glued[b] + inRun[b] + alone[b]
+                if total == 0 {
+                    continue
+                }
+                let v = encWeight(w, l.latin, map[b])
+                if l.latin {
+                    sum += v * Float(glued[b] + alone[b]) + (v - 0.3) * Float(inRun[b])
+                } else {
+                    sum += (v - 1.5) * Float(glued[b]) + v * Float(inRun[b] + alone[b])
+                }
+                if cs[b] == 1 {
+                    sum -= 1.5 * Float(beforeCap[b])
+                } else if cs[b] == 2 {
+                    sum -= 1.5 * Float(afterSmall[b])
+                }
+            }
+            var s = sum / Float(max(1, high)) + encPrior(e)
+            if hint == l.code {
+                s += 0.2
+            }
+            var found = -1
+            for (k, nm) in names.enumerated() {
+                if nm == e {
+                    found = k
+                }
+            }
+            if found < 0 {
+                names.append(e)
+                scores.append(s)
+                langs.append(l.code)
+            } else if s > scores[found] {
+                scores[found] = s
+                langs[found] = l.code
+            }
+        }
+    }
+    // Multi-byte encodings.
+    let cjk: [(String, String, String)] = [
+        ("shift_jis", "ja", encJaKanji), ("euc-jp", "ja", encJaKanji),
+        ("gbk", "zh-hans", encZhHans), ("big5", "zh-hant", encZhHant),
+        ("euc-kr", "ko", encKoSyllables),
+    ]
+    for (e, lang, freq) in cjk {
+        let (cps, bad) = encCodePoints(bytes, from: 0, to: to, encoding: e)
+        var s = encCjkScore(cps, bad: bad, lang: lang, frequent: encSetOf(freq)) + encPrior(e)
+        if hint == lang || (hint == "zh" && lang.hasPrefix("zh")) {
+            s += 0.2
+        }
+        names.append(e)
+        scores.append(s)
+        langs.append(if lang == "zh-hans" { "zh" } else { lang })
+    }
+    if mostlyUtf8 {
+        names.append("utf-8")
+        scores.append(0.9)
+        langs.append("")
+    }
+    // Best first.
+    var order: [Int] = []
+    for i in 0..names.count {
+        order.append(i)
+    }
+    order = order.sorted(by: { a, b in scores[a] > scores[b] })
+    // Two single-byte encodings that agree on every non-ASCII byte of the
+    // text decode it the same: they don't compete for the confidence.
+    var present: [Int] = []
+    for b in 0..128 {
+        if glued[b] + inRun[b] + alone[b] > 0 {
+            present.append(b)
+        }
+    }
+    var out: [EncodingGuess] = []
+    for (rank, i) in order.enumerated() {
+        var other = 0.0
+        var found = false
+        for j in order {
+            if j == i || encSameText(maps, names[i], names[j], present) {
+                continue
+            }
+            other = scores[j]
+            found = true
+            break
+        }
+        if !found {
+            other = 0.0
+        }
+        let s = scores[i]
+        let conf = max(0.0, min(1.0, s)) * max(0.0, min(1.0, 0.4 + (s - other) * 3.0))
+        out.append(EncodingGuess(name: names[i], confidence: conf, language: langs[i], score: s))
+    }
+    out
+}
+
+// Whether two encodings decode the given non-ASCII bytes alike (both
+// single-byte with the same characters for them).
+fn encSameText(_ maps: [String: [Int]], _ a: String, _ b: String, _ present: [Int]) -> Bool {
+    if a == b {
+        return true
+    }
+    if let ma = maps[a] {
+        if let mb = maps[b] {
+            for x in present {
+                if ma[x] != mb[x] {
+                    return false
+                }
+            }
+            return true
+        }
+    }
+    false
+}
+
+// The most likely encoding of bytes (see encodingGuesses).
+public fn detectEncoding(_ bytes: Data, language: String = "") -> EncodingGuess {
+    let all = encodingGuesses(bytes, language: language)
+    if all.isEmpty {
+        return EncodingGuess(name: "utf-8", confidence: 1.0)
+    }
+    all[0]
+}

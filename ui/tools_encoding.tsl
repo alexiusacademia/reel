@@ -1,0 +1,159 @@
+// The text encoding chooser for a subtitle file: every encoding subs can
+// read (subs.encodingList), grouped by script, with the one detection
+// picked marked with its confidence (and the runners-up with theirs), an
+// "Automatic" row, and a preview of the text as the app decodes it.
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+import "../subs"
+
+// One group of the list.
+public struct EncodingGroup {
+    script: String
+    names: [String] = []
+}
+
+// The script an encoding is for: "Unicode", "Latin", "Cyrillic", "Greek",
+// "Hebrew", "Arabic", "Thai" or "Chinese, Japanese, Korean".
+public fn encodingScript(_ name: String) -> String {
+    match name {
+        "utf-8", "utf-16le", "utf-16be" -> "Unicode"
+        "windows-1251", "koi8-r", "koi8-u", "iso-8859-5" -> "Cyrillic"
+        "windows-1253", "iso-8859-7" -> "Greek"
+        "windows-1255", "iso-8859-8" -> "Hebrew"
+        "windows-1256", "iso-8859-6" -> "Arabic"
+        "windows-874", "iso-8859-11" -> "Thai"
+        "shift_jis", "euc-jp", "gbk", "gb18030", "big5", "euc-kr" -> "Chinese, Japanese, Korean"
+        _ -> "Latin"
+    }
+}
+
+// subs.encodingList grouped by script, groups in the order they first
+// appear, encodings in the list's order.
+public fn encodingGroups() -> [EncodingGroup] {
+    var out: [EncodingGroup] = []
+    for name in subs.encodingList {
+        let s = encodingScript(name)
+        var found = false
+        for k in 0..out.count {
+            if out[k].script == s {
+                out[k].names.append(name)
+                found = true
+            }
+        }
+        if !found {
+            out.append(EncodingGroup(script: s, names: [name]))
+        }
+    }
+    out
+}
+
+// "92%".
+public fn confidenceText(_ c: Float) -> String {
+    "{Int(max(0.0, min(c, 1.0)) * 100.0 + 0.5)}%"
+}
+
+// The confidence detection gave an encoding, or -1 if it wasn't among
+// the guesses.
+public fn encodingConfidence(_ name: String, guesses: [subs.EncodingGuess]) -> Float {
+    for g in guesses {
+        if g.name == name {
+            return g.confidence
+        }
+    }
+    -1.0
+}
+
+// The order rows are walked with the arrow keys: "auto", then the groups.
+fn toolsEncodingOrder() -> [String] {
+    var out = ["auto"]
+    for g in encodingGroups() {
+        out.appendAll(g.names)
+    }
+    out
+}
+
+// `selected`: "auto" or a name of subs.encodingList; `detected`: what
+// subs.detectEncoding found (name "" if nothing was detected yet);
+// `guesses`: subs.encodingGuesses, for the runners-up's confidences;
+// `preview`: the start of the text as decoded with `selected`;
+// `onPick(name)`: the user chose an encoding ("auto" for automatic).
+public view EncodingPicker(selected: bind String, detected: subs.EncodingGuess = subs.EncodingGuess(name: ""), guesses: [subs.EncodingGuess] = [], preview: String = "", onPick: fn(String)) {
+    fn pick(_ name: String) {
+        selected = name
+        onPick(name)
+    }
+
+    fn step(_ delta: Int) {
+        let order = toolsEncodingOrder()
+        var at = order.index(of: selected) ?? 0
+        at = max(0, min(order.count - 1, at + delta))
+        pick(order[at])
+        scrollTo("enc-{order[at]}")
+    }
+
+    VStack(spacing: 8, alignment: .leading) {
+        Text("Text encoding").font(size: 15, weight: .semibold)
+        if !detected.name.isEmpty {
+            Text("Detected: {subs.encodingTitle(detected.name)}, {confidenceText(detected.confidence)} sure" + (if detected.bom { " (byte order mark)" } else { "" }))
+                .font(size: 12)
+                .color(.secondary)
+        }
+        Scroll {
+            VStack(spacing: 1, alignment: .leading) {
+                ToolsEncodingRow(title: "Automatic", note: if detected.name.isEmpty { "" } else { "uses " + subs.encodingTitle(detected.name) }, on: selected == "auto" || selected.isEmpty, detected: false, confidence: -1.0) { pick("auto") }
+                    .id("enc-auto")
+                for g in encodingGroups() {
+                    Text(g.script).font(size: 11, weight: .semibold).color(.secondary).padding(top: 8, leading: 4)
+                    for name in g.names {
+                        ToolsEncodingRow(title: subs.encodingTitle(name), note: "", on: selected == name, detected: name == detected.name, confidence: if name == detected.name { detected.confidence } else { encodingConfidence(name, guesses: guesses) }) { pick(name) }
+                            .id("enc-{name}")
+                    }
+                }
+            }
+        }
+        .frame(minHeight: 160, maxHeight: .infinity)
+        .border(.separator, radius: 4)
+        .onKeyEvent { e in
+            match e.key {
+                "down" -> step(1)
+                "up" -> step(-1)
+                _ -> {}
+            }
+        }
+        if !preview.isEmpty {
+            Text("Preview").font(size: 11, weight: .semibold).color(.secondary)
+            Text(preview)
+                .font(size: 12)
+                .lineLimit(6)
+                .padding(8)
+                .frame(maxWidth: .infinity, alignment: .topLeading)
+                .background(.sidebar, radius: 4)
+                .selectable()
+        }
+    }
+    .padding(12)
+    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+}
+
+view ToolsEncodingRow(title: String, note: String, on: Bool, detected: Bool, confidence: Float, action: fn()) {
+    HStack(spacing: 6) {
+        Svg(toolsSvgCheck()).color(toolsAccent).frame(width: 14, height: 14).opacity(if on { 1.0 } else { 0.0 })
+        Text(title).font(weight: if on { .semibold } else { .regular })
+        if !note.isEmpty {
+            Text(note).font(size: 11).color(.secondary).lineLimit(1)
+        }
+        Spacer()
+        if detected {
+            ToolsBadge(text: "Detected {confidenceText(confidence)}", color: .green)
+        } else if confidence >= 0.05 {
+            Text(confidenceText(confidence)).font(size: 11).color(.secondary).tooltip("How well this encoding fits the text")
+        }
+    }
+    .padding(horizontal: 6, vertical: 3)
+    .background(if on { toolsSelected() } else { .clear }, radius: 4)
+    .hoverBackground(.lightGray, radius: 4)
+    .onTap { action() }
+    .accessibilityLabel(title)
+}

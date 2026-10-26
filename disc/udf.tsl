@@ -1,0 +1,368 @@
+// UDF file listings of a disc image: UDF 1.02 (DVD-Video), 1.50/2.0x, and
+// 2.50/2.60 with a metadata partition (Blu-ray).
+//
+// Followed: ECMA-167 (3rd edition) parts 3 and 4 and the OSTA UDF
+// specification 2.60 (public). 2048-byte sectors.
+//   Anchor Volume Descriptor Pointer (tag 2) at sector 256 (or N−256, N−1):
+//     main Volume Descriptor Sequence extent at 16 (length, location).
+//   In that sequence: Primary Volume Descriptor (tag 1; volume identifier
+//     dstring[32] at 24), Partition Descriptor (tag 5; number at 22,
+//     starting sector at 188, length at 192), Logical Volume Descriptor
+//     (tag 6; block size at 212, File Set Descriptor long_ad at 248,
+//     partition map count at 268, maps at 440), Terminator (tag 8).
+//   Partition maps: type 1 (6 bytes: …, partition number at 4) or type 2
+//     (64 bytes, an entity id at 4 naming it; "*UDF Metadata Partition":
+//     partition number at 38, metadata file location at 40 — a file in the
+//     physical partition whose contents are the metadata partition's
+//     blocks).
+//   File Set Descriptor (tag 256): root directory ICB long_ad at 400.
+//   File Entry (tag 261: info length at 56, L_EA at 168, L_AD at 172,
+//     allocation descriptors at 176 + L_EA) and Extended File Entry (tag
+//     266: 56, 208, 212, 216 + L_EA); ICB tag at 16: file type at 27,
+//     flags at 34 (low 3 bits: 0 short_ad, 1 long_ad, 3 data embedded).
+//   short_ad: length (top 2 bits: extent type; 3 = the next run of
+//     descriptors) and block; long_ad adds the partition reference.
+//   File Identifier Descriptor (tag 257): characteristics at 18 (bit 1
+//     directory, bit 2 deleted, bit 3 parent), L_FI at 19, ICB long_ad at
+//     20, L_IU at 36, name (OSTA CS0: first byte 8 = 1 byte a character,
+//     16 = UTF-16 big-endian) at 38 + L_IU, padded to 4 bytes.
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+struct UdfMap {
+    // 1 physical, 2 metadata (other type 2 maps are read as physical).
+    kind: Int = 1
+    partition: Int = 0
+    // Metadata partition: the metadata file's extents (image offset,
+    // length pairs).
+    extents: [Int] = []
+}
+
+struct UdfVol {
+    block: Int = 2048
+    // Partition number → starting sector, as flat pairs.
+    parts: [Int] = []
+    maps: [UdfMap] = []
+    warnings: [String] = []
+}
+
+struct UdfNode {
+    name: String
+    // Image byte offset of its ICB and the partition reference it is in.
+    at: Int
+    ref: Int
+}
+
+fn udfTagOk(_ d: Data, _ at: Int, _ id: Int) -> Bool {
+    if at < 0 || at + 16 > d.count || dL16(d, at) != id {
+        return false
+    }
+    var sum = 0
+    for i in 0..16 {
+        if i != 4 {
+            sum += d[at + i]
+        }
+    }
+    sum & 255 == d[at + 4]
+}
+
+fn udfPartStart(_ v: UdfVol, _ number: Int) -> Int {
+    var i = 0
+    while i + 1 < v.parts.count {
+        if v.parts[i] == number {
+            return v.parts[i + 1]
+        }
+        i += 2
+    }
+    -1
+}
+
+// The image byte offset of logical block `lbn` of partition reference
+// `ref`, or −1.
+fn udfByte(_ v: UdfVol, _ ref: Int, _ lbn: Int) -> Int {
+    if ref < 0 || ref >= v.maps.count || lbn < 0 {
+        return -1
+    }
+    let m = v.maps[ref]
+    if m.kind == 2 {
+        var off = lbn * v.block
+        var i = 0
+        while i + 1 < m.extents.count {
+            if off < m.extents[i + 1] {
+                return m.extents[i] + off
+            }
+            off -= m.extents[i + 1]
+            i += 2
+        }
+        return -1
+    }
+    let start = udfPartStart(v, m.partition)
+    if start < 0 {
+        return -1
+    }
+    (start + lbn) * v.block
+}
+
+// A (extended) file entry at image byte `at` in partition reference `ref`:
+// (file type, information length, data extents as image offset/length
+// pairs); type −1 if it isn't one.
+fn udfEntry(_ d: Data, _ v: UdfVol, _ at: Int, _ ref: Int) -> (Int, Int, [Int]) {
+    var ex: [Int] = []
+    var eaAt = 168
+    var adAt = 176
+    if udfTagOk(d, at, 266) {
+        eaAt = 208
+        adAt = 216
+    } else if !udfTagOk(d, at, 261) {
+        return (-1, 0, ex)
+    }
+    let type = dU8(d, at + 27)
+    let adType = dL16(d, at + 34) & 7
+    let info = dL64(d, at + 56)
+    let lea = dL32(d, at + eaAt)
+    let lad = dL32(d, at + eaAt + 4)
+    var p = at + adAt + lea
+    var end = p + lad
+    if adType == 3 {
+        // The data is inside the entry.
+        ex.append(p)
+        ex.append(min(info, lad))
+        return (type, info, ex)
+    }
+    let step = if adType == 1 { 16 } else { 8 }
+    var left = info
+    var hops = 0
+    while p + step <= end && p + step <= d.count && left > 0 {
+        let raw = dL32(d, p)
+        let len = raw & 0x3FFFFFFF
+        let etype = raw >> 30
+        let lbn = dL32(d, p + 4)
+        let pref = if adType == 1 { dL16(d, p + 8) } else { ref }
+        if len == 0 {
+            break
+        }
+        if etype == 3 {
+            // The descriptors go on in another block (an Allocation Extent
+            // Descriptor, tag 258: its descriptors follow its 24 bytes).
+            let next = udfByte(v, pref, lbn)
+            hops += 1
+            if next < 0 || hops > 64 || !udfTagOk(d, next, 258) {
+                break
+            }
+            p = next + 24
+            end = p + dL32(d, next + 20)
+            continue
+        }
+        let use = min(len, left)
+        if etype == 0 {
+            let b = udfByte(v, pref, lbn)
+            if b < 0 {
+                break
+            }
+            ex.append(b)
+            ex.append(use)
+        }
+        left -= use
+        p += step
+    }
+    (type, info, ex)
+}
+
+// The bytes of extents.
+fn udfGather(_ d: Data, _ ex: [Int]) -> Data {
+    if ex.count == 2 {
+        return dSlice(d, ex[0], ex[0] + ex[1])
+    }
+    var out = Data()
+    var i = 0
+    while i + 1 < ex.count {
+        out += dSlice(d, ex[i], ex[i] + ex[i + 1])
+        i += 2
+    }
+    out
+}
+
+// OSTA CS0 text.
+fn udfName(_ d: Data, _ at: Int, _ n: Int) -> String {
+    if n <= 0 {
+        return ""
+    }
+    let comp = dU8(d, at)
+    if comp == 16 || comp == 255 {
+        return dUtf16be(d, at + 1, n - 1)
+    }
+    dLatin1(d, at + 1, n - 1)
+}
+
+// A dstring field (CS0 text whose last byte is its used length).
+fn udfDstring(_ d: Data, _ at: Int, _ size: Int) -> String {
+    let used = dU8(d, at + size - 1)
+    if used <= 0 || used >= size {
+        return ""
+    }
+    udfName(d, at, used).trim()
+}
+
+// The UDF file tree of an image.
+public fn udfFiles(_ d: Data, path: String = "") -> Result<DiscFs> {
+    var fs = DiscFs(root: path)
+    fs.iso = true
+    fs.image = d
+    fs.source = "udf"
+    // Anchor.
+    var avdp = -1
+    let last = d.count / 2048 - 1
+    for s in [256, last - 256, last] {
+        if avdp < 0 && s > 0 && udfTagOk(d, s * 2048, 2) {
+            avdp = s * 2048
+        }
+    }
+    if avdp < 0 {
+        return Result.failure(error: Error("no UDF anchor"))
+    }
+    var v = UdfVol()
+    let vdsAt = dL32(d, avdp + 20) * 2048
+    let vdsLen = dL32(d, avdp + 16)
+    var fsdBlock = -1
+    var fsdRef = 0
+    var rawMaps: [Int] = []
+    var p = vdsAt
+    var n = 0
+    while p < vdsAt + vdsLen && p + 2048 <= d.count && n < 64 {
+        let tag = dL16(d, p)
+        if udfTagOk(d, p, tag) {
+            if tag == 1 && fs.volumeName.isEmpty {
+                fs.volumeName = udfDstring(d, p + 24, 32)
+            } else if tag == 5 {
+                v.parts.append(dL16(d, p + 22))
+                v.parts.append(dL32(d, p + 188))
+            } else if tag == 6 && fsdBlock < 0 {
+                v.block = dL32(d, p + 212)
+                fsdBlock = dL32(d, p + 248 + 4)
+                fsdRef = dL16(d, p + 248 + 8)
+                let nm = min(16, dL32(d, p + 268))
+                var m = p + 440
+                for _ in 0..nm {
+                    let ml = dU8(d, m + 1)
+                    if ml < 6 {
+                        break
+                    }
+                    rawMaps.append(m)
+                    m += ml
+                }
+            } else if tag == 8 {
+                break
+            }
+        }
+        p += 2048
+        n += 1
+    }
+    if v.block != 2048 {
+        v.warnings.append("UDF block size {v.block}")
+        if v.block <= 0 || v.block > 65536 {
+            v.block = 2048
+        }
+    }
+    if fsdBlock < 0 {
+        return Result.failure(error: Error("UDF: no logical volume descriptor"))
+    }
+    // Partition maps. Physical maps first, so metadata files can be found.
+    for m in rawMaps {
+        var map = UdfMap()
+        if dU8(d, m) == 1 {
+            map.partition = dL16(d, m + 4)
+        } else {
+            map.partition = dL16(d, m + 38)
+            if dAscii(d, m + 5, 23).hasPrefix("*UDF Metadata Partition") {
+                map.kind = 2
+            }
+        }
+        v.maps.append(map)
+    }
+    var mi = 0
+    while mi < v.maps.count {
+        if v.maps[mi].kind == 2 {
+            let m = rawMaps[mi]
+            // The metadata file lives in the physical partition.
+            var phys = UdfVol(block: v.block, parts: v.parts)
+            phys.maps = [UdfMap(partition: v.maps[mi].partition)]
+            var ok = false
+            for loc in [dL32(d, m + 40), dL32(d, m + 44)] {
+                if !ok {
+                    let at = udfByte(phys, 0, loc)
+                    let (_, _, ex) = udfEntry(d, phys, at, 0)
+                    if !ex.isEmpty {
+                        v.maps[mi].extents = ex
+                        ok = true
+                    }
+                }
+            }
+            if !ok {
+                fs.files = []
+                return Result.failure(error: Error("UDF: the metadata partition's file can't be read"))
+            }
+        }
+        mi += 1
+    }
+    let fsdAt = udfByte(v, fsdRef, fsdBlock)
+    if !udfTagOk(d, fsdAt, 256) {
+        return Result.failure(error: Error("UDF: no file set descriptor"))
+    }
+    let rootRef = dL16(d, fsdAt + 400 + 8)
+    let rootAt = udfByte(v, rootRef, dL32(d, fsdAt + 400 + 4))
+    var queue: [UdfNode] = [UdfNode(name: "", at: rootAt, ref: rootRef)]
+    var seen: Set<Int> = []
+    var qi = 0
+    while qi < queue.count && fs.files.count < 200000 {
+        let node = queue[qi]
+        qi += 1
+        if seen.contains(node.at) || node.at < 0 {
+            continue
+        }
+        seen.insert(node.at)
+        let (_, _, ex) = udfEntry(d, v, node.at, node.ref)
+        let dir = udfGather(d, ex)
+        var q = 0
+        while q + 38 <= dir.count {
+            if !udfTagOk(dir, q, 257) {
+                break
+            }
+            let chars = dU8(dir, q + 18)
+            let lfi = dU8(dir, q + 19)
+            let lbn = dL32(dir, q + 24)
+            let ref = dL16(dir, q + 28)
+            let liu = dL16(dir, q + 36)
+            let name = udfName(dir, q + 38 + liu, lfi)
+            q += (38 + liu + lfi + 3) / 4 * 4
+            if chars & 4 != 0 || chars & 8 != 0 || name.isEmpty {
+                continue
+            }
+            let full = if node.name.isEmpty { name } else { node.name + "/" + name }
+            let at = udfByte(v, ref, lbn)
+            if chars & 2 != 0 {
+                fs.files.append(DiscFile(name: full, path: path, offset: at, folder: true))
+                if queue.count < 100000 {
+                    queue.append(UdfNode(name: full, at: at, ref: ref))
+                }
+            } else {
+                let (type, info, fex) = udfEntry(d, v, at, ref)
+                if type < 0 {
+                    v.warnings.append("UDF: {full} has no file entry")
+                    continue
+                }
+                var f = DiscFile(name: full, path: path, size: info)
+                if fex.count >= 2 {
+                    f.offset = fex[0]
+                }
+                if fex.count > 2 {
+                    f.extents = fex
+                    f = discMergeExtents(f)
+                }
+                fs.files.append(f)
+            }
+        }
+    }
+    fs.warnings = v.warnings
+    Result.ok(value: fs)
+}

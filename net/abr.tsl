@@ -1,0 +1,140 @@
+// Adaptive bitrate: choosing which variant (quality) to load the next
+// segment from, from the measured download throughput and how much is
+// buffered. Switches happen only between segments (the session asks
+// before each one).
+//
+// Reel's own rule:
+// - Throughput: each segment download gives a sample (bits / seconds).
+//   Two exponentially weighted averages, weighted by the segment's media
+//   seconds, with half-lives of 3 and 9 media seconds; the estimate is
+//   the lower one (quick to drop, slow to rise). Downloads under 16 KB
+//   count less (latency dominates them).
+// - Safety: aim at 70 % of the estimate while the buffer is under 8 s,
+//   85 % above it.
+// - Up: only with at least 10 s buffered, one step at a time, and not
+//   within two segments of the last switch.
+// - Down: to the highest variant that fits, at once — unless more than
+//   20 s are buffered and the estimate still covers the current one.
+// - Panic: under 2 s buffered after a download slower than real time,
+//   go to the lowest variant.
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+public struct Abr {
+    // Bits per second; 0 before the first sample.
+    fast: Float = 0.0
+    slow: Float = 0.0
+    // Media seconds seen (for the averages' start-up correction).
+    weightFast: Float = 0.0
+    weightSlow: Float = 0.0
+    samples: Int = 0
+    // The last download's speed relative to real time (media seconds per
+    // wall second).
+    lastSpeed: Float = 0.0
+    // Segments since the last switch.
+    sinceSwitch: Int = 100
+    // A fixed variant (-1: automatic).
+    fixed: Int = -1
+    // Before any sample: the bandwidth to start at.
+    startBandwidth: Int = 1500000
+    lowBuffer: Float = 8.0
+    upBuffer: Float = 10.0
+    keepBuffer: Float = 20.0
+    panicBuffer: Float = 2.0
+
+    // The throughput estimate in bits per second (0 before samples).
+    estimate: Float {
+        if samples == 0 {
+            return 0.0
+        }
+        let f = if weightFast > 0.0 { fast / weightFast } else { 0.0 }
+        let s = if weightSlow > 0.0 { slow / weightSlow } else { 0.0 }
+        min(f, s)
+    }
+
+    // Records a download of `bytes` that took `seconds` of wall time and
+    // holds `mediaSeconds` of media.
+    fn addSample(bytes: Int, seconds: Float, mediaSeconds: Float) {
+        if bytes <= 0 {
+            return
+        }
+        let secs = max(seconds, 0.001)
+        let bps = Float(bytes) * 8.0 / secs
+        var w = max(mediaSeconds, 0.1)
+        if bytes < 16384 {
+            w = w * 0.25
+        }
+        // EWMA with weights: value = Σ a^(age) x w / Σ a^(age) w, written
+        // as the running sums decayed by a = 0.5^(w / halfLife).
+        let af = pow(0.5, w / 3.0)
+        let asl = pow(0.5, w / 9.0)
+        fast = fast * af + bps * (1.0 - af)
+        weightFast = weightFast * af + (1.0 - af)
+        slow = slow * asl + bps * (1.0 - asl)
+        weightSlow = weightSlow * asl + (1.0 - asl)
+        samples += 1
+        lastSpeed = mediaSeconds / secs
+    }
+
+    // The variant to load next, given each variant's bandwidth (bits per
+    // second, lowest first), the current one and the seconds buffered.
+    fn choose(_ bandwidths: [Int], current: Int, buffered: Float) -> Int {
+        let n = bandwidths.count
+        if n == 0 {
+            return 0
+        }
+        if fixed >= 0 {
+            return min(fixed, n - 1)
+        }
+        var cur = current
+        if cur < 0 || cur >= n {
+            // Start: the highest at or under startBandwidth.
+            cur = 0
+            for i in 0..n {
+                if bandwidths[i] <= startBandwidth {
+                    cur = i
+                }
+            }
+            if samples == 0 {
+                return cur
+            }
+        }
+        if samples == 0 {
+            return cur
+        }
+        let est = estimate
+        if buffered < panicBuffer && lastSpeed > 0.0 && lastSpeed < 1.0 {
+            return 0
+        }
+        let target = est * (if buffered < lowBuffer { 0.7 } else { 0.85 })
+        var fit = 0
+        for i in 0..n {
+            if Float(bandwidths[i]) <= target {
+                fit = i
+            }
+        }
+        if fit > cur {
+            if buffered >= upBuffer && sinceSwitch >= 2 {
+                return cur + 1
+            }
+            return cur
+        }
+        if fit < cur {
+            if buffered >= keepBuffer && est >= Float(bandwidths[cur]) {
+                return cur
+            }
+            return fit
+        }
+        cur
+    }
+
+    // Tells the rule which variant the next segment came from.
+    fn used(_ variant: Int, previous: Int) {
+        if variant != previous {
+            sinceSwitch = 0
+        } else {
+            sinceSwitch += 1
+        }
+    }
+}

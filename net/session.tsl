@@ -1,0 +1,1098 @@
+// A streaming session: HLS or DASH turned into what the player plays.
+// `openSession` loads the playlist or MPD into a `Presentation` (the
+// qualities of the main stream, alternative audio, subtitles, each a list
+// of segments); the `Session` then says what to download next
+// (`nextFetch`), takes what was downloaded (`deliver`: playlists, keys,
+// init segments, indexes and media segments, decrypted and put into its
+// StreamBuffer), chooses qualities with `Abr`, reloads live playlists in
+// time, and follows seeks.
+//
+// The network part is kept apart so the player's own state can change in
+// place: `let f = session.nextFetch(now: now())`, `let r = await
+// net.fetch(f)`, `session.deliver(f, r, now: now())`. `step` does the three
+// on a copy for simple callers.
+//
+// HLS behaviour follows RFC 8216 §6.3 (client): variant and rendition
+// choice §6.3.1–6.3.2, live start §6.3.3, reloads §6.3.4, decryption
+// §6.3.6 (AES-128, IV from EXT-X-KEY or the media sequence number).
+// DASH follows ISO/IEC 23009-1 §5 and annex A (segment availability,
+// MPD updates by minimumUpdatePeriod).
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+import "../core"
+
+public struct MediaSegment {
+    url: String
+    offset: Int = -1
+    length: Int = -1
+    // Seconds on the presentation timeline.
+    start: Float = 0.0
+    duration: Float = 0.0
+    // HLS media sequence number / DASH segment number.
+    sequence: Int = 0
+    // HLS discontinuity sequence / DASH period index.
+    timeline: Int = 0
+    initUrl: String = ""
+    initOffset: Int = -1
+    initLength: Int = -1
+    // "NONE" or "AES-128".
+    keyMethod: String = "NONE"
+    keyUrl: String = ""
+    iv: Data = Data()
+    gap: Bool = false
+    programDateTime: Float = -1.0
+}
+
+// One quality of one stream (an HLS variant or rendition, a DASH
+// representation).
+public struct Rendition {
+    id: String = ""
+    // "main" (video, or the only stream), "audio", "subtitles".
+    kind: String = "main"
+    bandwidth: Int = 0
+    width: Int = 0
+    height: Int = 0
+    frameRate: Float = 0.0
+    codecs: String = ""
+    name: String = ""
+    language: String = ""
+    channels: String = ""
+    isDefault: Bool = false
+    forced: Bool = false
+    // HLS: the rendition's GROUP-ID, or a variant's AUDIO / SUBTITLES
+    // group.
+    groupId: String = ""
+    audioGroup: String = ""
+    subtitleGroup: String = ""
+    // HLS media playlist to load ("" when the segments are known).
+    playlistUrl: String = ""
+    loaded: Bool = false
+    live: Bool = false
+    targetDuration: Float = 0.0
+    segments: [MediaSegment] = []
+    // HLS: the media playlist as last loaded (for live merges).
+    playlist: HlsPlaylist = HlsPlaylist()
+    // Wall-clock time (now()) of the next live reload.
+    reloadAt: Float = 0.0
+    // DASH: where it is in the MPD, and SegmentBase's index range.
+    period: Int = 0
+    adaptationSet: Int = 0
+    representation: Int = 0
+    needsIndex: Bool = false
+    indexUrl: String = ""
+    indexOffset: Int = -1
+    indexLength: Int = -1
+    // The text MIME type for subtitles ("text/vtt", "application/ttml+xml").
+    mime: String = ""
+
+    // Where the listed segments end.
+    end: Float {
+        if segments.isEmpty {
+            return 0.0
+        }
+        let l = segments[segments.count - 1]
+        l.start + l.duration
+    }
+
+    // The segment to load for timeline position `t`: the one holding it,
+    // else the first that starts after it; -1 when there's none (yet).
+    fn segmentFor(_ t: Float) -> Int {
+        let n = segments.count
+        if n == 0 {
+            return -1
+        }
+        // Binary search on start times.
+        var lo = 0
+        var hi = n
+        while lo < hi {
+            let mid = (lo + hi) / 2
+            if segments[mid].start <= t + 0.01 {
+                lo = mid + 1
+            } else {
+                hi = mid
+            }
+        }
+        let i = lo - 1
+        if i < 0 {
+            return 0
+        }
+        let s = segments[i]
+        if t + 0.01 < s.start + s.duration {
+            return i
+        }
+        if i + 1 < n {
+            return i + 1
+        }
+        -1
+    }
+}
+
+public struct Presentation {
+    // "hls", "dash" or "file" (a plain media file).
+    kind: String = ""
+    url: String = ""
+    live: Bool = false
+    // Seconds, -1 for live.
+    duration: Float = -1.0
+    // Qualities of the main stream, lowest bandwidth first.
+    variants: [Rendition] = []
+    // Alternative audio (HLS EXT-X-MEDIA with a URI, DASH audio
+    // adaptation sets when there is video).
+    audios: [Rendition] = []
+    subtitles: [Rendition] = []
+    master: HlsPlaylist = HlsPlaylist()
+    dash: DashManifest = DashManifest()
+    // For "file": the bytes.
+    fileData: Data = Data()
+    title: String = ""
+    warnings: [String] = []
+}
+
+// Subtitle text that arrived (a WebVTT segment, or a whole subtitle file
+// for DASH): parse with subs.parseText(text, format:) and shift the cues
+// by `offset` seconds onto the presentation timeline.
+public struct SubtitleChunk {
+    text: String
+    format: String = "webvtt"
+    offset: Float = 0.0
+    start: Float = 0.0
+    end: Float = 0.0
+    sequence: Int = 0
+}
+
+// What to download next.
+public struct Fetch {
+    // "manifest", "playlist", "index", "key", "init", "segment".
+    kind: String
+    // 0 main, 1 audio, 2 subtitles.
+    stream: Int = 0
+    // Index into the stream's renditions, and into its segments.
+    rendition: Int = 0
+    segment: Int = -1
+    url: String = ""
+    offset: Int = -1
+    length: Int = -1
+}
+
+public struct Session {
+    presentation: Presentation
+    buffer: StreamBuffer = StreamBuffer()
+    abr: Abr = Abr()
+    // The main rendition segments come from (-1 before the first).
+    variant: Int = -1
+    // The chosen alternative audio (-1: the variant's own / default) and
+    // subtitles (-1: off).
+    audio: Int = -1
+    subtitle: Int = -1
+    // The next timeline position to load, per stream.
+    nextMain: Float = 0.0
+    nextAudio: Float = 0.0
+    nextSub: Float = 0.0
+    doneMain: Bool = false
+    doneAudio: Bool = false
+    doneSub: Bool = false
+    // Where the player is (it sets this as it plays).
+    position: Float = 0.0
+    // Seconds to keep loaded ahead of the position, and behind it for
+    // trim().
+    bufferAhead: Float = 30.0
+    keepBehind: Float = 30.0
+    // Downloaded keys (URL → AES), init sections ("url@offset" → bytes).
+    keyUrls: [String] = []
+    keys: [Aes] = []
+    initKeys: [String] = []
+    inits: [Data] = []
+    subtitleChunks: [SubtitleChunk] = []
+    // Wall-clock time of the next MPD reload (dynamic DASH).
+    manifestAt: Float = 0.0
+    started: Bool = false
+    // Consecutive failed downloads, and the last error.
+    failures: Int = 0
+    lastError: String = ""
+    // When a download fails, wait until this wall-clock time.
+    retryAt: Float = 0.0
+    warnings: [String] = []
+
+    // Seconds loaded ahead of the position.
+    buffered: Float { buffer.bufferedSeconds(at: position) }
+
+    // Whether everything up to the end is loaded (not for live).
+    finished: Bool { buffer.ended }
+
+    // The renditions of a stream.
+    fn renditions(_ stream: Int) -> [Rendition] {
+        match stream {
+            0 -> presentation.variants
+            1 -> presentation.audios
+            _ -> presentation.subtitles
+        }
+    }
+
+    // The audio rendition in use with the current variant: the chosen
+    // one, mapped into the variant's audio group by name and language.
+    fn audioIndex() -> Int {
+        let auds = presentation.audios
+        if auds.isEmpty {
+            return -1
+        }
+        var group = ""
+        if variant >= 0 && variant < presentation.variants.count {
+            group = presentation.variants[variant].audioGroup
+        }
+        if presentation.kind == "hls" && group.isEmpty {
+            return -1
+        }
+        var want = if audio >= 0 && audio < auds.count { auds[audio] } else { Rendition() }
+        var best = -1
+        for (i, r) in auds.enumerated() {
+            if !group.isEmpty && r.groupId != group {
+                continue
+            }
+            if audio >= 0 {
+                if r.name == want.name && r.language == want.language {
+                    return i
+                }
+            }
+            if best < 0 || (r.isDefault && !auds[best].isDefault) {
+                best = i
+            }
+        }
+        if best < 0 && audio >= 0 {
+            return audio
+        }
+        best
+    }
+
+    // Moves loading to `seconds`: the buffer is emptied (packet indexes
+    // start again: use buffer.rebase on your indexes, or start over).
+    fn seek(_ seconds: Float) {
+        var t = max(0.0, seconds)
+        if presentation.duration > 0.0 {
+            t = min(t, presentation.duration)
+        }
+        // Start from the beginning of the segment holding it, so the
+        // player gets a keyframe at or before `seconds`.
+        if variant >= 0 && variant < presentation.variants.count {
+            let r = presentation.variants[variant]
+            let i = r.segmentFor(t)
+            if i >= 0 && r.segments[i].start <= t {
+                t = r.segments[i].start
+            }
+        }
+        buffer.clear()
+        nextMain = t
+        nextAudio = t
+        nextSub = t
+        doneMain = false
+        doneAudio = false
+        doneSub = false
+        position = t
+        subtitleChunks = []
+    }
+
+    // Drops buffered segments that ended keepBehind seconds before the
+    // position. Gives how many packets went; then map your packet indexes
+    // with buffer.rebase(i).
+    fn trimBehind() -> Int {
+        buffer.dropBefore(position - keepBehind)
+    }
+
+    // Picks the alternative audio rendition (index into
+    // presentation.audios), from the current position on.
+    fn chooseAudio(_ index: Int) {
+        audio = index
+        nextAudio = position
+        doneAudio = false
+    }
+
+    // Turns subtitles on (index into presentation.subtitles) or off (-1).
+    fn chooseSubtitles(_ index: Int) {
+        subtitle = index
+        subtitleChunks = []
+        nextSub = max(0.0, position - 1.0)
+        doneSub = false
+    }
+
+    // What to download next, or nil when nothing is needed now (buffer
+    // full, waiting for a live playlist reload, or all loaded).
+    fn nextFetch(now: Float) -> Fetch? {
+        if now < retryAt {
+            return nil
+        }
+        let p = presentation
+        if p.kind == "file" {
+            return nil
+        }
+        if p.kind == "dash" && p.live && now >= manifestAt && manifestAt > 0.0 {
+            return Fetch(kind: "manifest", url: p.url)
+        }
+        if p.variants.isEmpty {
+            return nil
+        }
+        // The main stream's rendition: ABR's choice.
+        let bws = p.variants.map { r in if r.bandwidth > 0 { r.bandwidth } else { 1 } }
+        let mainBuffered = max(0.0, buffer.bufferedEnd(stream: 0) - position)
+        let v = abr.choose(bws, current: variant, buffered: if started { mainBuffered } else { 0.0 })
+        var candidates: [Fetch] = []
+        if !doneMain {
+            if let f = planStream(0, v, now) {
+                candidates.append(f)
+            }
+        }
+        let ai = audioIndex()
+        if ai >= 0 && !doneAudio && (p.audios[ai].playlistUrl.isEmpty || p.audios[ai].playlistUrl != p.variants[min(v, p.variants.count - 1)].playlistUrl) {
+            if let f = planStream(1, ai, now) {
+                candidates.append(f)
+            }
+        }
+        if subtitle >= 0 && subtitle < p.subtitles.count && !doneSub {
+            if let f = planStream(2, subtitle, now) {
+                candidates.append(f)
+            }
+        }
+        if candidates.isEmpty {
+            return nil
+        }
+        // Playlists, keys, inits and indexes first; then the stream with
+        // the least buffered.
+        for f in candidates {
+            if f.kind != "segment" {
+                return f
+            }
+        }
+        var best = candidates[0]
+        var least = 1e300
+        for f in candidates {
+            let ahead = switchNext(f.stream) - position
+            if ahead < least {
+                least = ahead
+                best = f
+            }
+        }
+        best
+    }
+
+    fn switchNext(_ stream: Int) -> Float {
+        match stream {
+            0 -> nextMain
+            1 -> nextAudio
+            _ -> nextSub
+        }
+    }
+
+    fn planStream(_ stream: Int, _ ri: Int, _ now: Float) -> Fetch? {
+        let rs = renditions(stream)
+        if ri < 0 || ri >= rs.count {
+            return nil
+        }
+        let r = rs[ri]
+        if !r.playlistUrl.isEmpty && (!r.loaded || (r.live && now >= r.reloadAt)) {
+            return Fetch(kind: "playlist", stream: stream, rendition: ri, url: r.playlistUrl)
+        }
+        if r.needsIndex {
+            return Fetch(kind: "index", stream: stream, rendition: ri, url: r.indexUrl, offset: r.indexOffset, length: r.indexLength)
+        }
+        let next = switchNext(stream)
+        let goal = if stream == 2 { bufferAhead + 30.0 } else { bufferAhead }
+        if started && next - position >= goal {
+            return nil
+        }
+        var si = r.segmentFor(next)
+        if si < 0 {
+            return nil
+        }
+        // EXT-X-GAP segments aren't loaded.
+        while si < r.segments.count && r.segments[si].gap {
+            si += 1
+        }
+        if si >= r.segments.count {
+            return nil
+        }
+        let s = r.segments[si]
+        if s.keyMethod == "AES-128" && !keyUrls.contains(s.keyUrl) {
+            return Fetch(kind: "key", stream: stream, rendition: ri, segment: si, url: s.keyUrl)
+        }
+        if !s.initUrl.isEmpty && !initKeys.contains(sessionInitKey(s)) {
+            return Fetch(kind: "init", stream: stream, rendition: ri, segment: si, url: s.initUrl, offset: s.initOffset, length: s.initLength)
+        }
+        Fetch(kind: "segment", stream: stream, rendition: ri, segment: si, url: s.url, offset: s.offset, length: s.length)
+    }
+
+    // Takes the result of a fetch.
+    fn deliver(_ f: Fetch, _ result: Result<Fetched>, now: Float) -> Error? {
+        var got = Fetched()
+        match result {
+            .ok(x) -> {
+                got = x
+            }
+            .failure(e) -> {
+                failures += 1
+                lastError = e.message
+                retryAt = now + min(8.0, 0.5 * Float(failures))
+                if f.kind == "segment" && failures >= 3 {
+                    // Give up on this segment: skip it.
+                    warnings.append("skipped a segment that failed 3 times: {f.url}")
+                    skipSegment(f)
+                    failures = 0
+                }
+                return e
+            }
+        }
+        failures = 0
+        retryAt = 0.0
+        match f.kind {
+            "manifest" -> {
+                return reloadManifest(got.data, now)
+            }
+            "playlist" -> {
+                return takePlaylist(f, got.data, now)
+            }
+            "index" -> {
+                return takeIndex(f, got.data)
+            }
+            "key" -> {
+                if got.data.count != 16 {
+                    return Error("an AES-128 key must be 16 bytes ({got.data.count} came from {f.url})")
+                }
+                keyUrls.append(f.url)
+                keys.append(newAes(got.data))
+                return nil
+            }
+            "init" -> {
+                let s = renditions(f.stream)[f.rendition].segments[f.segment]
+                initKeys.append(sessionInitKey(s))
+                inits.append(got.data)
+                return nil
+            }
+            _ -> {
+                return takeSegment(f, got, now)
+            }
+        }
+    }
+
+    fn skipSegment(_ f: Fetch) {
+        let rs = renditions(f.stream)
+        if f.rendition < rs.count && f.segment >= 0 && f.segment < rs[f.rendition].segments.count {
+            let s = rs[f.rendition].segments[f.segment]
+            setNext(f.stream, s.start + s.duration)
+        }
+    }
+
+    fn setNext(_ stream: Int, _ t: Float) {
+        if stream == 0 {
+            nextMain = t
+        } else if stream == 1 {
+            nextAudio = t
+        } else {
+            nextSub = t
+        }
+    }
+
+    fn setRendition(_ stream: Int, _ i: Int, _ r: Rendition) {
+        if stream == 0 {
+            presentation.variants[i] = r
+        } else if stream == 1 {
+            presentation.audios[i] = r
+        } else {
+            presentation.subtitles[i] = r
+        }
+    }
+
+    fn takePlaylist(_ f: Fetch, _ data: Data, _ now: Float) -> Error? {
+        let text = data.text ?? netLatin1(data)
+        var pl = HlsPlaylist()
+        match parseHls(text, url: f.url) {
+            .ok(x) -> {
+                pl = x
+            }
+            .failure(e) -> {
+                return e
+            }
+        }
+        var r = renditions(f.stream)[f.rendition]
+        var changed = true
+        if r.loaded && r.live {
+            let (merged, ch) = hlsMerge(r.playlist, pl)
+            pl = merged
+            changed = ch
+        } else if pl.isLive {
+            // First load of a live playlist: line it up with what's
+            // loaded already (another variant or the main stream).
+            let ref = sessionReference(self, f.stream, f.rendition)
+            if !ref.segments.isEmpty {
+                pl = sessionAlign(ref, pl)
+            }
+        }
+        r.playlist = pl
+        r.loaded = true
+        r.live = pl.isLive
+        r.targetDuration = pl.targetDuration
+        r.segments = sessionSegments(pl)
+        for w in pl.warnings {
+            if !warnings.contains(w) {
+                warnings.append(w)
+            }
+        }
+        if r.live {
+            r.reloadAt = now + hlsReloadDelay(pl, changed: changed)
+            presentation.live = true
+            presentation.duration = -1.0
+        } else if f.stream == 0 && presentation.duration < 0.0 {
+            presentation.duration = pl.duration
+            buffer.media.duration = pl.duration
+        }
+        setRendition(f.stream, f.rendition, r)
+        if !started && f.stream == 0 {
+            // Where to begin: the live start point, or EXT-X-START.
+            if r.live || pl.hasStart {
+                let i = hlsLiveStart(pl)
+                if i < r.segments.count {
+                    let t = r.segments[i].start
+                    nextMain = t
+                    nextAudio = t
+                    nextSub = t
+                    position = t
+                }
+            }
+        }
+        nil
+    }
+
+    fn takeIndex(_ f: Fetch, _ data: Data) -> Error? {
+        var r = renditions(f.stream)[f.rendition]
+        let p = presentation.dash
+        if r.period >= p.periods.count {
+            return Error("DASH: lost the period of a representation")
+        }
+        let period = p.periods[r.period]
+        let rep = period.adaptationSets[r.adaptationSet].representations[r.representation]
+        let applied = try dashApplySidx(rep, data, periodStart: period.start)
+        r.segments = sessionDashSegments(applied, r.period)
+        r.needsIndex = false
+        setRendition(f.stream, f.rendition, r)
+        nil
+    }
+
+    fn takeSegment(_ f: Fetch, _ got: Fetched, _ now: Float) -> Error? {
+        let rs = renditions(f.stream)
+        if f.rendition >= rs.count || f.segment < 0 || f.segment >= rs[f.rendition].segments.count {
+            return Error("a segment for a playlist that changed")
+        }
+        let s = rs[f.rendition].segments[f.segment]
+        var bytes = got.data
+        if s.keyMethod == "AES-128" {
+            var k = -1
+            for (i, u) in keyUrls.enumerated() {
+                if u == s.keyUrl {
+                    k = i
+                }
+            }
+            if k < 0 {
+                return Error("no key for {s.url}")
+            }
+            let iv = if s.iv.count == 16 { s.iv } else { sequenceIv(s.sequence) }
+            if let plain = keys[k].decryptCbc(bytes, iv: iv) {
+                bytes = plain
+            } else {
+                setNext(f.stream, s.start + s.duration)
+                return Error("couldn't decrypt {s.url} (wrong key or IV)")
+            }
+        }
+        var init = Data()
+        if !s.initUrl.isEmpty {
+            let key = sessionInitKey(s)
+            for (i, k) in initKeys.enumerated() {
+                if k == key {
+                    init = inits[i]
+                }
+            }
+        }
+        if f.stream == 0 {
+            abr.addSample(bytes: got.data.count, seconds: got.seconds, mediaSeconds: s.duration)
+            abr.used(f.rendition, previous: variant)
+            variant = f.rendition
+        }
+        setNext(f.stream, s.start + s.duration)
+        started = true
+        if f.stream == 2 {
+            let text = bytes.text ?? netLatin1(bytes)
+            subtitleChunks.append(SubtitleChunk(text: text, format: sessionSubFormat(rs[f.rendition].mime, s.url), offset: sessionVttOffset(self, text, s), start: s.start, end: s.start + s.duration, sequence: s.sequence))
+            checkDone(f.stream, rs[f.rendition])
+            return nil
+        }
+        let err = buffer.append(bytes, init: init, start: s.start, duration: s.duration, timeline: s.timeline, stream: f.stream, sequence: s.sequence, name: s.url)
+        checkDone(f.stream, rs[f.rendition])
+        if presentation.duration > 0.0 {
+            buffer.media.duration = presentation.duration
+        }
+        err
+    }
+
+    fn checkDone(_ stream: Int, _ r: Rendition) {
+        if r.live {
+            return
+        }
+        let next = switchNext(stream)
+        if next >= r.end - 0.01 {
+            if stream == 0 {
+                doneMain = true
+            } else if stream == 1 {
+                doneAudio = true
+            } else {
+                doneSub = true
+            }
+        }
+        if doneMain && (audioIndex() < 0 || doneAudio) {
+            buffer.ended = true
+        }
+    }
+
+    fn reloadManifest(_ data: Data, _ now: Float) -> Error? {
+        let text = data.text ?? netLatin1(data)
+        let m = try parseDash(text, url: presentation.url, now: sessionUtc(now))
+        // Keep choices; refresh segment lists by position in the MPD.
+        presentation.dash = m
+        for i in 0..presentation.variants.count {
+            presentation.variants[i] = sessionRefreshDash(m, presentation.variants[i])
+        }
+        for i in 0..presentation.audios.count {
+            presentation.audios[i] = sessionRefreshDash(m, presentation.audios[i])
+        }
+        for i in 0..presentation.subtitles.count {
+            presentation.subtitles[i] = sessionRefreshDash(m, presentation.subtitles[i])
+        }
+        manifestAt = now + (if m.minimumUpdatePeriod > 0.0 { m.minimumUpdatePeriod } else { 5.0 })
+        if !m.isLive {
+            presentation.live = false
+            presentation.duration = m.duration
+            manifestAt = 0.0
+        }
+        nil
+    }
+}
+
+fn sessionInitKey(_ s: MediaSegment) -> String {
+    "{s.initUrl}@{s.initOffset}+{s.initLength}"
+}
+
+fn sessionSubFormat(_ mime: String, _ url: String) -> String {
+    let m = mime.lowercase()
+    if m.contains("ttml") || url.lowercase().hasSuffix(".ttml") || url.lowercase().hasSuffix(".xml") {
+        return "ttml"
+    }
+    if url.lowercase().hasSuffix(".srt") {
+        return "srt"
+    }
+    "webvtt"
+}
+
+// WebVTT in HLS (RFC 8216 §3.5): X-TIMESTAMP-MAP=MPEGTS:<90 kHz>,LOCAL:<cue
+// time> maps cue times to media timestamps; those go onto the timeline
+// with the buffer's offset for the segment's timeline.
+fn sessionVttOffset(_ s: Session, _ text: String, _ seg: MediaSegment) -> Float {
+    var mpegts = -1
+    var local = 0.0
+    for line in text.lines().prefix(12) {
+        if line.hasPrefix("X-TIMESTAMP-MAP=") {
+            for part in line.substring(from: 16, to: line.count).split(",") {
+                if part.hasPrefix("MPEGTS:") {
+                    mpegts = parseInt(part.substring(from: 7, to: part.count).trim()).valueOr(-1)
+                } else if part.hasPrefix("LOCAL:") {
+                    local = sessionClock(part.substring(from: 6, to: part.count).trim())
+                }
+            }
+        }
+    }
+    if mpegts < 0 {
+        // No map: cue times are on the presentation timeline already
+        // (DASH, or HLS that starts at 0).
+        return if s.presentation.kind == "dash" { 0.0 } else { 0.0 }
+    }
+    var off = 0.0
+    var found = false
+    for (i, id) in s.buffer.timelineIds.enumerated() {
+        if id == seg.timeline {
+            off = s.buffer.timelineOffsets[i]
+            found = true
+        }
+    }
+    let media = Float(mpegts) / 90000.0
+    if !found {
+        // No media yet on this timeline: assume it starts where the
+        // segment does.
+        return seg.start - local
+    }
+    media - local + off
+}
+
+// "00:01:02.500" or "01:02.500" → seconds.
+fn sessionClock(_ t: String) -> Float {
+    let parts = t.split(":")
+    var v = 0.0
+    for p in parts {
+        v = v * 60.0 + parseFloat(p).valueOr(0.0)
+    }
+    v
+}
+
+// The rendition a newly loaded live playlist should line up with.
+fn sessionReference(_ s: Session, _ stream: Int, _ ri: Int) -> HlsPlaylist {
+    if stream == 0 && s.variant >= 0 && s.variant != ri && s.presentation.variants[s.variant].loaded {
+        return s.presentation.variants[s.variant].playlist
+    }
+    for (i, v) in s.presentation.variants.enumerated() {
+        if v.loaded && !(stream == 0 && i == ri) {
+            return v.playlist
+        }
+    }
+    HlsPlaylist()
+}
+
+// Lines a live playlist up with a reference one: by program date-time
+// when both have it, else by media sequence number.
+fn sessionAlign(_ ref: HlsPlaylist, _ new: HlsPlaylist) -> HlsPlaylist {
+    var a = -1
+    for (i, s) in ref.segments.enumerated() {
+        if s.programDateTime >= 0.0 {
+            a = i
+            break
+        }
+    }
+    var b = -1
+    for (i, s) in new.segments.enumerated() {
+        if s.programDateTime >= 0.0 {
+            b = i
+            break
+        }
+    }
+    if a >= 0 && b >= 0 {
+        var m = new
+        let want = ref.segments[a].start + (new.segments[b].programDateTime - ref.segments[a].programDateTime)
+        let shift = want - new.segments[b].start
+        for i in 0..m.segments.count {
+            m.segments[i].start += shift
+        }
+        return m
+    }
+    let (merged, _) = hlsMerge(ref, new)
+    merged
+}
+
+fn sessionSegments(_ pl: HlsPlaylist) -> [MediaSegment] {
+    var out: [MediaSegment] = []
+    for s in pl.segments {
+        var m = MediaSegment(url: s.uri, offset: s.offset, length: s.length, start: s.start, duration: s.duration, sequence: s.sequence, timeline: s.discontinuitySequence)
+        if !s.map.uri.isEmpty {
+            m.initUrl = s.map.uri
+            m.initOffset = s.map.offset
+            m.initLength = s.map.length
+        }
+        m.keyMethod = s.key.method
+        m.keyUrl = s.key.uri
+        m.iv = s.key.iv
+        m.gap = s.gap
+        m.programDateTime = s.programDateTime
+        out.append(m)
+    }
+    out
+}
+
+fn sessionDashSegments(_ r: DashRepresentation, _ period: Int) -> [MediaSegment] {
+    var out: [MediaSegment] = []
+    for s in r.segments {
+        var m = MediaSegment(url: s.url, offset: s.offset, length: s.length, start: s.start, duration: s.duration, sequence: s.number, timeline: period)
+        if !r.initialization.url.isEmpty {
+            m.initUrl = r.initialization.url
+            m.initOffset = r.initialization.offset
+            m.initLength = r.initialization.length
+        }
+        out.append(m)
+    }
+    out
+}
+
+fn sessionDashRendition(_ m: DashManifest, _ pi: Int, _ ai: Int, _ ri: Int, _ kind: String) -> Rendition {
+    let a = m.periods[pi].adaptationSets[ai]
+    let rep = a.representations[ri]
+    var r = Rendition(id: rep.id, kind: kind, bandwidth: rep.bandwidth, width: rep.width, height: rep.height, frameRate: rep.frameRate, codecs: rep.codecs)
+    r.language = rep.language
+    r.name = if a.label.isEmpty { rep.language } else { a.label }
+    r.channels = if rep.channels > 0 { "{rep.channels}" } else { "" }
+    r.isDefault = a.roles.contains("main")
+    r.loaded = true
+    r.live = m.isLive
+    r.period = pi
+    r.adaptationSet = ai
+    r.representation = ri
+    r.mime = rep.mimeType
+    r.segments = sessionDashSegments(rep, pi)
+    r.needsIndex = rep.needsIndex
+    r.indexUrl = rep.baseUrl
+    r.indexOffset = rep.indexOffset
+    r.indexLength = rep.indexLength
+    r
+}
+
+// A representation's segments again from a reloaded MPD, found by period
+// id (or position) and representation id.
+fn sessionRefreshDash(_ m: DashManifest, _ r: Rendition) -> Rendition {
+    var out = r
+    var segs: [MediaSegment] = []
+    for (pi, p) in m.periods.enumerated() {
+        for a in p.adaptationSets {
+            for rep in a.representations {
+                if rep.id == r.id && (rep.kind == "" || true) {
+                    if r.kind != "subtitles" || a.kind == "text" {
+                        segs += sessionDashSegments(rep, pi)
+                    }
+                }
+            }
+        }
+    }
+    if !segs.isEmpty {
+        out.segments = segs
+    }
+    out.live = m.isLive
+    out
+}
+
+// Seconds since 1970 now (Tessel's now() already is).
+fn sessionUtc(_ now: Float) -> Float {
+    now
+}
+
+// Builds the presentation of an HLS master or media playlist.
+public fn hlsPresentation(_ pl: HlsPlaylist) -> Presentation {
+    var p = Presentation(kind: "hls", url: pl.url)
+    p.master = pl
+    if !pl.isMaster {
+        var r = Rendition(id: "0", kind: "main", playlistUrl: pl.url)
+        r.playlist = pl
+        r.loaded = true
+        r.live = pl.isLive
+        r.targetDuration = pl.targetDuration
+        r.segments = sessionSegments(pl)
+        p.variants = [r]
+        p.live = pl.isLive
+        p.duration = if pl.isLive { -1.0 } else { pl.duration }
+        return p
+    }
+    for (i, v) in pl.variants.enumerated() {
+        var r = Rendition(id: "{i}", kind: "main", bandwidth: if v.averageBandwidth > 0 { v.averageBandwidth } else { v.bandwidth }, width: v.width, height: v.height, frameRate: v.frameRate, codecs: v.codecs)
+        r.audioGroup = v.audio
+        r.subtitleGroup = v.subtitles
+        r.playlistUrl = v.uri
+        r.name = if v.height > 0 { "{v.height}p" } else { "{v.bandwidth / 1000} kbit/s" }
+        p.variants.append(r)
+    }
+    for x in pl.renditions {
+        if x.uri.isEmpty {
+            continue
+        }
+        var r = Rendition(id: x.groupId + "/" + x.name, kind: if x.type == "AUDIO" { "audio" } else { "subtitles" })
+        r.name = x.name
+        r.language = x.language
+        r.channels = x.channels
+        r.isDefault = x.isDefault
+        r.forced = x.forced
+        r.groupId = x.groupId
+        r.playlistUrl = x.uri
+        if x.type == "AUDIO" {
+            p.audios.append(r)
+        } else if x.type == "SUBTITLES" {
+            r.mime = "text/vtt"
+            p.subtitles.append(r)
+        }
+    }
+    for d in pl.sessionData {
+        if d.id == "com.apple.hls.title" {
+            p.title = d.value
+        }
+    }
+    p
+}
+
+// Builds the presentation of a DASH MPD: the main stream is the first
+// video adaptation set (else the first audio one); other audio
+// adaptation sets become alternative audio (each at a representation of
+// up to 192 kbit/s); text adaptation sets become subtitles. Periods are
+// joined one after another.
+public fn dashPresentation(_ m: DashManifest) -> Presentation {
+    var p = Presentation(kind: "dash", url: m.url)
+    p.dash = m
+    p.live = m.isLive
+    p.duration = if m.isLive { -1.0 } else { m.duration }
+    if m.periods.isEmpty {
+        p.warnings.append("DASH: no periods")
+        return p
+    }
+    let first = m.periods[0]
+    var mainAs = -1
+    for (i, a) in first.adaptationSets.enumerated() {
+        if a.kind == "video" && mainAs < 0 {
+            mainAs = i
+        }
+    }
+    let hasVideo = mainAs >= 0
+    if !hasVideo {
+        for (i, a) in first.adaptationSets.enumerated() {
+            if a.kind == "audio" && mainAs < 0 {
+                mainAs = i
+            }
+        }
+    }
+    if mainAs < 0 {
+        p.warnings.append("DASH: no video or audio adaptation set")
+        return p
+    }
+    for ri in 0..first.adaptationSets[mainAs].representations.count {
+        var r = sessionDashRendition(m, 0, mainAs, ri, "main")
+        r.segments = sessionDashJoin(m, r, mainAs, ri)
+        if first.adaptationSets[mainAs].representations[ri].protected {
+            p.warnings.append("DASH: representation {r.id} is encrypted (ContentProtection); Reel can't play it")
+        }
+        p.variants.append(r)
+    }
+    for (ai, a) in first.adaptationSets.enumerated() {
+        if ai == mainAs || a.representations.isEmpty {
+            continue
+        }
+        if a.kind == "audio" && hasVideo {
+            var pick = 0
+            for (ri, rep) in a.representations.enumerated() {
+                if rep.bandwidth <= 192000 {
+                    pick = ri
+                }
+            }
+            var r = sessionDashRendition(m, 0, ai, pick, "audio")
+            r.segments = sessionDashJoin(m, r, ai, pick)
+            if r.name.isEmpty {
+                r.name = "Audio {p.audios.count + 1}"
+            }
+            p.audios.append(r)
+        } else if a.kind == "text" {
+            var r = sessionDashRendition(m, 0, ai, 0, "subtitles")
+            if r.name.isEmpty {
+                r.name = "Subtitles {p.subtitles.count + 1}"
+            }
+            p.subtitles.append(r)
+        }
+    }
+    if !p.audios.isEmpty {
+        p.audios[0].isDefault = true
+    }
+    p
+}
+
+// A representation's segments over every period (later periods: the
+// adaptation set and representation in the same place, or with the same
+// representation id).
+fn sessionDashJoin(_ m: DashManifest, _ r: Rendition, _ ai: Int, _ ri: Int) -> [MediaSegment] {
+    var out = r.segments
+    var pi = 1
+    while pi < m.periods.count {
+        let per = m.periods[pi]
+        var found = false
+        for (a, aset) in per.adaptationSets.enumerated() {
+            for (k, rep) in aset.representations.enumerated() {
+                if !found && rep.id == r.id {
+                    out += sessionDashSegments(rep, pi)
+                    found = true
+                }
+                if a == ai && k == ri {
+                    continue
+                }
+            }
+        }
+        if !found && ai < per.adaptationSets.count && ri < per.adaptationSets[ai].representations.count {
+            out += sessionDashSegments(per.adaptationSets[ai].representations[ri], pi)
+        }
+        pi += 1
+    }
+    out
+}
+
+// Downloads what a Fetch asks for.
+public async fn fetch(_ f: Fetch) -> Result<Fetched> {
+    await get(f.url, offset: f.offset, length: f.length)
+}
+
+// Opens an HLS playlist (master or media), a DASH MPD, or a plain media
+// file URL, and loads what's needed before the first segment.
+public async fn openSession(_ url: String) -> Result<Session> {
+    let first = try await get(url)
+    let text = first.data.text ?? ""
+    let t = now()
+    if isHlsPlaylist(text) {
+        let pl = try parseHls(text, url: url)
+        var s = Session(presentation: hlsPresentation(pl))
+        s.buffer.media.duration = s.presentation.duration
+        if !pl.isMaster && pl.isLive {
+            s.presentation.variants[0].reloadAt = t + hlsReloadDelay(pl, changed: true)
+            let i = hlsLiveStart(pl)
+            if i < s.presentation.variants[0].segments.count {
+                let st = s.presentation.variants[0].segments[i].start
+                s.nextMain = st
+                s.position = st
+            }
+        } else if !pl.isMaster && pl.hasStart {
+            let i = hlsLiveStart(pl)
+            if i < s.presentation.variants[0].segments.count {
+                let st = s.presentation.variants[0].segments[i].start
+                s.nextMain = st
+                s.position = st
+            }
+        }
+        return Result.ok(value: s)
+    }
+    if isDashManifest(text) {
+        let m = try parseDash(text, url: url, now: t)
+        var s = Session(presentation: dashPresentation(m))
+        s.buffer.media.duration = s.presentation.duration
+        if m.isLive {
+            s.manifestAt = t + (if m.minimumUpdatePeriod > 0.0 { m.minimumUpdatePeriod } else { 5.0 })
+            if !s.presentation.variants.isEmpty {
+                let r = s.presentation.variants[0]
+                let rep = m.periods[r.period].adaptationSets[r.adaptationSet].representations[r.representation]
+                let st = dashLiveStart(m, rep)
+                let i = r.segmentFor(st)
+                let at = if i >= 0 { r.segments[i].start } else { st }
+                s.nextMain = at
+                s.nextAudio = at
+                s.nextSub = at
+                s.position = at
+            }
+        }
+        if s.presentation.variants.isEmpty {
+            return Result.failure(error: Error("DASH: nothing Reel can play in {url}"))
+        }
+        return Result.ok(value: s)
+    }
+    // A plain media file.
+    var p = Presentation(kind: "file", url: url)
+    p.fileData = first.data
+    var s = Session(presentation: p)
+    if let e = s.buffer.append(first.data, start: 0.0, duration: 0.0, name: url) {
+        return Result.failure(error: e)
+    }
+    s.buffer.ended = true
+    Result.ok(value: s)
+}
+
+// One round on a copy: plans, downloads and delivers one thing. Gives the
+// new session and whether anything was done (false: nothing needed now).
+public async fn step(_ s: Session) -> (Session, Bool) {
+    var ss = s
+    let t = now()
+    if let f = ss.nextFetch(now: t) {
+        let r = await fetch(f)
+        let e = ss.deliver(f, r, now: now())
+        if let err = e {
+            ss.lastError = err.message
+        }
+        return (ss, true)
+    }
+    (ss, false)
+}

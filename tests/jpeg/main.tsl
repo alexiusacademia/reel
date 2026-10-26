@@ -1,0 +1,307 @@
+// Tests for the JPEG decoder: Motion-JPEG video (mjpeg.avi,
+// mjpeg422.avi) and cover.jpg against ffmpeg's decoded pictures, and
+// images made with libjpeg's cjpeg and PIL (tests/jpeg/fixtures, see
+// make_fixtures.sh): progressive with spectral selection and successive
+// approximation, restart intervals, odd sizes, gray, 4:2:2 with
+// optimised tables, 4:1:1 and 4:4:0, RGB, CMYK, EXIF orientation, frames
+// without Huffman tables, two-field frames and damaged data.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../../core"
+import "../../testkit"
+import "../../jpeg"
+
+fn fmt(_ x: Float) -> String {
+    x.formatted(decimals: 2)
+}
+
+// Mean and largest difference of RGBA pixels against a binary PPM (P6).
+fn rgbError(_ px: [Int], _ ppm: Data) -> (Float, Int) {
+    // Header: "P6\n<w> <h>\n255\n".
+    var newlines = 0
+    var at = 0
+    while at < ppm.count && newlines < 3 {
+        if ppm[at] == 10 {
+            newlines += 1
+        }
+        at += 1
+    }
+    var sum = 0
+    var worst = 0
+    var n = 0
+    for i in 0..px.count {
+        let p = px[i]
+        let rgb = [(p >> 24) & 255, (p >> 16) & 255, (p >> 8) & 255]
+        for c in 0..3 {
+            let j = at + i * 3 + c
+            if j < ppm.count {
+                let d = abs(rgb[c] - ppm[j])
+                sum += d
+                worst = max(worst, d)
+                n += 1
+            }
+        }
+    }
+    (Float(sum) / Float(max(n, 1)), worst)
+}
+
+// The image's bytes without its DHT segments.
+fn withoutDht(_ d: Data) -> Data {
+    var out = d.slice(from: 0, to: 2)
+    var i = 2
+    while i + 4 <= d.count {
+        let m = d[i + 1]
+        if m == 0xDA {
+            out += d.slice(from: i, to: d.count)
+            break
+        }
+        let len = d.uint16(at: i + 2, bigEndian: true)
+        if m != 0xC4 {
+            out += d.slice(from: i, to: i + 2 + len)
+        }
+        i += 2 + len
+    }
+    out
+}
+
+fn main() {
+    var passed = 0
+    var total = 0
+    fn check(_ ok: Bool, _ what: String) {
+        total += 1
+        if ok { passed += 1 } else { print("FAIL: {what}") }
+    }
+
+    // ---- Motion-JPEG in AVI ----
+    for name in ["mjpeg.avi", "mjpeg422.avi"] {
+        let file = testkit.fixture(name)
+        let ref = testkit.loadRef(name)
+        let m = testkit.mediaFromRef(file, ref)
+        let track = m.tracks[0]
+        var dec = jpeg.newDecoder(track).value() ?? jpeg.Decoder()
+        var pics: [core.Picture] = []
+        let t0 = now()
+        for p in core.packetsOf(m, 0) {
+            pics += dec.decode(core.packetBytes(file, m, p), pts: p.pts, dts: p.dts, key: p.key)
+        }
+        let ms = (now() - t0) * 1000.0
+        let md5s = testkit.frameMd5s(name)
+        let chroma = if name == "mjpeg.avi" { core.Chroma.yuv420 } else { core.Chroma.yuv422 }
+        let yuv = testkit.referenceYuv(name, width: 320, height: 240, chroma: chroma)
+        var same = 0
+        for i in 0..min(pics.count, md5s.count) {
+            if testkit.pictureMd5(pics[i]) == md5s[i] {
+                same += 1
+            }
+        }
+        var low = 99.0
+        var sum = 0.0
+        for i in 0..min(pics.count, yuv.count) {
+            let p = testkit.psnr(pics[i], yuv[i])
+            low = min(low, p)
+            sum += p
+        }
+        check(pics.count == md5s.count && pics.count == 25, "{name}: {pics.count} pictures")
+        check(yuv.count == 10 && low >= 45.0, "{name}: PSNR min {fmt(low)}")
+        check(same == md5s.count, "{name}: md5 same as ffmpeg {same} of {md5s.count}")
+        check(dec.warnings.isEmpty, "{name}: warnings {dec.warnings.first ?? ""}")
+        print("{name}: PSNR min {fmt(low)} avg {fmt(sum / Float(max(yuv.count, 1)))} dB over {yuv.count}; md5 same as ffmpeg {same} of {md5s.count}")
+        if let p = pics.first {
+            check(p.chroma == chroma && p.fullRange && p.matrix == .bt601 && p.key && p.width == 320 && p.height == 240, "{name}: picture format")
+            check(pics[3].pts == 3 && pics[3].duration == 1, "{name}: pts {pics[3].pts} duration {pics[3].duration}")
+        }
+        if pics.count > 0 {
+            print("time jpeg {name} per 320×240 picture: {fmt(ms / Float(pics.count))} ms")
+        }
+    }
+
+    // ---- Still images against ffmpeg's decoding ----
+    let exact = ["prog420.jpg", "prog444_restart.jpg", "prog_odd.jpg", "restart_odd.jpg", "gray.jpg", "b422_opt.jpg", "exif6.jpg", "field1.jpg"]
+    for name in exact {
+        let data = readData("tests/jpeg/fixtures/" + name) ?? Data()
+        let md5s = testkit.frameMd5s("../jpeg/fixtures/" + name)
+        match jpeg.decodeImage(data) {
+            .ok(p) -> {
+                let got = testkit.pictureMd5(p)
+                check(md5s.count == 1 && got == md5s[0], "{name}: md5 same as ffmpeg ({p.width}×{p.height} {p.chroma})")
+            }
+            .failure(e) -> check(false, "{name}: {e.message}")
+        }
+    }
+    let cover = testkit.fixture("cover.jpg")
+    let coverMd5 = testkit.frameMd5s("../jpeg/fixtures/cover.jpg")
+    let t1 = now()
+    match jpeg.decodeImage(cover) {
+        .ok(p) -> {
+            let ms = (now() - t1) * 1000.0
+            check(p.width == 200 && p.height == 200 && coverMd5.count == 1 && testkit.pictureMd5(p) == coverMd5[0], "cover.jpg: md5 same as ffmpeg")
+            let px = jpeg.toRgbaPixels(p)
+            check(px.count == 40000 && px[0] & 255 == 255, "cover.jpg: RGBA pixels")
+            print("time jpeg cover.jpg 200×200: {fmt(ms)} ms")
+        }
+        .failure(e) -> check(false, "cover.jpg: {e.message}")
+    }
+
+    // ---- Samplings Reel spreads: 4:1:1 → 4:2:2, 4:4:0 → 4:4:4 ----
+    for name in ["b411.jpg", "b440.jpg"] {
+        let data = readData("tests/jpeg/fixtures/" + name) ?? Data()
+        let raw = readData("tests/jpeg/fixtures/" + name + ".raw") ?? Data()
+        match jpeg.decodeImage(data) {
+            .ok(p) -> {
+                let w = 160
+                let h = 120
+                let is411 = name == "b411.jpg"
+                let cw = if is411 { 40 } else { 160 }
+                let ch = if is411 { 120 } else { 60 }
+                var ok = raw.count == w * h + 2 * cw * ch && p.chroma == (if is411 { core.Chroma.yuv422 } else { core.Chroma.yuv444 })
+                if ok {
+                    for y in 0..h {
+                        for x in 0..w {
+                            if p.luma(x, y) != raw[y * w + x] {
+                                ok = false
+                            }
+                        }
+                    }
+                    for y in 0..p.chromaHeight {
+                        for x in 0..p.chromaWidth {
+                            let rx = if is411 { x / 2 } else { x }
+                            let ry = if is411 { y } else { y / 2 }
+                            if p.cb(x, y) != raw[w * h + ry * cw + rx] || p.cr(x, y) != raw[w * h + cw * ch + ry * cw + rx] {
+                                ok = false
+                            }
+                        }
+                    }
+                }
+                check(ok, "{name}: samples same as ffmpeg's, chroma repeated to {p.chroma}")
+                check(jpeg.imageInfo(data).sampling == (if is411 { "4:1:1" } else { "4:4:0" }), "{name}: info sampling {jpeg.imageInfo(data).sampling}")
+            }
+            .failure(e) -> check(false, "{name}: {e.message}")
+        }
+    }
+
+    // ---- RGB and CMYK: shown colours against djpeg's ----
+    for name in ["rgb.jpg", "cmyk.jpg"] {
+        let data = readData("tests/jpeg/fixtures/" + name) ?? Data()
+        let ppm = readData("tests/jpeg/fixtures/" + name + ".ppm") ?? Data()
+        match jpeg.decodeImage(data) {
+            .ok(p) -> {
+                let (mean, worst) = rgbError(jpeg.toRgbaPixels(p), ppm)
+                check(p.chroma == .yuv444 && mean < 1.0 && worst <= 3, "{name}: RGB error mean {fmt(mean)} max {worst}")
+                print("{name}: RGB against djpeg: mean error {fmt(mean)}, max {worst}")
+            }
+            .failure(e) -> check(false, "{name}: {e.message}")
+        }
+    }
+
+    // ---- EXIF orientation ----
+    let exif = readData("tests/jpeg/fixtures/exif6.jpg") ?? Data()
+    check(jpeg.exifOrientation(exif) == 6 && jpeg.exifOrientation(cover) == 1, "EXIF orientation")
+    var od = jpeg.newDecoder(core.Track(index: 0, kind: .video, codec: "mjpeg")).value() ?? jpeg.Decoder()
+    let op = od.decode(exif, pts: 0, dts: 0, key: true)
+    check(op.count == 1 && od.orientation == 6 && jpeg.imageInfo(exif).orientation == 6, "decoder reports the orientation")
+    let info = jpeg.imageInfo(readData("tests/jpeg/fixtures/prog420.jpg") ?? Data())
+    check(info.width == 160 && info.height == 120 && info.progressive && info.sampling == "4:2:0" && info.components == 3, "imageInfo")
+
+    // ---- A frame without Huffman tables (AVI1 Motion-JPEG) ----
+    let plain = readData("tests/jpeg/fixtures/restart_odd.jpg") ?? Data()
+    let bare = withoutDht(plain)
+    let a = jpeg.decodeImage(plain)
+    let b = jpeg.decodeImage(bare)
+    check(bare.count < plain.count - 100 && a.isOk() && b.isOk() && testkit.pictureMd5(a.value() ?? core.Picture(width: 0, height: 0)) == testkit.pictureMd5(b.value() ?? core.Picture(width: 1, height: 1)), "no DHT: the Annex K tables")
+
+    // ---- Two fields in one packet ----
+    let f1 = readData("tests/jpeg/fixtures/field1.jpg") ?? Data()
+    let f2 = readData("tests/jpeg/fixtures/field2.jpg") ?? Data()
+    var ft = core.Track(index: 0, kind: .video, codec: "mjpeg")
+    ft.width = 160
+    ft.height = 120
+    var fd = jpeg.newDecoder(ft).value() ?? jpeg.Decoder()
+    let woven = fd.decode(f1 + f2, pts: 7, dts: 7, key: true)
+    let p1 = jpeg.decodeImage(f1).value() ?? core.Picture(width: 0, height: 0)
+    let p2 = jpeg.decodeImage(f2).value() ?? core.Picture(width: 0, height: 0)
+    var weaveOk = woven.count == 1 && woven[0].height == 120 && woven[0].width == 160 && woven[0].pts == 7
+    if weaveOk {
+        for y in 0..60 {
+            for x in 0..160 {
+                if woven[0].luma(x, 2 * y) != p1.luma(x, y) || woven[0].luma(x, 2 * y + 1) != p2.luma(x, y) {
+                    weaveOk = false
+                }
+            }
+        }
+    }
+    check(weaveOk, "two fields woven into one frame")
+
+    // ---- Damage ----
+    let mj = testkit.fixture("mjpeg.avi")
+    let mref = testkit.loadRef("mjpeg.avi")
+    let mm = testkit.mediaFromRef(mj, mref)
+    let vp = core.packetsOf(mm, 0)
+    var hd = jpeg.newDecoder(mm.tracks[0]).value() ?? jpeg.Decoder()
+    let good = hd.decode(core.packetBytes(mj, mm, vp[0]), pts: 0, dts: 0, key: true)
+    var bytes = core.packetBytes(mj, mm, vp[1]).bytes
+    for j in 4000..4400 {
+        bytes[j] = (j * 131) & 255
+    }
+    let hurt = hd.decode(Data(bytes: bytes), pts: 1, dts: 1, key: true)
+    let cut = hd.decode(core.packetBytes(mj, mm, vp[2]).slice(from: 0, to: 9000), pts: 2, dts: 2, key: true)
+    let junk = hd.decode(Data(bytes: [1, 2, 3, 4, 5]), pts: 3, dts: 3, key: true)
+    let myuv = testkit.referenceYuv("mjpeg.avi", width: 320, height: 240)
+    check(good.count == 1 && hurt.count == 1 && cut.count == 1 && junk.count == 1 && junk[0].pts == 3, "damage: a picture for every packet")
+    check(!hd.warnings.isEmpty, "damage: warnings ({hd.warnings.count}: {hd.warnings.joined(separator: "; ")})")
+    if hurt.count == 1 && cut.count == 1 {
+        let ph = testkit.psnr(hurt[0], myuv[1])
+        let pc = testkit.psnr(cut[0], myuv[2])
+        check(ph > 12.0 && pc > 12.0, "damage: concealed with the previous picture (PSNR {fmt(ph)}, {fmt(pc)} dB)")
+        print("damage: PSNR of the damaged picture {fmt(ph)} dB, of the cut one {fmt(pc)} dB")
+    }
+    check(!jpeg.decodeImage(Data(bytes: [0xFF, 0xD8, 0xFF, 0xD9])).isOk(), "an empty JPEG fails")
+    check(!jpeg.newDecoder(core.Track(index: 0, kind: .video, codec: "h264")).isOk(), "newDecoder refuses other codecs")
+
+    // ---- Fuzzing: random bytes changed in baseline and progressive
+    // images; nothing may stop the program ----
+    var seed = 777
+    var fuzzPics = 0
+    var fuzzRuns = 0
+    for name in ["prog420.jpg", "prog444_restart.jpg", "restart_odd.jpg", "b411.jpg", "cmyk.jpg", "exif6.jpg"] {
+        let orig = (readData("tests/jpeg/fixtures/" + name) ?? Data()).bytes
+        var fz = jpeg.newDecoder(core.Track(index: 0, kind: .video, codec: "mjpeg")).value() ?? jpeg.Decoder()
+        for round in 0..40 {
+            var b = orig
+            for _ in 0..(1 + round % 8) {
+                seed = (seed * 1103515245 + 12345) % 2147483648
+                let at = seed % b.count
+                seed = (seed * 1103515245 + 12345) % 2147483648
+                b[at] = seed % 256
+            }
+            fuzzPics += fz.decode(Data(bytes: b), pts: round, dts: round, key: true).count
+            fuzzRuns += 1
+        }
+    }
+    check(fuzzPics > fuzzRuns / 2, "fuzzing: {fuzzPics} pictures from {fuzzRuns} damaged images")
+
+    // ---- Speed: 1280×720 Motion-JPEG (made by make_fixtures.sh) ----
+    let hdData = readData("build/scratch/jpeg/hd720.mjpeg") ?? Data()
+    if !hdData.isEmpty {
+        var dec = jpeg.newDecoder(core.Track(index: 0, kind: .video, codec: "mjpeg")).value() ?? jpeg.Decoder()
+        var count = 0
+        var at = 0
+        let t2 = now()
+        while at < hdData.count {
+            // Images back to back: each ends with FF D9.
+            var end = at + 2
+            while end + 1 < hdData.count && !(hdData[end] == 0xFF && hdData[end + 1] == 0xD9) {
+                end += 1
+            }
+            count += dec.decode(hdData.slice(from: at, to: end + 2), pts: count, dts: count, key: true).count
+            at = end + 2
+        }
+        let ms = (now() - t2) * 1000.0
+        if count > 0 {
+            print("time jpeg 720p per picture ({hdData.count / count / 1000} KB each): {fmt(ms / Float(count))} ms")
+        }
+    }
+
+    print("jpeg: {passed} of {total} passed")
+}

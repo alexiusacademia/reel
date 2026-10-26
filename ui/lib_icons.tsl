@@ -1,0 +1,132 @@
+// Icons of the library views (sidebar groups, layout and sort buttons,
+// list actions), as SVG from the Lucide set (ISC license) in
+// currentColor, like ui/icons.tsl, plus the shared colours and small
+// building blocks the library views use: a drawn thumbnail with a
+// placeholder, a thin progress bar, and the dark panel's icon button.
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+public fn svgLibTv() -> String { lucide("<rect width='20' height='15' x='2' y='7' rx='2' ry='2'/><polyline points='17 2 12 7 7 2'/>") }
+public fn svgLibLayers() -> String { lucide("<path d='M12.83 2.18a2 2 0 0 0-1.66 0L2.6 6.08a1 1 0 0 0 0 1.83l8.58 3.91a2 2 0 0 0 1.66 0l8.58-3.9a1 1 0 0 0 0-1.83Z'/><path d='m22 17.65-9.17 4.16a2 2 0 0 1-1.66 0L2 17.65'/><path d='m22 12.65-9.17 4.16a2 2 0 0 1-1.66 0L2 12.65'/>") }
+public fn svgLibHistory() -> String { lucide("<path d='M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8'/><path d='M3 3v5h5'/><path d='M12 7v5l4 2'/>") }
+public fn svgLibListMusic() -> String { lucide("<path d='M21 15V6'/><path d='M18.5 18a2.5 2.5 0 1 0 0-5 2.5 2.5 0 0 0 0 5Z'/><path d='M12 12H3'/><path d='M16 6H3'/><path d='M12 18H3'/>") }
+public fn svgLibGrid() -> String { lucide("<rect width='7' height='7' x='3' y='3' rx='1'/><rect width='7' height='7' x='14' y='3' rx='1'/><rect width='7' height='7' x='14' y='14' rx='1'/><rect width='7' height='7' x='3' y='14' rx='1'/>") }
+public fn svgLibList() -> String { lucide("<line x1='8' x2='21' y1='6' y2='6'/><line x1='8' x2='21' y1='12' y2='12'/><line x1='8' x2='21' y1='18' y2='18'/><line x1='3' x2='3.01' y1='6' y2='6'/><line x1='3' x2='3.01' y1='12' y2='12'/><line x1='3' x2='3.01' y1='18' y2='18'/>") }
+public fn svgLibChevronLeft() -> String { lucide("<path d='m15 18-6-6 6-6'/>") }
+public fn svgLibChevronRight() -> String { lucide("<path d='m9 18 6-6-6-6'/>") }
+public fn svgLibCheck() -> String { lucide("<circle cx='12' cy='12' r='10'/><path d='m9 12 2 2 4-4'/>") }
+public fn svgLibSortDown() -> String { lucide("<path d='m3 16 4 4 4-4'/><path d='M7 20V4'/><path d='M11 4h10'/><path d='M11 8h7'/><path d='M11 12h4'/>") }
+public fn svgLibSortUp() -> String { lucide("<path d='m3 8 4-4 4 4'/><path d='M7 4v16'/><path d='M11 12h4'/><path d='M11 16h7'/><path d='M11 20h10'/>") }
+public fn svgLibGrip() -> String { lucide("<circle cx='9' cy='12' r='1'/><circle cx='9' cy='5' r='1'/><circle cx='9' cy='19' r='1'/><circle cx='15' cy='12' r='1'/><circle cx='15' cy='5' r='1'/><circle cx='15' cy='19' r='1'/>") }
+public fn svgLibX() -> String { lucide("<path d='M18 6 6 18'/><path d='m6 6 12 12'/>") }
+public fn svgLibPlus() -> String { lucide("<path d='M5 12h14'/><path d='M12 5v14'/>") }
+public fn svgLibSave() -> String { lucide("<path d='M15.2 3a2 2 0 0 1 1.4.6l3.8 3.8a2 2 0 0 1 .6 1.4V19a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2z'/><path d='M17 21v-7a1 1 0 0 0-1-1H8a1 1 0 0 0-1 1v7'/><path d='M7 3v4a1 1 0 0 0 1 1h7'/>") }
+public fn svgLibTrash() -> String { lucide("<path d='M3 6h18'/><path d='M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6'/><path d='M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2'/>") }
+public fn svgLibBookmark() -> String { lucide("<path d='m19 21-7-4-7 4V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2v16z'/>") }
+public fn svgLibBookmarkPlus() -> String { lucide("<path d='m19 21-7-4-7 4V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2v16z'/><line x1='12' x2='12' y1='7' y2='13'/><line x1='15' x2='9' y1='10' y2='10'/>") }
+public fn svgLibPencil() -> String { lucide("<path d='M21.174 6.812a1 1 0 0 0-3.986-3.987L3.842 16.174a2 2 0 0 0-.5.83l-1.321 4.352a.5.5 0 0 0 .623.622l4.353-1.32a2 2 0 0 0 .83-.497z'/><path d='m15 5 4 4'/>") }
+public fn svgLibFile() -> String { lucide("<path d='M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z'/><path d='M14 2v4a2 2 0 0 0 2 2h4'/>") }
+public fn svgLibFolder() -> String { lucide("<path d='M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z'/>") }
+public fn svgLibGlobe() -> String { lucide("<circle cx='12' cy='12' r='10'/><path d='M12 2a14.5 14.5 0 0 0 0 20 14.5 14.5 0 0 0 0-20'/><path d='M2 12h20'/>") }
+public fn svgLibLibrary() -> String { lucide("<path d='m16 6 4 14'/><path d='M12 6v14'/><path d='M8 8v12'/><path d='M4 4v16'/>") }
+public fn svgLibUser() -> String { lucide("<path d='M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2'/><circle cx='12' cy='7' r='4'/>") }
+public fn svgLibDisc() -> String { lucide("<circle cx='12' cy='12' r='10'/><circle cx='12' cy='12' r='2'/>") }
+
+// The sidebar icon of a group.
+public fn libGroupSvg(_ group: String) -> String {
+    match group {
+        "movies" -> svgFilm()
+        "tv" -> svgLibTv()
+        "music" -> svgMusic()
+        "other" -> svgLibLayers()
+        "history" -> svgLibHistory()
+        "playlists" -> svgLibListMusic()
+        _ -> svgLibLibrary()
+    }
+}
+
+// The placeholder icon for a file without a thumbnail.
+public fn libKindSvg(kind: String, group: String) -> String {
+    if group == "tv" {
+        return svgLibTv()
+    }
+    if kind == "audio" || group == "music" {
+        return svgMusic()
+    }
+    svgFilm()
+}
+
+// Reel's accent and the dark panels' colours (as in main.tsl).
+public let libAccent = Color.rgb(242, 140, 26)
+public let libAccentSoft = Color.rgba(242, 140, 26, 0.18)
+public let libDarkBar = Color.rgb(31, 31, 31)
+public let libDarkPanel = Color.rgb(23, 23, 23)
+public let libDarkText = Color.rgb(217, 217, 217)
+public let libDarkDim = Color.rgb(140, 140, 140)
+public let libDarkHover = Color.rgb(45, 45, 45)
+public let libDarkCard = Color.rgb(38, 38, 38)
+public let libTrack = Color.rgb(89, 89, 89)
+
+// A thumbnail drawn to fit `width`×`height` (letterboxed on `back`), or
+// the placeholder icon when there's none. `key` must change when the
+// picture shown changes (the canvas keeps its drawing otherwise): pass
+// something that names the item, like its id.
+public view LibThumbView(thumb: LibThumb, placeholder: String, width: Float, height: Float, key: Int, back: Color = .rgb(38, 38, 38), iconColor: Color = .rgb(110, 110, 110), radius: Float = 6) {
+    Canvas(redraw: key * 4 + (if thumb.isEmpty { 0 } else { 1 })) { g in
+        g.save()
+        g.beginPath()
+        g.rect(x: 0, y: 0, width: g.width, height: g.height, radius: radius)
+        g.clipPath()
+        g.fillRect(x: 0, y: 0, width: g.width, height: g.height, color: back)
+        if thumb.isEmpty {
+            let side = min(g.width, g.height) * 0.42
+            g.svg(text: placeholder, x: (g.width - side) / 2.0, y: (g.height - side) / 2.0, width: side, height: side, color: iconColor)
+        } else {
+            let tw = Float(thumb.width)
+            let th = Float(thumb.height)
+            // Fill the box (cropping the longer side a little), as posters do.
+            let k = max(g.width / tw, g.height / th)
+            let w = tw * k
+            let h = th * k
+            g.image(pixels: thumb.pixels, pixelWidth: thumb.width, pixelHeight: thumb.height, x: (g.width - w) / 2.0, y: (g.height - h) / 2.0, width: w, height: h)
+        }
+        g.restore()
+    }
+    .frame(width: width, height: height)
+}
+
+// A thin progress bar (0…1) in the accent colour, as wide as it's given
+// (give it a .frame(width:)).
+public view LibProgressBar(fraction: Float, height: Float = 3, track: Color = .rgb(89, 89, 89)) {
+    Canvas(redraw: Int(fraction * 1000.0)) { g in
+        g.fillRect(x: 0, y: 0, width: g.width, height: g.height, color: track, radius: g.height / 2.0)
+        g.fillRect(x: 0, y: 0, width: g.width * max(0.0, min(fraction, 1.0)), height: g.height, color: Color.rgb(242, 140, 26), radius: g.height / 2.0)
+    }
+    .frame(height: height)
+    .accessibilityLabel("{Int(fraction * 100.0 + 0.5)}% played")
+}
+
+// An SVG icon button for the dark panels (a smaller SvgButton).
+public view LibDarkButton(svg: String, tip: String, size: Float = 15, on: Bool = false, action: fn()) {
+    Svg(svg)
+        .color(if on { Color.rgb(242, 140, 26) } else { Color.rgb(217, 217, 217) })
+        .frame(width: size + 10.0, height: size + 10.0)
+        .padding(5)
+        .hoverBackground(.rgb(64, 64, 64), radius: 5)
+        .onTap { action() }
+        .tooltip(tip)
+        .accessibilityLabel(tip)
+}
+
+// The same for the system-coloured Library window.
+public view LibButton(svg: String, tip: String, size: Float = 16, on: Bool = false, action: fn()) {
+    Svg(svg)
+        .color(if on { Color.rgb(242, 140, 26) } else { Color.secondary })
+        .frame(width: size + 10.0, height: size + 10.0)
+        .padding(5)
+        .hoverBackground(.lightGray, radius: 5)
+        .onTap { action() }
+        .tooltip(tip)
+        .accessibilityLabel(tip)
+}

@@ -1,0 +1,893 @@
+// The Vorbis I audio decoder (Vorbis I section 4.3): packet → floors →
+// residues → inverse channel coupling → floor × residue → inverse MDCT →
+// windowed overlap-add → samples in WAV channel order.
+//
+//   var d = try vorbis.newDecoder(track)     // track.extra: the 3 headers
+//   let s = d.decode(packetBytes, pts: p.pts) // core.Samples, may be empty
+//
+// The first audio packet only primes the overlap (Vorbis returns nothing
+// for it, section 4.3.8); every later one returns the samples from the
+// centre of the previous block to the centre of its own: a quarter of
+// each block size. Headers may also come as packets (when `extra` is
+// empty, or a chained Ogg stream starts a new set): they set the decoder
+// up again.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../core"
+
+public struct Decoder {
+    rate: Int = 0
+    channels: Int = 0
+    layout: [String] = []
+    // Vorbis has no encoder delay of its own: the container's granule
+    // positions (or edit lists) say what to trim.
+    delay: Int = 0
+    warnings: [String] = []
+    // From the comment header.
+    tags: [String: String] = [:]
+    // Nominal bits per second from the identification header, 0 unknown.
+    bitrate: Int = 0
+
+    setup: Setup = Setup()
+    books: [Codebook] = []
+    ready: Bool = false
+    // Header packets met in the stream, waiting for the setup header.
+    pending: [Data] = []
+    setupBytes: Data = Data()
+    modeBits: Int = 0
+    mdct0: Mdct = Mdct()
+    mdct1: Mdct = Mdct()
+    // Window slopes for half-window lengths blocksize0/2 and blocksize1/2.
+    slope0: [Float] = []
+    slope1: [Float] = []
+    // Output position (WAV order) of each Vorbis channel.
+    outMap: [Int] = []
+
+    br: core.LsbReader = core.lsbReader(Data())
+    havePrev: Bool = false
+    prevN: Int = 0
+    // The windowed right half of each channel's previous block,
+    // channels × blocksize1/2.
+    prev: [Float] = []
+
+    // Scratch, sized at setup. `half` is blocksize1/2.
+    half: Int = 0
+    floorUnused: [Bool] = []
+    noResidue: [Bool] = []
+    // Floor 1 final Y values and step-2 flags, channels × 65.
+    floorY: [Int] = []
+    finalY: [Int] = []
+    step2: [Bool] = []
+    // Floor 0 amplitude and cos(coefficients), channels × 256.
+    f0Amp: [Int] = []
+    f0Cos: [Float] = []
+    // Residue / spectrum vectors, channels × half.
+    res: [Float] = []
+    // Residue decode buffer (vectors of one submap, or the interleaved
+    // vector of residue type 2), channels × half.
+    iv: [Float] = []
+    cls: [Int] = []
+    curve: [Float] = []
+    warned: Int = 0
+
+    // Decodes one packet. Returns the finished samples (none for the
+    // first audio packet, header packets and damaged packets).
+    fn decode(_ packet: Data, pts: Int) -> core.Samples {
+        var out = core.Samples(rate: rate, channels: channels, layout: layout, pts: pts)
+        if packet.isEmpty {
+            return out
+        }
+        if packet[0] & 1 == 1 {
+            headerPacket(packet)
+            out.rate = rate
+            out.channels = channels
+            out.layout = layout
+            return out
+        }
+        if !ready {
+            warn("a Vorbis audio packet came before the setup header")
+            return out
+        }
+        out.data = audioPacket(packet)
+        out
+    }
+
+    // End of stream: Vorbis holds no finished samples (the right half of
+    // the last block is only lapped by a block that never comes).
+    fn flush() -> core.Samples {
+        core.Samples(rate: rate, channels: channels, layout: layout)
+    }
+
+    // After a seek: forget the previous block; the next packet primes.
+    fn reset() {
+        havePrev = false
+    }
+
+    fn warn(_ w: String) {
+        // Keep the list short for streams damaged throughout.
+        if warned < 20 {
+            warnings.append(w)
+        }
+        warned += 1
+    }
+
+    // A header packet in the stream (section 4.2): 1 starts a new set, 5
+    // completes it.
+    fn headerPacket(_ p: Data) {
+        if isHeader(p, 1) {
+            pending = [p]
+        } else if isHeader(p, 3) {
+            if pending.count == 1 {
+                pending.append(p)
+            }
+        } else if isHeader(p, 5) {
+            if pending.count == 2 {
+                pending.append(p)
+                if !(ready && p == setupBytes) {
+                    if let e = configure(pending) {
+                        warn(e.message)
+                    }
+                }
+            }
+            pending = []
+        } else {
+            warn("a Vorbis packet is neither audio nor a header")
+        }
+    }
+
+    // Sets the decoder up from the three headers.
+    fn configure(_ headers: [Data]) -> Error? {
+        if headers.count < 3 {
+            return Error("Vorbis needs three header packets, found {headers.count}")
+        }
+        var s = Setup()
+        if let e = readIdentification(headers[0], s) {
+            return e
+        }
+        if let e = readSetup(headers[2], s) {
+            return e
+        }
+        s.tags = parseComments(headers[1])
+        s.vendor = s.tags["vendor"] ?? ""
+        setup = s
+        books = s.books
+        setupBytes = headers[2]
+        tags = s.tags
+        rate = s.rate
+        channels = s.channels
+        bitrate = max(0, s.bitrateNominal)
+        layout = core.defaultLayout(channels)
+        outMap = []
+        for c in 0..channels {
+            if channels <= 8 {
+                outMap.append(vorbisToWav[channels][c])
+            } else {
+                outMap.append(c)
+            }
+        }
+        modeBits = ilog(s.modes.count - 1)
+        mdct0 = newMdct(s.blocksize0)
+        mdct1 = newMdct(s.blocksize1)
+        slope0 = windowSlope(s.blocksize0 / 2)
+        slope1 = windowSlope(s.blocksize1 / 2)
+        half = s.blocksize1 / 2
+        prev = zerosF(channels * half)
+        res = zerosF(channels * half)
+        iv = zerosF(channels * half)
+        curve = zerosF(half)
+        floorUnused = []
+        noResidue = []
+        for _ in 0..channels {
+            floorUnused.append(true)
+            noResidue.append(true)
+        }
+        floorY = zerosI(channels * 65)
+        finalY = zerosI(channels * 65)
+        step2 = []
+        for _ in 0..(channels * 65) {
+            step2.append(false)
+        }
+        f0Amp = zerosI(channels)
+        f0Cos = zerosF(channels * 256)
+        cls = []
+        havePrev = false
+        ready = true
+        nil
+    }
+
+    // Reads one codeword with book b (section 3.3, scalar context): the
+    // entry number, or -1 at the end of the packet or on a bad codeword.
+    fn readEntry(_ b: Int) -> Int {
+        let single = books[b].single
+        if single >= 0 {
+            br.bits(1)
+            if br.overrun {
+                return -1
+            }
+            return single
+        }
+        let bits = books[b].tableBits
+        if bits == 0 {
+            return -1
+        }
+        let e = books[b].table[br.peek(bits)]
+        if e != 0 {
+            br.bits(e & 63)
+            if br.overrun {
+                return -1
+            }
+            return e >> 6
+        }
+        let maxLen = books[b].maxLen
+        let q = br.peek(maxLen)
+        let count = books[b].longCodes.count
+        for k in 0..count {
+            let len = books[b].longLens[k]
+            if q & ((1 << len) - 1) == books[b].longCodes[k] {
+                br.bits(len)
+                if br.overrun {
+                    return -1
+                }
+                return books[b].longEntries[k]
+            }
+        }
+        // Past the end of the packet, or a codeword the book doesn't have.
+        br.bits(maxLen)
+        -1
+    }
+
+    // One audio packet (section 4.3), as interleaved samples.
+    fn audioPacket(_ packet: Data) -> [Float] {
+        var none: [Float] = []
+        br = core.lsbReader(packet)
+        br.bits(1)
+        let modeNumber = br.bits(modeBits)
+        if modeNumber >= setup.modes.count {
+            warn("a Vorbis packet has a mode that doesn't exist")
+            return none
+        }
+        let long = setup.modes[modeNumber].blockflag
+        let mapping = setup.modes[modeNumber].mapping
+        let n = if long { setup.blocksize1 } else { setup.blocksize0 }
+        var prevFlag = false
+        var nextFlag = false
+        if long {
+            prevFlag = br.flag()
+            nextFlag = br.flag()
+        }
+        if br.overrun {
+            warn("a Vorbis packet ends in its header")
+            return none
+        }
+        let n2 = n / 2
+        let m = setup.mappings[mapping]
+
+        // Floors, in channel order (section 4.3.2).
+        for c in 0..channels {
+            let floorNumber = m.submapFloor[m.mux[c]]
+            let used = if setup.floors[floorNumber].type == 0 { floor0Packet(c, floorNumber) } else { floor1Packet(c, floorNumber) }
+            floorUnused[c] = !used
+            noResidue[c] = !used
+        }
+        // Nonzero vector propagate (section 4.3.3).
+        for i in 0..m.magnitude.count {
+            let a = m.magnitude[i]
+            let b = m.angle[i]
+            if !noResidue[a] || !noResidue[b] {
+                noResidue[a] = false
+                noResidue[b] = false
+            }
+        }
+        // Residues, by submap (section 4.3.4).
+        for c in 0..channels {
+            let base = c * half
+            for i in 0..n2 {
+                res[base + i] = 0.0
+            }
+        }
+        for sm in 0..m.submaps {
+            var chans: [Int] = []
+            for c in 0..channels {
+                if m.mux[c] == sm {
+                    chans.append(c)
+                }
+            }
+            residuePacket(m.submapResidue[sm], chans, n2)
+        }
+        // Inverse coupling (section 4.3.5), last step first.
+        var step = m.magnitude.count - 1
+        while step >= 0 {
+            let mb = m.magnitude[step] * half
+            let ab = m.angle[step] * half
+            for i in 0..n2 {
+                let mv = res[mb + i]
+                let av = res[ab + i]
+                if mv > 0.0 {
+                    if av > 0.0 {
+                        res[ab + i] = mv - av
+                    } else {
+                        res[ab + i] = mv
+                        res[mb + i] = mv + av
+                    }
+                } else {
+                    if av > 0.0 {
+                        res[ab + i] = mv + av
+                    } else {
+                        res[ab + i] = mv
+                        res[mb + i] = mv - av
+                    }
+                }
+            }
+            step -= 1
+        }
+        // Floor curve × residue (section 4.3.6).
+        for c in 0..channels {
+            let base = c * half
+            if floorUnused[c] {
+                for i in 0..n2 {
+                    res[base + i] = 0.0
+                }
+                continue
+            }
+            let floorNumber = m.submapFloor[m.mux[c]]
+            if setup.floors[floorNumber].type == 0 {
+                floor0Curve(c, floorNumber, n2, long)
+            } else {
+                floor1Curve(c, floorNumber, n2)
+            }
+            for i in 0..n2 {
+                res[base + i] = res[base + i] * curve[i]
+            }
+        }
+        // Inverse MDCT, window and overlap-add (sections 4.3.1, 4.3.7, 4.3.8).
+        let bs0 = setup.blocksize0
+        var leftStart = 0
+        var leftEnd = n2
+        var leftN = n2
+        var rightStart = n2
+        var rightEnd = n
+        var rightN = n2
+        if long && !prevFlag {
+            leftStart = n / 4 - bs0 / 4
+            leftEnd = n / 4 + bs0 / 4
+            leftN = bs0 / 2
+        }
+        if long && !nextFlag {
+            rightStart = n * 3 / 4 - bs0 / 4
+            rightEnd = n * 3 / 4 + bs0 / 4
+            rightN = bs0 / 2
+        }
+        let leftSlope = if leftN == setup.blocksize0 / 2 { slope0 } else { slope1 }
+        let rightSlope = if rightN == setup.blocksize0 / 2 { slope0 } else { slope1 }
+        let count = if havePrev { prevN / 4 + n / 4 } else { 0 }
+        var data: [Float] = []
+        for _ in 0..(count * channels) {
+            data.append(0.0)
+        }
+        let shift = n / 4 - prevN / 4
+        let prevHalf = prevN / 2
+        for c in 0..channels {
+            let base = c * half
+            var w: [Float] = []
+            if floorUnused[c] {
+                for _ in 0..n {
+                    w.append(0.0)
+                }
+            } else {
+                if long {
+                    mdct1.inverse(res, from: base)
+                    w = mdct1.out
+                } else {
+                    mdct0.inverse(res, from: base)
+                    w = mdct0.out
+                }
+                for i in 0..leftStart {
+                    w[i] = 0.0
+                }
+                for i in leftStart..leftEnd {
+                    w[i] = w[i] * leftSlope[i - leftStart]
+                }
+                for i in rightStart..rightEnd {
+                    w[i] = w[i] * rightSlope[rightN - 1 - (i - rightStart)]
+                }
+                for i in rightEnd..n {
+                    w[i] = 0.0
+                }
+            }
+            if havePrev {
+                let pos = outMap[c]
+                for t in 0..count {
+                    var v = 0.0
+                    if t < prevHalf {
+                        v = prev[base + t]
+                    }
+                    let ci = t + shift
+                    if ci >= 0 && ci < n2 {
+                        v += w[ci]
+                    }
+                    data[t * channels + pos] = v
+                }
+            }
+            for i in 0..n2 {
+                prev[base + i] = w[n2 + i]
+            }
+        }
+        prevN = n
+        havePrev = true
+        data
+    }
+
+    // Floor 1 packet decode (section 7.2.3) and amplitude synthesis
+    // (section 7.2.4 step 1). False when the channel is unused.
+    fn floor1Packet(_ c: Int, _ fn1: Int) -> Bool {
+        if !br.flag() {
+            return false
+        }
+        let f = setup.floors[fn1]
+        let range = floor1Ranges[f.multiplier - 1]
+        let ybits = ilog(range - 1)
+        let base = c * 65
+        floorY[base] = br.bits(ybits)
+        floorY[base + 1] = br.bits(ybits)
+        var offset = 2
+        for i in 0..f.partitionClass.count {
+            let cl = f.partitionClass[i]
+            let cdim = f.classDims[cl]
+            let cbits = f.classSubclasses[cl]
+            let csub = (1 << cbits) - 1
+            var cval = 0
+            if cbits > 0 {
+                cval = readEntry(f.classMasterbook[cl])
+                if cval < 0 {
+                    return false
+                }
+            }
+            for j in 0..cdim {
+                let book = f.subclassBooks[cl * 8 + (cval & csub)]
+                cval = cval >> cbits
+                if book >= 0 {
+                    let v = readEntry(book)
+                    if v < 0 {
+                        return false
+                    }
+                    floorY[base + offset + j] = v
+                } else {
+                    floorY[base + offset + j] = 0
+                }
+            }
+            offset += cdim
+        }
+        if br.overrun {
+            return false
+        }
+        // Step 1: unwrap the coded differences against the prediction
+        // from each point's neighbours.
+        finalY[base] = floorY[base]
+        finalY[base + 1] = floorY[base + 1]
+        step2[base] = true
+        step2[base + 1] = true
+        for i in 2..f.xList.count {
+            let low = f.lowNeighbor[i]
+            let high = f.highNeighbor[i]
+            let predicted = renderPoint(f.xList[low], finalY[base + low], f.xList[high], finalY[base + high], f.xList[i])
+            let val = floorY[base + i]
+            let highroom = range - predicted
+            let lowroom = predicted
+            let room = if highroom < lowroom { highroom * 2 } else { lowroom * 2 }
+            if val != 0 {
+                step2[base + low] = true
+                step2[base + high] = true
+                step2[base + i] = true
+                if val >= room {
+                    if highroom > lowroom {
+                        finalY[base + i] = val - lowroom + predicted
+                    } else {
+                        finalY[base + i] = predicted - val + highroom - 1
+                    }
+                } else if val & 1 == 1 {
+                    finalY[base + i] = predicted - (val + 1) / 2
+                } else {
+                    finalY[base + i] = predicted + val / 2
+                }
+            } else {
+                step2[base + i] = false
+                finalY[base + i] = predicted
+            }
+        }
+        // Valid setups stay in [0, range); guard against damaged ones.
+        for i in 0..f.xList.count {
+            finalY[base + i] = finalY[base + i].clamped(min: 0, max: range - 1)
+        }
+        true
+    }
+
+    // Floor 1 curve synthesis (section 7.2.4 step 2) into curve[0 ..< n].
+    fn floor1Curve(_ c: Int, _ fn1: Int, _ n: Int) {
+        let f = setup.floors[fn1]
+        let base = c * 65
+        let mult = f.multiplier
+        var lx = 0
+        var ly = finalY[base + f.sorted[0]] * mult
+        var hx = 0
+        var hy = ly
+        for k in 1..f.sorted.count {
+            let i = f.sorted[k]
+            if step2[base + i] {
+                hy = finalY[base + i] * mult
+                hx = f.xList[i]
+                renderLine(lx, ly, hx, hy, n)
+                lx = hx
+                ly = hy
+            }
+        }
+        if hx < n {
+            renderLine(hx, hy, n, hy, n)
+        }
+    }
+
+    // render_line (section 9.2.7), writing linear amplitudes of the dB
+    // line into curve[x0 ..< min(x1, n)].
+    fn renderLine(_ x0: Int, _ y0: Int, _ x1: Int, _ y1: Int, _ n: Int) {
+        let dy = y1 - y0
+        let adx = x1 - x0
+        if adx <= 0 || x0 >= n {
+            return
+        }
+        var ady = abs(dy)
+        let base = dy / adx
+        let sy = if dy < 0 { base - 1 } else { base + 1 }
+        ady -= abs(base) * adx
+        var y = y0
+        var err = 0
+        let end = min(x1, n)
+        curve[x0] = floor1InverseDb[y.clamped(min: 0, max: 255)]
+        var x = x0 + 1
+        while x < end {
+            err += ady
+            if err >= adx {
+                err -= adx
+                y += sy
+            } else {
+                y += base
+            }
+            curve[x] = floor1InverseDb[y.clamped(min: 0, max: 255)]
+            x += 1
+        }
+    }
+
+    // Floor 0 packet decode (section 6.2.2). False when unused.
+    fn floor0Packet(_ c: Int, _ fn0: Int) -> Bool {
+        let f = setup.floors[fn0]
+        let amplitude = br.bits(f.amplitudeBits)
+        if amplitude == 0 || br.overrun {
+            return false
+        }
+        let bookNumber = br.bits(ilog(f.books.count))
+        if bookNumber >= f.books.count {
+            return false
+        }
+        let book = f.books[bookNumber]
+        let dims = books[book].dims
+        if dims == 0 || books[book].values.isEmpty {
+            return false
+        }
+        var last = 0.0
+        var got = 0
+        let base = c * 256
+        while got < f.order {
+            let e = readEntry(book)
+            if e < 0 {
+                return false
+            }
+            for d in 0..dims {
+                let v = books[book].values[e * dims + d] + last
+                if got + d < f.order {
+                    f0Cos[base + got + d] = cos(v)
+                }
+                if d == dims - 1 {
+                    last = v
+                }
+            }
+            got += dims
+        }
+        f0Amp[c] = amplitude
+        true
+    }
+
+    // Floor 0 curve computation (section 6.2.3) into curve[0 ..< n].
+    fn floor0Curve(_ c: Int, _ fn0: Int, _ n: Int, _ long: Bool) {
+        let f = setup.floors[fn0]
+        let map = if long { f.map1 } else { f.map0 }
+        let base = c * 256
+        let order = f.order
+        let amplitude = Float(f0Amp[c])
+        let offset = Float(f.amplitudeOffset)
+        let maxAmp = Float((1 << f.amplitudeBits) - 1)
+        var i = 0
+        while i < n {
+            let w = pi * Float(map[i]) / Float(f.barkMapSize)
+            let cw = cos(w)
+            var p = 0.0
+            var q = 0.0
+            if order % 2 == 1 {
+                p = 1.0 - cw * cw
+                q = 0.25
+                var j = 0
+                while 2 * j + 1 < order {
+                    let d = f0Cos[base + 2 * j + 1] - cw
+                    p *= 4.0 * d * d
+                    j += 1
+                }
+                j = 0
+                while 2 * j < order {
+                    let d = f0Cos[base + 2 * j] - cw
+                    q *= 4.0 * d * d
+                    j += 1
+                }
+            } else {
+                p = (1.0 - cw) / 2.0
+                q = (1.0 + cw) / 2.0
+                var j = 0
+                while 2 * j + 1 < order {
+                    let dp = f0Cos[base + 2 * j + 1] - cw
+                    let dq = f0Cos[base + 2 * j] - cw
+                    p *= 4.0 * dp * dp
+                    q *= 4.0 * dq * dq
+                    j += 1
+                }
+            }
+            var value = exp(0.11512925 * (amplitude * offset / (maxAmp * sqrt(p + q)) - offset))
+            if !value.isFinite {
+                // p + q is 0 only for damaged coefficients.
+                value = 0.0
+            }
+            let mark = map[i]
+            while i < n && map[i] == mark {
+                curve[i] = value
+                i += 1
+            }
+        }
+    }
+
+    // Residue decode of one submap's channels (section 8.6.2) into `res`.
+    fn residuePacket(_ rn: Int, _ chans: [Int], _ n2: Int) {
+        let r = setup.residues[rn]
+        let nch = chans.count
+        if nch == 0 {
+            return
+        }
+        var anyUsed = false
+        for c in chans {
+            if !noResidue[c] {
+                anyUsed = true
+            }
+        }
+        if !anyUsed {
+            return
+        }
+        // Residue 2 codes the channels interleaved as one vector.
+        let nvec = if r.type == 2 { 1 } else { nch }
+        let size = if r.type == 2 { n2 * nch } else { n2 }
+        var decodeIt: [Bool] = []
+        if r.type == 2 {
+            decodeIt.append(true)
+        } else {
+            for c in chans {
+                decodeIt.append(!noResidue[c])
+            }
+        }
+        for i in 0..(nvec * size) {
+            iv[i] = 0.0
+        }
+        residueVectors(r, nvec, size, decodeIt)
+        // Back into the channels' vectors.
+        if r.type == 2 {
+            for j in 0..nch {
+                let base = chans[j] * half
+                var k = j
+                for i in 0..n2 {
+                    res[base + i] = iv[k]
+                    k += nch
+                }
+            }
+        } else {
+            for j in 0..nch {
+                let base = chans[j] * half
+                let from = j * size
+                for i in 0..n2 {
+                    res[base + i] = iv[from + i]
+                }
+            }
+        }
+    }
+
+    // The format 0/1 partition decode loop over `nvec` vectors of `size`
+    // values in `iv` (section 8.6.2, 8.6.3, 8.6.4). Stops quietly at the end
+    // of the packet, as the spec says.
+    fn residueVectors(_ r: Residue, _ nvec: Int, _ size: Int, _ decodeIt: [Bool]) {
+        let begin = min(r.begin, size)
+        let end = min(r.end, size)
+        let psize = r.partitionSize
+        let classwords = books[r.classbook].dims
+        let toRead = end - begin
+        if toRead <= 0 {
+            return
+        }
+        let partitions = toRead / psize
+        let stride = partitions + classwords
+        while cls.count < nvec * stride {
+            cls.append(0)
+        }
+        let nclass = r.classifications
+        for pass in 0..8 {
+            var pc = 0
+            while pc < partitions {
+                if pass == 0 {
+                    for j in 0..nvec {
+                        if decodeIt[j] {
+                            var temp = readEntry(r.classbook)
+                            if temp < 0 {
+                                return
+                            }
+                            var i = classwords - 1
+                            while i >= 0 {
+                                cls[j * stride + i + pc] = temp % nclass
+                                temp = temp / nclass
+                                i -= 1
+                            }
+                        }
+                    }
+                }
+                var i = 0
+                while i < classwords && pc < partitions {
+                    for j in 0..nvec {
+                        if decodeIt[j] {
+                            let vqclass = cls[j * stride + pc]
+                            let vqbook = r.books[vqclass * 8 + pass]
+                            if vqbook >= 0 {
+                                let off = j * size + begin + pc * psize
+                                let ok = if r.type == 0 { partition0(vqbook, off, psize) } else { partition1(vqbook, off, psize) }
+                                if !ok {
+                                    return
+                                }
+                            }
+                        }
+                    }
+                    pc += 1
+                    i += 1
+                }
+            }
+        }
+    }
+
+    // A residue 0 partition: values interleaved by the book's dimension.
+    fn partition0(_ b: Int, _ off: Int, _ psize: Int) -> Bool {
+        let dims = books[b].dims
+        if dims <= 0 {
+            return false
+        }
+        let values = books[b].values
+        let step = psize / dims
+        for i in 0..step {
+            let e = readEntry(b)
+            if e < 0 {
+                return false
+            }
+            let vb = e * dims
+            for j in 0..dims {
+                iv[off + i + j * step] = iv[off + i + j * step] + values[vb + j]
+            }
+        }
+        true
+    }
+
+    // A residue 1 (and 2) partition: values in order.
+    fn partition1(_ b: Int, _ off: Int, _ psize: Int) -> Bool {
+        let dims = books[b].dims
+        if dims <= 0 {
+            return false
+        }
+        let values = books[b].values
+        var i = 0
+        let limit = min(psize, iv.count - off)
+        while i < limit {
+            let e = readEntry(b)
+            if e < 0 {
+                return false
+            }
+            let vb = e * dims
+            var j = 0
+            while j < dims && i < limit {
+                iv[off + i] = iv[off + i] + values[vb + j]
+                i += 1
+                j += 1
+            }
+        }
+        true
+    }
+}
+
+// render_point (section 9.2.6): the Y of the integer line at x.
+fn renderPoint(_ x0: Int, _ y0: Int, _ x1: Int, _ y1: Int, _ x: Int) -> Int {
+    let dy = y1 - y0
+    let adx = x1 - x0
+    if adx == 0 {
+        return y0
+    }
+    let err = abs(dy) * (x - x0)
+    let off = err / adx
+    if dy < 0 { y0 - off } else { y0 + off }
+}
+
+// The Vorbis window slope of n values (section 4.3.1):
+// sin(π/2 · sin²((i + 0.5)/n · π/2)).
+fn windowSlope(_ n: Int) -> [Float] {
+    var out: [Float] = []
+    for i in 0..n {
+        let s = sin((Float(i) + 0.5) / Float(n) * pi / 2.0)
+        out.append(sin(pi / 2.0 * s * s))
+    }
+    out
+}
+
+fn zerosF(_ n: Int) -> [Float] {
+    var out: [Float] = []
+    for _ in 0..n {
+        out.append(0.0)
+    }
+    out
+}
+
+fn zerosI(_ n: Int) -> [Int] {
+    var out: [Int] = []
+    for _ in 0..n {
+        out.append(0)
+    }
+    out
+}
+
+// A decoder for a Vorbis track. `track.extra` holds the three headers
+// (core's form, or Xiph-laced as in Matroska); when it's empty the headers
+// are expected as the first packets.
+public fn newDecoder(_ track: core.Track) -> Result<Decoder> {
+    var d = Decoder()
+    if track.extra.isEmpty {
+        d.rate = track.sampleRate
+        d.channels = track.channels
+        d.layout = core.defaultLayout(track.channels)
+        return .ok(value: d)
+    }
+    let headers = splitHeaders(track.extra)
+    if let e = d.configure(headers) {
+        return .failure(error: e)
+    }
+    Result.ok(value: d)
+}
+
+// A one-line description for a media info window, e.g.
+// "Vorbis, 44100 Hz, stereo, 128 kb/s".
+public fn streamInfo(_ track: core.Track) -> String {
+    var s = Setup()
+    let headers = splitHeaders(track.extra)
+    if headers.count < 1 {
+        return "Vorbis"
+    }
+    let problem = readIdentification(headers[0], s)
+    if problem != nil {
+        return "Vorbis"
+    }
+    let chans = match s.channels {
+        1 -> "mono"
+        2 -> "stereo"
+        6 -> "5.1"
+        8 -> "7.1"
+        _ -> "{s.channels} channels"
+    }
+    var out = "Vorbis, {s.rate} Hz, {chans}"
+    if s.bitrateNominal > 0 {
+        out += ", {s.bitrateNominal / 1000} kb/s"
+    }
+    out
+}

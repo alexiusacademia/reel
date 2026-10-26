@@ -1,0 +1,758 @@
+// Tests for the disc module: DVD-Video and Blu-ray folders and ISO images
+// made by tests/disc/make_fixtures.py (IFO / MPLS / CLPI / index /
+// MovieObject written from the format descriptions; VOB and m2ts contents
+// from ffmpeg, keyframes from ffprobe; ISO 9660 + Joliet + UDF 1.02/1.50
+// images from macOS hdiutil, a UDF 2.50 image with a metadata partition
+// written by the script). The expected_*.json files say what the parser
+// should find. Also: the segments' bytes demux as the right streams, seek
+// points land on VOBU / keyframe packet starts, the dvdsub palette goes
+// through subs.parseIdx, .BUP fallback, and damaged files never stop the
+// program.
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+import "../../disc"
+import "../../core"
+import "../../demux"
+import "../../subs"
+
+let fx = "tests/disc/fixtures"
+let scratch = "build/scratch/disc"
+
+struct ExpSeg {
+    file: String
+    from: Int
+    to: Int
+    start: Float
+}
+
+struct ExpStream {
+    kind: String
+    codec: String
+    id: Int
+    language: String = ""
+    note: String = ""
+    channels: Int = 0
+}
+
+struct ExpTitle {
+    number: Int = 0
+    duration: Float = 0.0
+    chapters: [Float] = []
+    segments: [ExpSeg] = []
+    streams: [ExpStream] = []
+    palette: [Int] = []
+    angles: Int = 1
+    width: Int = 0
+    height: Int = 0
+    aspect: String = ""
+}
+
+struct ExpInterleaved {
+    duration: Float = 0.0
+    angle1Bytes: Int = 0
+    angle2Bytes: Int = 0
+    ilvus: Int = 0
+    angle1Md5: String = ""
+    angle2Md5: String = ""
+    unresolvedTo: Int = 0
+}
+
+struct ExpDvd {
+    titles: [ExpTitle]
+    angle2: ExpTitle
+    interleaved: ExpInterleaved = ExpInterleaved()
+    main: Int
+    vobus1: [Int]
+    vobus2: [Int]
+}
+
+struct ExpPlaylist {
+    duration: Float = 0.0
+    segments: [ExpSeg] = []
+    chapters: [Float] = []
+    items: Int = 0
+}
+
+struct ExpClip {
+    start: Int
+    end: Int
+    packets: Int
+}
+
+struct ExpBluray {
+    playlists: [String: ExpPlaylist]
+    main: Int
+    titlePlaylists: [Int]
+    keys: [String: [[Int]]]
+    angle2: ExpPlaylist
+    listed: [Int]
+    clipInfo: [String: ExpClip]
+}
+
+struct Checks {
+    passed: Int = 0
+    total: Int = 0
+
+    fn check(_ ok: Bool, _ what: String) {
+        total += 1
+        if ok {
+            passed += 1
+        } else {
+            print("FAIL: {what}")
+        }
+    }
+}
+
+fn near(_ a: Float, _ b: Float) -> Bool {
+    abs(a - b) < 0.000001
+}
+
+fn kindName(_ k: core.TrackKind) -> String {
+    match k {
+        .video -> "video"
+        .audio -> "audio"
+        .subtitle -> "subtitle"
+        .other -> "other"
+    }
+}
+
+// Whether a title's segments are the expected ones (by file name).
+fn segsMatch(_ t: disc.Title, _ want: [ExpSeg]) -> Bool {
+    if t.segments.count != want.count {
+        print("  {t.segments.count} segments, want {want.count}")
+        return false
+    }
+    var i = 0
+    while i < want.count {
+        let s = t.segments[i]
+        let w = want[i]
+        if s.path.fileName != w.file || s.from != w.from || s.to != w.to || !near(s.start, w.start) {
+            print("  segment {i}: {s.path.fileName} {s.from}–{s.to} at {s.start}, want {w.file} {w.from}–{w.to} at {w.start}")
+            return false
+        }
+        i += 1
+    }
+    true
+}
+
+fn chaptersMatch(_ t: disc.Title, _ want: [Float]) -> Bool {
+    if t.chapters.count != want.count {
+        print("  {t.chapters.count} chapters, want {want.count}")
+        return false
+    }
+    var i = 0
+    while i < want.count {
+        if !near(t.chapters[i].start, want[i]) {
+            print("  chapter {i} at {t.chapters[i].start}, want {want[i]}")
+            return false
+        }
+        i += 1
+    }
+    true
+}
+
+fn streamsMatch(_ t: disc.Title, _ want: [ExpStream]) -> Bool {
+    if t.streams.count != want.count {
+        print("  {t.streams.count} streams, want {want.count}")
+        return false
+    }
+    var i = 0
+    while i < want.count {
+        let s = t.streams[i]
+        let w = want[i]
+        if kindName(s.kind) != w.kind || s.codec != w.codec || s.id != w.id || s.language != w.language || s.note != w.note || (w.channels > 0 && s.channels != w.channels) {
+            print("  stream {i}: {kindName(s.kind)} {s.codec} {s.id} {s.language} \"{s.note}\" {s.channels}, want {w.kind} {w.codec} {w.id} {w.language} \"{w.note}\" {w.channels}")
+            return false
+        }
+        i += 1
+    }
+    true
+}
+
+// The bytes of a whole title, segment after segment.
+fn titleBytes(_ t: disc.Title, _ image: Data) -> Data {
+    var out = Data()
+    for s in t.segments {
+        if !image.isEmpty {
+            out += image.slice(from: s.from, to: s.to)
+        } else if let d = disc.readSegment(s) {
+            out += d
+        }
+    }
+    out
+}
+
+fn bytesAt(_ d: Data, _ at: Int, _ n: Int) -> [Int] {
+    if at < 0 || at + n > d.count {
+        return []
+    }
+    d.slice(from: at, to: at + n).bytes
+}
+
+// A tiny deterministic random number generator for the damage tests.
+struct Lcg {
+    s: Int = 12345
+
+    fn next(_ n: Int) -> Int {
+        s = (s * 1103515245 + 12345) % 2147483648
+        if n <= 0 {
+            return 0
+        }
+        (s >> 8) % n
+    }
+}
+
+fn damaged(_ d: Data, _ r: Lcg) -> (Data, Lcg) {
+    var g = r
+    var b = d.bytes
+    let mode = g.next(4)
+    if mode == 0 && b.count > 1 {
+        // Cut short.
+        let n = g.next(b.count)
+        return (Data(bytes: b.prefix(n)), g)
+    }
+    let hits = 1 + g.next(if mode == 1 { 4 } else { 64 })
+    for _ in 0..hits {
+        if b.isEmpty {
+            break
+        }
+        let at = g.next(b.count)
+        b[at] = if mode == 3 { 0xFF } else { g.next(256) }
+    }
+    (Data(bytes: b), g)
+}
+
+fn testDvd(_ c: Checks) -> Checks {
+    var k = c
+    let exp: ExpDvd = fromJson(readFile(joinPath(fx, "expected_dvd.json")) ?? "") ?? ExpDvd(titles: [], angle2: ExpTitle(), main: -1, vobus1: [], vobus2: [])
+    k.check(exp.titles.count == 3, "expected_dvd.json loads")
+    let t0 = now()
+    let r = disc.open(joinPath(fx, "dvd"))
+    print("time open DVD folder: {((now() - t0) * 1000.0).formatted(decimals: 1)} ms")
+    k.check(r.isOk(), "DVD folder opens: {r.error()?.message ?? ""}")
+    let d = r.value() ?? disc.Disc(kind: "", path: "")
+    k.check(d.kind == "dvd", "DVD kind")
+    k.check(d.titles.count == 4, "4 DVD titles (got {d.titles.count})")
+    k.check(d.main == exp.main, "DVD main title is {exp.main} (got {d.main})")
+    k.check(d.warnings.isEmpty, "no warnings for a good DVD: {d.warnings.joined(separator: "; ")}")
+    var i = 0
+    while i < exp.titles.count && i < d.titles.count {
+        let t = d.titles[i]
+        let w = exp.titles[i]
+        k.check(t.number == w.number, "title {i + 1} number")
+        k.check(near(t.duration, w.duration), "title {w.number} duration {t.duration}, want {w.duration}")
+        k.check(chaptersMatch(t, w.chapters), "title {w.number} chapters")
+        k.check(segsMatch(t, w.segments), "title {w.number} segments")
+        k.check(streamsMatch(t, w.streams), "title {w.number} streams")
+        k.check(t.palette == w.palette, "title {w.number} palette")
+        k.check(t.angles == w.angles, "title {w.number} angles {t.angles}")
+        k.check(t.width == w.width && t.height == w.height && t.aspect == w.aspect, "title {w.number} picture {t.width}x{t.height} {t.aspect}")
+        k.check(t.warnings.isEmpty, "title {w.number} has no warnings: {t.warnings.joined(separator: "; ")}")
+        // Chapter ends and title size.
+        var ends = true
+        var j = 0
+        while j < t.chapters.count {
+            let e = if j + 1 < t.chapters.count { t.chapters[j + 1].start } else { t.duration }
+            ends = ends && near(t.chapters[j].end, e)
+            j += 1
+        }
+        k.check(ends, "title {w.number} chapter ends")
+        var size = 0
+        for s in w.segments {
+            size += s.to - s.from
+        }
+        k.check(t.size == size, "title {w.number} size {t.size}")
+        i += 1
+    }
+    k.check(d.titles.count == 4 && d.titles[0].pgcs == [1] && d.titles[2].pgcs == [1, 2], "program chains played")
+    k.check(d.titles.count == 4 && d.titles[2].segments.count == 3 && d.titles[2].segments[2].discontinuity && d.titles[2].segments[1].discontinuity && !d.titles[0].segments[1].discontinuity, "discontinuity flags (new PGC, STC cell)")
+
+    // Other ways to name the same disc.
+    for p in [joinPath(fx, "dvd/VIDEO_TS"), joinPath(fx, "dvd/VIDEO_TS/VIDEO_TS.IFO"), joinPath(fx, "dvd/VIDEO_TS/")] {
+        let o = disc.open(p)
+        k.check(o.isOk() && (o.value()?.titles.count ?? 0) == 4, "opens as {p}")
+    }
+    k.check(disc.probe(joinPath(fx, "dvd")) == "dvd" && disc.probe(joinPath(fx, "dvd/VIDEO_TS")) == "dvd", "probe says dvd")
+
+    // Angle 2.
+    if let fs = disc.openDiscFs(joinPath(fx, "dvd")).value() {
+        let a2 = disc.withAngle(fs, d.titles[2], angle: 2)
+        k.check(a2.angle == 2 && segsMatch(a2, exp.angle2.segments), "title 3 angle 2 segments")
+        k.check(chaptersMatch(a2, exp.angle2.chapters) && near(a2.duration, exp.angle2.duration), "title 3 angle 2 chapters and length")
+        let a9 = disc.withAngle(fs, d.titles[2], angle: 9)
+        k.check(a9.angle == 2, "an angle past the last is the last")
+
+        // Interleaved angle cells (title 4): cut to their own ILVUs.
+        let iv = exp.interleaved
+        let t4 = d.titles[3]
+        k.check(disc.needsInterleave(t4) && !t4.warnings.isEmpty && !disc.needsInterleave(d.titles[0]), "title 4 needs interleave resolving")
+        k.check(t4.segments.count == 1 && t4.segments[0].to == iv.unresolvedTo, "title 4 before: the whole interleaved range")
+        let t0i = now()
+        let r1 = disc.resolveInterleaved(fs, t4)
+        print("time resolve interleaved title: {((now() - t0i) * 1000.0).formatted(decimals: 1)} ms")
+        let b1 = titleBytes(r1, Data())
+        k.check(r1.size == iv.angle1Bytes && b1.hash("md5").hex == iv.angle1Md5, "title 4 angle 1: its own ILVUs' bytes ({r1.size})")
+        k.check(r1.segments.count == iv.ilvus && r1.points.count == iv.ilvus && near(r1.duration, iv.duration) && r1.warnings.isEmpty && !disc.needsInterleave(r1), "title 4 angle 1: one segment and seek point per ILVU")
+        k.check(r1.segments[0].discontinuity && !r1.segments[1].discontinuity && near(r1.segments[1].start, iv.duration * Float(r1.segments[0].to - r1.segments[0].from) / Float(r1.size)), "title 4 angle 1: times spread by bytes")
+        let r2 = disc.resolveInterleaved(fs, disc.withAngle(fs, t4, angle: 2))
+        let b2 = titleBytes(r2, Data())
+        k.check(r2.size == iv.angle2Bytes && b2.hash("md5").hex == iv.angle2Md5, "title 4 angle 2: its own ILVUs' bytes")
+        match demux.psOpen(b2) {
+            .ok(m) -> k.check(m.tracks.count >= 2, "title 4 angle 2 demuxes")
+            .failure(e) -> k.check(false, "title 4 angle 2 demuxes: {e.message}")
+        }
+        k.check(disc.resolveInterleaved(fs, d.titles[0]).size == d.titles[0].size, "resolving a plain title changes nothing")
+    }
+
+    // Seek points: every one is a pack start, time map ones a VOBU (NAV
+    // pack) start; points sorted; seek gives the last point at or before.
+    let t1 = d.titles[0]
+    let bytes1 = titleBytes(t1, Data())
+    k.check(bytes1.count == t1.size, "title 1 bytes read")
+    var packs = true
+    var navs = 0
+    var last = -1.0
+    for p in t1.points {
+        packs = packs && bytesAt(bytes1, p.pos, 4) == [0, 0, 1, 0xBA] && p.time >= last
+        last = p.time
+        let h = 14 + ((bytesAt(bytes1, p.pos + 13, 1).first ?? 0) & 7)
+        if bytesAt(bytes1, p.pos + h, 4) == [0, 0, 1, 0xBB] {
+            navs += 1
+        }
+    }
+    k.check(t1.points.count >= 6, "title 1 has cell and time map points ({t1.points.count})")
+    k.check(packs, "title 1 seek points are pack starts, in time order")
+    k.check(navs == t1.points.count, "title 1 seek points are VOBU starts ({navs} of {t1.points.count})")
+    let sp = disc.seek(t1, 2.5)
+    k.check(sp.time <= 2.5 && sp.time > 1.0, "seek(2.5) → point at {sp.time}")
+    let (si, sPath, sOff) = disc.locate(t1, sp.pos)
+    k.check(si >= 0 && sPath.hasSuffix(".VOB") && sOff >= t1.segments[si].from, "locate a seek point")
+    k.check(disc.locate(t1, t1.size).0 == -1, "locate past the end")
+    k.check(disc.chapterAt(t1, 0.5) == 0 && disc.chapterAt(t1, t1.chapters[1].start + 0.01) == 1, "chapterAt")
+    k.check(disc.segmentAt(t1, t1.segments[2].start + 0.001) == 2, "segmentAt")
+
+    // The title's bytes demux as the streams it lists.
+    match demux.psOpen(bytes1) {
+        .ok(m) -> {
+            var ids: [Int] = []
+            for tr in m.tracks {
+                ids.append(tr.id)
+            }
+            k.check(ids.contains(0xE0) && ids.contains(0xBD80), "title 1 demuxes with video 0xE0 and AC-3 0xBD80 (tracks {ids})")
+            var codecs = true
+            for tr in m.tracks {
+                for s in t1.streams {
+                    if s.id == tr.id {
+                        codecs = codecs && s.codec == tr.codec
+                    }
+                }
+            }
+            k.check(codecs, "demuxed codecs match the IFO's")
+            k.check(abs(m.duration - t1.duration) < 0.7, "demuxed length {m.duration} near the IFO's {t1.duration}")
+            let a = disc.annotate(m, t1)
+            var lang = ""
+            var isDefault = false
+            for tr in a.tracks {
+                if tr.id == 0xBD80 {
+                    lang = tr.language
+                    isDefault = tr.isDefault
+                }
+            }
+            k.check(lang == "eng" && isDefault && a.chapters.count == 2 && near(a.duration, t1.duration), "annotate: language, default, chapters, length")
+        }
+        .failure(e) -> k.check(false, "title 1 demuxes: {e.message}")
+    }
+
+    // The palette through the subtitle decoder's idx parser.
+    let setup = subs.parseIdx(disc.dvdsubIdx(t1))
+    k.check(setup.hasPalette && setup.palette == t1.palette && setup.width == 352 && setup.height == 240, "dvdsub idx: palette and size")
+    let tr = core.Track(index: 0, kind: core.TrackKind.subtitle, codec: "dvdsub", extra: disc.dvdsubExtra(t1))
+    k.check(subs.newDecoder(tr).isOk(), "dvdsub decoder takes the extra")
+
+    // Main title choice: bogus titles (too little data for their length,
+    // or the same cells twice) lose to the real one.
+    var real = disc.Title(number: 1)
+    real.duration = 5400.0
+    real.size = 5400 * 600000
+    real.segments = [disc.Segment(path: "a", from: 0, to: real.size)]
+    var thin = disc.Title(number: 2)
+    thin.duration = 30000.0
+    thin.size = 2048 * 10
+    thin.segments = [disc.Segment(path: "a", from: 0, to: thin.size)]
+    var loop = disc.Title(number: 3)
+    loop.duration = 9000.0
+    loop.size = 9000 * 600000
+    loop.segments = [disc.Segment(path: "a", from: 0, to: 4500 * 600000), disc.Segment(path: "a", from: 0, to: 4500 * 600000)]
+    k.check(disc.pickMainDvd([thin, real, loop]) == 1, "main title skips bogus titles")
+    k.check(disc.pickMainDvd([thin]) == 0 && disc.pickMainDvd([]) == -1, "main title: all bogus → longest; none → -1")
+
+    // .BUP fallback: damaged .IFO files.
+    let broken = joinPath(scratch, "broken/VIDEO_TS")
+    createFolder(broken)
+    for name in listFolder(joinPath(fx, "dvd/VIDEO_TS")) ?? [] {
+        copyFile(from: joinPath(joinPath(fx, "dvd/VIDEO_TS"), name), to: joinPath(broken, name))
+    }
+    writeData(path: joinPath(broken, "VIDEO_TS.IFO"), data: Data(bytes: [1, 2, 3]))
+    writeData(path: joinPath(broken, "VTS_01_0.IFO"), data: Data(text: "DVDVIDEO-VTX garbage"))
+    match disc.open(joinPath(scratch, "broken")) {
+        .ok(b) -> {
+            k.check(b.titles.count == 4 && segsMatch(b.titles[0], exp.titles[0].segments), "broken IFOs: titles from the .BUP files")
+            k.check(b.warnings.count == 2, "broken IFOs: two warnings ({b.warnings.joined(separator: "; ")})")
+        }
+        .failure(e) -> k.check(false, "broken IFOs: {e.message}")
+    }
+    // A missing VOB: a warning, not a stop.
+    deleteFile(joinPath(broken, "VTS_01_2.VOB"))
+    match disc.open(joinPath(scratch, "broken")) {
+        .ok(b) -> k.check(!b.titles[0].warnings.isEmpty && b.titles[0].size < d.titles[0].size, "missing VOB: title cut with a warning")
+        .failure(e) -> k.check(false, "missing VOB: {e.message}")
+    }
+    k
+}
+
+fn testBluray(_ c: Checks) -> Checks {
+    var k = c
+    let exp: ExpBluray? = fromJson(readFile(joinPath(fx, "expected_bluray.json")) ?? "")
+    k.check(exp != nil, "expected_bluray.json loads")
+    let e = exp ?? ExpBluray(playlists: [:], main: 0, titlePlaylists: [], keys: [:], angle2: ExpPlaylist(duration: 0.0, segments: [], chapters: [], items: 0), listed: [], clipInfo: [:])
+    let t0 = now()
+    let r = disc.open(joinPath(fx, "bluray"))
+    print("time open Blu-ray folder: {((now() - t0) * 1000.0).formatted(decimals: 1)} ms")
+    k.check(r.isOk(), "Blu-ray folder opens: {r.error()?.message ?? ""}")
+    let d = r.value() ?? disc.Disc(kind: "", path: "")
+    k.check(d.kind == "bluray", "Blu-ray kind")
+    var listed: [Int] = []
+    for t in d.titles {
+        listed.append(t.playlist)
+    }
+    k.check(listed == e.listed, "playlists listed {listed} (duplicate dropped)")
+    k.check(d.main >= 0 && d.main < d.titles.count && d.titles[d.main].playlist == e.main, "main feature is playlist {e.main}")
+    k.check(d.warnings.isEmpty, "no warnings for a good Blu-ray: {d.warnings.joined(separator: "; ")}")
+    for t in d.titles {
+        if let w = e.playlists["{t.playlist}"] {
+            k.check(near(t.duration, w.duration), "playlist {t.playlist} duration {t.duration}, want {w.duration}")
+            k.check(segsMatch(t, w.segments), "playlist {t.playlist} segments")
+            k.check(chaptersMatch(t, w.chapters), "playlist {t.playlist} chapters")
+            k.check(t.clips.count == w.items, "playlist {t.playlist} clips")
+        } else {
+            k.check(false, "playlist {t.playlist} expected")
+        }
+    }
+    let main = if d.main >= 0 { d.titles[d.main] } else { disc.Title(number: 0) }
+    k.check(main.number == 1 && d.titles.count > 1 && d.titles[1].number == 2, "index titles name playlists 0 and 2")
+    let want = [ExpStream(kind: "video", codec: "h264", id: 0x1011),
+                ExpStream(kind: "audio", codec: "ac3", id: 0x1100, language: "eng", channels: 6),
+                ExpStream(kind: "audio", codec: "truehd", id: 0x1101, language: "fra", channels: 6),
+                ExpStream(kind: "subtitle", codec: "pgs", id: 0x1200, language: "eng"),
+                ExpStream(kind: "subtitle", codec: "pgs", id: 0x1201, language: "deu"),
+                ExpStream(kind: "other", codec: "unknown:igs", id: 0x1400)]
+    k.check(streamsMatch(main, want), "main feature streams (STN table)")
+    k.check(main.width == 1920 && main.height == 1080 && main.streams[0].fpsNum == 24000 && main.streams[0].fpsDen == 1001 && main.streams[1].sampleRate == 48000, "video 1080p 23.976, audio 48 kHz")
+
+    // Clip info and its EP map against ffprobe's keyframes.
+    if let fs = disc.openDiscFs(joinPath(fx, "bluray")).value() {
+        if let info = disc.readBlurayInfo(fs).value() {
+            k.check(info.titlePlaylists == e.titlePlaylists, "index.bdmv + MovieObject: title playlists {info.titlePlaylists}")
+            k.check(info.index.titles.count == 3 && info.index.titles[2].objectType == 2 && info.index.titles[2].bdjo == "00000", "BD-J title")
+            for (name, ci) in e.clipInfo {
+                if let clip = info.clips[name] {
+                    k.check(clip.packets == ci.packets && clip.presentation == [ci.start, ci.end] && clip.applicationType == 1, "clip {name}: info")
+                    let keys = e.keys[name] ?? []
+                    var ok = clip.epMaps.count == 1 && clip.epMaps[0].pid == 0x1011 && clip.epMaps[0].pts.count == keys.count
+                    var j = 0
+                    while ok && j < keys.count {
+                        ok = clip.epMaps[0].pts[j] == keys[j][0] && clip.epMaps[0].spn[j] == keys[j][1]
+                        j += 1
+                    }
+                    k.check(ok, "clip {name}: EP map = ffprobe's keyframes ({keys.count})")
+                    k.check(clip.streams.count == 2 && clip.streams[0].codec == "h264" && clip.streams[1].language == "eng", "clip {name}: program info streams")
+                } else {
+                    k.check(false, "clip {name} parsed")
+                }
+            }
+            // Angle 2 of playlist 9.
+            for t in d.titles {
+                if t.playlist == 9 {
+                    k.check(t.angles == 2, "playlist 9 has 2 angles")
+                    let a2 = disc.withAngle(fs, t, angle: 2)
+                    k.check(segsMatch(a2, e.angle2.segments) && a2.clips == ["00003"], "playlist 9 angle 2 plays clip 00003")
+                }
+            }
+            // With the usual 20 s minimum nothing is long enough; with
+            // 3.5 s only the main-length playlists and the long decoy.
+            let some = disc.blurayTitles(fs, info, minDuration: 3.5)
+            var nums: [Int] = []
+            for t in some {
+                nums.append(t.playlist)
+            }
+            k.check(nums == [0, 3, 4, 5, 8], "minimum duration filter {nums}")
+        }
+    }
+
+    // Seek points land on video packets that start a PES packet.
+    let bytes = titleBytes(main, Data())
+    var ok = main.points.count >= 8
+    for p in main.points {
+        let h = bytesAt(bytes, p.pos + 4, 3)
+        ok = ok && h.count == 3 && h[0] == 0x47 && (h[1] & 0x40) != 0 && ((h[1] & 0x1F) << 8 | h[2]) == 0x1011
+    }
+    k.check(ok, "Blu-ray seek points are video PES starts ({main.points.count})")
+    let sp = disc.seek(main, 5.0)
+    k.check(sp.time <= 5.0 && sp.time > 3.9, "seek(5) in the second clip → {sp.time}")
+    k.check(disc.segmentAt(main, 5.0) == 1, "segmentAt in the second clip")
+    // The main feature's first clip demuxes as the STN table says.
+    if let s0 = disc.readSegment(main.segments[0]) {
+        match demux.tsOpen(s0) {
+            .ok(m) -> {
+                var ids: [Int] = []
+                for tr in m.tracks {
+                    ids.append(tr.id)
+                }
+                k.check(ids.contains(0x1011) && ids.contains(0x1100), "clip demuxes with PIDs 0x1011 and 0x1100 ({ids})")
+            }
+            .failure(er) -> k.check(false, "clip demuxes: {er.message}")
+        }
+    }
+    k.check(disc.probe(joinPath(fx, "bluray")) == "bluray" && disc.probe(joinPath(fx, "bluray/BDMV/PLAYLIST")) == "bluray", "probe says bluray")
+    k
+}
+
+// An image's titles match the folder's, and its segments hold the same bytes.
+fn sameAsFolder(_ k: Checks, _ name: String, _ img: disc.Disc, _ dir: disc.Disc, _ image: Data) -> Checks {
+    var c = k
+    c.check(img.titles.count == dir.titles.count && img.main == dir.main, "{name}: same titles as the folder")
+    var i = 0
+    while i < img.titles.count && i < dir.titles.count {
+        let a = img.titles[i]
+        let b = dir.titles[i]
+        c.check(near(a.duration, b.duration) && a.chapters.count == b.chapters.count && a.streams.count == b.streams.count && a.segments.count == b.segments.count && a.points.count == b.points.count && a.palette == b.palette, "{name}: title {i} same model")
+        c.check(titleBytes(a, image) == titleBytes(b, Data()), "{name}: title {i} bytes from the image = the folder's")
+        i += 1
+    }
+    c
+}
+
+fn unpack(_ name: String) -> (String, Data) {
+    let packed = readData(joinPath(fx, name + ".gz")) ?? Data()
+    let d = packed.decompressed("gzip") ?? Data()
+    let path = joinPath(scratch, name)
+    writeData(path: path, data: d)
+    (path, d)
+}
+
+fn testIso(_ c: Checks) -> Checks {
+    var k = c
+    createFolder(scratch)
+    let dvdDir = disc.open(joinPath(fx, "dvd")).value() ?? disc.Disc(kind: "", path: "")
+    let bdDir = disc.open(joinPath(fx, "bluray")).value() ?? disc.Disc(kind: "", path: "")
+
+    // DVD image: UDF 1.02 + ISO 9660 + Joliet (hdiutil).
+    let (dvdPath, dvdImg) = unpack("dvd.iso")
+    k.check(dvdImg.count > 1000000, "dvd.iso unpacked")
+    var t0 = now()
+    let u = disc.udfFiles(dvdImg, path: dvdPath)
+    print("time UDF listing (1.4 MB image): {((now() - t0) * 1000.0).formatted(decimals: 1)} ms")
+    k.check(u.isOk(), "dvd.iso: UDF: {u.error()?.message ?? ""}")
+    let ufs = u.value() ?? disc.DiscFs(root: "")
+    let iso = disc.iso9660Files(dvdImg, path: dvdPath).value() ?? disc.DiscFs(root: "")
+    let jol = disc.iso9660Files(dvdImg, path: dvdPath, joliet: true).value() ?? disc.DiscFs(root: "")
+    k.check(jol.source == "joliet" && iso.source == "iso9660", "dvd.iso: Joliet and ISO 9660 trees found")
+    var same = !ufs.files.isEmpty
+    var names = 0
+    for f in ufs.files {
+        if !f.folder {
+            names += 1
+            let a = disc.discFind(iso, f.name)
+            let b = disc.discFind(jol, f.name)
+            same = same && a != nil && b != nil && a?.offset == f.offset && a?.size == f.size && b?.offset == f.offset
+            if let local = readData(joinPath(joinPath(fx, "dvd"), f.name)) {
+                same = same && dvdImg.slice(from: f.offset, to: f.offset + f.size) == local
+            } else {
+                same = false
+            }
+        }
+    }
+    k.check(same && names == 12, "dvd.iso: UDF, ISO 9660 and Joliet list the same 12 files, with the folder's bytes")
+    k.check(!ufs.volumeName.isEmpty && iso.volumeName == "REEL_DVD", "dvd.iso: volume names \"{ufs.volumeName}\" \"{iso.volumeName}\"")
+    t0 = now()
+    let di = disc.open(dvdPath)
+    print("time open DVD image: {((now() - t0) * 1000.0).formatted(decimals: 1)} ms")
+    k.check(di.isOk() && (di.value()?.iso ?? false), "dvd.iso opens: {di.error()?.message ?? ""}")
+    if let dd = di.value() {
+        k = sameAsFolder(k, "dvd.iso", dd, dvdDir, dvdImg)
+    }
+    k.check(disc.probe(dvdPath) == "iso", "probe says iso")
+
+    // Blu-ray images: UDF 1.50 (hdiutil) and UDF 2.50 with a metadata
+    // partition (made by the fixture script).
+    let (bdPath, bdImg) = unpack("bluray.iso")
+    match disc.open(bdPath) {
+        .ok(b) -> { k = sameAsFolder(k, "bluray.iso", b, bdDir, bdImg) }
+        .failure(e) -> k.check(false, "bluray.iso opens: {e.message}")
+    }
+    let (b250Path, b250Img) = unpack("bluray250.iso")
+    let u250 = disc.udfFiles(b250Img, path: b250Path)
+    k.check(u250.isOk(), "UDF 2.50: {u250.error()?.message ?? ""}")
+    let offs: [String: Int] = fromJson(readFile(joinPath(fx, "expected_udf250.json")) ?? "") ?? [:]
+    let fs250 = u250.value() ?? disc.DiscFs(root: "")
+    var hit = 0
+    for (name, off) in offs {
+        if let f = disc.discFind(fs250, name) {
+            if f.offset == off {
+                hit += 1
+            }
+        }
+    }
+    k.check(offs.count > 10 && hit == offs.count, "UDF 2.50: {hit} of {offs.count} files at the right place")
+    k.check(fs250.volumeName == "REEL_BD", "UDF 2.50 volume name \"{fs250.volumeName}\"")
+    match disc.open(b250Path) {
+        .ok(b) -> { k = sameAsFolder(k, "bluray250.iso", b, bdDir, b250Img) }
+        .failure(e) -> k.check(false, "bluray250.iso opens: {e.message}")
+    }
+    k
+}
+
+fn testDamage(_ c: Checks) -> Checks {
+    var k = c
+    var rng = Lcg()
+    let t0 = now()
+    var runs = 0
+    // Every navigation file, damaged many ways.
+    let files = ["dvd/VIDEO_TS/VIDEO_TS.IFO", "dvd/VIDEO_TS/VTS_01_0.IFO", "dvd/VIDEO_TS/VTS_02_0.IFO", "bluray/BDMV/index.bdmv", "bluray/BDMV/MovieObject.bdmv", "bluray/BDMV/PLAYLIST/00000.mpls", "bluray/BDMV/PLAYLIST/00009.mpls", "bluray/BDMV/CLIPINF/00001.clpi"]
+    let good = disc.readDvdInfo(disc.folderFs(joinPath(fx, "dvd"))).value() ?? disc.DvdInfo()
+    for f in files {
+        let data = readData(joinPath(fx, f)) ?? Data()
+        for _ in 0..150 {
+            let (bad, g) = damaged(data, rng)
+            rng = g
+            runs += 1
+            if f.hasSuffix("VIDEO_TS.IFO") {
+                if let v = disc.parseVmg(bad).value() {
+                    var info = good
+                    info.vmg = v
+                    for t in disc.dvdTitles(info) {
+                        disc.formatTime(t.duration)
+                    }
+                }
+            } else if f.hasSuffix(".IFO") {
+                if let v = disc.parseVts(bad, number: 1).value() {
+                    var info = good
+                    info.sets[0] = v
+                    info.sets[1] = v
+                    for e in info.vmg.titles {
+                        disc.dvdTitle(info, e, angle: 1 + rng.next(3))
+                    }
+                }
+            } else if f.hasSuffix("index.bdmv") {
+                disc.parseIndex(bad)
+            } else if f.hasSuffix(".bdmv") {
+                disc.parseMovieObjects(bad)
+            } else if f.hasSuffix(".mpls") {
+                disc.parseMpls(bad)
+            } else {
+                disc.parseClpi(bad)
+            }
+        }
+    }
+    // Damaged Blu-ray folders: a playlist and a clip info replaced.
+    let bd = joinPath(scratch, "badbd/BDMV")
+    for sub in ["", "/PLAYLIST", "/CLIPINF", "/STREAM"] {
+        createFolder(bd + sub)
+    }
+    copyFile(from: joinPath(fx, "bluray/BDMV/index.bdmv"), to: bd + "/index.bdmv")
+    copyFile(from: joinPath(fx, "bluray/BDMV/STREAM/00001.m2ts"), to: bd + "/STREAM/00001.m2ts")
+    let mpls = readData(joinPath(fx, "bluray/BDMV/PLAYLIST/00000.mpls")) ?? Data()
+    let clpi = readData(joinPath(fx, "bluray/BDMV/CLIPINF/00001.clpi")) ?? Data()
+    var opened = 0
+    for _ in 0..40 {
+        let (m, g1) = damaged(mpls, rng)
+        let (cl, g2) = damaged(clpi, g1)
+        rng = g2
+        writeData(path: bd + "/PLAYLIST/00000.mpls", data: m)
+        writeData(path: bd + "/CLIPINF/00001.clpi", data: cl)
+        if disc.open(joinPath(scratch, "badbd")).isOk() {
+            opened += 1
+        }
+        runs += 1
+    }
+    // Damaged NAV packs in an interleaved title set.
+    let ilv = joinPath(scratch, "badilvu/VIDEO_TS")
+    createFolder(ilv)
+    for name in listFolder(joinPath(fx, "dvd/VIDEO_TS")) ?? [] {
+        copyFile(from: joinPath(joinPath(fx, "dvd/VIDEO_TS"), name), to: joinPath(ilv, name))
+    }
+    let vob3 = readData(joinPath(ilv, "VTS_03_1.VOB")) ?? Data()
+    var vb = vob3.bytes
+    var walked = 0
+    for _ in 0..30 {
+        // Hit the DSI fields of a NAV pack (or anywhere).
+        let sec = rng.next(max(1, vb.count / 2048))
+        let at = if rng.next(2) == 0 { sec * 2048 + 0x407 + 0x20 + rng.next(14) } else { rng.next(vb.count) }
+        if at < vb.count {
+            vb[at] = rng.next(256)
+        }
+        writeData(path: joinPath(ilv, "VTS_03_1.VOB"), data: Data(bytes: vb))
+        let fs = disc.folderFs(joinPath(scratch, "badilvu"))
+        if let dd = disc.openFs(fs).value() {
+            if dd.titles.count == 4 {
+                let r = disc.resolveInterleaved(fs, dd.titles[3])
+                if r.size <= dd.titles[3].size {
+                    walked += 1
+                }
+            }
+        }
+        runs += 1
+    }
+    k.check(walked == 30, "damaged NAV packs: the walk stays inside the cell ({walked} of 30)")
+
+    // Damaged images (UDF, ISO 9660).
+    let img = readData(joinPath(scratch, "dvd.iso")) ?? Data()
+    let img2 = readData(joinPath(scratch, "bluray250.iso")) ?? Data()
+    var b = img.bytes
+    var b2 = img2.bytes
+    for n in 0..30 {
+        // Hit the file system structures (the first 300 sectors).
+        let at = 16 * 2048 + rng.next(300 * 2048)
+        let at2 = 256 * 2048 + rng.next(80 * 2048)
+        let keep = b[at]
+        let keep2 = b2[at2]
+        b[at] = rng.next(256)
+        b2[at2] = rng.next(256)
+        let d1 = Data(bytes: b)
+        let d2 = Data(bytes: b2)
+        if let fs = disc.imageFs(d1, path: "x.iso").value() {
+            disc.openFs(fs)
+        }
+        if let fs = disc.imageFs(d2, path: "y.iso").value() {
+            disc.openFs(fs)
+        }
+        disc.iso9660Files(d1, joliet: n % 2 == 0)
+        if n % 3 != 0 {
+            b[at] = keep
+            b2[at2] = keep2
+        }
+        runs += 2
+    }
+    // Not discs at all.
+    k.check(!disc.open(joinPath(scratch, "nowhere")).isOk(), "a missing path fails")
+    createFolder(joinPath(scratch, "empty"))
+    k.check(!disc.open(joinPath(scratch, "empty")).isOk(), "an empty folder fails")
+    writeData(path: joinPath(scratch, "junk.iso"), data: Data(text: "not an image at all"))
+    k.check(!disc.open(joinPath(scratch, "junk.iso")).isOk(), "a junk .iso fails")
+    k.check(!disc.imageFs(Data()).isOk(), "an empty image fails")
+    print("time damaged files ({runs} parses): {((now() - t0) * 1000.0).formatted(decimals: 1)} ms")
+    k.check(runs > 1000, "damaged files never stop the program ({runs} parses, {opened} of 40 damaged Blu-ray folders still open)")
+    k
+}
+
+fn main() {
+    var c = Checks()
+    createFolder(scratch)
+    c = testDvd(c)
+    c = testBluray(c)
+    c = testIso(c)
+    c = testDamage(c)
+    print("disc: {c.passed} of {c.total} passed")
+}

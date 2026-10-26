@@ -1,0 +1,3242 @@
+// Reel: a media player written entirely in Tessel. The window: the video
+// (or cover art for music) with subtitles, a seek bar, the transport and
+// volume controls, an optional playlist beside it, and menus like VLC's.
+//
+// Playback runs from a timer (`tick`, 100 times a second): it moves the
+// clock, starts the next sound chunk when one ends, shows the frame that's
+// due, and sends the pumps back into background work when what's decoded
+// ahead runs low. See player.tsl for the state, play/ for the pumps.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "core"
+import "play"
+import "subs"
+import "ui"
+import "library"
+import "net"
+import "fx"
+import "render"
+import "vfx"
+import "export"
+import "disc"
+
+let tickSeconds = 0.01
+let mediaExtensions = ["mp4", "m4v", "mov", "mkv", "webm", "avi", "ts", "m2ts", "mts", "mpg", "mpeg", "vob", "ogv", "ivf", "wmv", "asf", "wma", "thd", "mlp", "dts", "dtshd", "mp3", "m4a", "aac", "flac", "ogg", "oga", "opus", "wav", "aif", "aiff", "mka", "ac3", "eac3", "mp2"]
+
+app Reel(title: "Reel", width: 960, height: 600, documentTypes: ["mp4", "m4v", "mov", "mkv", "webm", "avi", "ts", "m2ts", "mts", "mpg", "mpeg", "ogv", "wmv", "asf", "wma", "ivf", "mp3", "m4a", "aac", "flac", "ogg", "oga", "opus", "wav", "mka"]) {
+    state p = Player()
+    state sound: Sound? = nil
+    // The chunk before, still fading out.
+    state fading: Sound? = nil
+    state fadingPath = ""
+    // The next chunk, loaded ahead (muted and paused) so that it starts at
+    // once when its turn comes: a new sound takes a moment to load.
+    state upcoming: Sound? = nil
+    state upcomingPath = ""
+    // Whether the sound has started since the last start or seek: until
+    // then the clock waits for it; after, the clock runs on real time and
+    // follows the sound gently, so a late chunk doesn't stop the picture.
+    state soundStarted = false
+    state playlist: [String] = []
+    state current = -1
+    state showPlaylist = false
+    state splitSize = 680.0
+    state showInfo = false
+    state showAbout = false
+    state showStats = false
+    state loopMode = 0
+    state shuffle = false
+    state status = ""
+    state redraw = 0
+    // The seek and volume bars also redraw when this changes: ten times a
+    // second while playing (the picture itself only when it changes).
+    state barTick = 0
+    state cueKey = ""
+    state timer = -1
+    state opening = false
+    state openSerial = 0
+    state cover: [Int] = []
+    state coverW = 0
+    state coverH = 0
+    state dragging = false
+    state dragTime = 0.0
+    // The recent files (newest first), from the library.
+    state recent: [String] = []
+    // Settings, the media library (history, per-file memory) and the keys.
+    state prefs = library.defaultPreferences()
+    state lib: library.Library? = nil
+    state keymap = library.defaultKeymap()
+    // What's remembered for the open file (tracks, volume, bookmarks…).
+    state fileSettings = library.FileSettings()
+    state savedAt = 0.0
+    // Sleep timer: 0 off, 1 after sleepMinutes (sleepLeft seconds of
+    // playing to go), 2 at the end of the current item.
+    // A network stream (HLS, DASH, a file over http): its session, one
+    // segment download at a time, and the "Open Network Stream" window.
+    state stream: [net.Session] = []
+    state streamLoading = false
+    state streamOpening = false
+    state streamTrimAt = 0.0
+    state showOpenURL = false
+    // The Effects and Filters window.
+    state showEffects = false
+    // Preferences, the library window, the home screen.
+    state showPrefs = false
+    state prefsTab = "general"
+    state prefsExtra = ui.PrefsExtra()
+    state prefsStatus = ui.PrefsStatus()
+    state prefsSerial = 0
+    state showLibrary = false
+    state libModel = ui.LibraryModel()
+    state posters: [String: ui.LibThumb] = [:]
+    state home = ui.HomeData()
+    state thumbs: [library.ThumbCache] = []
+    state savedPlaylists: [String] = []
+    // A position to go to once the file opening now is open (from "Continue
+    // watching"); -1: none.
+    state resumeOnOpen = -1.0
+    // Seek-bar preview: where the mouse is over the bar (-1: not), the
+    // picture shown, thumbnails made so far (by keyframe) and the job.
+    state hoverX = -1.0
+    state hoverThumb = ui.LibThumb()
+    state hoverKey = -2
+    state thumbMem: [Int: ui.LibThumb] = [:]
+    state thumbBusy = false
+    // The scene strip and its keyframe scan.
+    state showScenes = false
+    state scenes: [ui.SceneThumb] = []
+    state sceneScan: [play.SceneScan] = []
+    state scanBusy = false
+    // The pane beside the picture: "playlist", "bookmarks", "find",
+    // "transcript"; the dialogue of the open file for the last two.
+    state sidePanel = "playlist"
+    state dialogue = subs.DialogueIndex()
+    state dialogueFor = ""
+    state transcriptSource = 0
+    // Subtitle files found beside the video, and the encoding the loaded
+    // one was read with.
+    state siblingSubs: [subs.SiblingFile] = []
+    state subEncoding = "auto"
+    // Export windows (clip, GIF).
+    state showClip = false
+    state clipForm = ui.ExportClipForm()
+    state clipBusy = false
+    state clipResult = ""
+    state showGif = false
+    state gifForm = ui.ExportGifForm()
+    state gifBusy = false
+    state gifResult = ""
+    // OpenSubtitles.
+    state showOs = false
+    state osForm = ui.SubtitleSearchForm()
+    state osResults: [subs.OsSubtitle] = []
+    state osBusy = false
+    state osMessage = ""
+    state osError = ""
+    state osUser = subs.OsUser()
+    state osLoginNeeded = false
+    state osLoginError = ""
+    // Jump to time, sleep timer, media information, discs.
+    state showJump = false
+    state showSleep = false
+    state sleepChoice = "off"
+    state sleepCustom = 30
+    state infoTab = "general"
+    state infoStrings: [String] = []
+    state showDisc = false
+    state showMini = false
+    state discOpen: [disc.Disc] = []
+    state fxTab = "equalizer"
+    state syncUi = ui.SyncSettings()
+    state meterUi = ui.MeterReadout()
+    state effectsSerial = 0
+    state urlText = ""
+    state sleepMode = 0
+    state sleepMinutes = 30.0
+    state sleepLeft = 0.0
+    // The offer to continue where the file was left: shown for a few
+    // seconds after it opens (-1: none).
+    state resumeAt = -1.0
+    state resumeSerial = 0
+    state fullScreen = false
+    // Full screen: the controls float over the picture and hide after
+    // controlsHideAfter seconds without the mouse moving (while playing).
+    state controlsIdle = 0.0
+    state controlsShown = true
+    state overControls = false
+    state seekW = 1.0
+    // REEL_TRACE=1: prints how long ticks take (see traceTick).
+    state traceOn = false
+    state traceLast = 0.0
+    state traceN = 0
+    state traceGap = 0.0
+    state traceGapMax = 0.0
+    state traceWork = 0.0
+
+    VStack(spacing: 0) {
+        if fullScreen {
+            ZStack(alignment: .bottom) {
+                screen()
+                if controlsShown {
+                    VStack(spacing: 0) {
+                        seekBar()
+                        controls()
+                    }
+                    .padding(6)
+                    .background(.rgb(31, 31, 31), radius: 10)
+                    .frame(maxWidth: 980)
+                    .padding(horizontal: 40)
+                    .padding(bottom: 28)
+                    .onPointer { e in
+                        if e.kind == .move {
+                            overControls = true
+                            controlsIdle = 0.0
+                        } else if e.kind == .leave {
+                            overControls = false
+                        }
+                    }
+                }
+            }
+        } else if showPlaylist {
+            HSplit(size: splitSize) {
+                screen()
+                sidePane()
+            }
+        } else {
+            screen()
+        }
+        if !fullScreen {
+            if showScenes && p.hasVideo {
+                ui.SceneStrip(scenes: scenes, current: p.clock, onSeek: { t in seekTo(t) })
+            }
+            seekBar()
+            controls()
+        }
+    }
+    .background(.black)
+    .onAppear { startup() }
+    .onDrop { path in addAndPlay(path) }
+    .onOpenFile { path in addAndPlay(path) }
+    .onKeyEvent { e in key(e) }
+    .onCloseRequest {
+        savePosition()
+        quit()
+    }
+    .menuBar {
+        Menu("Media") {
+            MenuItem("Open File…", shortcut: sc("open-file")) { chooseFiles() }
+            MenuItem("Open Folder…", shortcut: sc("open-folder")) { chooseFolderToPlay() }
+            MenuItem("Open Network Stream…", shortcut: "cmd+n") { openURLWindow() }
+            MenuItem("Open Disc…") { openDiscFolder() }
+            MenuItem("Save Playlist…") { savePlaylistFile() }
+                .disabled(playlist.isEmpty)
+            Menu("Open Recent") {
+                for r in recent {
+                    MenuItem(r.fileName) { addAndPlay(r) }
+                }
+            }
+            .disabled(recent.isEmpty)
+            MenuDivider()
+            MenuDivider()
+            MenuItem("Export Clip…", shortcut: sc("export-clip")) { openClipExport() }
+                .disabled(!p.loaded || !stream.isEmpty)
+            MenuItem("Export GIF…") { openGifExport() }
+                .disabled(!p.loaded || !p.hasVideo)
+            MenuDivider()
+            MenuItem("Close", shortcut: sc("close")) { closeMedia() }
+                .disabled(!p.loaded)
+        }
+        Menu("Playback") {
+            MenuItem(if p.playing { "Pause" } else { "Play" }, shortcut: sc("play-pause")) { togglePlay() }
+            MenuItem("Stop", shortcut: sc("stop")) { stop() }
+                .disabled(!p.loaded)
+            MenuItem("Previous", shortcut: sc("previous")) { previous() }
+            MenuItem("Next", shortcut: sc("next")) { next() }
+            MenuItem("Next Episode", shortcut: sc("next-episode")) { playNextEpisode() }
+                .disabled(!p.loaded)
+            MenuDivider()
+            MenuItem("Jump Forward", shortcut: sc("jump-forward")) { jump(prefs.jumpNormal) }
+            MenuItem("Jump Back", shortcut: sc("jump-back")) { jump(-prefs.jumpNormal) }
+            MenuItem("Next Frame", shortcut: sc("frame-step")) { frameStep() }
+            MenuItem("Previous Frame", shortcut: sc("frame-back")) { frameBack() }
+            MenuItem("Jump to Time…", shortcut: sc("jump-to-time")) { showJump = true }
+                .disabled(!p.loaded)
+            Menu("Chapter") {
+                MenuItem("Next Chapter", shortcut: sc("next-chapter")) { chapterJump(1) }
+                MenuItem("Previous Chapter", shortcut: sc("previous-chapter")) { chapterJump(-1) }
+                if !p.media.chapters.isEmpty {
+                    MenuDivider()
+                    for (i, c) in p.media.chapters.enumerated() {
+                        MenuItem(if c.title.isEmpty { "Chapter {i + 1}  {timeText(c.start)}" } else { "{c.title}  {timeText(c.start)}" }) { seekTo(c.start) }
+                    }
+                }
+            }
+            .disabled(!p.loaded)
+            Menu("Bookmarks") {
+                MenuItem("Add Bookmark", shortcut: sc("bookmark-add")) { addBookmark() }
+                MenuItem("Next Bookmark", shortcut: sc("bookmark-next")) { bookmarkJump(true) }
+                MenuItem("Previous Bookmark", shortcut: sc("bookmark-previous")) { bookmarkJump(false) }
+                if !fileSettings.bookmarks.isEmpty {
+                    MenuDivider()
+                    for b in fileSettings.bookmarks {
+                        MenuItem(if b.name.isEmpty { timeText(b.time) } else { "{b.name}  {timeText(b.time)}" }) { seekTo(b.time) }
+                    }
+                }
+            }
+            .disabled(!p.loaded)
+            MenuItem(abLoopTitle(), shortcut: sc("ab-loop")) { cycleABLoop() }
+                .disabled(!p.loaded)
+            MenuDivider()
+            Menu("Speed") {
+                for s in [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0, 4.0] {
+                    MenuItem("{s}×", checked: p.speed == s) { setSpeed(s) }
+                }
+            }
+            MenuItem("Faster", shortcut: sc("faster")) { setSpeed(min(p.speed * 1.25, 4.0)) }
+            MenuItem("Slower", shortcut: sc("slower")) { setSpeed(max(p.speed / 1.25, 0.25)) }
+            MenuItem("Normal Speed", shortcut: sc("normal-speed")) { setSpeed(1.0) }
+            MenuDivider()
+            MenuItem("Loop: Off", checked: loopMode == 0) { loopMode = 0 }
+            MenuItem("Loop: All", checked: loopMode == 1) { loopMode = 1 }
+            MenuItem("Loop: One", checked: loopMode == 2) { loopMode = 2 }
+            MenuItem("Shuffle", checked: shuffle) { shuffle = !shuffle }
+            Menu("Sleep Timer") {
+                MenuItem("Off", checked: sleepMode == 0) { setSleepTimer(0, sleepMinutes) }
+                for m in [15.0, 30.0, 45.0, 60.0, 90.0, 120.0] {
+                    MenuItem("{Int(m)} Minutes", checked: sleepMode == 1 && sleepMinutes == m) { setSleepTimer(1, m) }
+                }
+                MenuItem("End of This Item", checked: sleepMode == 2) { setSleepTimer(2, sleepMinutes) }
+                MenuDivider()
+                MenuItem("Custom…") { showSleep = true }
+            }
+        }
+        Menu("Audio") {
+            Menu("Audio Track") {
+                MenuItem("Off", checked: p.audio < 0) { chooseAudio(-1) }
+                for t in core.tracksOf(p.media, .audio) {
+                    MenuItem(play.trackLabel(t), checked: p.audio == t.index) { chooseAudio(t.index) }
+                        .disabled(!play.canDecodeAudio(t.codec))
+                }
+            }
+            MenuItem("Volume Up", shortcut: sc("volume-up")) { setVolume(p.volume + 0.1) }
+            MenuItem("Volume Down", shortcut: sc("volume-down")) { setVolume(p.volume - 0.1) }
+            MenuItem("Mute", shortcut: sc("mute"), checked: p.muted) { toggleMute() }
+            MenuDivider()
+            MenuItem("Audio Delay +50 ms", shortcut: sc("audio-delay-later")) { shiftAudio(0.05) }
+            MenuItem("Audio Delay −50 ms", shortcut: sc("audio-delay-earlier")) { shiftAudio(-0.05) }
+            MenuItem("Reset Audio Delay") { shiftAudio(-p.audioDelay) }
+                .disabled(p.audioDelay == 0.0)
+        }
+        Menu("Video") {
+            Menu("Video Track") {
+                MenuItem("Off", checked: p.video < 0) { chooseVideo(-1) }
+                for t in core.tracksOf(p.media, .video) {
+                    MenuItem(play.trackLabel(t), checked: p.video == t.index) { chooseVideo(t.index) }
+                        .disabled(!play.canDecodeVideo(t.codec))
+                }
+            }
+            if !stream.isEmpty && stream[0].presentation.variants.count > 1 {
+                Menu("Quality") {
+                    for (i, v) in stream[0].presentation.variants.enumerated() {
+                        MenuItem(qualityLabel(v), checked: stream[0].variant == i) { chooseQuality(i) }
+                    }
+                }
+            }
+            MenuItem("Full Screen", shortcut: sc("fullscreen"), checked: fullScreen) { toggleFullScreen() }
+            MenuItem("Snapshot", shortcut: sc("snapshot")) { snapshot() }
+                .disabled(p.shown.width == 0)
+        }
+        Menu("Subtitle") {
+            Menu("Subtitle Track") {
+                MenuItem("Off", checked: !p.hasSubtitles) { chooseSubtitle(-1) }
+                for t in core.tracksOf(p.media, .subtitle) {
+                    MenuItem(play.trackLabel(t), checked: p.subtitle == t.index) { chooseSubtitle(t.index) }
+                }
+            }
+            Menu("Second Subtitle Track") {
+                MenuItem("Off", checked: !p.hasSubtitles2) { chooseSubtitle2(-1) }
+                for t in core.tracksOf(p.media, .subtitle) {
+                    MenuItem(play.trackLabel(t), checked: p.subtitle2 == t.index) { chooseSubtitle2(t.index) }
+                }
+            }
+            .disabled(!p.loaded)
+            if !siblingSubs.isEmpty {
+                Menu("Beside the Video") {
+                    for f in siblingSubs {
+                        MenuItem(siblingLabel(f), checked: p.subFilePath == f.path) { loadSubFile(f.path, encoding: prefs.subtitleEncoding, language: f.language) }
+                    }
+                }
+            }
+            MenuItem("Add Subtitle File…") { addSubtitleFile() }
+                .disabled(!p.loaded)
+            MenuItem("Download Subtitles…") { openOs() }
+                .disabled(!p.loaded)
+            Menu("Text Encoding") {
+                MenuItem("Detect Automatically", checked: subEncoding == "auto") { reloadWithEncoding("auto") }
+                MenuDivider()
+                for name in subs.encodingList {
+                    MenuItem(subs.encodingTitle(name), checked: subEncoding == name) { reloadWithEncoding(name) }
+                }
+            }
+            .disabled(p.subFilePath.isEmpty || p.subtitle != -2)
+            MenuDivider()
+            MenuItem("Find in Dialogue…", shortcut: sc("find-dialogue")) { showSide("find") }
+                .disabled(!p.loaded)
+            MenuItem("Transcript", shortcut: sc("transcript")) { showSide("transcript") }
+                .disabled(!p.loaded)
+            MenuDivider()
+            MenuItem("Delay +0.1 s", shortcut: sc("subtitle-delay-later")) { shiftSubs(0.1) }
+            MenuItem("Delay −0.1 s", shortcut: sc("subtitle-delay-earlier")) { shiftSubs(-0.1) }
+        }
+        Menu("Tools") {
+            MenuItem("Media Information", shortcut: sc("media-info")) { openInfo() }
+                .disabled(!p.loaded)
+            MenuItem("Statistics", checked: showStats) { showStats = !showStats }
+            MenuItem("Effects and Filters", shortcut: sc("effects")) { openEffects("equalizer") }
+            MenuItem("Synchronisation") { openEffects("sync") }
+        }
+        Menu("View") {
+            MenuItem("Playlist", shortcut: sc("playlist"), checked: showPlaylist) { showPlaylist = !showPlaylist }
+            MenuItem("Library", shortcut: sc("library")) { openLibrary() }
+            MenuItem("Bookmarks") { showSide("bookmarks") }
+            MenuItem("Mini Player", shortcut: sc("mini-player"), checked: showMini) { showMini = !showMini }
+            MenuItem("Scene Strip", checked: showScenes) { toggleScenes() }
+        }
+        Menu("Reel") {
+            MenuItem("About Reel") { showAbout = true }
+            MenuItem("Preferences…", shortcut: sc("preferences")) { openPrefs("general") }
+        }
+    }
+
+    Window("Effects and Filters", isOpen: showEffects, width: 680, height: 600) {
+        ui.EffectsView(audio: p.fxSettings, look: p.look, filters: p.vfxSettings, sync: syncUi, meter: meterUi, tab: fxTab, onChange: { effectsChanged() })
+    }
+
+    Window("Preferences", isOpen: showPrefs, width: 820, height: 600) {
+        ui.PreferencesView(prefs: prefs, keymap: keymap, extra: prefsExtra, tab: prefsTab, status: prefsStatus,
+            onChange: { prefsChanged() },
+            onAddFolder: { addLibraryFolder() },
+            onRescan: { rescanLibrary() },
+            onClearHistory: { clearHistory() },
+            onClearThumbnails: { clearThumbnails() },
+            onChooseSnapshotFolder: {
+                if let f = chooseFolder(title: "Save Snapshots To") {
+                    prefs.snapshotFolder = f
+                    prefsChanged()
+                }
+            },
+            onCheckOpenSubtitles: { checkOpenSubtitles() },
+            onLogOutOpenSubtitles: { prefsChanged() })
+    }
+
+    Window("Library", isOpen: showLibrary, width: 980, height: 640) {
+        if let l = lib {
+            ui.LibraryView(model: libModel, lib: l, posters: posters, playlists: savedPlaylists,
+                onPlay: { items in playItems(items.map { i in i.path }) },
+                onPlayNext: { items in playNext(items.map { i in i.path }) },
+                onAddToPlaylist: { items, pl in addToPlaylist(items.map { i in i.path }, pl) },
+                onShowInFinder: { path in revealInFinder(path) },
+                onOpenPlaylist: { path in openPlaylistFile(path) },
+                onNeedPoster: { it in needPoster(it.path, it.size) },
+                onChanged: { refreshHome() })
+        }
+    }
+
+    Window("Open Network Stream", isOpen: showOpenURL, width: 520, height: 170) {
+        VStack(spacing: 10, alignment: .leading) {
+            Text("Address of a video, an HLS (.m3u8) or DASH (.mpd) stream, or a radio station:")
+                .font(size: 12)
+                .color(.secondary)
+            TextField("https://…", text: urlText)
+                .onSubmit { openTypedURL() }
+            HStack {
+                Spacer()
+                Button("Cancel") { showOpenURL = false }
+                Button("Open") { openTypedURL() }
+                    .disabled(!net.isHttp(urlText.trim()))
+            }
+        }
+        .padding(16)
+    }
+
+    Window("Media Information", isOpen: showInfo, width: 640, height: 520) {
+        ui.MediaInfoView(media: p.media, path: p.path, fileSize: p.file.count, streamInfo: infoStrings, trackNotes: trackNotes(), stats: statRows(), warnings: p.warnings, tab: infoTab, onSeek: { t in seekTo(t) })
+    }
+
+    Window("Export Clip", isOpen: showClip, width: 620, height: 560) {
+        ui.ExportClipView(media: p.media, form: clipForm, position: p.clock, busy: clipBusy, result: clipResult,
+            onChooseOutput: {
+                if let f = saveFile(name: clipForm.output.fileName, types: [clipForm.container]) {
+                    clipForm.output = f
+                }
+            },
+            onExport: { exportClip() },
+            onClose: { showClip = false })
+    }
+
+    Window("Export GIF", isOpen: showGif, width: 560, height: 560) {
+        ui.ExportGifView(form: gifForm, duration: p.duration, position: p.clock, sourceWidth: p.shown.width, sourceHeight: p.shown.height,
+            preview: p.shown.pixels, previewWidth: p.shown.width, previewHeight: p.shown.height, busy: gifBusy, result: gifResult,
+            onChooseOutput: {
+                if let f = saveFile(name: gifForm.output.fileName, types: ["gif"]) {
+                    gifForm.output = f
+                }
+            },
+            onExport: { exportGif() },
+            onClose: { showGif = false })
+    }
+
+    Window("Download Subtitles", isOpen: showOs, width: 760, height: 520) {
+        ui.SubtitleSearchView(form: osForm, results: osResults, hasHash: !net.isHttp(p.path), busy: osBusy, message: osMessage, error: osError,
+            user: osUser, loggedIn: !prefs.openSubtitlesToken.isEmpty, loginNeeded: osLoginNeeded, loginError: osLoginError,
+            onSearch: { osSearch() },
+            onDownload: { sub in osDownload(sub) },
+            onLogin: { user, pass in osLogin(user, pass) },
+            onLogout: {
+                prefs.openSubtitlesToken = ""
+                prefsChanged()
+            })
+    }
+
+    Window("Jump to Time", isOpen: showJump, width: 380, height: 170) {
+        ui.JumpToTimeView(position: p.clock, duration: p.duration,
+            onJump: { t in
+                showJump = false
+                seekTo(t)
+            },
+            onCancel: { showJump = false })
+    }
+
+    Window("Sleep Timer", isOpen: showSleep, width: 360, height: 360) {
+        ui.SleepTimerView(choice: sleepChoice, customMinutes: sleepCustom, remaining: if sleepMode == 1 { sleepLeft } else { -1.0 },
+            onChange: {
+                let secs = ui.sleepTimerSeconds(sleepChoice, customMinutes: sleepCustom)
+                if secs < 0.0 {
+                    setSleepTimer(0, sleepMinutes)
+                } else if secs == 0.0 {
+                    setSleepTimer(2, sleepMinutes)
+                } else {
+                    setSleepTimer(1, secs / 60.0)
+                }
+            })
+    }
+
+    Window("Reel Mini Player", isOpen: showMini, width: 400, height: 280) {
+        VStack(spacing: 0) {
+            Canvas(redraw: redraw) { g in
+                drawScreen(g)
+            }
+            .onPointer { e in
+                if e.kind == .down {
+                    togglePlay()
+                }
+            }
+            HStack(spacing: 2) {
+                ui.SvgButton(svg: if p.playing { ui.svgPause() } else { ui.svgPlay() }, tip: if p.playing { "Pause" } else { "Play" }, size: 18) { togglePlay() }
+                ui.SvgButton(svg: ui.svgPrevious(), tip: "Previous", size: 16) { previous() }
+                ui.SvgButton(svg: ui.svgNext(), tip: "Next", size: 16) { next() }
+                Text("{timeText(p.clock)} / {timeText(p.duration)}").font(size: 11).color(.rgb(217, 217, 217))
+                Spacer()
+                ui.SvgButton(svg: volumeSvg(), tip: if p.muted { "Unmute" } else { "Mute" }, size: 16, on: p.muted) { toggleMute() }
+            }
+            .padding(horizontal: 6, vertical: 3)
+            .background(.rgb(31, 31, 31))
+        }
+        .background(.black)
+        .onKeyEvent { e in key(e) }
+    }
+
+    Window("Disc", isOpen: showDisc, width: 720, height: 480) {
+        if !discOpen.isEmpty {
+            ui.DiscTitlesView(disc: discOpen[0], onPlay: { t, angle in playDiscTitle(t, angle) }, onClose: { showDisc = false })
+        }
+    }
+
+    Window("About Reel", isOpen: showAbout, width: 340, height: 220) {
+        VStack(spacing: 8) {
+            Text("Reel").font(size: 26, weight: .bold)
+            Text("A media player written entirely in Tessel").color(.secondary)
+            Text("Version 0.1.0").font(size: 12).color(.secondary)
+            Divider()
+            Text("Alexius Academia")
+            Link("syncster.dev", url: "https://syncster.dev")
+        }
+        .padding(20)
+    }
+
+    // The picture, cover art or the welcome text, with subtitles.
+    fn screen() -> View {
+        ZStack(alignment: .topTrailing) {
+            if !p.loaded && !opening {
+                ui.HomeView(data: home, posters: posters,
+                    onPlay: { e, fromStart in playFromHome(e, fromStart) },
+                    onRemove: { e in
+                        if let l = lib {
+                            l.setFinished(e.path, size: e.size, true)
+                        }
+                        refreshHome()
+                    },
+                    onShowInFinder: { path in revealInFinder(path) },
+                    onOpenFile: { chooseFiles() },
+                    onOpenFolder: { chooseFolderToPlay() },
+                    onOpenStream: { openURLWindow() },
+                    onOpenLibrary: { openLibrary() },
+                    onNeedPoster: { e in needPoster(e.path, e.size) })
+            } else {
+                screenCanvas()
+            }
+            if resumeAt >= 0.0 {
+                resumeOffer()
+            }
+            if hoverX >= 0.0 && p.duration > 0.0 && p.hasVideo && !fullScreen {
+                VStack(spacing: 0) {
+                    Spacer()
+                    HStack(spacing: 0) {
+                        ui.SeekPreview(thumb: hoverThumb, time: timeAt(hoverX), x: hoverX, barWidth: seekW, chapter: chapterTitleAt(timeAt(hoverX)))
+                        Spacer()
+                    }
+                }
+                .padding(bottom: 4)
+            }
+        }
+    }
+
+    fn screenCanvas() -> View {
+        Canvas(redraw: redraw) { g in
+            drawScreen(g)
+        }
+        .onResize { w, h in resized(w, h) }
+        .onPointer { e in
+            if e.kind == .move {
+                wakeControls()
+            } else if e.kind == .down && e.clicks == 2 {
+                toggleFullScreen()
+            } else if e.kind == .down {
+                togglePlay()
+            }
+        }
+        .accessibilityLabel("Video")
+    }
+
+    fn drawScreen(_ g: Graphics) {
+        g.fillRect(x: 0, y: 0, width: g.width, height: g.height, color: .black)
+        if p.shown.width > 0 {
+            let fw = Float(p.shown.width)
+            let fh = Float(p.shown.height)
+            let k = min(g.width / fw, g.height / fh)
+            let w = fw * k
+            let h = fh * k
+            let x = (g.width - w) / 2.0
+            let y = (g.height - h) / 2.0
+            g.image(pixels: p.shown.pixels, pixelWidth: p.shown.width, pixelHeight: p.shown.height, x: x, y: y, width: w, height: h)
+            subs.drawTracks(g, primary: p.cuesNow(), secondary: p.cuesNow2(), at: p.clock - p.subDelay, x: x, y: y, width: w, height: h, scale: 1.6)
+        } else if p.loaded && !p.hasVideo && !unplayableVideo().isEmpty {
+            // A video Reel can't decode: say so, and play the sound.
+            g.svg(text: ui.svgVideoOff(), x: g.width / 2.0 - 24.0, y: g.height / 2.0 - 80.0, width: 48, height: 48, color: .rgb(140, 140, 140))
+            g.text("This video is {unplayableVideo()}, which Reel can't show yet.", x: g.width / 2.0, y: g.height / 2.0 - 12.0, size: 16, color: .rgb(230, 230, 230), align: .center)
+            g.text("The sound plays; subtitles show here when turned on.", x: g.width / 2.0, y: g.height / 2.0 + 14.0, size: 13, color: .gray, align: .center)
+            if p.hasSubtitles {
+                subs.drawTracks(g, primary: p.cuesNow(), secondary: p.cuesNow2(), at: p.clock - p.subDelay, x: 0.0, y: 0.0, width: g.width, height: g.height, scale: 1.6)
+            }
+        } else if p.loaded && !p.hasVideo {
+            drawMusic(g)
+        } else if opening {
+            g.text("Opening…", x: g.width / 2.0, y: g.height / 2.0, size: 16, color: .gray, align: .center)
+        } else if !p.loaded {
+            g.svg(text: ui.svgFilm(), x: g.width / 2.0 - 28.0, y: g.height / 2.0 - 110.0, width: 56, height: 56, color: .rgb(242, 140, 26))
+            g.text("Reel", x: g.width / 2.0, y: g.height / 2.0 - 30.0, size: 40, color: .rgb(217, 217, 217), weight: .bold, align: .center)
+            g.text("Drop a video or song here, or choose Media ▸ Open File…", x: g.width / 2.0, y: g.height / 2.0 + 20.0, size: 14, color: .gray, align: .center)
+        }
+        if p.loaded && p.hasVideo && p.shown.width == 0 && !p.error.isEmpty {
+            g.text(p.error, x: g.width / 2.0, y: g.height / 2.0, size: 14, color: .orange, align: .center)
+        }
+        if !status.isEmpty {
+            g.text(status, x: 14.0, y: 12.0, size: 14, color: .white, align: .topLeading)
+        }
+        if showStats {
+            var y = 34.0
+            for line in statsLines() {
+                g.text(line, x: 14.0, y: y, size: 12, color: .yellow, align: .topLeading)
+                y += 16.0
+            }
+        }
+    }
+
+    // The name of the video's codec when the file has video (not cover
+    // art) that Reel can't decode, else "".
+    fn unplayableVideo() -> String {
+        for t in p.media.tracks {
+            if t.kind == .video && !play.canDecodeVideo(t.codec) {
+                return codecName(t.codec)
+            }
+        }
+        ""
+    }
+
+    // Audio only: the cover (or a placeholder), the title and a spectrum.
+    fn drawMusic(_ g: Graphics) {
+        let side = min(g.width, g.height) * 0.55
+        let x = (g.width - side) / 2.0
+        let y = g.height * 0.1
+        if coverW > 0 {
+            g.image(pixels: cover, pixelWidth: coverW, pixelHeight: coverH, x: x, y: y, width: side, height: side)
+        } else {
+            g.fillRect(x: x, y: y, width: side, height: side, color: .rgb(38, 38, 38), radius: 12)
+            g.svg(text: ui.svgMusic(), x: x + side * 0.3, y: y + side * 0.3, width: side * 0.4, height: side * 0.4, color: .rgb(102, 102, 102))
+        }
+        let title = p.media.tags["title"] ?? p.path.fileName
+        let artist = p.media.tags["artist"] ?? ""
+        g.text(title, x: g.width / 2.0, y: y + side + 22.0, size: 18, color: .white, weight: .bold, align: .center)
+        if !artist.isEmpty {
+            g.text(artist, x: g.width / 2.0, y: y + side + 46.0, size: 14, color: .gray, align: .center)
+        }
+        if p.chunkPlaying && !p.chunk.levels.isEmpty {
+            let n = p.chunk.levels.count
+            let bw = side / Float(n)
+            for (i, v) in p.chunk.levels.enumerated() {
+                let h = max(2.0, v * 40.0)
+                g.fillRect(x: x + Float(i) * bw + 1.0, y: g.height - 10.0 - h, width: bw - 2.0, height: h, color: .rgb(242, 140, 26))
+            }
+        }
+    }
+
+    // The seek bar: a canvas, so dragging doesn't fight the clock.
+    fn seekBar() -> View {
+        Canvas(redraw: redraw * 1000000 + barTick) { g in
+            g.fillRect(x: 0, y: 0, width: g.width, height: g.height, color: .rgb(31, 31, 31))
+            let d = p.duration
+            let t = if dragging { dragTime } else { p.clock }
+            g.fillRect(x: 10.0, y: g.height / 2.0 - 2.0, width: g.width - 20.0, height: 4.0, color: .rgb(89, 89, 89), radius: 2)
+            if d > 0.0 {
+                let f = max(0.0, min(t / d, 1.0))
+                g.fillRect(x: 10.0, y: g.height / 2.0 - 2.0, width: (g.width - 20.0) * f, height: 4.0, color: .rgb(242, 140, 26), radius: 2)
+                g.fillCircle(x: 10.0 + (g.width - 20.0) * f, y: g.height / 2.0, radius: 6.0, color: .white)
+                for c in p.media.chapters {
+                    let cx = 10.0 + (g.width - 20.0) * max(0.0, min(c.start / d, 1.0))
+                    g.fillRect(x: cx - 1.0, y: g.height / 2.0 - 5.0, width: 2.0, height: 10.0, color: .rgb(204, 204, 204))
+                }
+            }
+        }
+        .frame(height: 22)
+        .onResize { w, h in seekW = w }
+        .onPointer { e in seekPointer(e) }
+        .accessibilityLabel("Seek bar")
+    }
+
+    fn seekPointer(_ e: PointerEvent) {
+        let d = p.duration
+        if d <= 0.0 {
+            return
+        }
+        let width = 1.0
+        match e.kind {
+            .down -> {
+                dragging = true
+                dragTime = timeAt(e.x)
+                redraw += 1
+            }
+            .drag -> {
+                dragTime = timeAt(e.x)
+                redraw += 1
+            }
+            .up -> {
+                if dragging {
+                    dragging = false
+                    seekTo(timeAt(e.x))
+                }
+            }
+            .move -> {
+                hoverX = e.x
+                requestThumb(timeAt(e.x))
+            }
+            .leave -> { hoverX = -1.0 }
+            _ -> {}
+        }
+    }
+
+    // What belongs to the file that was open: previews, scenes, dialogue.
+    fn resetPerFile() {
+        thumbMem = [:]
+        hoverKey = -2
+        hoverThumb = ui.LibThumb()
+        sceneScan = []
+        scenes = []
+        dialogue = subs.DialogueIndex()
+        dialogueFor = ""
+        if showScenes {
+            // Started again once the new file is open (see storePoster's tick).
+            showScenes = false
+        }
+    }
+
+    // The chapter title at a time ("" without chapters).
+    fn chapterTitleAt(_ t: Float) -> String {
+        var title = ""
+        for (i, c) in p.media.chapters.enumerated() {
+            if c.start <= t {
+                title = if c.title.isEmpty { "Chapter {i + 1}" } else { c.title }
+            }
+        }
+        title
+    }
+
+    // The preview picture for a time: from memory, or a background job
+    // decodes the keyframe before it (one job at a time; the latest
+    // wanted one goes next).
+    fn requestThumb(_ t: Float) {
+        if !p.hasVideo || p.video < 0 {
+            return
+        }
+        let key = play.thumbnailKey(p.media, track: p.video, seconds: t)
+        if key == hoverKey {
+            return
+        }
+        hoverKey = key
+        if let th = thumbMem[key] {
+            hoverThumb = th
+            return
+        }
+        if thumbBusy {
+            return
+        }
+        thumbBusy = true
+        let file = p.file
+        let media = p.media
+        let track = p.video
+        let serial = openSerial
+        background(work: { thumbJob(file, media, track, t) }) { r in
+            thumbBusy = false
+            if serial != openSerial {
+                return
+            }
+            let th = ui.LibThumb(width: r.width, height: r.height, pixels: r.pixels)
+            thumbMem[key] = th
+            if hoverKey == key {
+                hoverThumb = th
+            } else if hoverX >= 0.0 {
+                // The mouse moved on meanwhile.
+                let wanted = hoverKey
+                hoverKey = -2
+                requestThumb(timeAt(hoverX))
+                if hoverKey == -2 {
+                    hoverKey = wanted
+                }
+            }
+        }
+    }
+
+    // --- Scene strip ---
+
+    fn toggleScenes() {
+        showScenes = !showScenes
+        if showScenes && p.hasVideo && sceneScan.isEmpty {
+            sceneScan = [play.newSceneScan(p.media, track: p.video)]
+            scenes = []
+            scanStep()
+        }
+    }
+
+    // A few keyframes per background job, until the scan is done; files
+    // without chapters get chapters from the scenes found.
+    fn scanStep() {
+        if scanBusy || sceneScan.isEmpty || sceneScan[0].done {
+            return
+        }
+        scanBusy = true
+        let sc = sceneScan[0]
+        let file = p.file
+        let media = p.media
+        let serial = openSerial
+        background(work: { sceneScanStep(sc, file, media) }) { r in
+            scanBusy = false
+            if serial != openSerial {
+                return
+            }
+            sceneScan = [r]
+            scenes = r.scenes.map { th in ui.SceneThumb(time: th.time, thumb: ui.LibThumb(width: th.width, height: th.height, pixels: th.pixels)) }
+            if r.done {
+                if p.media.chapters.isEmpty {
+                    p.media.chapters = r.chapters(duration: p.duration)
+                    if !p.media.chapters.isEmpty {
+                        flash("{p.media.chapters.count} chapters from scene changes")
+                    }
+                }
+            } else {
+                scanStep()
+            }
+        }
+    }
+
+    // --- Side pane ---
+
+    fn sidePane() -> View {
+        VStack(spacing: 0) {
+            HStack(spacing: 2) {
+                sideTab("playlist", "Playlist")
+                sideTab("bookmarks", "Bookmarks")
+                sideTab("find", "Find")
+                sideTab("transcript", "Transcript")
+                Spacer()
+            }
+            .padding(4)
+            .background(.rgb(23, 23, 23))
+            if sidePanel == "find" {
+                ui.FindPanel(index: dialogue, position: p.clock, onOtherKey: { e in key(e) }, onSeek: { t in seekTo(t) })
+                    .id(p.path)
+            } else if sidePanel == "transcript" {
+                ui.TranscriptPanel(index: dialogue, source: transcriptSource, position: p.clock - p.subDelay, onSeek: { t in seekTo(t) })
+            } else if sidePanel == "bookmarks" {
+                ui.BookmarksPanel(bookmarks: fileSettings.bookmarks, current: p.clock,
+                    onJump: { t in seekTo(t) },
+                    onAdd: { name in
+                        let t = p.clock
+                        rememberChange({ s in library.addBookmark(s, time: t, name: name) })
+                    },
+                    onRename: { i, name in rememberChange({ s in library.renameBookmark(s, index: i, name: name) }) },
+                    onDelete: { i in rememberChange({ s in library.removeBookmark(s, index: i) }) })
+            } else {
+                ui.PlaylistPanel(items: playlist, current: current, shuffle: shuffle, loopMode: loopMode,
+                    onPlay: { i in playIndex(i) },
+                    onAdd: { chooseFiles() },
+                    onSave: { savePlaylistFile() },
+                    onShuffle: { shuffle = !shuffle },
+                    onLoop: { loopMode = (loopMode + 1) % 3 })
+            }
+        }
+        .background(.rgb(23, 23, 23))
+    }
+
+    fn sideTab(_ id: String, _ title: String) -> View {
+        Text(title)
+            .font(size: 11, weight: if sidePanel == id { .bold } else { .regular })
+            .color(if sidePanel == id { ui.iconOnColor } else { ui.iconColor })
+            .padding(horizontal: 8, vertical: 4)
+            .hoverBackground(ui.iconHover, radius: 4)
+            .onTap { showSide(id) }
+    }
+
+    fn showSide(_ id: String) {
+        if id == "find" || id == "transcript" {
+            buildDialogue()
+        }
+        if sidePanel == id && showPlaylist {
+            showPlaylist = false
+            return
+        }
+        sidePanel = id
+        showPlaylist = true
+    }
+
+    // Every text subtitle track of the file (and a loaded subtitle file),
+    // for Find and Transcript; once per file.
+    fn buildDialogue() {
+        if dialogueFor == p.path || !p.loaded {
+            return
+        }
+        dialogueFor = p.path
+        var idx = subs.DialogueIndex()
+        for t in core.tracksOf(p.media, .subtitle) {
+            if t.codec == "pgs" || t.codec == "dvdsub" || t.codec == "dvbsub" {
+                continue
+            }
+            match subs.decodeTrack(p.file, p.media, track: t.index) {
+                .ok(track) -> { idx.add(track, name: play.trackLabel(t)) }
+                .failure(_) -> {}
+            }
+        }
+        if p.hasSubtitles && p.subtitle < 0 {
+            idx.add(p.subtitles, name: "Subtitle file")
+        }
+        dialogue = idx
+        transcriptSource = 0
+    }
+
+    fn timeAt(_ x: Float) -> Float {
+        let w = max(seekW - 20.0, 1.0)
+        max(0.0, min((x - 10.0) / w, 1.0)) * p.duration
+    }
+
+    fn controls() -> View {
+        HStack(spacing: 2) {
+            ui.SvgButton(svg: if p.playing { ui.svgPause() } else { ui.svgPlay() }, tip: if p.playing { "Pause (Space)" } else { "Play (Space)" }, size: 26) { togglePlay() }
+            Spacer().frame(width: 6)
+            ui.SvgButton(svg: ui.svgPrevious(), tip: "Previous in the playlist") { previous() }
+            ui.SvgButton(svg: ui.svgStop(), tip: "Stop") { stop() }
+            ui.SvgButton(svg: ui.svgNext(), tip: "Next in the playlist") { next() }
+            Spacer().frame(width: 10)
+            ui.SvgButton(svg: if fullScreen { ui.svgExitFullScreen() } else { ui.svgFullScreen() }, tip: if fullScreen { "Leave full screen" } else { "Full screen" }) { toggleFullScreen() }
+            ui.SvgButton(svg: ui.svgPlaylist(), tip: "Show or hide the playlist", on: showPlaylist) { showPlaylist = !showPlaylist }
+            ui.SvgButton(svg: if loopMode == 2 { ui.svgRepeatOne() } else { ui.svgRepeat() }, tip: loopTip(), on: loopMode > 0) { loopMode = (loopMode + 1) % 3 }
+            ui.SvgButton(svg: ui.svgShuffle(), tip: if shuffle { "Shuffle is on" } else { "Shuffle is off" }, on: shuffle) { shuffle = !shuffle }
+            ui.SvgButton(svg: ui.svgSubtitles(), tip: "Next subtitle track", on: p.hasSubtitles) { cycleSubtitle() }
+            Spacer().frame(width: 10)
+            Text("{timeText(if dragging { dragTime } else { p.clock })} / {timeText(p.duration)}")
+                .font(size: 12)
+                .color(.rgb(217, 217, 217))
+            Spacer()
+            Text("{speedText()}").font(size: 12).color(.orange)
+            ui.SvgButton(svg: volumeSvg(), tip: if p.muted { "Unmute" } else { "Mute" }, on: p.muted) { toggleMute() }
+            volumeBar()
+        }
+        .padding(horizontal: 8, vertical: 4)
+        .background(.rgb(31, 31, 31))
+    }
+
+    // The volume: a canvas bar like the seek bar (Slider is always blue).
+    fn volumeBar() -> View {
+        Canvas(redraw: redraw * 1000000 + barTick) { g in
+            let w = g.width - 12.0
+            let v = if p.muted { 0.0 } else { max(0.0, min(p.volume, 1.0)) }
+            g.fillRect(x: 6.0, y: g.height / 2.0 - 2.0, width: w, height: 4.0, color: .rgb(89, 89, 89), radius: 2)
+            g.fillRect(x: 6.0, y: g.height / 2.0 - 2.0, width: w * v, height: 4.0, color: .rgb(242, 140, 26), radius: 2)
+            g.fillCircle(x: 6.0 + w * v, y: g.height / 2.0, radius: 5.0, color: .white)
+        }
+        .frame(width: 100, height: 24)
+        .onPointer { e in
+            if e.kind == .down || e.kind == .drag {
+                setVolume(max(0.0, min((e.x - 6.0) / 88.0, 1.0)))
+                redraw += 1
+            }
+        }
+        .tooltip("Volume {Int(p.volume * 100.0 + 0.5)}%")
+        .accessibilityLabel("Volume")
+    }
+
+    fn loopTip() -> String {
+        match loopMode {
+            1 -> "Loop: all (click for one)"
+            2 -> "Loop: one (click for off)"
+            _ -> "Loop: off (click for all)"
+        }
+    }
+
+    fn volumeSvg() -> String {
+        if p.muted || p.volume <= 0.0 {
+            return ui.svgVolumeOff()
+        }
+        if p.volume < 0.5 { ui.svgVolumeLow() } else { ui.svgVolumeHigh() }
+    }
+
+    fn speedText() -> String {
+        if p.speed == 1.0 { "" } else { "{p.speed}×" }
+    }
+
+    fn playlistPanel() -> View {
+        VStack(spacing: 2, alignment: .leading) {
+            HStack {
+                Text("Playlist").font(size: 13, weight: .bold).color(.white)
+                Spacer()
+                ui.IconButton(icon: .plus, tip: "Add files…") { chooseFiles() }
+                ui.IconButton(icon: .trash, tip: "Clear the playlist") {
+                    playlist = []
+                    current = -1
+                }
+            }
+            .padding(6)
+            Scroll {
+                VStack(spacing: 0, alignment: .leading) {
+                    for (i, item) in playlist.enumerated() {
+                        HStack(spacing: 6) {
+                            Svg(ui.svgPlay())
+                                .color(.orange)
+                                .frame(width: 9, height: 9)
+                                .opacity(if i == current { 1.0 } else { 0.0 })
+                            Text(item.fileName)
+                                .font(size: 12, weight: if i == current { .bold } else { .regular })
+                                .color(if i == current { .orange } else { .rgb(217, 217, 217) })
+                                .lineLimit(1)
+                            Spacer()
+                        }
+                        .padding(4)
+                        .hoverBackground(.rgb(45, 45, 45), radius: 4)
+                        .onTap { playIndex(i) }
+                    }
+                }
+            }
+        }
+        .background(.rgb(23, 23, 23))
+    }
+
+    // --- Starting up and opening ---
+
+    fn startup() {
+        let data = dataFolder()
+        prefs = library.loadPreferences(library.preferencesPath(data))
+        keymap = library.keymapWith(overrides: prefs.keyOverrides)
+        match library.openLibrary(joinPath(data, "library.db")) {
+            .ok(l) -> {
+                var opened = l
+                // recent.json and positions.json from earlier versions.
+                opened.migrateLegacyFiles(folder: data)
+                opened.finishedMargin = prefs.finishedMarginSeconds
+                opened.finishedFraction = prefs.finishedFraction
+                lib = opened
+            }
+            .failure(e) -> flash("The library can't be opened: {e.message}")
+        }
+        if let text = readFile(joinPath(data, "preferences-extra.json")) {
+            let extra: ui.PrefsExtra = fromJson(text) ?? ui.PrefsExtra()
+            prefsExtra = extra
+        }
+        thumbs = [library.thumbCache(joinPath(data, "thumbs"), maxMB: prefs.thumbnailCacheMB)]
+        if let l = lib {
+            for f in prefs.libraryFolders {
+                l.addFolder(f)
+            }
+        }
+        refreshRecent()
+        refreshHome()
+        if prefs.scanOnStart && !prefs.libraryFolders.isEmpty {
+            after(seconds: 1.0) {
+                rescanLibrary()
+            }
+        }
+        clearSoundFolder()
+        traceOn = environment("REEL_TRACE") != nil
+        timer = every(seconds: tickSeconds) {
+            tick()
+            // Stream downloads run in blocks of their own (the timer must
+            // not wait for the network), one at a time.
+            if !stream.isEmpty && !streamLoading {
+                streamLoading = true
+                after(seconds: 0.0) {
+                    await streamFetch()
+                }
+            }
+        }
+        // Files named on the command line play at once.
+        for a in arguments() {
+            if fileExists(a) && isMediaPath(a) {
+                playlist.append(a)
+            }
+        }
+        if !playlist.isEmpty {
+            playIndex(0)
+        }
+    }
+
+    fn chooseFiles() {
+        let paths = openFiles(types: mediaExtensions)
+        if paths.isEmpty {
+            return
+        }
+        let first = playlist.count
+        playlist.appendAll(paths)
+        playIndex(first)
+    }
+
+    fn chooseFolderToPlay() {
+        if let folder = chooseFolder() {
+            let first = playlist.count
+            for name in (listFolder(folder) ?? []).sorted() {
+                let path = joinPath(folder, name)
+                if isMediaPath(path) {
+                    playlist.append(path)
+                }
+            }
+            if playlist.count > first {
+                playIndex(first)
+            }
+        }
+    }
+
+    fn addAndPlay(_ path: String) {
+        if path.lowercase().hasSuffix(".srt") || path.lowercase().hasSuffix(".ass") || path.lowercase().hasSuffix(".ssa") || path.lowercase().hasSuffix(".vtt") || path.lowercase().hasSuffix(".sup") {
+            if p.loaded {
+                loadSubFile(path, encoding: prefs.subtitleEncoding)
+            }
+            return
+        }
+        if library.isPlaylistPath(path) {
+            openPlaylistFile(path)
+            return
+        }
+        playlist.append(path)
+        playIndex(playlist.count - 1)
+    }
+
+    fn playIndex(_ i: Int) {
+        if i < 0 || i >= playlist.count {
+            return
+        }
+        current = i
+        openPath(playlist[i])
+    }
+
+    // --- Media information, export, OpenSubtitles, discs ---
+
+    fn openInfo() {
+        infoStrings = p.media.tracks.map { t in play.streamInfoOf(t) }
+        showInfo = true
+    }
+
+    fn trackNotes() -> [String] {
+        p.media.tracks.map { t in
+            if t.kind == .video && !play.canDecodeVideo(t.codec) {
+                "Reel can't decode this video yet"
+            } else if t.kind == .audio && !play.canDecodeAudio(t.codec) {
+                "Reel can't decode this audio yet"
+            } else {
+                ""
+            }
+        }
+    }
+
+    fn statRows() -> [ui.MediaInfoRow] {
+        statsLines().map { line in ui.MediaInfoRow(label: "", value: line) }
+    }
+
+    fn openClipExport() {
+        let fs = fileSettings
+        let a = if library.hasABLoop(fs) { fs.abStart } else { p.clock }
+        let b = if library.hasABLoop(fs) { fs.abEnd } else { min(p.clock + 30.0, p.duration) }
+        clipForm = ui.exportClipForm(p.media, path: p.path, from: a, to: b)
+        clipResult = ""
+        showClip = true
+    }
+
+    fn exportClip() {
+        if clipBusy {
+            return
+        }
+        clipBusy = true
+        clipResult = "Writing…"
+        let file = p.file
+        let media = p.media
+        let tracks = ui.exportClipTracks(clipForm, media)
+        let from = ui.exportClipStart(clipForm)
+        let to = ui.exportClipEnd(clipForm)
+        let exact = clipForm.exactStart
+        let out = ui.exportOutputPath(clipForm.output, container: clipForm.container)
+        background(work: { exportClipJob(file, media, tracks, from, to, exact, out) }) { text in
+            clipBusy = false
+            clipResult = text
+        }
+    }
+
+    fn openGifExport() {
+        gifForm = ui.exportGifForm(position: p.clock, duration: p.duration, path: p.path, sourceWidth: p.shown.width)
+        gifResult = ""
+        showGif = true
+    }
+
+    fn exportGif() {
+        if gifBusy || p.video < 0 {
+            return
+        }
+        gifBusy = true
+        gifResult = "Making the GIF…"
+        let file = p.file
+        let media = p.media
+        let track = p.video
+        let t = media.tracks[track]
+        let from = ui.parseJumpTime(gifForm.fromText, position: p.clock, duration: p.duration) ?? p.clock
+        let to = ui.parseJumpTime(gifForm.toText, position: p.clock, duration: p.duration) ?? (from + 3.0)
+        let w = gifForm.width
+        let h = ui.gifHeight(width: w, sourceWidth: t.width, sourceHeight: t.height, sarNum: t.sarNum, sarDen: t.sarDen)
+        let fps = gifForm.fps
+        let options = ui.gifOptions(gifForm)
+        let out = ui.exportOutputPath(gifForm.output, container: "gif")
+        background(work: { exportGifJob(file, media, track, from, to, fps, w, h, options, out) }) { text in
+            gifBusy = false
+            gifResult = text
+        }
+    }
+
+    fn osClient() -> subs.OsClient {
+        var c = subs.OsClient(apiKey: prefs.openSubtitlesApiKey, userAgent: "Reel v0.1")
+        c.token = prefs.openSubtitlesToken
+        c
+    }
+
+    fn openOs() {
+        osForm = ui.subtitleSearchForm(videoPath: p.path, languages: prefs.subtitleLanguages)
+        osError = if prefs.openSubtitlesApiKey.isEmpty { "Add your OpenSubtitles API key in Preferences ▸ OpenSubtitles first." } else { "" }
+        showOs = true
+    }
+
+    fn osSearch() {
+        if prefs.openSubtitlesApiKey.isEmpty {
+            osError = "Add your OpenSubtitles API key in Preferences ▸ OpenSubtitles first."
+            return
+        }
+        osBusy = true
+        osError = ""
+        osMessage = "Searching…"
+        let hash = if net.isHttp(p.path) { "" } else { subs.movieHash(p.file) }
+        subs.opensubtitlesSearch(osClient(), ui.subtitleQuery(osForm, movieHash: hash)) { r in
+            osBusy = false
+            match r {
+                .ok(res) -> {
+                    osResults = res.subtitles
+                    osMessage = "{res.subtitles.count} found"
+                }
+                .failure(e) -> {
+                    osMessage = ""
+                    osError = e.message
+                }
+            }
+        }
+    }
+
+    fn osDownload(_ sub: subs.OsSubtitle) {
+        if prefs.openSubtitlesToken.isEmpty {
+            osLoginNeeded = true
+            return
+        }
+        if sub.files.isEmpty {
+            return
+        }
+        let f = sub.files[0]
+        let path = if net.isHttp(p.path) { joinPath(dataFolder(), f.fileName) } else { subs.osSavePath(videoPath: p.path, sub, fileName: f.fileName) }
+        osBusy = true
+        osMessage = "Downloading…"
+        subs.opensubtitlesDownload(osClient(), fileId: f.fileId, path: path) { r in
+            osBusy = false
+            match r {
+                .ok(d) -> {
+                    osMessage = if d.remaining >= 0 { "Downloaded; {d.remaining} downloads left today" } else { "Downloaded" }
+                    loadSubFile(path, encoding: prefs.subtitleEncoding, language: sub.language)
+                }
+                .failure(e) -> {
+                    osMessage = ""
+                    osError = e.message
+                    if e.message.contains("401") || e.message.lowercase().contains("log in") {
+                        osLoginNeeded = true
+                    }
+                }
+            }
+        }
+    }
+
+    fn osLogin(_ user: String, _ pass: String) {
+        osLoginError = ""
+        subs.opensubtitlesLogin(osClient(), username: user, password: pass) { r in
+            match r {
+                .ok(c) -> {
+                    prefs.openSubtitlesToken = c.token
+                    prefs.openSubtitlesUser = user
+                    prefsChanged()
+                    osLoginNeeded = false
+                }
+                .failure(e) -> { osLoginError = e.message }
+            }
+        }
+    }
+
+    fn openDiscFolder() {
+        if let f = chooseFolder(title: "Open a DVD or Blu-ray Folder") {
+            openDisc(f)
+        }
+    }
+
+    fn openDisc(_ path: String) {
+        match disc.open(path) {
+            .ok(d) -> {
+                if d.titles.isEmpty {
+                    flash("No titles on this disc")
+                    return
+                }
+                discOpen = [d]
+                showDisc = true
+            }
+            .failure(e) -> flash("Can't open the disc: {e.message}")
+        }
+    }
+
+    fn playDiscTitle(_ index: Int, _ angle: Int) {
+        if discOpen.isEmpty || index < 0 || index >= discOpen[0].titles.count {
+            return
+        }
+        showDisc = false
+        var t = discOpen[0].titles[index]
+        match disc.openDiscFs(discOpen[0].path) {
+            .ok(fs) -> {
+                if angle > 1 {
+                    t = disc.withAngle(fs, t, angle: angle)
+                }
+                t = disc.resolveInterleaved(fs, t)
+            }
+            .failure(_) -> {}
+        }
+        savePosition()
+        stopSounds()
+        p = freshPlayer(p)
+        resetPerFile()
+        stream = []
+        opening = true
+        openSerial += 1
+        let serial = openSerial
+        let volume = if discOpen[0].volumeName.isEmpty { "Disc" } else { discOpen[0].volumeName }
+        let name = "{volume} — Title {t.number}"
+        setWindowTitle(name)
+        redraw += 1
+        let title = t
+        background(work: { openDiscTitleJob(title, name) }) { r in
+            if serial != openSerial {
+                return
+            }
+            opening = false
+            if !r.ok {
+                flash(r.problem)
+                return
+            }
+            p.start(r.source, folder: soundFolder())
+            p.playing = true
+            redraw += 1
+        }
+    }
+
+    // --- Library, home screen, preferences ---
+
+    fn refreshHome() {
+        if let l = lib {
+            home = ui.loadHomeData(l, minSeconds: prefs.resumeMinSeconds)
+            if showLibrary {
+                libModel.reload(l)
+            }
+        }
+    }
+
+    fn openLibrary() {
+        if let l = lib {
+            libModel.reload(l)
+        }
+        showLibrary = true
+    }
+
+    fn openPrefs(_ tab: String) {
+        if let l = lib {
+            prefsStatus.historyCount = l.history(limit: 100000).count
+        }
+        if !thumbs.isEmpty {
+            prefsStatus.thumbnailCacheBytes = thumbs[0].totalBytes()
+        }
+        prefsTab = tab
+        showPrefs = true
+    }
+
+    // Saved half a second after the last change.
+    fn prefsChanged() {
+        prefsSerial += 1
+        let serial = prefsSerial
+        after(seconds: 0.5) {
+            if serial == prefsSerial {
+                savePrefs()
+            }
+        }
+    }
+
+    fn savePrefs() {
+        let data = dataFolder()
+        prefs = library.validated(prefs)
+        if let e = library.savePreferences(prefs, path: library.preferencesPath(data)) {
+            flash("Preferences can't be saved: {e.message}")
+        }
+        writeFile(path: joinPath(data, "preferences-extra.json"), text: toJson(prefsExtra))
+        if let l0 = lib {
+            var l = l0
+            l.finishedMargin = prefs.finishedMarginSeconds
+            l.finishedFraction = prefs.finishedFraction
+            lib = l
+            for f in prefs.libraryFolders {
+                l.addFolder(f)
+            }
+            for f in l.folders() {
+                if !prefs.libraryFolders.contains(f) {
+                    l.removeFolder(f)
+                }
+            }
+        }
+        refreshRecent()
+        if p.loaded && (p.hasSubtitles || p.hasSubtitles2) {
+            restyleSubs()
+        }
+    }
+
+    fn addLibraryFolder() {
+        if let f = chooseFolder(title: "Add to Library") {
+            if !prefs.libraryFolders.contains(f) {
+                prefs.libraryFolders.append(f)
+                prefsChanged()
+                after(seconds: 0.6) {
+                    rescanLibrary()
+                }
+            }
+        }
+    }
+
+    fn rescanLibrary() {
+        if let l = lib {
+            prefsStatus.scanning = true
+            prefsStatus.libraryStatus = "Scanning…"
+            let r = l.scan(readTags: true, maxTagBytes: prefs.scanTagMB * 1000000)
+            prefsStatus.scanning = false
+            prefsStatus.libraryStatus = "{l.count()} files in the library (+{r.added} new, −{r.removed} gone)"
+            refreshHome()
+            libModel.reload(l)
+        }
+    }
+
+    fn clearHistory() {
+        if let l = lib {
+            l.clearHistory()
+        }
+        prefsStatus.historyCount = 0
+        refreshRecent()
+        refreshHome()
+    }
+
+    fn clearThumbnails() {
+        if !thumbs.isEmpty {
+            thumbs[0].clear()
+        }
+        posters = [:]
+        prefsStatus.thumbnailCacheBytes = 0
+    }
+
+    fn checkOpenSubtitles() {
+        prefsStatus.openSubtitlesStatus = if prefs.openSubtitlesApiKey.isEmpty { "Enter an API key first." } else { "The key is saved; it's checked at the first search." }
+    }
+
+    // A thumbnail for the library and the home screen, from the cache.
+    fn needPoster(_ path: String, _ size: Int) {
+        if thumbs.isEmpty {
+            posters[path] = ui.LibThumb()
+            return
+        }
+        posters[path] = ui.libThumbOf(thumbs[0].load(path, size: size))
+    }
+
+    // The picture showing now, as the file's poster (once per file).
+    fn storePoster() {
+        if thumbs.isEmpty || p.path.isEmpty || p.shown.width == 0 || net.isHttp(p.path) {
+            return
+        }
+        let size = p.file.count
+        if thumbs[0].load(p.path, size: size) != nil {
+            return
+        }
+        let w = 320
+        let h = max(1, p.shown.height * w / max(p.shown.width, 1))
+        let px = scaledPixels(p.shown.pixels, p.shown.width, p.shown.height, w, h)
+        thumbs[0].store(p.path, size: size, width: w, height: h, pixels: px)
+        posters[p.path] = ui.LibThumb(width: w, height: h, pixels: px)
+    }
+
+    fn playFromHome(_ e: ui.HomeEntry, _ fromStart: Bool) {
+        resumeOnOpen = if fromStart { 0.0 } else { e.position }
+        addAndPlay(e.path)
+    }
+
+    fn playItems(_ paths: [String]) {
+        if paths.isEmpty {
+            return
+        }
+        playlist = paths
+        playIndex(0)
+    }
+
+    fn playNext(_ paths: [String]) {
+        var at = current + 1
+        for path in paths {
+            playlist.insert(path, at: min(at, playlist.count))
+            at += 1
+        }
+        if current < 0 {
+            playIndex(0)
+        }
+    }
+
+    fn addToPlaylist(_ paths: [String], _ pl: String) {
+        if pl.isEmpty {
+            playlist.appendAll(paths)
+            showPlaylist = true
+            return
+        }
+        match library.readPlaylist(pl) {
+            .ok(old) -> {
+                var all = library.playlistPaths(old)
+                all.appendAll(paths)
+                library.savePlaylist(library.playlistOf(all, title: old.title), path: pl)
+                flash("Added to {pl.fileName}")
+            }
+            .failure(e) -> flash("Can't read {pl.fileName}: {e.message}")
+        }
+    }
+
+    fn openPlaylistFile(_ path: String) {
+        match library.readPlaylist(path) {
+            .ok(pl) -> {
+                let paths = library.playlistPaths(pl)
+                if !savedPlaylists.contains(path) {
+                    savedPlaylists.insert(path, at: 0)
+                }
+                playItems(paths)
+                showPlaylist = true
+            }
+            .failure(e) -> flash("Can't open {path.fileName}: {e.message}")
+        }
+    }
+
+    fn savePlaylistFile() {
+        if playlist.isEmpty {
+            return
+        }
+        if let path = saveFile(name: "Playlist.m3u8", types: ["m3u8", "m3u", "pls", "xspf"]) {
+            if let e = library.savePlaylist(library.playlistOf(playlist), path: path) {
+                flash("Can't save: {e.message}")
+            } else {
+                if !savedPlaylists.contains(path) {
+                    savedPlaylists.insert(path, at: 0)
+                }
+                flash("Saved {path.fileName}")
+            }
+        }
+    }
+
+    fn revealInFinder(_ path: String) {
+        let _opened = openURL(net.asUrl(path.folder))
+    }
+
+    // --- Network streams ---
+
+    // Opens an http(s) URL: an HLS (.m3u8) or DASH (.mpd) presentation or a
+    // plain file. Playback starts when the first segments are in.
+    async fn openStreamURL(_ url: String) {
+        savePosition()
+        resumeAt = -1.0
+        stopSounds()
+        p = freshPlayer(p)
+        resetPerFile()
+        stream = []
+        streamLoading = false
+        refreshHome()
+        opening = true
+        openSerial += 1
+        let serial = openSerial
+        cover = []
+        coverW = 0
+        status = ""
+        redraw += 1
+        setWindowTitle(net.urlFileName(url))
+        match await net.openSession(url) {
+            .ok(s) -> {
+                if serial != openSerial {
+                    return
+                }
+                if traceOn {
+                    traceLine("stream: opened {s.presentation.kind}, {s.presentation.variants.count} variants, duration {s.presentation.duration}")
+                }
+                stream = [s]
+                streamOpening = true
+            }
+            .failure(e) -> {
+                if serial != openSerial {
+                    return
+                }
+                opening = false
+                p.error = e.message
+                flash("Can't open {url}: {e.message}")
+            }
+        }
+    }
+
+    // One download of the stream (called from the timer when none is going).
+    // One download of the stream; streamLoading is set by the caller and
+    // cleared here.
+    async fn streamFetch() {
+        if stream.isEmpty {
+            streamLoading = false
+            return
+        }
+        stream[0].position = p.clock
+        if let f = stream[0].nextFetch(now: now()) {
+            if traceOn {
+                traceLine("stream: fetching {f.kind} {f.url.fileName}")
+            }
+            let serial = openSerial
+            let r = await net.fetch(f)
+            if serial != openSerial || stream.isEmpty {
+                streamLoading = false
+                return
+            }
+            if let e = stream[0].deliver(f, r, now: now()) {
+                p.warnings.append(e.message)
+                if traceOn {
+                    traceLine("stream: {e.message}")
+                }
+            }
+            if traceOn {
+                traceLine("stream: fetched {f.url.fileName}, {stream[0].buffer.media.packets.count} packets, {stream[0].buffer.media.tracks.count} tracks, buffered {stream[0].buffered} s")
+            }
+            streamArrived()
+        }
+        streamLoading = false
+    }
+
+    // New bytes in the stream's buffer: start playing once there's enough,
+    // else hand the grown buffer to the player.
+    fn streamArrived() {
+        let s = stream[0]
+        var media = s.buffer.media
+        media.duration = s.presentation.duration
+        if streamOpening {
+            if media.tracks.isEmpty || (s.buffered < 2.0 && !s.buffer.ended) {
+                return
+            }
+            streamOpening = false
+            opening = false
+            var src = play.Source(path: s.presentation.url, file: s.buffer.file, media: media)
+            src.video = play.pickTrack(media, .video, playable: { c in play.canDecodeVideo(c) })
+            src.audio = play.pickTrack(media, .audio, playable: { c in play.canDecodeAudio(c) })
+            src.subtitle = play.pickSubtitle(media)
+            p.start(src, folder: soundFolder())
+            // Quality stays where it started (a switch would change the
+            // tracks under the decoders); the Quality menu changes it.
+            stream[0].abr.fixed = stream[0].variant
+            remember(s.presentation.url)
+            p.playing = true
+            redraw += 1
+            return
+        }
+        if p.loaded {
+            p.file = s.buffer.file
+            p.media = media
+        }
+        // Old segments go, now and then, when no job holds packet indexes.
+        if p.clock - streamTrimAt > 30.0 && !p.videoBusy && !p.audioBusy && !p.stagesBusy() && !p.convertBusy {
+            streamTrimAt = p.clock
+            let gone = stream[0].trimBehind()
+            if gone > 0 {
+                let b = stream[0].buffer
+                if !p.sparser.isEmpty {
+                    p.sparser[0].next = b.rebase(p.sparser[0].next)
+                }
+                if !p.vpump.isEmpty {
+                    p.vpump[0].next = b.rebase(p.vpump[0].next)
+                }
+                if !p.apump.isEmpty {
+                    p.apump[0].next = b.rebase(p.apump[0].next)
+                }
+                var m2 = b.media
+                m2.duration = stream[0].presentation.duration
+                p.file = b.file
+                p.media = m2
+            }
+        }
+    }
+
+    fn openURLWindow() {
+        let clip = clipboardText() ?? ""
+        if urlText.isEmpty && net.isHttp(clip.trim()) {
+            urlText = clip.trim()
+        }
+        showOpenURL = true
+    }
+
+    fn openTypedURL() {
+        let u = urlText.trim()
+        if !net.isHttp(u) {
+            return
+        }
+        showOpenURL = false
+        addAndPlay(u)
+    }
+
+    fn qualityLabel(_ v: net.Rendition) -> String {
+        var parts: [String] = []
+        if v.height > 0 {
+            parts.append("{v.height}p")
+        }
+        if v.bandwidth > 0 {
+            parts.append("{v.bandwidth / 1000} kb/s")
+        }
+        if parts.isEmpty { v.name } else { parts.joined(separator: " · ") }
+    }
+
+    // --- Effects and filters ---
+
+    fn openEffects(_ tab: String) {
+        syncUi.audioDelayMs = Int(round(p.audioDelay * 1000.0))
+        syncUi.subtitleDelayMs = Int(round(p.subDelay * 1000.0))
+        syncUi.speed = p.speed
+        fxTab = tab
+        showEffects = true
+    }
+
+    // The window changed something: picture and filters show from the next
+    // converted frames, sound from the next decoded sound (about 2 s);
+    // delays and speed at once. Saved per file after a short pause.
+    fn effectsChanged() {
+        p.subDelay = Float(syncUi.subtitleDelayMs) / 1000.0
+        p.audioDelay = Float(syncUi.audioDelayMs) / 1000.0
+        if abs(syncUi.speed - p.speed) > 0.001 {
+            setSpeed(syncUi.speed)
+        }
+        redraw += 1
+        effectsSerial += 1
+        let serial = effectsSerial
+        after(seconds: 0.5) {
+            if serial == effectsSerial {
+                saveLook()
+            }
+        }
+    }
+
+    // The picture, filter, equalizer and delay settings of this file, for
+    // next time.
+    fn saveLook() {
+        let look = p.look
+        let filt = p.vfxSettings
+        let eq = p.fxSettings
+        let ad = p.audioDelay
+        let sd = p.subDelay
+        rememberChange({ s in
+            var n = s
+            n.brightness = look.brightness
+            n.contrast = look.contrast
+            n.saturation = look.saturation
+            n.gamma = look.gamma
+            n.hue = look.hue
+            n.crop = if look.cropLeft == 0 && look.cropTop == 0 && look.cropRight == 0 && look.cropBottom == 0 { "" } else { "{look.cropLeft},{look.cropTop},{look.cropRight},{look.cropBottom}" }
+            n.aspect = if look.aspect > 0.0 { "{look.aspect}" } else { "" }
+            n.zoom = look.zoom
+            n.panX = look.panX
+            n.panY = look.panY
+            n.rotation = look.rotation
+            n.flipH = look.flipH
+            n.flipV = look.flipV
+            n.deinterlace = filt.deinterlace
+            n.equalizer = if eq.eqOn { eq.eqPreset } else { "" }
+            n.audioDelay = ad
+            n.subtitleDelay = sd
+            n
+        })
+    }
+
+    // The remembered picture settings of the open file back into effect.
+    fn applyLook(_ fs: library.FileSettings) {
+        var look = render.View()
+        look.brightness = fs.brightness
+        look.contrast = fs.contrast
+        look.saturation = fs.saturation
+        look.gamma = fs.gamma
+        look.hue = fs.hue
+        let crop = fs.crop.split(",")
+        if crop.count == 4 {
+            look.cropLeft = Int(crop[0]) ?? 0
+            look.cropTop = Int(crop[1]) ?? 0
+            look.cropRight = Int(crop[2]) ?? 0
+            look.cropBottom = Int(crop[3]) ?? 0
+        }
+        look.aspect = render.parseAspect(fs.aspect)
+        look.zoom = if fs.zoom > 0.0 { fs.zoom } else { 1.0 }
+        look.panX = fs.panX
+        look.panY = fs.panY
+        look.rotation = fs.rotation
+        look.flipH = fs.flipH
+        look.flipV = fs.flipV
+        p.look = look
+        if !fs.deinterlace.isEmpty {
+            p.vfxSettings.deinterlace = fs.deinterlace
+        }
+        if !fs.equalizer.isEmpty {
+            p.fxSettings = fx.withPreset(p.fxSettings, fs.equalizer)
+            p.fxSettings.eqOn = true
+        }
+    }
+
+    // A quality of the stream (index into its variants), from here on.
+    fn chooseQuality(_ i: Int) {
+        if stream.isEmpty {
+            return
+        }
+        stream[0].abr.fixed = i
+        stream[0].variant = i
+        seekTo(p.clock)
+    }
+
+    fn openPath(_ path: String) {
+        if net.isHttp(path) {
+            after(seconds: 0.0) {
+                await openStreamURL(path)
+            }
+            return
+        }
+        stream = []
+        streamOpening = false
+        savePosition()
+        resumeAt = -1.0
+        stopSounds()
+        p = freshPlayer(p)
+        resetPerFile()
+        opening = true
+        openSerial += 1
+        let serial = openSerial
+        cover = []
+        coverW = 0
+        status = ""
+        redraw += 1
+        setWindowTitle(path.fileName)
+        background(work: { openInBackground(path) }) { result in
+            if serial != openSerial {
+                return
+            }
+            opening = false
+            match result {
+                .ok(src) -> {
+                    p.start(src, folder: soundFolder())
+                    loadCover()
+                    findSubtitlesBeside(path)
+                    remember(path)
+                    p.playing = true
+                    if resumeOnOpen >= 0.0 {
+                        if resumeOnOpen > 1.0 {
+                            seekTo(resumeOnOpen)
+                        }
+                        resumeOnOpen = -1.0
+                    } else {
+                        offerResume(path)
+                    }
+                    if !p.error.isEmpty && !p.hasVideo && !p.hasAudio {
+                        flash(p.error)
+                    }
+                }
+                .failure(e) -> {
+                    p.error = e.message
+                    flash("Can't play {path.fileName}: {e.message}")
+                }
+            }
+            redraw += 1
+        }
+    }
+
+    fn soundFolder() -> String {
+        let f = joinPath(dataFolder(), "sound")
+        createFolder(f)
+        f
+    }
+
+    // Sound chunks left from an earlier run.
+    fn clearSoundFolder() {
+        let f = soundFolder()
+        for name in listFolder(f) ?? [] {
+            if name.hasSuffix(".wav") {
+                deleteFile(path: joinPath(f, name))
+            }
+        }
+    }
+
+    fn loadCover() {
+        if p.media.cover.isEmpty {
+            return
+        }
+        let f = joinPath(dataFolder(), "cover")
+        if writeData(path: f, data: p.media.cover) {
+            if let (w, h, px) = readImage(f) {
+                cover = px
+                coverW = w
+                coverH = h
+            }
+        }
+    }
+
+    // movie.mkv → movie.srt, movie.en.srt …
+    // Subtitle files beside the video (name variants, language codes,
+    // Subs/ folders): the best one loads unless the file has its own;
+    // all of them are listed in the Subtitle menu.
+    fn findSubtitlesBeside(_ path: String) {
+        siblingSubs = []
+        if net.isHttp(path) {
+            return
+        }
+        let folder = path.folder
+        var listing = listFolder(folder) ?? []
+        for sub in subs.subtitleFolders(listing) {
+            for name in listFolder(joinPath(folder, sub)) ?? [] {
+                let rel = "{sub}/{name}"
+                listing.append(rel)
+                if isFolder(joinPath(folder, rel)) {
+                    for inner in listFolder(joinPath(folder, rel)) ?? [] {
+                        listing.append("{rel}/{inner}")
+                    }
+                }
+            }
+        }
+        siblingSubs = subs.siblingFiles(path, listing, languages: prefs.subtitleLanguages)
+        if p.hasSubtitles || siblingSubs.isEmpty || prefs.subtitleMode == "never" {
+            return
+        }
+        loadSubFile(siblingSubs[0].path, encoding: prefs.subtitleEncoding, language: siblingSubs[0].language)
+    }
+
+    fn siblingLabel(_ f: subs.SiblingFile) -> String {
+        var label = f.name
+        if !f.languageName.isEmpty {
+            label += " — {f.languageName}"
+        }
+        if f.forced {
+            label += " (forced)"
+        }
+        if f.hearingImpaired {
+            label += " (SDH)"
+        }
+        label
+    }
+
+    fn reloadWithEncoding(_ name: String) {
+        if !p.subFilePath.isEmpty {
+            loadSubFile(p.subFilePath, encoding: name)
+            subEncoding = name
+        }
+    }
+
+    // Loads a subtitle file with an encoding ("auto" detects) and styles it.
+    fn loadSubFile(_ path: String, encoding: String = "auto", language: String = "") {
+        match subs.loadFile(path, encoding: if encoding.isEmpty { "auto" } else { encoding }, language: language) {
+            .ok(track) -> {
+                p.subtitles = subs.styleTrack(track, primaryStyle())
+                p.hasSubtitles = true
+                p.subtitle = -2
+                p.subFilePath = path
+                subEncoding = track.encoding
+                if track.encodingConfidence > 0.0 && track.encodingConfidence < 0.6 {
+                    flash("Read as {subs.encodingTitle(track.encoding)}: change in Subtitle ▸ Text Encoding")
+                }
+                dialogueFor = ""
+                redraw += 1
+            }
+            .failure(e) -> flash("Can't load {path.fileName}: {e.message}")
+        }
+    }
+
+    fn refreshRecent() {
+        if let l = lib {
+            recent = l.recentPaths(limit: prefs.recentCount)
+        }
+    }
+
+    // A file has opened: the library records it, and what was remembered
+    // for it (tracks, volume, speed, delays, picture) comes back.
+    fn remember(_ path: String) {
+        let size = p.file.count
+        if let l = lib {
+            l.startedPlaying(path, size: size, duration: p.duration)
+            l.reportPlayed(path, size: size, media: p.media)
+            fileSettings = if prefs.rememberPerFile { l.fileSettings(path, size: size) } else { library.FileSettings() }
+        }
+        refreshRecent()
+        applyFileSettings()
+    }
+
+    // Puts the remembered settings of the open file into effect.
+    fn applyFileSettings() {
+        let fs = fileSettings
+        // Audio and subtitle tracks: the remembered choice (by language and
+        // codec), else the preferred languages.
+        let a = library.chooseTrack(fs.audio, p.media, kind: .audio) ?? library.preferredTrack(p.media, kind: .audio, languages: prefs.audioLanguages, canUse: { t in play.canDecodeAudio(t.codec) })
+        if a >= 0 && a != p.audio && play.canDecodeAudio(p.media.tracks[a].codec) {
+            chooseAudio(a)
+        }
+        let s = library.chooseTrack(fs.subtitle, p.media, kind: .subtitle) ?? library.preferredSubtitle(p.media, audioIndex: p.audio, mode: prefs.subtitleMode, languages: prefs.subtitleLanguages)
+        if s != p.subtitle && (s >= 0 || p.hasSubtitles) {
+            chooseSubtitle(s)
+        }
+        if fs.volume >= 0.0 {
+            p.volume = fs.volume
+            sound?.setVolume(if p.muted { 0.0 } else { p.volume })
+        }
+        if fs.speed > 0.0 && fs.speed != p.speed {
+            setSpeed(fs.speed)
+        }
+        p.subDelay = fs.subtitleDelay
+        p.audioDelay = fs.audioDelay
+        applyLook(fs)
+    }
+
+    // Saves a change to what's remembered for the open file.
+    fn rememberChange(_ change: fn(library.FileSettings) -> library.FileSettings) {
+        fileSettings = change(fileSettings)
+        if !prefs.rememberPerFile || !p.loaded || p.path.isEmpty {
+            return
+        }
+        if let l = lib {
+            l.saveFileSettings(p.path, size: p.file.count, fileSettings)
+        }
+    }
+
+    // Remembers where the open file is (the library decides when it counts
+    // as finished, and ignores the first seconds).
+    fn savePosition() {
+        if !p.loaded || p.path.isEmpty {
+            return
+        }
+        savedAt = p.clock
+        if let l = lib {
+            l.savePosition(p.path, size: p.file.count, position: p.clock, duration: p.duration)
+        }
+    }
+
+    // After opening: what prefs.resume says — offer to continue for 8
+    // seconds ("ask"), continue at once ("always") or not ("never").
+    fn offerResume(_ path: String) {
+        var t = -1.0
+        if let l = lib {
+            t = l.resumePosition(path, size: p.file.count, minSeconds: prefs.resumeMinSeconds)
+        }
+        if t < prefs.resumeMinSeconds || prefs.resume == "never" {
+            return
+        }
+        if prefs.resume == "always" {
+            seekTo(t)
+            flash("Continuing from {timeText(t)}")
+            return
+        }
+        resumeAt = t
+        resumeSerial += 1
+        let serial = resumeSerial
+        after(seconds: 8.0) {
+            if resumeSerial == serial {
+                resumeAt = -1.0
+            }
+        }
+    }
+
+    fn continueFromSaved() {
+        let t = resumeAt
+        resumeAt = -1.0
+        if t >= 0.0 {
+            seekTo(t)
+            flash("Continuing from {timeText(t)}")
+        }
+    }
+
+    // The "Continue from …" button over the picture.
+    fn resumeOffer() -> View {
+        HStack(spacing: 4) {
+            HStack(spacing: 8) {
+                Svg(ui.svgPlay()).color(ui.iconOnColor).frame(width: 12, height: 12)
+                Text("Continue from {timeText(resumeAt)}").font(size: 13, weight: .bold).color(.white)
+            }
+            .padding(horizontal: 10, vertical: 7)
+            .hoverBackground(ui.iconHover, radius: 6)
+            .onTap { continueFromSaved() }
+            .tooltip("Jump to where you stopped last time")
+            ui.IconButton(icon: .close, tip: "Keep playing from the start", size: 14) { resumeAt = -1.0 }
+        }
+        .padding(4)
+        .background(.rgba(24, 24, 24, 0.9), radius: 8)
+        .padding(16)
+    }
+
+    fn closeMedia() {
+        savePosition()
+        stream = []
+        streamOpening = false
+        resumeAt = -1.0
+        stopSounds()
+        p = freshPlayer(p)
+        resetPerFile()
+        openSerial += 1
+        setWindowTitle("Reel")
+        refreshHome()
+        redraw += 1
+    }
+
+    // --- The timer ---
+
+    fn tick() {
+        let t0 = now()
+        tickBody()
+        if traceOn {
+            traceTick(t0, now())
+        }
+    }
+
+    // Every 200 ticks: the mean and longest time from one tick to the
+    // next (the tick, rebuilding the view, drawing, job callbacks) and the
+    // mean time in the tick itself.
+    fn traceTick(_ start: Float, _ end: Float) {
+        if traceLast > 0.0 {
+            let gap = (start - traceLast) * 1000.0
+            traceGap += gap
+            traceGapMax = max(traceGapMax, gap)
+        }
+        traceLast = start
+        traceWork += (end - start) * 1000.0
+        traceN += 1
+        if traceN == 200 {
+            traceLine("trace: tick gap mean {Float(Int(traceGap / 2.0)) / 100.0} ms, max {Float(Int(traceGapMax * 100.0)) / 100.0} ms; tick work mean {Float(Int(traceWork / 2.0)) / 100.0} ms; clock {Int(p.clock * 100.0)} cs, shown {p.shownCount}, dropped {p.dropped}, playing {p.playing}, audio {p.hasAudio}, ended {p.ended}, frames {p.frames.count}, raws {p.raws.count}")
+            traceN = 0
+            traceGap = 0.0
+            traceGapMax = 0.0
+            traceWork = 0.0
+        }
+    }
+
+    fn tickBody() {
+        tickControls()
+        if !p.loaded {
+            return
+        }
+        let t = now()
+        var dt = t - p.lastTick
+        if dt <= 0.0 || dt > 0.5 {
+            dt = tickSeconds
+        }
+        p.lastTick = t
+        if p.playing && !p.ended {
+            if p.hasAudio {
+                tickSound(dt)
+            } else {
+                p.advanceByTime(dt)
+            }
+        }
+        tickTools(dt)
+        var changed = p.pickFrame()
+        if changed && p.shownCount == 12 {
+            storePoster()
+        }
+        let key = cueSignature()
+        if key != cueKey {
+            cueKey = key
+            changed = true
+        }
+        // The picture redraws when it changes; the music view (spectrum)
+        // and the statistics all the time.
+        if changed || dragging || (p.playing && (!p.hasVideo || showStats)) {
+            redraw += 1
+        }
+        let tenths = Int(p.clock * 10.0)
+        if tenths != barTick {
+            barTick = tenths
+        }
+        feed()
+        if p.playing && abs(p.clock - savedAt) >= 5.0 {
+            savePosition()
+        }
+        if p.playing && p.checkEnded() {
+            finished()
+        }
+    }
+
+    fn tickSound(_ dt: Float) {
+        if p.chunkPlaying {
+            if let s = sound {
+                let pos = s.position()
+                let heard = p.chunk.start + pos * p.chunk.speed
+                if !soundStarted {
+                    // Starting: picture and sound start together.
+                    p.clock = heard
+                    if pos > 0.0 {
+                        soundStarted = true
+                    }
+                } else {
+                    p.clock += dt * p.speed
+                    if pos > 0.0 {
+                        let off = heard - p.clock
+                        if abs(off) > 0.3 {
+                            p.clock = heard
+                        } else {
+                            p.clock += off * 0.1
+                        }
+                    }
+                }
+                if pos >= p.chunk.length - 0.004 || (!s.isPlaying() && s.duration() > 0.0) {
+                    nextChunk()
+                }
+            }
+            prepareNextChunk()
+        } else if !p.chunks.isEmpty {
+            nextChunk()
+        } else if p.audioDone {
+            // The sound has ended; let the video run out by the clock.
+            p.advanceByTime(dt)
+        }
+    }
+
+    fn nextChunk() {
+        if p.chunks.isEmpty {
+            if p.audioDone {
+                p.chunkPlaying = false
+            }
+            return
+        }
+        let c = p.chunks.removeFirst()
+        fading?.stop()
+        forgetChunkFile(fadingPath)
+        fading = sound
+        fadingPath = if p.chunkPlaying { p.chunk.path } else { "" }
+        let volume = if p.muted { 0.0 } else { p.volume }
+        var started = false
+        if upcomingPath == c.path {
+            if let u = upcoming {
+                u.setVolume(volume)
+                u.resume()
+                sound = u
+                started = true
+            }
+        }
+        if !started {
+            upcoming?.stop()
+            forgetChunkFile(upcomingPath)
+            sound = playSound(c.path, volume: volume)
+        }
+        upcoming = nil
+        upcomingPath = ""
+        p.chunk = c
+        p.chunkPlaying = true
+        if !soundStarted {
+            p.clock = c.start
+        }
+    }
+
+    // Loads the next chunk's sound ahead, muted and paused.
+    fn prepareNextChunk() {
+        if p.chunks.isEmpty || !upcomingPath.isEmpty {
+            return
+        }
+        let path = p.chunks[0].path
+        let u = playSound(path, volume: 0.0)
+        u.pause()
+        upcoming = u
+        upcomingPath = path
+    }
+
+    // A chunk's WAV file, once its sound is done with.
+    fn forgetChunkFile(_ path: String) {
+        if !path.isEmpty {
+            deleteFile(path: path)
+        }
+    }
+
+    // Sends pumps back to work when what's decoded ahead runs low.
+    // The open stream still has segments to come.
+    fn streamGrowing() -> Bool {
+        !stream.isEmpty && !stream[0].buffer.ended
+    }
+
+    fn feed() {
+        if p.wantVideo() {
+            var pump = p.vpump[0]
+            pump.growing = streamGrowing()
+            pump.dec.setSkipNonReference(p.videoBehind())
+            p.vpump = []
+            p.videoBusy = true
+            let file = p.file
+            let media = p.media
+            let gen = p.gen
+            let serial = openSerial
+            background(work: { decodeVideoBatch(pump, file, media, count: 4) }) { b in
+                if serial != openSerial {
+                    return
+                }
+                p.videoBusy = false
+                p.vpump = [b.pump]
+                if gen == p.gen {
+                    p.raws.appendAll(b.raws)
+                    p.videoDone = b.pump.done
+                }
+                p.settle()
+                feed()
+            }
+        }
+        if p.wantParse() {
+            var sp = p.sparser[0]
+            sp.growing = streamGrowing()
+            sp.setSkipNonReference(p.videoBehind())
+            p.sparser = []
+            p.parseBusy = true
+            let file = p.file
+            let media = p.media
+            let gen = p.gen
+            let serial = openSerial
+            background(work: { play.parseStage(sp, file, media, count: 3) }) { r in
+                if serial != openSerial {
+                    return
+                }
+                p.parseBusy = false
+                p.sparser = [r.parser]
+                if gen == p.gen {
+                    p.parsedQ.append(r.batch)
+                    p.parseDone = r.parser.done
+                }
+                p.settle()
+                feed()
+            }
+        }
+        if p.wantReconstruct() {
+            let batch = p.parsedQ.removeFirst()
+            let split = p.split
+            let lr = p.recLuma[0]
+            let cr = if split { p.recChroma[0] } else { p.recLuma[0] }
+            p.recLuma = []
+            if split {
+                p.recChroma = []
+                p.chromaBusy = true
+            } else {
+                p.chromaDone = true
+            }
+            p.lumaBusy = true
+            let gen = p.gen
+            let serial = openSerial
+            background(work: { play.reconstructStage(lr, batch) }) { r in
+                if serial != openSerial {
+                    return
+                }
+                p.lumaBusy = false
+                p.recLuma = [r.rec]
+                if gen == p.gen {
+                    p.lumaOut = r.pictures
+                    p.lumaGrains = r.grains
+                    p.lumaDone = true
+                    p.joinHalves()
+                }
+                p.settle()
+                feed()
+            }
+            if split {
+            background(work: { play.reconstructStage(cr, batch) }) { r in
+                if serial != openSerial {
+                    return
+                }
+                p.chromaBusy = false
+                p.recChroma = [r.rec]
+                if gen == p.gen {
+                    p.chromaOut = r.pictures
+                    p.chromaDone = true
+                    p.joinHalves()
+                }
+                p.settle()
+                feed()
+            }
+            }
+        }
+        if p.wantConvert() {
+            var conv = p.conv[0]
+            conv.look = p.look
+            if !conv.filters.isEmpty {
+                conv.filters[0].configure(p.vfxSettings)
+            }
+            conv.boxW = p.boxW * p.pixelScale
+            conv.boxH = p.boxH * p.pixelScale
+            let raws = p.raws
+            p.raws = []
+            p.conv = []
+            p.convertBusy = true
+            let gen = p.gen
+            let serial = openSerial
+            let last = p.videoDone
+            background(work: { convertBatch(conv, raws, gen: gen, last: last) }) { b in
+                if serial != openSerial {
+                    return
+                }
+                p.convertBusy = false
+                p.conv = [b.conv]
+                if gen == p.gen {
+                    p.frames.appendAll(b.frames)
+                }
+                feed()
+            }
+        }
+        if p.wantAudio() {
+            var pump = p.apump[0]
+            pump.growing = streamGrowing()
+            pump.setEffects(p.fxSettings)
+            p.apump = []
+            p.audioBusy = true
+            let file = p.file
+            let media = p.media
+            let gen = p.gen
+            let serial = openSerial
+            background(work: { decodeAudioBatch(pump, file, media) }) { b in
+                if serial != openSerial {
+                    if b.has {
+                        forgetChunkFile(b.chunk.path)
+                    }
+                    return
+                }
+                p.audioBusy = false
+                p.apump = [b.pump]
+                if gen != p.gen && b.has {
+                    // From before a seek.
+                    forgetChunkFile(b.chunk.path)
+                }
+                if gen == p.gen {
+                    if b.has {
+                        p.chunks.append(b.chunk)
+                    }
+                    if (!b.has && !b.pump.starved) || (b.has && b.chunk.last) {
+                        p.audioDone = true
+                    }
+                }
+                p.settle()
+                feed()
+            }
+        }
+    }
+
+    fn finished() {
+        // Watched to the end: next time it starts from the beginning.
+        if !p.path.isEmpty {
+            if let l = lib {
+                l.savePosition(p.path, size: p.file.count, position: p.duration, duration: p.duration)
+            }
+        }
+        resumeAt = -1.0
+        stopSounds()
+        p.playing = false
+        if sleepMode == 2 {
+            sleepMode = 0
+            flash("Sleep timer: stopped at the end")
+            return
+        }
+        if loopMode == 2 {
+            seekTo(0.0)
+            p.playing = true
+            return
+        }
+        if current + 1 < playlist.count {
+            if shuffle {
+                playIndex(Int(randomFloat() * Float(playlist.count)) % playlist.count)
+            } else {
+                playIndex(current + 1)
+            }
+        } else if loopMode == 1 && !playlist.isEmpty {
+            playIndex(0)
+        } else if prefs.autoNextEpisode {
+            // The end of an episode: the next one, if there is one.
+            var nextPath = ""
+            if let l = lib {
+                nextPath = l.nextEpisodeOf(p.path)
+            }
+            if !nextPath.isEmpty {
+                flash("Next episode: {nextPath.fileName}")
+                addAndPlay(nextPath)
+            }
+        }
+    }
+
+    // --- Controls ---
+
+    fn togglePlay() {
+        if !p.loaded {
+            if playlist.isEmpty {
+                chooseFiles()
+            } else {
+                playIndex(max(current, 0))
+            }
+            return
+        }
+        if p.ended {
+            seekTo(0.0)
+            p.playing = true
+            return
+        }
+        p.playing = !p.playing
+        // (After a pause the clock waits for the sound again.)
+        soundStarted = false
+        if p.playing {
+            sound?.resume()
+            fading?.stop()
+        } else {
+            sound?.pause()
+            fading?.stop()
+        }
+        redraw += 1
+    }
+
+    fn stop() {
+        if !p.loaded {
+            return
+        }
+        stopSounds()
+        p.playing = false
+        p.seek(0.0)
+        redraw += 1
+    }
+
+    fn previous() {
+        if p.clock > 3.0 || current <= 0 {
+            seekTo(0.0)
+        } else {
+            playIndex(current - 1)
+        }
+    }
+
+    fn next() {
+        if current + 1 < playlist.count {
+            playIndex(current + 1)
+        }
+    }
+
+    fn seekTo(_ t: Float) {
+        if !p.loaded {
+            return
+        }
+        stopSounds()
+        if !stream.isEmpty {
+            // The stream loads again from there (its buffer starts over).
+            stream[0].seek(t)
+            var m = stream[0].buffer.media
+            m.duration = stream[0].presentation.duration
+            p.file = stream[0].buffer.file
+            p.media = m
+        }
+        p.seek(t)
+        redraw += 1
+    }
+
+    fn jump(_ by: Float) {
+        seekTo(p.clock + by)
+        flash("{timeText(p.clock)}")
+    }
+
+    fn frameStep() {
+        if !p.loaded || !p.hasVideo {
+            return
+        }
+        if p.playing {
+            togglePlay()
+        }
+        if !p.frames.isEmpty {
+            p.shown = p.frames.removeFirst()
+            p.clock = p.shown.time
+            p.shownSerial += 1
+            redraw += 1
+        }
+    }
+
+    fn setSpeed(_ s: Float) {
+        p.speed = s
+        if !p.apump.isEmpty {
+            p.apump[0].setSpeed(s)
+        }
+        if p.loaded {
+            seekTo(p.clock)
+        }
+        flash("Speed {s}×")
+        rememberChange({ f in
+            var n = f
+            n.speed = s
+            n
+        })
+    }
+
+    fn setVolume(_ v: Float) {
+        p.volume = max(0.0, min(v, 1.0))
+        p.muted = false
+        sound?.setVolume(p.volume)
+        flash("Volume {Int(p.volume * 100.0)} %")
+        let v = p.volume
+        rememberChange({ f in
+            var n = f
+            n.volume = v
+            n
+        })
+    }
+
+    fn toggleMute() {
+        p.muted = !p.muted
+        sound?.setVolume(if p.muted { 0.0 } else { p.volume })
+        flash(if p.muted { "Muted" } else { "Volume {Int(p.volume * 100.0)} %" })
+    }
+
+    fn toggleFullScreen() {
+        fullScreen = !fullScreen
+        setFullScreen(fullScreen)
+        overControls = false
+        wakeControls()
+    }
+
+    // The mouse moved: show the controls again.
+    fn wakeControls() {
+        controlsIdle = 0.0
+        if !controlsShown {
+            controlsShown = true
+        }
+    }
+
+    // Counts the time since the mouse last moved and hides the floating
+    // controls in full screen once it's long enough.
+    fn tickControls() {
+        if !fullScreen {
+            return
+        }
+        // Left full screen another way (the window's green button, a
+        // swipe): go back to the normal layout.
+        if !isFullScreen() {
+            fullScreen = false
+            overControls = false
+            controlsShown = true
+            return
+        }
+        controlsIdle += tickSeconds
+        let show = controlsIdle < controlsHideAfter || !p.playing || overControls
+        if show != controlsShown {
+            controlsShown = show
+        }
+    }
+
+    fn chooseAudio(_ t: Int) {
+        p.audio = t
+        restartPumps()
+        let media = p.media
+        rememberChange({ s in
+            var n = s
+            n.audio = library.rememberTrack(media, index: t, kind: .audio)
+            n
+        })
+    }
+
+    fn chooseVideo(_ t: Int) {
+        p.video = t
+        restartPumps()
+    }
+
+    fn restartPumps() {
+        let at = p.clock
+        stopSounds()
+        openSerial += 1
+        p.videoBusy = false
+        p.convertBusy = false
+        p.parseBusy = false
+        p.lumaBusy = false
+        p.chromaBusy = false
+        p.audioBusy = false
+        p.resetQueues()
+        p.makePumps(folder: soundFolder())
+        p.applySeek(at)
+        p.clock = at
+        redraw += 1
+    }
+
+    fn chooseSubtitle(_ t: Int) {
+        p.chooseSubtitle(t)
+        if t < 0 {
+            p.hasSubtitles = false
+        } else if p.hasSubtitles {
+            p.subtitles = subs.styleTrack(p.subtitles, primaryStyle())
+        }
+        redraw += 1
+        let media = p.media
+        rememberChange({ s in
+            var n = s
+            n.subtitle = library.rememberTrack(media, index: t, kind: .subtitle)
+            n
+        })
+    }
+
+    fn addSubtitleFile() {
+        if let path = openFile(types: ["srt", "ass", "ssa", "vtt", "sup", "idx", "sub", "txt"]) {
+            loadSubFile(path, encoding: prefs.subtitleEncoding)
+            if p.hasSubtitles && p.subFilePath == path {
+                flash("Subtitles: {path.fileName}")
+            }
+        }
+    }
+
+    fn shiftSubs(_ by: Float) {
+        p.subDelay += by
+        let d = p.subDelay
+        rememberChange({ s in
+            var n = s
+            n.subtitleDelay = d
+            n
+        })
+        flash("Subtitle delay {Int(round(p.subDelay * 1000.0))} ms")
+    }
+
+    fn snapshot() {
+        if p.shown.width == 0 {
+            return
+        }
+        if let path = saveFile(name: "Snapshot {timeText(p.clock).replace(":", with: ".")}.png", types: ["png"]) {
+            writeImage(path: path, width: p.shown.width, height: p.shown.height, pixels: p.shown.pixels)
+            flash("Saved {path.fileName}")
+        }
+    }
+
+    fn stopSounds() {
+        sound?.stop()
+        fading?.stop()
+        upcoming?.stop()
+        if p.chunkPlaying {
+            forgetChunkFile(p.chunk.path)
+        }
+        forgetChunkFile(fadingPath)
+        if upcomingPath.isEmpty || p.chunks.isEmpty || p.chunks[0].path != upcomingPath {
+            forgetChunkFile(upcomingPath)
+        }
+        // (Every caller empties the queue next.)
+        for c in p.chunks {
+            forgetChunkFile(c.path)
+        }
+        sound = nil
+        fading = nil
+        upcoming = nil
+        fadingPath = ""
+        upcomingPath = ""
+        soundStarted = false
+        p.chunkPlaying = false
+    }
+
+    fn resized(_ w: Float, _ h: Float) {
+        p.boxW = max(Int(w), 16)
+        p.boxH = max(Int(h), 16)
+    }
+
+    fn flash(_ text: String) {
+        status = text
+        let shown = text
+        after(seconds: 1.5) {
+            if status == shown {
+                status = ""
+                redraw += 1
+            }
+        }
+        redraw += 1
+    }
+
+    fn cueSignature() -> String {
+        if !p.hasSubtitles && !p.hasSubtitles2 {
+            return ""
+        }
+        var s = ""
+        for c in p.cuesNow() {
+            s += "{c.start}/"
+        }
+        s += "|"
+        for c in p.cuesNow2() {
+            s += "{c.start}/"
+        }
+        s
+    }
+
+    // The subtitle looks of Preferences ▸ Subtitles.
+    fn primaryStyle() -> subs.TextStyle {
+        ui.prefsTextStyle(prefs.subtitleStyle)
+    }
+
+    fn secondStyle() -> subs.TextStyle {
+        var st = ui.prefsTextStyle(prefsExtra.secondaryStyle)
+        st.position = "top"
+        st
+    }
+
+    // Applies the styles to the shown tracks (reloading them first, so a
+    // style change starts from the track's own look).
+    fn restyleSubs() {
+        if p.subtitle >= 0 {
+            p.chooseSubtitle(p.subtitle)
+        } else if p.subtitle == -2 && !p.subFilePath.isEmpty {
+            p.loadSubtitleFile(p.subFilePath)
+        }
+        if p.hasSubtitles {
+            p.subtitles = subs.styleTrack(p.subtitles, primaryStyle())
+        }
+        if p.subtitle2 >= 0 {
+            chooseSubtitle2(p.subtitle2)
+        }
+        redraw += 1
+    }
+
+    // The second subtitle track (shown at the top), or -1 for none.
+    fn chooseSubtitle2(_ t: Int) {
+        p.subtitle2 = t
+        p.hasSubtitles2 = false
+        if t < 0 {
+            redraw += 1
+            return
+        }
+        match subs.decodeTrack(p.file, p.media, track: t) {
+            .ok(track) -> {
+                p.subtitles2 = subs.styleTrack(track, secondStyle())
+                p.hasSubtitles2 = true
+            }
+            .failure(e) -> flash("Second subtitles: {e.message}")
+        }
+        redraw += 1
+    }
+
+    fn cycleSubtitle2() {
+        let ts = core.tracksOf(p.media, .subtitle)
+        if ts.isEmpty {
+            return
+        }
+        var i = -1
+        for (k, t) in ts.enumerated() {
+            if t.index == p.subtitle2 {
+                i = k
+            }
+        }
+        if i + 1 < ts.count {
+            chooseSubtitle2(ts[i + 1].index)
+            flash("Second subtitles: {play.trackLabel(ts[i + 1])}")
+        } else {
+            chooseSubtitle2(-1)
+            flash("Second subtitles off")
+        }
+    }
+
+    fn statsLines() -> [String] {
+        var out: [String] = []
+        if p.staged && !p.sparser.isEmpty && !p.recLuma.isEmpty {
+            let sp = p.sparser[0]
+            let n = Float(max(sp.parsed, 1))
+            if p.split && !p.recChroma.isEmpty {
+                out.append("video: {sp.codec} in 3 stages, {sp.parsed} pictures: parse {Int(sp.parseMs / n)} ms, luma {Int(p.recLuma[0].ms / n)} ms, chroma {Int(p.recChroma[0].ms / n)} ms each")
+            } else {
+                out.append("video: {sp.codec} in 2 stages, {sp.parsed} pictures: parse {Int(sp.parseMs / n)} ms, rebuild {Int(p.recLuma[0].ms / n)} ms each")
+            }
+        }
+        if !p.vpump.isEmpty && !p.conv.isEmpty {
+            let v = p.vpump[0]
+            let c = p.conv[0]
+            out.append("video: {v.dec.codec}, {v.pictures} pictures, decode {Int(v.decodeMs / Float(max(v.pictures, 1)) * 10.0) / 10} ms, convert {Int(c.convertMs / Float(max(c.converted, 1)) * 10.0) / 10} ms each")
+        }
+        out.append("shown {p.shownCount}, dropped {p.dropped}, queued {p.raws.count} decoded + {p.frames.count} frames, {p.chunks.count} sound chunks")
+        out.append("clock {Int(p.clock * 1000.0)} ms, speed {p.speed}")
+        out
+    }
+
+    // A menu item's shortcut from the keymap (its Cmd combination).
+    fn sc(_ action: String) -> String {
+        keymap.menuShortcut(action)
+    }
+
+    fn abLoopTitle() -> String {
+        let fs = fileSettings
+        if library.hasABLoop(fs) {
+            return "A-B Loop: {timeText(fs.abStart)} – {timeText(fs.abEnd)} (Clear)"
+        }
+        if fs.abStart >= 0.0 {
+            return "A-B Loop: Set End"
+        }
+        "A-B Loop: Set Start"
+    }
+
+    // Keys without Cmd go through the keymap (Preferences ▸ Shortcuts);
+    // Cmd combinations belong to the menus, which take theirs from it too.
+    fn key(_ e: KeyEvent) {
+        if e.command {
+            return
+        }
+        let action = library.keyAction(keymap, e)
+        if !action.isEmpty {
+            runAction(action)
+        }
+    }
+
+    // What an action of the keymap does.
+    fn runAction(_ action: String) {
+        match action {
+            "play-pause" -> togglePlay()
+            "stop" -> stop()
+            "next" -> next()
+            "previous" -> previous()
+            "next-episode" -> playNextEpisode()
+            "jump-forward" -> jump(prefs.jumpNormal)
+            "jump-back" -> jump(-prefs.jumpNormal)
+            "jump-forward-short" -> jump(prefs.jumpShort)
+            "jump-back-short" -> jump(-prefs.jumpShort)
+            "jump-forward-long" -> jump(prefs.jumpLong)
+            "jump-back-long" -> jump(-prefs.jumpLong)
+            "frame-step" -> frameStep()
+            "frame-back" -> frameBack()
+            "next-chapter" -> chapterJump(1)
+            "previous-chapter" -> chapterJump(-1)
+            "faster" -> setSpeed(min(p.speed * 1.25, 4.0))
+            "slower" -> setSpeed(max(p.speed / 1.25, 0.25))
+            "normal-speed" -> setSpeed(1.0)
+            "ab-loop" -> cycleABLoop()
+            "bookmark-add" -> addBookmark()
+            "bookmark-next" -> bookmarkJump(true)
+            "bookmark-previous" -> bookmarkJump(false)
+            "volume-up" -> setVolume(p.volume + 0.05)
+            "volume-down" -> setVolume(p.volume - 0.05)
+            "mute" -> toggleMute()
+            "cycle-audio" -> cycleAudio()
+            "audio-delay-later" -> shiftAudio(0.05)
+            "audio-delay-earlier" -> shiftAudio(-0.05)
+            "fullscreen" -> toggleFullScreen()
+            "exit-fullscreen" -> {
+                if fullScreen {
+                    toggleFullScreen()
+                }
+            }
+            "snapshot" -> snapshot()
+            "cycle-subtitle" -> cycleSubtitle()
+            "subtitle-delay-later" -> shiftSubs(0.1)
+            "subtitle-delay-earlier" -> shiftSubs(-0.1)
+            "open-file" -> chooseFiles()
+            "open-folder" -> chooseFolderToPlay()
+            "close" -> closeMedia()
+            "media-info" -> openInfo()
+            "jump-to-time" -> { showJump = true }
+            "export-clip" -> openClipExport()
+            "playlist" -> { showPlaylist = !showPlaylist }
+            "sleep-timer" -> cycleSleepTimer()
+            "library" -> openLibrary()
+            "find-dialogue" -> showSide("find")
+            "transcript" -> showSide("transcript")
+            "cycle-secondary-subtitle" -> cycleSubtitle2()
+            "mini-player" -> { showMini = !showMini }
+            "preferences" -> openPrefs("general")
+            "effects" -> openEffects("equalizer")
+            _ -> {}
+        }
+    }
+
+    // --- Playback tools ---
+
+    // One picture back: decode again from the keyframe before it.
+    fn frameBack() {
+        if !p.loaded || !p.hasVideo || p.shown.time < 0.0 {
+            return
+        }
+        if p.playing {
+            togglePlay()
+        }
+        let t = p.media.tracks[p.video]
+        let step = if t.fpsNum > 0 && t.fpsDen > 0 { Float(t.fpsDen) / Float(t.fpsNum) } else { 0.04 }
+        seekTo(max(p.shown.time - step * 0.5, 0.0))
+    }
+
+    // The next (1) or previous (-1) chapter; back goes to the start of the
+    // current one first when it began more than 3 s ago.
+    fn chapterJump(_ dir: Int) {
+        let cs = p.media.chapters
+        if cs.isEmpty {
+            jump(Float(dir) * prefs.jumpLong)
+            return
+        }
+        var target = -1.0
+        if dir > 0 {
+            for c in cs {
+                if c.start > p.clock + 0.5 && target < 0.0 {
+                    target = c.start
+                }
+            }
+        } else {
+            for c in cs {
+                if c.start < p.clock - 3.0 {
+                    target = c.start
+                }
+            }
+            target = max(target, 0.0)
+        }
+        if target >= 0.0 {
+            seekTo(target)
+            for c in cs {
+                if c.start == target && !c.title.isEmpty {
+                    flash(c.title)
+                }
+            }
+        }
+    }
+
+    fn cycleABLoop() {
+        if !p.loaded {
+            return
+        }
+        let t = p.clock
+        rememberChange({ s in library.cycleABLoop(s, at: t) })
+        let fs = fileSettings
+        if library.hasABLoop(fs) {
+            flash("Loop {timeText(fs.abStart)} – {timeText(fs.abEnd)}")
+        } else if fs.abStart >= 0.0 {
+            flash("Loop from {timeText(fs.abStart)}: press again for the end")
+        } else {
+            flash("Loop off")
+        }
+    }
+
+    fn addBookmark() {
+        if !p.loaded {
+            return
+        }
+        let t = p.clock
+        rememberChange({ s in library.addBookmark(s, time: t) })
+        flash("Bookmark at {timeText(t)}")
+    }
+
+    fn bookmarkJump(_ forward: Bool) {
+        if let b = library.nextBookmark(fileSettings, after: p.clock, forward: forward) {
+            seekTo(b.time)
+            flash(if b.name.isEmpty { "Bookmark {timeText(b.time)}" } else { b.name })
+        }
+    }
+
+    fn shiftAudio(_ by: Float) {
+        p.audioDelay += by
+        let d = p.audioDelay
+        rememberChange({ s in
+            var n = s
+            n.audioDelay = d
+            n
+        })
+        flash("Audio delay {Int(round(p.audioDelay * 1000.0))} ms")
+        redraw += 1
+    }
+
+    fn playNextEpisode() {
+        if !p.loaded {
+            return
+        }
+        var nextPath = ""
+        if let l = lib {
+            nextPath = l.nextEpisodeOf(p.path)
+        }
+        if nextPath.isEmpty {
+            flash("No next episode found")
+            return
+        }
+        addAndPlay(nextPath)
+    }
+
+    // Sleep timer: off → 15 → 30 → 60 → 90 min → end of this item → off.
+    fn cycleSleepTimer() {
+        let steps = [15.0, 30.0, 60.0, 90.0]
+        if sleepMode == 0 {
+            sleepMode = 1
+            sleepMinutes = steps[0]
+        } else if sleepMode == 1 {
+            var i = 0
+            while i < steps.count && steps[i] <= sleepMinutes {
+                i += 1
+            }
+            if i < steps.count {
+                sleepMinutes = steps[i]
+            } else {
+                sleepMode = 2
+            }
+        } else {
+            sleepMode = 0
+        }
+        setSleepTimer(sleepMode, sleepMinutes)
+    }
+
+    // mode 0 off, 1 after `minutes`, 2 at the end of the current item.
+    fn setSleepTimer(_ mode: Int, _ minutes: Float) {
+        sleepMode = mode
+        sleepMinutes = minutes
+        sleepLeft = minutes * 60.0
+        match mode {
+            1 -> flash("Sleep in {Int(minutes)} min")
+            2 -> flash("Sleep at the end of this item")
+            _ -> flash("Sleep timer off")
+        }
+    }
+
+    // Called every tick: the sleep timer and the A-B loop.
+    fn tickTools(_ dt: Float) {
+        if sleepMode == 1 && p.playing {
+            sleepLeft -= dt
+            if sleepLeft <= 0.0 {
+                sleepMode = 0
+                togglePlay()
+                flash("Sleep timer: paused")
+            }
+        }
+        let fs = fileSettings
+        if p.playing && library.hasABLoop(fs) && p.clock >= fs.abEnd {
+            seekTo(fs.abStart)
+        }
+    }
+
+    fn cycleSubtitle() {
+        let ts = core.tracksOf(p.media, .subtitle)
+        if ts.isEmpty {
+            return
+        }
+        var i = -1
+        for (k, t) in ts.enumerated() {
+            if t.index == p.subtitle {
+                i = k
+            }
+        }
+        if i + 1 < ts.count {
+            chooseSubtitle(ts[i + 1].index)
+            flash("Subtitles: {play.trackLabel(ts[i + 1])}")
+        } else {
+            chooseSubtitle(-1)
+            flash("Subtitles off")
+        }
+    }
+
+    fn cycleAudio() {
+        let ts = core.tracksOf(p.media, .audio).filter { t in play.canDecodeAudio(t.codec) }
+        if ts.count < 2 {
+            return
+        }
+        var i = 0
+        for (k, t) in ts.enumerated() {
+            if t.index == p.audio {
+                i = k
+            }
+        }
+        let t = ts[(i + 1) % ts.count]
+        chooseAudio(t.index)
+        flash("Audio: {play.trackLabel(t)}")
+    }
+}
+
+let controlsHideAfter = 3.0
+
+// REEL_TRACE=1 prints trace lines; REEL_TRACE=<path> also appends them
+// to that file (headless scripts that fail lose their printed output).
+fn traceLine(_ text: String) {
+    print(text)
+    let target = environment("REEL_TRACE") ?? ""
+    if target.count > 1 {
+        appendFile(path: target, text: text + "\n")
+    }
+}
+
+// Where Reel keeps its library, settings and sound chunks; REEL_DATA
+// points it elsewhere (for tests).
+fn dataFolder() -> String {
+    let f = environment("REEL_DATA") ?? appDataFolder("Reel")
+    createFolder(f)
+    f
+}
+
+// A picture's pixels at another size (nearest sample; for posters).
+fn scaledPixels(_ px: [Int], _ w: Int, _ h: Int, _ nw: Int, _ nh: Int) -> [Int] {
+    var out: [Int] = []
+    if w <= 0 || h <= 0 || px.count < w * h {
+        return out
+    }
+    for y in 0..nh {
+        let sy = min(h - 1, y * h / nh)
+        for x in 0..nw {
+            out.append(px[sy * w + min(w - 1, x * w / nw)])
+        }
+    }
+    out
+}
+
+fn isMediaPath(_ path: String) -> Bool {
+    let lower = path.lowercase()
+    for ext in mediaExtensions {
+        if lower.hasSuffix("." + ext) {
+            return true
+        }
+    }
+    false
+}
+
+// A new, empty player that keeps the old one's settings.
+fn freshPlayer(_ old: Player) -> Player {
+    var p = Player()
+    p.boxW = old.boxW
+    p.boxH = old.boxH
+    p.volume = old.volume
+    p.muted = old.muted
+    p.speed = 1.0
+    p
+}

@@ -1,0 +1,514 @@
+// Sequence and picture parameter sets (ITU-T H.264 7.3.2.1 and 7.3.2.2):
+// the stream-wide settings every slice refers to. Includes the VUI (Annex
+// E: sample aspect ratio, colour description, bitstream restriction) and
+// the scaling matrices (7.3.2.1.1.1) with their fall-back rules (Table
+// 7-2), and the dequantisation tables derived from them (8.5.9).
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../core"
+
+public struct Sps {
+    valid: Bool = false
+    id: Int = 0
+    profileIdc: Int = 0
+    constraintFlags: Int = 0
+    levelIdc: Int = 0
+    chromaFormatIdc: Int = 1
+    separateColourPlane: Bool = false
+    bitDepthLuma: Int = 8
+    bitDepthChroma: Int = 8
+    transformBypass: Bool = false
+    scalingPresent: Bool = false
+    // 6 lists of 16 and 6 lists of 64, raster order (Intra Y, Cb, Cr,
+    // Inter Y, Cb, Cr).
+    scaling4: [Int] = []
+    scaling8: [Int] = []
+    log2MaxFrameNum: Int = 4
+    pocType: Int = 0
+    log2MaxPocLsb: Int = 4
+    deltaPicOrderAlwaysZero: Bool = false
+    offsetForNonRefPic: Int = 0
+    offsetForTopToBottomField: Int = 0
+    offsetForRefFrame: [Int] = []
+    maxNumRefFrames: Int = 0
+    gapsAllowed: Bool = false
+    mbWidth: Int = 0
+    // In frame macroblocks (pic_height_in_map_units times 2 when fields
+    // are allowed).
+    mbHeight: Int = 0
+    frameMbsOnly: Bool = true
+    mbAff: Bool = false
+    direct8x8Inference: Bool = false
+    cropLeft: Int = 0
+    cropRight: Int = 0
+    cropTop: Int = 0
+    cropBottom: Int = 0
+    // VUI.
+    sarNum: Int = 0
+    sarDen: Int = 1
+    fullRange: Bool = false
+    colourPrimaries: Int = 2
+    transfer: Int = 2
+    matrixCoeffs: Int = 2
+    timingNum: Int = 0
+    timingDen: Int = 0
+    bitstreamRestriction: Bool = false
+    numReorderFrames: Int = 0
+    maxDecFrameBuffering: Int = 0
+
+    width: Int { mbWidth * 16 - cropLeft - cropRight }
+    height: Int { mbHeight * 16 - cropTop - cropBottom }
+}
+
+public struct Pps {
+    valid: Bool = false
+    id: Int = 0
+    spsId: Int = 0
+    cabac: Bool = false
+    bottomFieldPicOrderInFramePresent: Bool = false
+    numSliceGroups: Int = 1
+    // Slice groups (FMO, 7.4.2.2): map type and its parameters.
+    sliceGroupMapType: Int = 0
+    runLength: [Int] = []
+    topLeft: [Int] = []
+    bottomRight: [Int] = []
+    changeDirection: Int = 0
+    changeRate: Int = 1
+    sliceGroupId: [Int] = []
+    numRefIdxDefault0: Int = 1
+    numRefIdxDefault1: Int = 1
+    weightedPred: Bool = false
+    weightedBipredIdc: Int = 0
+    picInitQp: Int = 26
+    picInitQs: Int = 26
+    chromaQpIndexOffset: Int = 0
+    secondChromaQpIndexOffset: Int = 0
+    deblockingFilterControlPresent: Bool = false
+    constrainedIntraPred: Bool = false
+    redundantPicCntPresent: Bool = false
+    transform8x8Mode: Bool = false
+    scalingPresent: Bool = false
+    scaling4: [Int] = []
+    scaling8: [Int] = []
+    // Dequantisation multipliers from LevelScale(m, i, j) = weightScale *
+    // normAdjust (8.5.9): dq4[(list * 52 + qp) * 16 + pos] holds
+    // LevelScale4x4 << (qp / 6 + 2) and dq8[(list * 52 + qp) * 64 + pos]
+    // LevelScale8x8 << (qp / 6), so that a coefficient c scales to
+    // (c * dq + 32) >> 6, which equals the spec's formulas of 8.5.12.1 for
+    // every qp (rounding included).
+    dq4: [Int] = []
+    dq8: [Int] = []
+    // QPc by QPy for Cb then Cr (52 each), with the index offsets applied.
+    chromaQp: [Int] = []
+}
+
+// normAdjust4x4 (8.5.9): v for positions (0,0)-type, (1,1)-type, other.
+let normAdjust4: [Int] = [10, 16, 13, 11, 18, 14, 13, 20, 16, 14, 23, 18, 16, 25, 20, 18, 29, 23]
+// normAdjust8x8 (8.5.9), 6 classes per qp%6.
+let normAdjust8: [Int] = [
+    20, 18, 32, 19, 25, 24,
+    22, 19, 35, 21, 28, 26,
+    26, 23, 42, 24, 33, 31,
+    28, 25, 45, 26, 35, 33,
+    32, 28, 51, 30, 40, 38,
+    36, 32, 58, 34, 46, 43,
+]
+
+// The class (0..2) of a 4x4 coefficient position for normAdjust4x4.
+fn h264Norm4Class(_ x: Int, _ y: Int) -> Int {
+    if x % 2 == 0 && y % 2 == 0 { return 0 }
+    if x % 2 == 1 && y % 2 == 1 { return 1 }
+    2
+}
+
+// The class (0..5) of an 8x8 coefficient position for normAdjust8x8.
+fn h264Norm8Class(_ x: Int, _ y: Int) -> Int {
+    if x % 4 == 0 && y % 4 == 0 { return 0 }
+    if x % 2 == 1 && y % 2 == 1 { return 1 }
+    if x % 4 == 2 && y % 4 == 2 { return 2 }
+    if (x % 4 == 0 && y % 2 == 1) || (x % 2 == 1 && y % 4 == 0) { return 3 }
+    if (x % 4 == 0 && y % 4 == 2) || (x % 4 == 2 && y % 4 == 0) { return 4 }
+    5
+}
+
+fn h264Flat(_ n: Int) -> [Int] {
+    core.filled(n, 16)
+}
+
+// Reads one scaling_list() (7.3.2.1.1.1) into `dst` at `at` (raster order).
+// Returns 0 when the list was coded, 1 when it says "use the default",
+// 2 when it isn't present (use the fall-back).
+fn h264ReadScalingList(_ r: bind core.BitReader, _ dst: bind [Int], _ at: Int, _ size: Int) -> Int {
+    if !r.flag() {
+        return 2
+    }
+    var last = 8
+    var next = 8
+    for j in 0..size {
+        if next != 0 {
+            let delta = r.se()
+            next = (last + delta + 256) % 256
+            if j == 0 && next == 0 {
+                return 1
+            }
+        }
+        let pos = if size == 16 { zigzag4x4[j] } else { zigzag8x8[j] }
+        let v = if next == 0 { last } else { next }
+        dst[at + pos] = v
+        last = v
+    }
+    0
+}
+
+fn h264CopyList(_ dst: bind [Int], _ at: Int, _ src: [Int], _ from: Int, _ n: Int) {
+    for i in 0..n {
+        dst[at + i] = src[from + i]
+    }
+}
+
+// Reads the scaling matrices of an SPS (isSps) or PPS. `fb4`/`fb8` are the
+// fall-backs for the first intra and inter lists (Table 7-2 rule A: the
+// defaults; rule B: the SPS's lists).
+fn h264ReadScalingMatrices(_ r: bind core.BitReader, _ s4: bind [Int], _ s8: bind [Int], fb4: [Int], fb8: [Int], n8: Int) {
+    for i in 0..6 {
+        let res = h264ReadScalingList(r, s4, i * 16, 16)
+        if res == 1 {
+            let d = if i < 3 { 0 } else { 16 }
+            h264CopyList(s4, i * 16, defaultScaling4, d, 16)
+        } else if res == 2 {
+            if i == 0 || i == 3 {
+                h264CopyList(s4, i * 16, fb4, i * 16, 16)
+            } else {
+                h264CopyList(s4, i * 16, s4, (i - 1) * 16, 16)
+            }
+        }
+    }
+    for k in 0..n8 {
+        // Order in the stream: Intra Y, Inter Y, Intra Cb, Inter Cb, Intra
+        // Cr, Inter Cr; stored as Intra Y, Cb, Cr, Inter Y, Cb, Cr.
+        let list = (k % 2) * 3 + k / 2
+        let res = h264ReadScalingList(r, s8, list * 64, 64)
+        if res == 1 {
+            let d = if k % 2 == 0 { 0 } else { 64 }
+            h264CopyList(s8, list * 64, defaultScaling8, d, 64)
+        } else if res == 2 {
+            if k < 2 {
+                h264CopyList(s8, list * 64, fb8, list * 64, 64)
+            } else {
+                h264CopyList(s8, list * 64, s8, (list - 1) * 64, 64)
+            }
+        }
+    }
+}
+
+fn h264DefaultLists4() -> [Int] {
+    var out: [Int] = []
+    for i in 0..6 {
+        let d = if i < 3 { 0 } else { 16 }
+        for j in 0..16 {
+            out.append(defaultScaling4[d + j])
+        }
+    }
+    out
+}
+
+fn h264DefaultLists8() -> [Int] {
+    var out: [Int] = []
+    for i in 0..6 {
+        let d = if i < 3 { 0 } else { 64 }
+        for j in 0..64 {
+            out.append(defaultScaling8[d + j])
+        }
+    }
+    out
+}
+
+// Skips hrd_parameters() (E.1.2).
+fn h264SkipHrd(_ r: bind core.BitReader) {
+    let cpbCnt = r.ue() + 1
+    r.bits(4)
+    r.bits(4)
+    for _ in 0..min(cpbCnt, 32) {
+        r.ue()
+        r.ue()
+        r.bits(1)
+    }
+    r.bits(5)
+    r.bits(5)
+    r.bits(5)
+    r.bits(5)
+}
+
+// The pixel aspect ratios of aspect_ratio_idc 1..16 (Table E-1).
+let h264SarTable: [Int] = [1, 1, 12, 11, 10, 11, 16, 11, 40, 33, 24, 11, 20, 11, 32, 11, 80, 33, 18, 11, 15, 11, 64, 33, 160, 99, 4, 3, 3, 2, 2, 1]
+
+// seq_parameter_set_rbsp() (7.3.2.1.1) from the unescaped NAL payload
+// (after the one-byte NAL header).
+public fn parseSps(_ rbsp: Data) -> Sps {
+    var r = core.bitReader(rbsp)
+    var s = Sps()
+    s.profileIdc = r.bits(8)
+    s.constraintFlags = r.bits(8)
+    s.levelIdc = r.bits(8)
+    s.id = r.ue()
+    if s.id > 31 {
+        return s
+    }
+    s.scaling4 = h264Flat(96)
+    s.scaling8 = h264Flat(384)
+    let p = s.profileIdc
+    if p == 100 || p == 110 || p == 122 || p == 244 || p == 44 || p == 83 || p == 86 || p == 118 || p == 128 || p == 138 || p == 139 || p == 134 || p == 135 || p == 144 {
+        s.chromaFormatIdc = r.ue()
+        if s.chromaFormatIdc == 3 {
+            s.separateColourPlane = r.flag()
+        }
+        s.bitDepthLuma = r.ue() + 8
+        s.bitDepthChroma = r.ue() + 8
+        s.transformBypass = r.flag()
+        if r.flag() {
+            s.scalingPresent = true
+            let n8 = if s.chromaFormatIdc == 3 { 6 } else { 2 }
+            h264ReadScalingMatrices(r, s.scaling4, s.scaling8, fb4: h264DefaultLists4(), fb8: h264DefaultLists8(), n8: n8)
+        }
+    }
+    s.log2MaxFrameNum = r.ue() + 4
+    s.pocType = r.ue()
+    if s.pocType == 0 {
+        s.log2MaxPocLsb = r.ue() + 4
+    } else if s.pocType == 1 {
+        s.deltaPicOrderAlwaysZero = r.flag()
+        s.offsetForNonRefPic = r.se()
+        s.offsetForTopToBottomField = r.se()
+        let n = r.ue()
+        for _ in 0..min(n, 255) {
+            s.offsetForRefFrame.append(r.se())
+        }
+    }
+    s.maxNumRefFrames = r.ue()
+    s.gapsAllowed = r.flag()
+    s.mbWidth = r.ue() + 1
+    let mapUnits = r.ue() + 1
+    s.frameMbsOnly = r.flag()
+    s.mbHeight = if s.frameMbsOnly { mapUnits } else { mapUnits * 2 }
+    if !s.frameMbsOnly {
+        s.mbAff = r.flag()
+    }
+    s.direct8x8Inference = r.flag()
+    if r.flag() {
+        let cl = r.ue()
+        let cr = r.ue()
+        let ct = r.ue()
+        let cb = r.ue()
+        let cx = if s.chromaFormatIdc == 1 || s.chromaFormatIdc == 2 { 2 } else { 1 }
+        var cy = if s.chromaFormatIdc == 1 { 2 } else { 1 }
+        if !s.frameMbsOnly {
+            cy *= 2
+        }
+        s.cropLeft = cl * cx
+        s.cropRight = cr * cx
+        s.cropTop = ct * cy
+        s.cropBottom = cb * cy
+        if s.cropLeft + s.cropRight >= s.mbWidth * 16 || s.cropTop + s.cropBottom >= s.mbHeight * 16 {
+            s.cropLeft = 0
+            s.cropRight = 0
+            s.cropTop = 0
+            s.cropBottom = 0
+        }
+    }
+    let coreOk = !r.overrun
+    if r.flag() {
+        // vui_parameters() (E.1.1).
+        if r.flag() {
+            let idc = r.bits(8)
+            if idc == 255 {
+                s.sarNum = r.bits(16)
+                s.sarDen = r.bits(16)
+            } else if idc >= 1 && idc <= 16 {
+                s.sarNum = h264SarTable[(idc - 1) * 2]
+                s.sarDen = h264SarTable[(idc - 1) * 2 + 1]
+            }
+        }
+        if r.flag() {
+            r.bits(1)
+        }
+        if r.flag() {
+            r.bits(3)
+            s.fullRange = r.flag()
+            if r.flag() {
+                s.colourPrimaries = r.bits(8)
+                s.transfer = r.bits(8)
+                s.matrixCoeffs = r.bits(8)
+            }
+        }
+        if r.flag() {
+            r.ue()
+            r.ue()
+        }
+        if r.flag() {
+            s.timingNum = r.bits(32)
+            s.timingDen = r.bits(32)
+            r.bits(1)
+        }
+        let nalHrd = r.flag()
+        if nalHrd {
+            h264SkipHrd(r)
+        }
+        let vclHrd = r.flag()
+        if vclHrd {
+            h264SkipHrd(r)
+        }
+        if nalHrd || vclHrd {
+            r.bits(1)
+        }
+        r.bits(1)
+        if r.left > 0 && r.flag() {
+            r.bits(1)
+            r.ue()
+            r.ue()
+            r.ue()
+            r.ue()
+            let reorder = r.ue()
+            let maxDec = r.ue()
+            if !r.overrun {
+                s.bitstreamRestriction = true
+                s.numReorderFrames = min(reorder, 16)
+                s.maxDecFrameBuffering = min(maxDec, 16)
+            }
+        }
+    }
+    // Limits of the spec (7.4.2.1.1) and of level 6.2 (139264 macroblocks).
+    s.valid = s.mbWidth > 0 && s.mbHeight > 0 && s.mbWidth * s.mbHeight <= 139264 && s.log2MaxFrameNum <= 16 && s.log2MaxPocLsb <= 16 && s.pocType <= 2 && s.maxNumRefFrames <= 16 && coreOk
+    s
+}
+
+// pic_parameter_set_rbsp() (7.3.2.2). The SPS it names must be known for
+// the parts after transform_8x8_mode_flag.
+public fn parsePps(_ rbsp: Data, _ spsList: [Sps]) -> Pps {
+    var r = core.bitReader(rbsp)
+    var p = Pps()
+    p.id = r.ue()
+    p.spsId = r.ue()
+    if p.id > 255 || p.spsId > 31 {
+        return p
+    }
+    p.cabac = r.flag()
+    p.bottomFieldPicOrderInFramePresent = r.flag()
+    p.numSliceGroups = r.ue() + 1
+    if p.numSliceGroups > 8 {
+        return p
+    }
+    if p.numSliceGroups > 1 {
+        // Slice groups (FMO, 7.3.2.2), Baseline and Extended profiles.
+        let mapType = r.ue()
+        p.sliceGroupMapType = mapType
+        if mapType == 0 {
+            for _ in 0..p.numSliceGroups {
+                p.runLength.append(min(r.ue(), 139264) + 1)
+            }
+        } else if mapType == 2 {
+            for _ in 0..(p.numSliceGroups - 1) {
+                let tl = r.ue()
+                let br = r.ue()
+                if tl > br || br >= 139264 {
+                    return p
+                }
+                p.topLeft.append(tl)
+                p.bottomRight.append(br)
+            }
+        } else if mapType == 3 || mapType == 4 || mapType == 5 {
+            p.changeDirection = r.bits(1)
+            p.changeRate = r.ue() + 1
+            if p.changeRate > 139264 {
+                return p
+            }
+        } else if mapType == 6 {
+            let n = r.ue() + 1
+            if n > 139264 {
+                return p
+            }
+            var bits = 0
+            while (1 << bits) < p.numSliceGroups {
+                bits += 1
+            }
+            for _ in 0..n {
+                p.sliceGroupId.append(r.bits(bits))
+                if r.overrun {
+                    return p
+                }
+            }
+        } else if mapType > 6 {
+            return p
+        }
+    }
+    p.numRefIdxDefault0 = r.ue() + 1
+    p.numRefIdxDefault1 = r.ue() + 1
+    p.weightedPred = r.flag()
+    p.weightedBipredIdc = r.bits(2)
+    p.picInitQp = 26 + r.se()
+    p.picInitQs = 26 + r.se()
+    p.chromaQpIndexOffset = r.se()
+    p.deblockingFilterControlPresent = r.flag()
+    p.constrainedIntraPred = r.flag()
+    p.redundantPicCntPresent = r.flag()
+    p.secondChromaQpIndexOffset = p.chromaQpIndexOffset
+    var sps = Sps()
+    for s in spsList {
+        if s.valid && s.id == p.spsId {
+            sps = s
+        }
+    }
+    p.scaling4 = if sps.valid { sps.scaling4 } else { h264Flat(96) }
+    p.scaling8 = if sps.valid { sps.scaling8 } else { h264Flat(384) }
+    if r.moreRbspData() {
+        p.transform8x8Mode = r.flag()
+        if r.flag() {
+            p.scalingPresent = true
+            let fb4 = if sps.scalingPresent { sps.scaling4 } else { h264DefaultLists4() }
+            let fb8 = if sps.scalingPresent { sps.scaling8 } else { h264DefaultLists8() }
+            var n8 = 0
+            if p.transform8x8Mode {
+                n8 = if sps.chromaFormatIdc == 3 { 6 } else { 2 }
+            }
+            p.scaling4 = h264Flat(96)
+            p.scaling8 = h264Flat(384)
+            h264ReadScalingMatrices(r, p.scaling4, p.scaling8, fb4: fb4, fb8: fb8, n8: n8)
+            if n8 == 0 {
+                // Not sent: the 8x8 lists keep the fall-back (rule A or B).
+                p.scaling8 = fb8
+            }
+        }
+        p.secondChromaQpIndexOffset = r.se()
+    }
+    h264BuildDequant(p)
+    p.valid = !r.overrun || r.left > -64
+    p
+}
+
+// Builds the dequantisation and chroma QP tables of a PPS (8.5.9, 8.5.8).
+fn h264BuildDequant(_ p: bind Pps) {
+    p.dq4 = core.zeros(6 * 52 * 16)
+    p.dq8 = core.zeros(6 * 52 * 64)
+    for list in 0..6 {
+        for qp in 0..52 {
+            let m = qp % 6
+            for pos in 0..16 {
+                let cls = h264Norm4Class(pos % 4, pos / 4)
+                p.dq4[(list * 52 + qp) * 16 + pos] = (p.scaling4[list * 16 + pos] * normAdjust4[m * 3 + cls]) << (qp / 6 + 2)
+            }
+            for pos in 0..64 {
+                let cls = h264Norm8Class(pos % 8, pos / 8)
+                p.dq8[(list * 52 + qp) * 64 + pos] = (p.scaling8[list * 64 + pos] * normAdjust8[m * 6 + cls]) << (qp / 6)
+            }
+        }
+    }
+    p.chromaQp = []
+    for c in 0..2 {
+        let off = if c == 0 { p.chromaQpIndexOffset } else { p.secondChromaQpIndexOffset }
+        for qp in 0..52 {
+            let qpi = max(0, min(51, qp + off))
+            p.chromaQp.append(chromaQpTable[qpi])
+        }
+    }
+}

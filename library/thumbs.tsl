@@ -1,0 +1,180 @@
+// The thumbnail cache: small pictures of files (a poster for the library,
+// and pictures at times for seek previews and the scene strip), kept as PNG
+// files under one folder with a size limit. The pictures come from the
+// player (vfx.thumbnail → RGBA pixels); this only decides where they go
+// and what to drop when the cache is too big.
+//
+// Layout: <folder>/<hh>/<hash>.png for a file's poster and
+// <folder>/<hh>/<hash>-<ms>.png for the picture at <ms> milliseconds, where
+// <hash> is the first 16 hex digits of SHA-1 of "<path>|<size>" (so a
+// changed file gets new thumbnails) and <hh> its first two, which keeps
+// folders small.
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+public struct ThumbCache {
+    folder: String
+    maxBytes: Int = 200_000_000
+
+    // The cache key of a file.
+    fn key(_ path: String, size: Int) -> String {
+        Data(text: "{path}|{size}").hash("sha1").hex.substring(from: 0, to: 16)
+    }
+
+    // Where a thumbnail goes: the poster with `time` < 0, else the picture
+    // at `time` seconds (rounded to milliseconds).
+    fn pathFor(_ path: String, size: Int, time: Float = -1.0) -> String {
+        let k = key(path, size: size)
+        let sub = joinPath(folder, k.substring(from: 0, to: 2))
+        if time < 0.0 {
+            return joinPath(sub, k + ".png")
+        }
+        joinPath(sub, "{k}-{Int(time * 1000.0 + 0.5)}.png")
+    }
+
+    fn has(_ path: String, size: Int, time: Float = -1.0) -> Bool {
+        fileExists(pathFor(path, size: size, time: time))
+    }
+
+    // Stores RGBA pixels (r<<24|g<<16|b<<8|a, as vfx.thumbnail and
+    // render give them). Returns the file written, or "" on failure.
+    fn store(_ path: String, size: Int, time: Float = -1.0, width: Int, height: Int, pixels: [Int]) -> String {
+        if width <= 0 || height <= 0 || pixels.count < width * height {
+            return ""
+        }
+        let p = pathFor(path, size: size, time: time)
+        createFolder(p.folder)
+        if writeImage(path: p, width: width, height: height, pixels: pixels) {
+            return p
+        }
+        ""
+    }
+
+    // A stored thumbnail: width, height and pixels, or nil.
+    fn load(_ path: String, size: Int, time: Float = -1.0) -> (Int, Int, [Int])? {
+        let p = pathFor(path, size: size, time: time)
+        if !fileExists(p) {
+            return nil
+        }
+        readImage(p)
+    }
+
+    // The times (seconds) that have thumbnails for a file, in order.
+    fn times(_ path: String, size: Int) -> [Float] {
+        let k = key(path, size: size)
+        let sub = joinPath(folder, k.substring(from: 0, to: 2))
+        var out: [Float] = []
+        for name in listFolder(sub) ?? [] {
+            if name.hasPrefix(k + "-") && name.hasSuffix(".png") {
+                let ms = parseInt(name.substring(from: k.count + 1, to: name.count - 4)).valueOr(-1)
+                if ms >= 0 {
+                    out.append(Float(ms) / 1000.0)
+                }
+            }
+        }
+        out.sorted()
+    }
+
+    // The stored time nearest to `t` for a seek preview, or −1.
+    fn nearestTime(_ path: String, size: Int, to: Float) -> Float {
+        let t = to
+        var best = -1.0
+        for x in times(path, size: size) {
+            if best < 0.0 || abs(x - t) < abs(best - t) {
+                best = x
+            }
+        }
+        best
+    }
+
+    // Deletes a file's thumbnails. Returns how many.
+    fn remove(_ path: String, size: Int) -> Int {
+        let k = key(path, size: size)
+        let sub = joinPath(folder, k.substring(from: 0, to: 2))
+        var n = 0
+        for name in listFolder(sub) ?? [] {
+            if name.hasPrefix(k) && deleteFile(path: joinPath(sub, name)) {
+                n += 1
+            }
+        }
+        n
+    }
+
+    // Every thumbnail file with its size and date.
+    fn entries() -> [(String, Int, Float)] {
+        var out: [(String, Int, Float)] = []
+        for sub in listFolder(folder) ?? [] {
+            let sp = joinPath(folder, sub)
+            if sub.count != 2 || !isFolder(sp) {
+                continue
+            }
+            for name in listFolder(sp) ?? [] {
+                if name.hasSuffix(".png") {
+                    let p = joinPath(sp, name)
+                    out.append((p, fileSize(p) ?? 0, modifiedTime(p) ?? 0.0))
+                }
+            }
+        }
+        out
+    }
+
+    // Bytes the cache holds.
+    fn totalBytes() -> Int {
+        var n = 0
+        for e in entries() {
+            n += e.1
+        }
+        n
+    }
+
+    // Deletes the oldest thumbnails until the cache is under `maxBytes`
+    // (posters last: they are what the library shows). Returns how many
+    // were deleted.
+    fn trim() -> Int {
+        let all = entries()
+        var total = 0
+        for e in all {
+            total += e.1
+        }
+        if total <= maxBytes {
+            return 0
+        }
+        let order = all.sorted(by: { a, b in
+            let pa = !a.0.fileName.contains("-")
+            let pb = !b.0.fileName.contains("-")
+            if pa != pb {
+                return !pa
+            }
+            a.2 < b.2
+        })
+        var n = 0
+        for e in order {
+            if total <= maxBytes {
+                break
+            }
+            if deleteFile(path: e.0) {
+                total -= e.1
+                n += 1
+            }
+        }
+        n
+    }
+
+    // Deletes every thumbnail.
+    fn clear() -> Int {
+        var n = 0
+        for e in entries() {
+            if deleteFile(path: e.0) {
+                n += 1
+            }
+        }
+        n
+    }
+}
+
+// The cache in `folder` (created) with a limit in megabytes.
+public fn thumbCache(_ folder: String, maxMB: Int = 200) -> ThumbCache {
+    createFolder(folder)
+    ThumbCache(folder: folder, maxBytes: maxMB * 1_000_000)
+}

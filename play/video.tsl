@@ -1,0 +1,329 @@
+// The video side of the player: a VideoPump walks one video track's
+// packets, decodes them, and turns the pictures into screen pixels
+// (scaled to fit a box, keeping the pixel shape, rotated as the track
+// says) a batch at a time. The app runs `run` in background work and
+// shows the frames by the clock.
+//
+// After `seek`, decoding restarts at the keyframe before the target and
+// pictures before the target are decoded but not converted (exact seek).
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../core"
+import "../demux"
+import "../render"
+import "../av1"
+import "../vfx"
+
+// A decoded picture waiting to be converted, with its time.
+public struct RawPicture {
+    time: Float
+    picture: core.Picture
+    // AV1 film grain still to add (none, or one).
+    grain: [av1.FilmGrain] = []
+}
+
+// A picture ready for g.image(pixels:…).
+public struct VideoFrame {
+    // Seconds on the media's clock.
+    time: Float
+    width: Int
+    height: Int
+    pixels: [Int] = []
+    key: Bool = false
+}
+
+public struct VideoPump {
+    // The packets are still arriving (a network stream): running out of
+    // them means wait, not the end.
+    growing: Bool = false
+    track: Int
+    dec: VideoDecoder
+    renderer: render.Renderer
+    timescale: Int = 1000
+    rotation: Int = 0
+    // Next packet to look at, in media.packets.
+    next: Int = 0
+    // All packets read and the decoder flushed.
+    done: Bool = false
+    // Pictures before this time (seconds) are dropped (after a seek).
+    dropBefore: Float = -1000000.0
+    // The box the frames are fitted into; 0 = the picture's own size.
+    boxW: Int = 0
+    boxH: Int = 0
+    smooth: Bool = true
+    // The last picture's time, for pictures without one.
+    lastTime: Float = 0.0
+    frameStep: Float = 0.04
+    warnings: [String] = []
+    // Milliseconds spent decoding and converting, for the stats overlay.
+    decodeMs: Float = 0.0
+    convertMs: Float = 0.0
+    pictures: Int = 0
+
+    // Decodes until `count` frames are ready or the track ends.
+    fn run(_ file: Data, _ media: core.Media, count: Int) -> [VideoFrame] {
+        var out: [VideoFrame] = []
+        let n = media.packets.count
+        while out.count < count && !done {
+            if next >= n {
+                let t0 = now()
+                let pics = dec.flush()
+                decodeMs += (now() - t0) * 1000.0
+                for p in pics {
+                    take(p, out)
+                }
+                done = true
+                break
+            }
+            let p = media.packets[next]
+            next += 1
+            if p.track != track {
+                continue
+            }
+            let bytes = core.packetBytes(file, media, p)
+            let t0 = now()
+            let pics = dec.decode(bytes, pts: p.pts, dts: p.dts, key: p.key)
+            decodeMs += (now() - t0) * 1000.0
+            for pic in pics {
+                take(pic, out)
+            }
+        }
+        let w = dec.takeWarnings()
+        if !w.isEmpty {
+            warnings.appendAll(w)
+            if warnings.count > 50 {
+                warnings = warnings.suffix(50)
+            }
+        }
+        out
+    }
+
+    fn take(_ pic: core.Picture, _ out: bind [VideoFrame]) {
+        var t = lastTime + frameStep
+        if pic.pts != core.noTime {
+            t = core.seconds(pic.pts, timescale)
+        }
+        lastTime = t
+        if t < dropBefore - 0.001 {
+            return
+        }
+        let t0 = now()
+        var w = pic.width
+        var h = pic.height
+        if boxW > 0 && boxH > 0 {
+            // Never larger than the picture itself (with its pixel shape):
+            // the screen enlarges for free, and converting costs per pixel.
+            let turned = rotation == 90 || rotation == 270
+            let bw = if turned { boxH } else { boxW }
+            let bh = if turned { boxW } else { boxH }
+            let natW = max(pic.width * max(pic.sarNum, 1) / max(pic.sarDen, 1), pic.width)
+            let (fw, fh) = render.fitSize(pic, boxW: min(bw, natW), boxH: min(bh, pic.height))
+            w = max(fw, 1)
+            h = max(fh, 1)
+        }
+        var pixels = renderer.toRgba(pic, width: w, height: h, smooth: smooth)
+        if rotation != 0 {
+            let (rw, rh) = render.rotatedSize(width: w, height: h, degrees: rotation)
+            pixels = render.rotate(pixels, width: w, height: h, degrees: rotation)
+            w = rw
+            h = rh
+        }
+        convertMs += (now() - t0) * 1000.0
+        pictures += 1
+        out.append(VideoFrame(time: t, width: w, height: h, pixels: pixels, key: pic.key))
+    }
+
+    // Decodes until `count` pictures are ready (or the track ends), without
+    // converting them: the app converts them in other background work, so
+    // decoding and converting run side by side.
+    fn decodeOnly(_ file: Data, _ media: core.Media, count: Int) -> [RawPicture] {
+        var out: [RawPicture] = []
+        let n = media.packets.count
+        while out.count < count && !done {
+            var pics: [core.Picture] = []
+            if next >= n && growing {
+                break
+            }
+            if next >= n {
+                let t0 = now()
+                pics = dec.flush()
+                decodeMs += (now() - t0) * 1000.0
+                done = true
+            } else {
+                let p = media.packets[next]
+                next += 1
+                if p.track != track {
+                    continue
+                }
+                let bytes = core.packetBytes(file, media, p)
+                let t0 = now()
+                pics = dec.decode(bytes, pts: p.pts, dts: p.dts, key: p.key)
+                decodeMs += (now() - t0) * 1000.0
+            }
+            for pic in pics {
+                var t = lastTime + frameStep
+                if pic.pts != core.noTime {
+                    t = core.seconds(pic.pts, timescale)
+                }
+                lastTime = t
+                if t >= dropBefore - 0.001 {
+                    out.append(RawPicture(time: t, picture: pic))
+                }
+                pictures += 1
+            }
+        }
+        let w = dec.takeWarnings()
+        if !w.isEmpty {
+            warnings.appendAll(w)
+            if warnings.count > 50 {
+                warnings = warnings.suffix(50)
+            }
+        }
+        out
+    }
+
+    // Goes back to the keyframe at or before `seconds`; frames come again
+    // from exactly there.
+    fn seek(_ media: core.Media, to: Float) {
+        let seconds = to
+        dec.reset()
+        let i = demux.keyBefore(media, track: track, seconds: seconds)
+        next = max(i, 0)
+        done = false
+        dropBefore = seconds
+        lastTime = seconds
+    }
+
+    // Frames continue from the next keyframe after the current position
+    // (for when decoding falls far behind).
+    fn skipToNextKey(_ media: core.Media) {
+        var i = next
+        while i < media.packets.count {
+            let p = media.packets[i]
+            if p.track == track && p.key {
+                break
+            }
+            i += 1
+        }
+        next = i
+        dec.reset()
+    }
+}
+
+public fn newVideoPump(_ media: core.Media, track: Int) -> Result<VideoPump> {
+    let t = media.tracks[track]
+    let dec = try newVideoDecoder(t)
+    var step = 0.04
+    if t.fpsNum > 0 && t.fpsDen > 0 {
+        step = Float(t.fpsDen) / Float(t.fpsNum)
+    }
+    Result.ok(value: VideoPump(track: track, dec: dec, renderer: render.newRenderer(), timescale: t.timescale, rotation: t.rotation, frameStep: step))
+}
+
+// Turns decoded pictures into screen frames: fitted into boxW×boxH (never
+// larger than the picture), rotated. Keeps its tables and buffers between
+// calls, so the app hands the same Converter back each time.
+public struct Converter {
+    renderer: render.Renderer
+    boxW: Int = 0
+    boxH: Int = 0
+    rotation: Int = 0
+    smooth: Bool = true
+    // The picture settings (adjustments, crop, aspect, zoom, flips) and the
+    // filters (deinterlace, denoise, sharpen; one item, see vfx.Chain).
+    look: render.View = render.View()
+    filters: [vfx.Chain] = []
+    // The player's generation (it changes at every seek): filters that
+    // keep pictures between calls start over when it changes.
+    gen: Int = -1
+    convertMs: Float = 0.0
+    converted: Int = 0
+
+    fn convert(_ raws: [RawPicture], generation: Int = -1) -> [VideoFrame] {
+        var out: [VideoFrame] = []
+        if generation != gen {
+            gen = generation
+            if !filters.isEmpty {
+                filters[0].reset()
+            }
+        }
+        for r in raws {
+            var pic = if r.picture.matrix == .rgb { rgbAsYcbcr(r.picture) } else { r.picture }
+            if !r.grain.isEmpty {
+                pic = av1.applyFilmGrain(pic, r.grain[0])
+            }
+            let t0 = now()
+            let fields = if filters.isEmpty { [vfx.Field(picture: pic, time: r.time)] } else { filters[0].process(pic, time: r.time) }
+            for f in fields {
+                out.append(frameOf(f.picture, f.time))
+            }
+            convertMs += (now() - t0) * 1000.0
+            converted += 1
+        }
+        out
+    }
+
+    // At the end of the track: pictures the filters still hold.
+    fn flush() -> [VideoFrame] {
+        var out: [VideoFrame] = []
+        if !filters.isEmpty {
+            for f in filters[0].flush() {
+                out.append(frameOf(f.picture, f.time))
+            }
+        }
+        out
+    }
+
+    fn frameOf(_ pic: core.Picture, _ time: Float) -> VideoFrame {
+        let settings = if filters.isEmpty { look } else { filters[0].applyCrop(look) }
+        let bw = if boxW > 0 { boxW } else { pic.width }
+        let bh = if boxH > 0 { boxH } else { pic.height }
+        let fr = renderer.frame(pic, settings: settings, boxW: bw, boxH: bh, trackRotation: rotation, smooth: smooth)
+        VideoFrame(time: time, width: fr.width, height: fr.height, pixels: fr.pixels, key: pic.key)
+    }
+}
+
+public fn newConverter(rotation: Int) -> Converter {
+    // Default filters: interlaced pictures are deinterlaced (adaptive).
+    Converter(renderer: render.newRenderer(), rotation: rotation, filters: [vfx.newChain()])
+}
+
+// A G, B, R picture (DNxHR 444 RGB) as full-range BT.709 Y'CbCr 4:4:4, for
+// the renderer, which only takes Y'CbCr.
+public fn rgbAsYcbcr(_ p: core.Picture) -> core.Picture {
+    var out = core.Picture(width: p.width, height: p.height, chroma: .yuv444, depth: p.depth)
+    let top = (1 << p.depth) - 1
+    let half = Float(1 << (p.depth - 1))
+    let n = p.width * p.height
+    var ys: [Int] = []
+    var us: [Int] = []
+    var vs: [Int] = []
+    for row in 0..p.height {
+        let gy = p.yOffset + row * p.yStride
+        let cy = p.cOffset + row * p.cStride
+        for x in 0..p.width {
+            let g = Float(p.y[gy + x])
+            let b = Float(p.u[cy + x])
+            let r = Float(p.v[cy + x])
+            let yv = 0.2126 * r + 0.7152 * g + 0.0722 * b
+            ys.append(max(0, min(top, Int(yv + 0.5))))
+            us.append(max(0, min(top, Int((b - yv) / 1.8556 + half + 0.5))))
+            vs.append(max(0, min(top, Int((r - yv) / 1.5748 + half + 0.5))))
+        }
+    }
+    out.y = ys
+    out.u = us
+    out.v = vs
+    out.yStride = p.width
+    out.cStride = p.width
+    out.matrix = .bt709
+    out.fullRange = true
+    out.pts = p.pts
+    out.duration = p.duration
+    out.key = p.key
+    out.sarNum = p.sarNum
+    out.sarDen = p.sarDen
+    out
+}

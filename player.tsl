@@ -1,0 +1,589 @@
+// What's playing: the open source, its pumps, the frames and sound
+// chunks decoded ahead, and the clock. Plain data with methods; the app
+// (main.tsl) runs the pumps in background work, starts the sounds, and
+// calls `tick` from a timer.
+//
+// The clock: while a sound chunk plays, media time is the chunk's start
+// plus its position × its speed (sound leads, video follows). Without
+// sound, the clock moves with the timer, by `now()` (or by the timer's own
+// interval where `now()` stands still, as in headless test runs).
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "core"
+import "play"
+import "av1"
+import "fx"
+import "render"
+import "vfx"
+import "export"
+import "disc"
+import "demux"
+import "subs"
+
+struct Player {
+    // Something is open.
+    loaded: Bool = false
+    path: String = ""
+    file: Data = Data()
+    media: core.Media = core.Media()
+    // Chosen tracks, -1 for none.
+    video: Int = -1
+    audio: Int = -1
+    subtitle: Int = -1
+    // The pumps (one item while they're here; empty while background work
+    // has them).
+    vpump: [play.VideoPump] = []
+    apump: [play.AudioPump] = []
+    videoBusy: Bool = false
+    audioBusy: Bool = false
+    // Bumped by every seek and track change: results of background work
+    // started before it are dropped.
+    gen: Int = 0
+    // Staged decoding (H.264): the parser and the two reconstructors (one
+    // item each while home), parsed batches waiting, and the luma and chroma
+    // halves of the batch being rebuilt.
+    staged: Bool = false
+    split: Bool = false
+    sparser: [play.StagedParser] = []
+    recLuma: [play.StagedReconstructor] = []
+    recChroma: [play.StagedReconstructor] = []
+    parseBusy: Bool = false
+    lumaBusy: Bool = false
+    chromaBusy: Bool = false
+    parsedQ: [play.ParsedBatch] = []
+    lumaOut: [core.Picture] = []
+    lumaGrains: [av1.FilmGrain] = []
+    chromaOut: [core.Picture] = []
+    lumaDone: Bool = false
+    chromaDone: Bool = false
+    parseDone: Bool = false
+    lastPicTime: Float = 0.0
+    // Decoded ahead: pictures waiting to be converted, then frames.
+    raws: [play.RawPicture] = []
+    conv: [play.Converter] = []
+    convertBusy: Bool = false
+    frames: [play.VideoFrame] = []
+    chunks: [play.AudioChunk] = []
+    videoDone: Bool = false
+    audioDone: Bool = false
+    // What's on screen.
+    shown: play.VideoFrame = play.VideoFrame(time: -1.0, width: 0, height: 0)
+    shownSerial: Int = 0
+    // The chunk playing now (valid while chunkPlaying).
+    chunk: play.AudioChunk = play.AudioChunk(path: "", start: 0.0, length: 0.0)
+    chunkPlaying: Bool = false
+    // Media time, seconds.
+    clock: Float = 0.0
+    lastTick: Float = 0.0
+    playing: Bool = false
+    ended: Bool = false
+    speed: Float = 1.0
+    volume: Float = 1.0
+    muted: Bool = false
+    // Seconds added to subtitle and sound times (the user's sync fixes).
+    subDelay: Float = 0.0
+    // Seconds the sound is late against the picture (VLC's sign: positive
+    // = sound later); the picture is picked for clock + audioDelay.
+    audioDelay: Float = 0.0
+    // Effects and filters (the Effects and Filters window): handed to the
+    // audio pump and the converter each time they go to work.
+    fxSettings: fx.Settings = fx.Settings()
+    look: render.View = render.View()
+    vfxSettings: vfx.Settings = vfx.Settings()
+    // Subtitles: the track's cues, decoded when it's chosen.
+    subtitles: subs.SubTrack = subs.SubTrack()
+    hasSubtitles: Bool = false
+    // The subtitle file loaded (subtitle == -2), for reloading.
+    subFilePath: String = ""
+    // A second subtitle track shown at the top (track index, -2 a file,
+    // -1 none), with its own delay.
+    subtitles2: subs.SubTrack = subs.SubTrack()
+    hasSubtitles2: Bool = false
+    subtitle2: Int = -1
+    sub2Delay: Float = 0.0
+    // Where to seek once the pumps are back from background work.
+    pendingSeek: Float = -1.0
+    // Pictures before this (after a seek) are decoded but not shown.
+    seekTarget: Float = -1000000.0
+    // Box the video is drawn in (points) and how many pixels per point.
+    boxW: Int = 640
+    boxH: Int = 360
+    pixelScale: Int = 2
+    // For the statistics overlay.
+    dropped: Int = 0
+    shownCount: Int = 0
+    warnings: [String] = []
+    error: String = ""
+
+    duration: Float {
+        media.duration
+    }
+
+    hasVideo: Bool {
+        video >= 0
+    }
+
+    hasAudio: Bool {
+        audio >= 0
+    }
+
+    // Takes a freshly opened source and makes its pumps.
+    fn start(_ src: play.Source, folder: String) {
+        loaded = true
+        path = src.path
+        file = src.file
+        media = src.media
+        video = src.video
+        audio = src.audio
+        subtitle = -1
+        error = ""
+        warnings = []
+        resetQueues()
+        makePumps(folder: folder)
+        if src.subtitle >= 0 {
+            chooseSubtitle(src.subtitle)
+        }
+        clock = 0.0
+        ended = false
+    }
+
+    fn resetQueues() {
+        frames = []
+        raws = []
+        parsedQ = []
+        lumaOut = []
+        lumaGrains = []
+        chromaOut = []
+        lumaDone = false
+        chromaDone = false
+        chunks = []
+        chunkPlaying = false
+        videoDone = video < 0
+        audioDone = audio < 0
+        shown = play.VideoFrame(time: -1.0, width: 0, height: 0)
+        shownSerial += 1
+        gen += 1
+    }
+
+    fn makePumps(folder: String) {
+        vpump = []
+        apump = []
+        conv = []
+        staged = false
+        sparser = []
+        recLuma = []
+        recChroma = []
+        if video >= 0 && play.canStage(media.tracks[video].codec) {
+            match play.newStages(media, track: video) {
+                .ok(st) -> {
+                    staged = true
+                    split = st.split
+                    sparser = [st.parser]
+                    recLuma = [st.luma]
+                    recChroma = [st.chroma]
+                    parseDone = false
+                }
+                .failure(e) -> { warnings.append(e.message) }
+            }
+        }
+        if video >= 0 {
+            conv = [play.newConverter(rotation: media.tracks[video].rotation)]
+        }
+        if video >= 0 && !staged {
+            match play.newVideoPump(media, track: video) {
+                .ok(p) -> {
+                    var pump = p
+                    pump.boxW = boxW * pixelScale
+                    pump.boxH = boxH * pixelScale
+                    vpump = [pump]
+                }
+                .failure(e) -> {
+                    error = e.message
+                    video = -1
+                    videoDone = true
+                }
+            }
+        }
+        if audio >= 0 {
+            match play.newAudioPump(media, track: audio, folder: folder) {
+                .ok(p) -> {
+                    var pump = p
+                    pump.setSpeed(speed)
+                    apump = [pump]
+                }
+                .failure(e) -> {
+                    error = e.message
+                    audio = -1
+                    audioDone = true
+                }
+            }
+        }
+    }
+
+    // Moves to `t` seconds. Pumps that are out in background work get the
+    // seek when they come back.
+    fn seek(_ t0: Float) {
+        let t = max(0.0, min(t0, max(duration, 0.0)))
+        resetQueues()
+        clock = t
+        ended = false
+        if videoBusy || audioBusy || stagesBusy() {
+            pendingSeek = t
+            return
+        }
+        applySeek(t)
+    }
+
+    fn stagesBusy() -> Bool {
+        parseBusy || lumaBusy || chromaBusy
+    }
+
+    fn applySeek(_ t: Float) {
+        if staged && !sparser.isEmpty {
+            sparser[0].seek(media, to: t)
+            recLuma[0].reset()
+            recChroma[0].reset()
+            parseDone = false
+            videoDone = false
+            seekTarget = t
+        }
+        if !vpump.isEmpty {
+            vpump[0].seek(media, to: t)
+            videoDone = false
+        }
+        if !apump.isEmpty {
+            apump[0].seek(media, to: t)
+            apump[0].setSpeed(speed)
+            audioDone = false
+        }
+        pendingSeek = -1.0
+    }
+
+    // Called when both pumps are home: a seek waiting for them happens now.
+    fn settle() {
+        if pendingSeek >= 0.0 && !videoBusy && !audioBusy && !stagesBusy() {
+            applySeek(pendingSeek)
+        }
+    }
+
+    // How many pictures to keep decoded ahead.
+    fn wantVideo() -> Bool {
+        !vpump.isEmpty && !videoBusy && !videoDone && frames.count + raws.count < 12 && pendingSeek < 0.0
+    }
+
+    // Staged: parse more when little is waiting further along.
+    fn wantParse() -> Bool {
+        staged && !sparser.isEmpty && !parseBusy && !parseDone && pendingSeek < 0.0 && parsedQ.count < 2 && frames.count + raws.count < 12
+    }
+
+    // Staged: both reconstructors home and a batch waiting.
+    fn wantReconstruct() -> Bool {
+        staged && !recLuma.isEmpty && (!split || !recChroma.isEmpty) && !lumaBusy && !chromaBusy && !parsedQ.isEmpty && pendingSeek < 0.0
+    }
+
+    // Both halves of a batch are back: join them into pictures to convert.
+    fn joinHalves() {
+        if !lumaDone || !chromaDone {
+            return
+        }
+        let pics = play.mergeStages(media.tracks[video].codec, lumaOut, chromaOut)
+        let grains = lumaGrains
+        lumaOut = []
+        lumaGrains = []
+        chromaOut = []
+        lumaDone = false
+        chromaDone = false
+        let scale = media.tracks[video].timescale
+        for (i, pic) in pics.enumerated() {
+            var t = lastPicTime + 0.04
+            if pic.pts != core.noTime {
+                t = core.seconds(pic.pts, scale)
+            }
+            lastPicTime = t
+            if t >= seekTarget - 0.001 {
+                let grain = if i < grains.count && grains[i].apply { [grains[i]] } else { [] }
+                raws.append(play.RawPicture(time: t, picture: pic, grain: grain))
+            }
+        }
+        if parseDone && parsedQ.isEmpty && !lumaBusy && !chromaBusy {
+            videoDone = true
+        }
+    }
+
+    fn wantConvert() -> Bool {
+        !conv.isEmpty && !convertBusy && !raws.isEmpty
+    }
+
+    fn wantAudio() -> Bool {
+        !apump.isEmpty && !audioBusy && !audioDone && chunks.count < 2 && pendingSeek < 0.0
+    }
+
+    // Decoding has fallen behind the clock: nothing waiting to be shown.
+    fn videoBehind() -> Bool {
+        if staged {
+            return playing && shownCount > 0 && frames.isEmpty && raws.isEmpty && parsedQ.isEmpty && !videoDone
+        }
+        playing && shownCount > 0 && frames.isEmpty && raws.isEmpty && !videoDone
+    }
+
+    // Moves the clock without sound: `dt` seconds of real time.
+    fn advanceByTime(_ dt: Float) {
+        if playing && !ended {
+            clock += dt * speed
+        }
+    }
+
+    // Picks the frame for the clock: the latest one due, dropping older
+    // ones. Gives true when the picture changed.
+    fn pickFrame() -> Bool {
+        var changed = false
+        var i = 0
+        while i < frames.count && frames[i].time <= clock + audioDelay + 0.005 {
+            i += 1
+        }
+        if i > 0 {
+            if i > 1 {
+                dropped += i - 1
+            }
+            shown = frames[i - 1]
+            frames = frames.dropFirst(i)
+            shownSerial += 1
+            shownCount += 1
+            changed = true
+        } else if shown.time < 0.0 && !frames.isEmpty && !playing {
+            // Paused after a seek or open: show the first frame there.
+            shown = frames[0]
+            shownSerial += 1
+            changed = true
+        }
+        changed
+    }
+
+    // Whether the end has been reached (all decoded and shown).
+    fn checkEnded() -> Bool {
+        let noMoreVideo = !hasVideo || (videoDone && frames.isEmpty)
+        let noMoreAudio = !hasAudio || (audioDone && chunks.isEmpty && !chunkPlaying)
+        if noMoreVideo && noMoreAudio && loaded {
+            ended = true
+        }
+        ended
+    }
+
+    fn chooseSubtitle(_ t: Int) {
+        subtitle = t
+        hasSubtitles = false
+        if t < 0 {
+            return
+        }
+        match subs.decodeTrack(file, media, track: t) {
+            .ok(track) -> {
+                subtitles = track
+                hasSubtitles = true
+            }
+            .failure(e) -> warnings.append("subtitles: {e.message}")
+        }
+    }
+
+    // Subtitles from a file next to the video, or chosen by the user.
+    fn loadSubtitleFile(_ p: String) -> Bool {
+        match subs.loadFile(p) {
+            .ok(track) -> {
+                subtitles = track
+                hasSubtitles = true
+                subtitle = -2
+                subFilePath = p
+                return true
+            }
+            .failure(e) -> {
+                warnings.append("subtitles: {e.message}")
+                return false
+            }
+        }
+    }
+
+    // The cues to draw now.
+    fn cuesNow2() -> [subs.Cue] {
+        if !hasSubtitles2 {
+            return []
+        }
+        subs.activeCues(subtitles2, at: clock - sub2Delay)
+    }
+
+    fn cuesNow() -> [subs.Cue] {
+        if !hasSubtitles {
+            return []
+        }
+        subs.activeCues(subtitles, at: clock - subDelay)
+    }
+}
+
+// "1:02:03" or "2:03".
+fn timeText(_ seconds: Float) -> String {
+    if seconds < 0.0 {
+        return "--:--"
+    }
+    let s = Int(seconds)
+    let h = s / 3600
+    let m = (s / 60) % 60
+    let sec = s % 60
+    let ss = if sec < 10 { "0{sec}" } else { "{sec}" }
+    if h > 0 {
+        let mm = if m < 10 { "0{m}" } else { "{m}" }
+        return "{h}:{mm}:{ss}"
+    }
+    "{m}:{ss}"
+}
+
+// The results background work brings back.
+struct VideoBatch {
+    pump: play.VideoPump
+    frames: [play.VideoFrame]
+}
+
+struct AudioBatch {
+    pump: play.AudioPump
+    chunk: play.AudioChunk
+    has: Bool
+}
+
+struct RawBatch {
+    pump: play.VideoPump
+    raws: [play.RawPicture]
+}
+
+struct ConvertBatch {
+    conv: play.Converter
+    frames: [play.VideoFrame]
+}
+
+fn decodeVideoBatch(_ pump: play.VideoPump, _ file: Data, _ media: core.Media, count: Int) -> RawBatch {
+    var p = pump
+    let raws = p.decodeOnly(file, media, count: count)
+    RawBatch(pump: p, raws: raws)
+}
+
+// `last`: these are the track's last pictures, so the filters give out
+// what they still hold too.
+fn convertBatch(_ conv: play.Converter, _ raws: [play.RawPicture], gen: Int, last: Bool) -> ConvertBatch {
+    var c = conv
+    var frames = c.convert(raws, generation: gen)
+    if last {
+        frames.appendAll(c.flush())
+    }
+    ConvertBatch(conv: c, frames: frames)
+}
+
+// Sound chunks start short (playing starts quickly) and grow, so there are
+// few chunk changes once it's going: 1, 2, 4, 8, then 15 seconds.
+fn decodeAudioBatch(_ pump: play.AudioPump, _ file: Data, _ media: core.Media) -> AudioBatch {
+    var p = pump
+    let lengths = [1.0, 2.0, 4.0, 8.0]
+    let seconds = if p.serial < lengths.count { lengths[p.serial] } else { 15.0 }
+    if let c = p.chunk(file, media, seconds: seconds) {
+        return AudioBatch(pump: p, chunk: c, has: true)
+    }
+    AudioBatch(pump: p, chunk: play.AudioChunk(path: "", start: 0.0, length: 0.0, last: true), has: false)
+}
+
+fn openInBackground(_ path: String) -> Result<play.Source> {
+    play.openSource(path)
+}
+
+// Background work for the seek-bar preview: the keyframe before `t` as a
+// 160-pixel-wide thumbnail (an empty one when there's none).
+fn thumbJob(_ file: Data, _ media: core.Media, _ track: Int, _ t: Float) -> play.Thumb {
+    play.thumbnailAt(file, media, track: track, seconds: t, width: 160) ?? play.Thumb()
+}
+
+// Background work for the scene strip: eight more keyframes of the scan.
+fn sceneScanStep(_ scan: play.SceneScan, _ file: Data, _ media: core.Media) -> play.SceneScan {
+    var s = scan
+    s.step(file, media, count: 8)
+    s
+}
+
+// Background work: writes a clip (MKV or MP4); gives "" or the problem,
+// then any warnings.
+fn exportClipJob(_ file: Data, _ media: core.Media, _ tracks: [Int], _ from: Float, _ to: Float, _ exact: Bool, _ out: String) -> String {
+    match export.planClip(media, tracks: tracks, from: from, to: to, exactStart: exact) {
+        .ok(plan) -> {
+            let r = if out.lowercase().hasSuffix(".mp4") { export.writeMp4(file, plan, path: out) } else { export.writeMkv(file, plan, path: out) }
+            match r {
+                .ok(w) -> {
+                    var text = "Saved {out.fileName} ({w.bytes / 1000000} MB)"
+                    if !w.warnings.isEmpty {
+                        text += ". " + w.warnings.joined(separator: " ")
+                    }
+                    text
+                }
+                .failure(e) -> "Can't write the clip: {e.message}"
+            }
+        }
+        .failure(e) -> "Can't make the clip: {e.message}"
+    }
+}
+
+// Background work: a GIF of a range.
+fn exportGifJob(_ file: Data, _ media: core.Media, _ track: Int, _ from: Float, _ to: Float, _ fps: Int, _ width: Int, _ height: Int, _ options: export.GifOptions, _ out: String) -> String {
+    let frames = play.rangeFrames(file, media, track: track, from: from, to: to, fps: fps, width: width, height: height)
+    if frames.isEmpty {
+        return "No pictures in that range."
+    }
+    var enc = export.newGifEncoder(width: width, height: height, options: options)
+    writeData(path: out, data: Data())
+    for f in frames {
+        enc.addFrame(f, delay: 1.0 / Float(max(fps, 1)))
+        appendData(path: out, data: enc.takeData())
+    }
+    appendData(path: out, data: enc.finish())
+    "Saved {out.fileName} ({frames.count} frames, {(fileSize(out) ?? 0) / 1000} KB)"
+}
+
+struct DiscOpen {
+    ok: Bool = false
+    problem: String = ""
+    source: play.Source = play.Source(path: "", file: Data(), media: core.Media())
+}
+
+// Background work: a disc title's bytes (its segments, read file by file)
+// and the media in them, labelled from the disc's navigation.
+fn openDiscTitleJob(_ t: disc.Title, _ name: String) -> DiscOpen {
+    var total = 0
+    for seg in t.segments {
+        total += seg.to - seg.from
+    }
+    // Whole files only (Tessel #45): keep within memory.
+    if total > 8000000000 {
+        return DiscOpen(problem: "This title is {total / 1000000000} GB; Reel can't hold titles over 8 GB yet.")
+    }
+    var data = Data()
+    var cachedPath = ""
+    var cached = Data()
+    for seg in t.segments {
+        if seg.path != cachedPath {
+            cached = readData(seg.path) ?? Data()
+            cachedPath = seg.path
+        }
+        if seg.to <= cached.count {
+            data += cached.slice(from: seg.from, to: seg.to)
+        }
+    }
+    cached = Data()
+    if data.isEmpty {
+        return DiscOpen(problem: "The title's files can't be read.")
+    }
+    let opened = if t.kind == "bluray" { demux.tsOpen(data) } else { demux.psOpen(data) }
+    match opened {
+        .ok(m0) -> {
+            let m = disc.annotate(m0, t)
+            var src = play.Source(path: name, file: data, media: m)
+            src.video = play.pickTrack(m, .video, playable: { c in play.canDecodeVideo(c) })
+            src.audio = play.pickTrack(m, .audio, playable: { c in play.canDecodeAudio(c) })
+            src.subtitle = play.pickSubtitle(m)
+            return DiscOpen(ok: true, source: src)
+        }
+        .failure(e) -> DiscOpen(problem: "The title can't be read: {e.message}")
+    }
+}

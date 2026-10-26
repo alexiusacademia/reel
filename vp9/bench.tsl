@@ -1,0 +1,133 @@
+// Development timing of the sample-level kernels, called by benchmarks
+// under build/scratch/vp9 (not used by Reel).
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+public fn benchMc() {
+    var px = Vp9Px()
+    px.setup()
+    px.setDepth(8)
+    var ref: [Int] = []
+    for i in 0..(1024 * 512) {
+        ref.append((i * 7 + (i >> 10) * 13) & 255)
+    }
+    px.pl = vp9Zeros(1024 * 512)
+    for size in [4, 8, 16, 64] {
+        var line = "size {size}:"
+        for k in 0..4 {
+            let mx = if k == 1 || k == 3 { 6 } else { 0 }
+            let my = if k >= 2 { 10 } else { 0 }
+            let n = 2000000 / (size * size)
+            let t = now()
+            for i in 0..n {
+                let x = 100 + (i * 37) % 700
+                let y = 100 + (i * 11) % 300
+                px.mc(ref, 1024, 1024, 512, x, y, mx, my, y * 1024 + x, 1024, size, size, 1, false)
+            }
+            let ns = (now() - t) * 1000000000.0 / Float(n * size * size)
+            
+            line += " [{mx},{my}] {Int(ns * 100.0)}"
+        }
+        print("{line} (0.01 ns per pixel)")
+    }
+}
+
+public fn benchLf() {
+    var px = Vp9Px()
+    px.setup()
+    px.setDepth(8)
+    px.setSharpness(0)
+    var pl: [Int] = []
+    var seed = 1
+    for i in 0..(1024 * 256) {
+        seed = (seed * 1103515245 + 12345) & 0x7fffffff
+        pl.append(100 + ((i >> 3) & 7) + ((seed >> 10) & 3))
+    }
+    px.pl = pl
+    for wd in [4, 8, 16] {
+        for dir in 0..2 {
+            let n = 200000
+            let t = now()
+            for i in 0..n {
+                let at = 16 * 1024 + 16 + ((i * 24) % 900) + ((i / 37) % 200) * 1024
+                if dir == 0 {
+                    px.lf(at, 32, 1024, 1, wd)
+                } else {
+                    px.lf(at, 32, 1, 1024, wd)
+                }
+            }
+            let ns = (now() - t) * 1000000000.0 / Float(n * 8)
+            print("lf wd {wd} dir {dir}: {Int(ns * 100.0)} (0.01 ns per sample)")
+        }
+    }
+}
+
+public fn benchBool() {
+    var bytes: [Int] = []
+    var x = 12345
+    for _ in 0..4000000 {
+        x = (x * 1103515245 + 12345) & 0x7fffffff
+        bytes.append((x >> 16) & 255)
+    }
+    var b = Vp9Bool()
+    b.setup()
+    b.start(bytes, 0, bytes.count)
+    let t = now()
+    var s = 0
+    for i in 0..10000000 {
+        s += b.read(64 + (i & 127))
+    }
+    print("time 10M bool reads: {Int((now() - t) * 1000.0)} ms ({s})")
+}
+
+public fn benchItx() {
+    var px = Vp9Px()
+    px.setup()
+    px.setDepth(8)
+    px.pl = vp9Zeros(256 * 256)
+    for tx in 0..4 {
+        let n = 4 << tx
+        for kind in [0, 3] {
+            if tx == 3 && kind != 0 {
+                continue
+            }
+            // A few low-frequency coefficients, not DC only.
+            let coefs = [5, 40 * 1024 + 0, -12 * 1024 + 1, 7 * 1024 + n, 3 * 1024 + n + 1, -2 * 1024 + 2 * n]
+            let reps = 200000 / (n * n / 16)
+            let t = now()
+            for i in 0..reps {
+                px.itxAdd(coefs, 0, 5, (i & 7) * n, 256, tx, kind)
+            }
+            let ns = (now() - t) * 1000000000.0 / Float(reps)
+            print("itx {n}x{n} kind {kind}: {Int(ns)} ns per block, {Int(ns * 100.0 / Float(n * n))} (0.01 ns per sample)")
+        }
+    }
+}
+
+public fn benchIntra() {
+    var px = Vp9Px()
+    px.setup()
+    px.setDepth(8)
+    var pl: [Int] = []
+    for i in 0..(512 * 512) {
+        pl.append((i * 7) & 255)
+    }
+    px.pl = pl
+    for tx in 0..4 {
+        let n = 4 << tx
+        var line = "intra {n}x{n}:"
+        for mode in [0, 1, 2, 3, 4, 5, 6, 7, 8, 9] {
+            let reps = 100000 / (n * n / 16)
+            let t = now()
+            for i in 0..reps {
+                let at = 64 * 512 + 64 + (i & 15) * n
+                let m = px.edges(mode, at, 512, tx, true, true, true, 256, 256)
+                px.predict(m, at, 512, tx)
+            }
+            let ns = (now() - t) * 1000000000.0 / Float(reps)
+            line += " {mode}:{Int(ns)}"
+        }
+        print("{line} ns per block")
+    }
+}

@@ -1,0 +1,81 @@
+{
+ "format": "matroska,webm",
+ "duration": 0.3,
+ "tags": {
+  "encoder": "Lavf62.12.102"
+ },
+ "tracks": [
+  {
+   "index": 0,
+   "kind": "audio",
+   "codec": "alac",
+   "ffCodec": "alac",
+   "profile": "",
+   "timescale": 1000,
+   "duration": -9223372036854775807,
+   "extraHex": "00000024616c616300000000000010000010280a0e02000000004004001588800000ac44",
+   "width": 0,
+   "height": 0,
+   "sarNum": 1,
+   "sarDen": 1,
+   "fpsNum": 0,
+   "fpsDen": 0,
+   "rotation": 0,
+   "pixFmt": "",
+   "sampleRate": 44100,
+   "channels": 2,
+   "channelLayout": "stereo",
+   "bitsPerSample": 16,
+   "pcm": {
+    "bits": 16,
+    "float": false,
+    "bigEndian": false,
+    "signed": true
+   },
+   "language": "",
+   "title": "",
+   "isDefault": false,
+   "isCover": false,
+   "frames": -1
+  }
+ ],
+ "packets": [
+  {
+   "track": 0,
+   "pts": 0,
+   "dts": 0,
+   "duration": 0,
+   "key": true,
+   "pos": 553,
+   "size": 1568
+  },
+  {
+   "track": 0,
+   "pts": 93,
+   "dts": 93,
+   "duration": 0,
+   "key": true,
+   "pos": 2128,
+   "size": 1589
+  },
+  {
+   "track": 0,
+   "pts": 186,
+   "dts": 186,
+   "duration": 0,
+   "key": true,
+   "pos": 3724,
+   "size": 1583
+  },
+  {
+   "track": 0,
+   "pts": 279,
+   "dts": 279,
+   "duration": 0,
+   "key": true,
+   "pos": 5314,
+   "size": 479
+  }
+ ],
+ "chapters": []
+}

@@ -1,0 +1,107 @@
+// The deblocking filter's sample operations (ITU-T H.264 8.7.2.3 and
+// 8.7.2.4): filtering one edge of luma or chroma for given boundary
+// strengths and thresholds. Which edges and strengths: engine.tsl.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../core"
+
+
+fn h264MvFar(_ ax: Int, _ ay: Int, _ bx: Int, _ by: Int, _ limY: Int) -> Bool {
+    let dx = ax - bx
+    let dy = ay - by
+    dx >= 4 || dx <= -4 || dy >= limY || dy <= -limY
+}
+
+
+// Filters one edge: `at` is q0 of the first line, `across` the step from
+// p0 to q0, `along` the step to the next line; bs holds the strength of
+// each group of `per` lines.
+fn h264FilterEdge(_ p: bind [Int], _ at: Int, _ across: Int, _ along: Int, _ lines: Int, _ per: Int, _ bs: [Int], _ indexA: Int, _ indexB: Int, _ chroma: Bool) {
+    if p.isEmpty {
+        // A plane this reconstructor doesn't make.
+        return
+    }
+    let alpha = deblockAlpha[indexA]
+    let beta = deblockBeta[indexB]
+    if alpha == 0 || beta == 0 {
+        return
+    }
+    let tcTab = deblockTc0
+    let a2 = 2 * across
+    let a3 = 3 * across
+    for seg in 0..4 {
+        let b = bs[seg]
+        if b == 0 {
+            continue
+        }
+        let tc0 = if b < 4 { tcTab[indexA * 3 + b - 1] } else { 0 }
+        var q = at + seg * per * along
+        for _ in 0..per {
+            let p0 = p[q - across]
+            let q0 = p[q]
+            let p1 = p[q - a2]
+            let q1 = p[q + across]
+            let d0 = p0 - q0
+            let d1 = p1 - p0
+            let d2 = q1 - q0
+            if d0 < alpha && d0 > -alpha && d1 < beta && d1 > -beta && d2 < beta && d2 > -beta {
+                if chroma {
+                    if b < 4 {
+                        let tc = tc0 + 1
+                        let delta = max(-tc, min(tc, (((q0 - p0) << 2) + (p1 - q1) + 4) >> 3))
+                        p[q - across] = h264Clip(p0 + delta)
+                        p[q] = h264Clip(q0 - delta)
+                    } else {
+                        p[q - across] = (2 * p1 + p0 + q1 + 2) >> 2
+                        p[q] = (2 * q1 + q0 + p1 + 2) >> 2
+                    }
+                } else {
+                    let p2 = p[q - a3]
+                    let q2 = p[q + a2]
+                    let ap = if p2 > p0 { p2 - p0 } else { p0 - p2 }
+                    let aq = if q2 > q0 { q2 - q0 } else { q0 - q2 }
+                    if b < 4 {
+                        var tc = tc0
+                        if ap < beta {
+                            tc += 1
+                        }
+                        if aq < beta {
+                            tc += 1
+                        }
+                        let delta = max(-tc, min(tc, (((q0 - p0) << 2) + (p1 - q1) + 4) >> 3))
+                        p[q - across] = h264Clip(p0 + delta)
+                        p[q] = h264Clip(q0 - delta)
+                        if ap < beta {
+                            p[q - a2] = p1 + max(-tc0, min(tc0, (p2 + ((p0 + q0 + 1) >> 1) - (p1 << 1)) >> 1))
+                        }
+                        if aq < beta {
+                            p[q + across] = q1 + max(-tc0, min(tc0, (q2 + ((p0 + q0 + 1) >> 1) - (q1 << 1)) >> 1))
+                        }
+                    } else {
+                        let ad = if d0 < 0 { -d0 } else { d0 }
+                        let strong = ad < ((alpha >> 2) + 2)
+                        if ap < beta && strong {
+                            let p3 = p[q - 4 * across]
+                            p[q - across] = (p2 + 2 * p1 + 2 * p0 + 2 * q0 + q1 + 4) >> 3
+                            p[q - a2] = (p2 + p1 + p0 + q0 + 2) >> 2
+                            p[q - a3] = (2 * p3 + 3 * p2 + p1 + p0 + q0 + 4) >> 3
+                        } else {
+                            p[q - across] = (2 * p1 + p0 + q1 + 2) >> 2
+                        }
+                        if aq < beta && strong {
+                            let q3 = p[q + a3]
+                            p[q] = (p1 + 2 * p0 + 2 * q0 + 2 * q1 + q2 + 4) >> 3
+                            p[q + across] = (p0 + q0 + q1 + q2 + 2) >> 2
+                            p[q + a2] = (2 * q3 + 3 * q2 + q1 + q0 + p0 + 4) >> 3
+                        } else {
+                            p[q] = (2 * q1 + q0 + p1 + 2) >> 2
+                        }
+                    }
+                }
+            }
+            q += along
+        }
+    }
+}

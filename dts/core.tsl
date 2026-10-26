@@ -1,0 +1,1872 @@
+// The DTS Coherent Acoustics core (ETSI TS 102 114): parsing a core
+// frame into subband samples, the backward compatible extensions carried
+// in the core substream (XCh 6.1, XXCH 7.1, X96 96 kHz) and those carried
+// in the DTS-HD extension substream (XBR, XXCH, X96), and filtering the
+// subband samples to PCM (dsp.tsl).
+//
+// A core frame (5.3–5.5) holds npcmblocks × 32 PCM samples per channel
+// split into 32 subbands. The frame header says the channel arrangement
+// (AMODE), rate and options; the primary audio coding header gives per
+// channel the active subbands, the subband from which high frequencies
+// are vector quantized (VQ), joint intensity coding and the Huffman
+// codebooks used. Then come 1–16 subframes, each of 1–4 subsubframes of 8
+// samples per subband: side information (ADPCM prediction modes and
+// coefficient indices, bit allocation, transient modes, scale factors),
+// then the audio data (quantization indices: Huffman, block or linear
+// codes), LFE samples, and a DSYNC word.
+//
+// Subband samples are integers (24-bit range) as in the DTS reference
+// decoder and FFmpeg's dca_core.c, which this follows step by step, so
+// that a lossless (XLL) residual can be added to the exact core output.
+//
+// Speakers are numbered as in the DTS-HD specification (FFmpeg's
+// DCASpeaker): C L R Ls Rs LFE1 Cs Lsr Rsr Lss Rss Lc Rc Lh Ch Rh LFE2 Lw
+// Rw Oh Lhs Rhs Chr Lhr Rhr Cl Ll Rl.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../core"
+
+// Speaker numbers.
+let dtsSpkC = 0
+let dtsSpkL = 1
+let dtsSpkR = 2
+let dtsSpkLs = 3
+let dtsSpkRs = 4
+let dtsSpkLfe1 = 5
+let dtsSpkCs = 6
+let dtsSpkLss = 9
+let dtsSpkRss = 10
+
+// Extension masks (which extensions a frame decoded).
+let dtsCssCore = 0x001
+let dtsCssXxch = 0x002
+let dtsCssX96 = 0x004
+let dtsCssXch = 0x008
+let dtsExssCore = 0x010
+let dtsExssXbr = 0x020
+let dtsExssXxch = 0x040
+let dtsExssX96 = 0x080
+let dtsExssLbr = 0x100
+let dtsExssXll = 0x200
+let dtsExssMask = 0xff0
+
+// The speakers of each AMODE's primary channels (Table 5-4) and their mask.
+let dtsPrmChToSpkr: [Int] = [
+    0, -1, -1, -1, -1,
+    1, 2, -1, -1, -1,
+    1, 2, -1, -1, -1,
+    1, 2, -1, -1, -1,
+    1, 2, -1, -1, -1,
+    0, 1, 2, -1, -1,
+    1, 2, 6, -1, -1,
+    0, 1, 2, 6, -1,
+    1, 2, 3, 4, -1,
+    0, 1, 2, 3, 4,
+]
+
+let dtsAudioModeMask: [Int] = [0x1, 0x6, 0x6, 0x6, 0x6, 0x7, 0x46, 0x47, 0x1e, 0x1f]
+
+// Bits of the two block codes for ABITS 1…7 (5.5.2).
+let dtsBlockCodeBits: [Int] = [7, 10, 12, 13, 15, 17, 19]
+
+// What an asset of the extension substream holds (exss.tsl fills it).
+public struct DtsAsset {
+    ok: Bool = false
+    oneToOneMap: Bool = true
+    representationType: Int = 0
+    maxSampleRate: Int = 0
+    pcmBitRes: Int = 0
+    nchannelsTotal: Int = 0
+    spkrMask: Int = 0
+    extensionMask: Int = 0
+    coreOffset: Int = 0
+    coreSize: Int = 0
+    xbrOffset: Int = 0
+    xbrSize: Int = 0
+    xxchOffset: Int = 0
+    xxchSize: Int = 0
+    x96Offset: Int = 0
+    x96Size: Int = 0
+    lbrOffset: Int = 0
+    lbrSize: Int = 0
+    xllOffset: Int = 0
+    xllSize: Int = 0
+    xllSyncPresent: Bool = false
+    xllDelayFrames: Int = 0
+    xllSyncOffset: Int = 0
+    hdStreamId: Int = 0
+}
+
+// Subband samples per channel and band: 4 ADPCM history samples, then up
+// to 128 samples of the frame.
+let dtsStride = 132
+
+public struct DtsCore {
+    br: core.BitReader = core.bitReader(Data())
+    // Bit position (in br) where the current reading range starts, for
+    // positions relative to it.
+    brStart: Int = 0
+    vlcError: Bool = false
+    error: String = ""
+
+    // Tables copied into the struct (fast to read).
+    vlcTable: [Int] = dtsVlc.table
+    vlcBase: [Int] = dtsVlc.base
+    vlcBits: [Int] = dtsVlc.firstBits
+    adpcmVb: [Int] = dtsAdpcmVb
+    hfVq: [Int] = dtsHighFreqVq
+
+    // Frame header (5.3.1).
+    crcPresent: Bool = false
+    npcmblocks: Int = 0
+    frameSize: Int = 0
+    audioMode: Int = 0
+    sampleRate: Int = 0
+    bitRate: Int = 0
+    drcPresent: Bool = false
+    tsPresent: Bool = false
+    auxPresent: Bool = false
+    extAudioType: Int = 0
+    extAudioPresent: Bool = false
+    syncSsf: Bool = false
+    lfePresent: Int = 0
+    predictorHistory: Bool = false
+    filterPerfect: Bool = false
+    sourcePcmRes: Int = 0
+    esFormat: Bool = false
+    sumdiffFront: Bool = false
+    sumdiffSurround: Bool = false
+
+    // Primary audio coding header (5.3.2).
+    nsubframes: Int = 0
+    nchannels: Int = 0
+    chMask: Int = 0
+    nsubbands: [Int] = core.zeros(7)
+    subbandVqStart: [Int] = core.zeros(7)
+    jointIntensityIndex: [Int] = core.zeros(7)
+    transitionModeSel: [Int] = core.zeros(7)
+    scaleFactorSel: [Int] = core.zeros(7)
+    bitAllocationSel: [Int] = core.zeros(7)
+    quantIndexSel: [Int] = core.zeros(70)
+    scaleFactorAdj: [Int] = core.zeros(70)
+
+    // Side information (5.4.1): [16] subframes, [7 × 64] channel × band,
+    // transition modes [16 × 7 × 32], scale factors [7 × 32 × 2].
+    nsubsubframes: [Int] = core.zeros(16)
+    predictionMode: [Int] = core.zeros(448)
+    predictionVqIndex: [Int] = core.zeros(448)
+    bitAllocation: [Int] = core.zeros(448)
+    transitionMode: [Int] = core.zeros(3584)
+    scaleFactors: [Int] = core.zeros(448)
+    jointScaleSel: [Int] = core.zeros(7)
+    jointScaleFactors: [Int] = core.zeros(448)
+
+    // Auxiliary data.
+    primDmixEmbedded: Bool = false
+    primDmixType: Int = 0
+
+    extAudioMask: Int = 0
+    xchPos: Int = 0
+
+    // XXCH (7.1 extension).
+    xxchCrcPresent: Bool = false
+    xxchMaskNbits: Int = 0
+    xxchCoreMask: Int = 0
+    xxchSpkrMask: Int = 0
+    xxchDmixEmbedded: Bool = false
+    xxchDmixScaleInv: Int = 0
+    xxchDmixMask: [Int] = core.zeros(2)
+    xxchDmixCoeff: [Int] = core.zeros(12)
+    xxchPos: Int = 0
+
+    // X96 (96 kHz extension).
+    x96RevNo: Int = 0
+    x96CrcPresent: Bool = false
+    x96Nchannels: Int = 0
+    x96HighRes: Bool = false
+    x96SubbandStart: Int = 0
+    x96Rand: Int = 1
+    x96Pos: Int = 0
+
+    // Subband samples: (ch × 32 + band) × dtsStride; X96 (ch × 64 + band)
+    // × dtsStride; LFE: 8 history samples then the frame's.
+    sub: [Int] = core.zeros(7 * 32 * 132)
+    x96Sub: [Int] = core.zeros(7 * 64 * 132)
+    lfe: [Int] = core.zeros(8 + 64)
+    audio: [Int] = core.zeros(16)
+    vqIndex: [Int] = core.zeros(32)
+
+    // XBR scratch.
+    xbrNabits: [Int] = core.zeros(8)
+    xbrAlloc: [Int] = core.zeros(7 * 32)
+    xbrScaleBits: [Int] = core.zeros(8)
+    xbrScale: [Int] = core.zeros(7 * 32 * 2)
+
+    // Synthesis and output.
+    syn: DtsSynth = DtsSynth()
+    filterMode: Int = -1
+    outputRate: Int = 0
+    npcmsamples: Int = 0
+
+    fn fail(_ text: String) -> Int {
+        if error.isEmpty {
+            error = text
+        }
+        -1
+    }
+
+    // Bits read since `brStart`.
+    pos: Int {
+        br.position - brStart
+    }
+
+    // FFmpeg's ff_dca_seek_bits: moves forward to bit p (relative), or
+    // fails if that is behind us or past the end.
+    fn seekBits(_ p: Int) -> Bool {
+        let now = pos
+        if p < now || brStart + p > br.end * 8 {
+            return false
+        }
+        br.skip(p - now)
+        true
+    }
+
+    fn setRange(_ data: Data, from: Int, to: Int) {
+        br = core.bitReaderRange(data, from: from, to: to)
+        brStart = from * 8
+    }
+
+    // Reads one Huffman code of `book` (vlc.tsl).
+    fn vlc(_ book: Int) -> Int {
+        let fb = vlcBits[book]
+        var e = vlcTable[vlcBase[book] + br.peek(fb)]
+        if e < 0 {
+            br.skip(fb)
+            let x = -e
+            e = vlcTable[(x >> 5) + br.peek(x & 31)]
+        }
+        if e == 0 {
+            vlcError = true
+            br.skip(1)
+            return 0
+        }
+        br.skip(e & 31)
+        (e >> 5) - 512
+    }
+
+    // --- 5.3.1 Frame header ---
+
+    // Reads the core frame header at data[at…] (16-bit big-endian form).
+    fn parseFrameHeader() -> Int {
+        let h = dtsReadCoreHeader(br)
+        if !h.ok {
+            return fail(h.problem)
+        }
+        // Move past the header (dtsReadCoreHeader read a copy).
+        br.skip(h.headerBits)
+        crcPresent = h.crcPresent
+        npcmblocks = h.npcmblocks
+        frameSize = h.frameSize
+        audioMode = h.audioMode
+        sampleRate = dtsSampleRates[h.srCode]
+        bitRate = dtsBitRates[h.brCode]
+        drcPresent = h.drcPresent
+        tsPresent = h.tsPresent
+        auxPresent = h.auxPresent
+        extAudioType = h.extAudioType
+        extAudioPresent = h.extAudioPresent
+        syncSsf = h.syncSsf
+        lfePresent = h.lfePresent
+        predictorHistory = h.predictorHistory
+        filterPerfect = h.filterPerfect
+        sourcePcmRes = dtsBitsPerSample[h.pcmrCode]
+        esFormat = (h.pcmrCode & 1) == 1
+        sumdiffFront = h.sumdiffFront
+        sumdiffSurround = h.sumdiffSurround
+        0
+    }
+
+    // --- 5.3.2 Primary audio coding header (also XCh and XXCH channel sets) ---
+
+    // header: 0 core, 1 XCh, 2 XXCH.
+    fn parseCodingHeader(_ header: Int, _ xchBase: Int) -> Int {
+        let headerPos = pos
+        var headerSize = 0
+        if br.left < 0 {
+            return fail("core coding header past the end")
+        }
+        if header == 0 {
+            nsubframes = br.bits(4) + 1
+            nchannels = br.bits(3) + 1
+            if nchannels != dtsChannelsForMode[audioMode] {
+                return fail("invalid number of primary channels ({nchannels}) for AMODE {audioMode}")
+            }
+            chMask = dtsAudioModeMask[audioMode]
+            if lfePresent != 0 {
+                chMask = chMask | (1 << dtsSpkLfe1)
+            }
+        } else if header == 1 {
+            nchannels = dtsChannelsForMode[audioMode] + 1
+            chMask = chMask | (1 << dtsSpkCs)
+        } else {
+            headerSize = br.bits(7) + 1
+            let n = br.bits(3) + 1
+            if n > 2 {
+                return fail("{n} XXCH channels")
+            }
+            nchannels = dtsChannelsForMode[audioMode] + n
+            let mask = br.long(xxchMaskNbits - dtsSpkCs)
+            xxchSpkrMask = mask << dtsSpkCs
+            if dtsPopcount(xxchSpkrMask) != n {
+                return fail("invalid XXCH speaker mask")
+            }
+            if (xxchCoreMask & xxchSpkrMask) != 0 {
+                return fail("XXCH speaker mask overlaps the core")
+            }
+            chMask = xxchCoreMask | xxchSpkrMask
+            if br.flag() {
+                var cp = 0
+                xxchDmixEmbedded = br.flag()
+                let index = br.bits(6) * 4 - 41 - 3
+                if index < 0 || index >= 201 {
+                    return fail("invalid XXCH downmix scale index")
+                }
+                xxchDmixScaleInv = dtsInvDmixTable[index]
+                for ch in 0..n {
+                    let m = br.long(xxchMaskNbits)
+                    if (m & xxchCoreMask) != m {
+                        return fail("invalid XXCH downmix channel mask")
+                    }
+                    xxchDmixMask[ch] = m
+                }
+                for ch in 0..n {
+                    for b in 0..xxchMaskNbits {
+                        if (xxchDmixMask[ch] & (1 << b)) != 0 {
+                            var code = br.bits(7)
+                            let neg = (code >> 6) == 0
+                            code = code & 63
+                            if code != 0 {
+                                let idx = code * 4 - 3
+                                if idx >= 242 {
+                                    return fail("invalid XXCH downmix coefficient")
+                                }
+                                // (table ^ sign) − sign with sign = −1 when bit 6 is clear.
+                                xxchDmixCoeff[cp] = if neg { -dtsDmixTable[idx] } else { dtsDmixTable[idx] }
+                            } else {
+                                xxchDmixCoeff[cp] = 0
+                            }
+                            cp += 1
+                        }
+                    }
+                }
+            } else {
+                xxchDmixEmbedded = false
+            }
+        }
+
+        for ch in xchBase..nchannels {
+            nsubbands[ch] = br.bits(5) + 2
+            if nsubbands[ch] > 32 {
+                return fail("invalid subband activity count")
+            }
+        }
+        for ch in xchBase..nchannels {
+            subbandVqStart[ch] = br.bits(5) + 1
+        }
+        for ch in xchBase..nchannels {
+            var n = br.bits(3)
+            if n != 0 && header == 2 {
+                n += xchBase - 1
+            }
+            if n > nchannels {
+                return fail("invalid joint intensity coding index")
+            }
+            jointIntensityIndex[ch] = n
+        }
+        for ch in xchBase..nchannels {
+            transitionModeSel[ch] = br.bits(2)
+        }
+        for ch in xchBase..nchannels {
+            scaleFactorSel[ch] = br.bits(3)
+            if scaleFactorSel[ch] == 7 {
+                return fail("invalid scale factor code book")
+            }
+        }
+        for ch in xchBase..nchannels {
+            bitAllocationSel[ch] = br.bits(3)
+            if bitAllocationSel[ch] == 7 {
+                return fail("invalid bit allocation quantizer select")
+            }
+        }
+        for n in 0..10 {
+            for ch in xchBase..nchannels {
+                quantIndexSel[ch * 10 + n] = br.bits(dtsQuantIndexSelBits[n])
+            }
+        }
+        for n in 0..10 {
+            for ch in xchBase..nchannels {
+                if quantIndexSel[ch * 10 + n] < dtsQuantIndexGroupSize[n] {
+                    scaleFactorAdj[ch * 10 + n] = dtsScaleAdj[br.bits(2)]
+                }
+            }
+        }
+        if header == 2 {
+            if !seekBits(headerPos + headerSize * 8) {
+                return fail("read past the end of the XXCH channel set header")
+            }
+        } else if crcPresent {
+            br.skip(16)
+        }
+        0
+    }
+
+    // A scale factor (5.4.1 SCALES): Huffman coded differences for SEL < 5,
+    // else a (SEL + 1)-bit index; looked up in the 6- or 7-bit table.
+    // Returns −1 on a bad index.
+    fn parseScale(_ index: Int, _ sel: Int) -> Int {
+        var i = index
+        if sel < 5 {
+            i += vlc(dtsBookScale + sel)
+        } else {
+            i = br.bits(sel + 1)
+        }
+        lastScaleIndex = i
+        if sel > 5 {
+            if i < 0 || i >= 128 {
+                return -1
+            }
+            return dtsScaleQuant7[i]
+        }
+        if i < 0 || i >= 64 {
+            return -1
+        }
+        dtsScaleQuant6[i]
+    }
+    lastScaleIndex: Int = 0
+
+    fn parseJointScale(_ sel: Int) -> Int {
+        var i = 0
+        if sel < 5 {
+            i = vlc(dtsBookScale + sel)
+        } else {
+            i = br.bits(sel + 1)
+        }
+        i += 64
+        if i < 0 || i >= 129 {
+            return -1
+        }
+        dtsJointScale[i]
+    }
+
+    // --- 5.4.1 Primary audio coding side information ---
+
+    fn parseSubframeHeader(_ sf: Int, _ header: Int, _ xchBase: Int) -> Int {
+        if br.left < 0 {
+            return fail("subframe header past the end")
+        }
+        if header == 0 {
+            nsubsubframes[sf] = br.bits(2) + 1
+            br.skip(3)
+        }
+        for ch in xchBase..nchannels {
+            for band in 0..nsubbands[ch] {
+                predictionMode[ch * 64 + band] = br.bits(1)
+            }
+        }
+        for ch in xchBase..nchannels {
+            for band in 0..nsubbands[ch] {
+                if predictionMode[ch * 64 + band] != 0 {
+                    predictionVqIndex[ch * 64 + band] = br.bits(12)
+                }
+            }
+        }
+        for ch in xchBase..nchannels {
+            let sel = bitAllocationSel[ch]
+            for band in 0..subbandVqStart[ch] {
+                var abits = 0
+                if sel < 5 {
+                    abits = vlc(dtsBookBitAlloc + sel)
+                } else {
+                    abits = br.bits(sel - 1)
+                }
+                if abits > 26 {
+                    return fail("invalid bit allocation index")
+                }
+                bitAllocation[ch * 64 + band] = abits
+            }
+        }
+        for ch in xchBase..nchannels {
+            let t = (sf * 7 + ch) * 32
+            for band in 0..32 {
+                transitionMode[t + band] = 0
+            }
+            if nsubsubframes[sf] > 1 {
+                let sel = transitionModeSel[ch]
+                for band in 0..subbandVqStart[ch] {
+                    if bitAllocation[ch * 64 + band] != 0 {
+                        transitionMode[t + band] = vlc(dtsBookTransition + sel)
+                    }
+                }
+            }
+        }
+        for ch in xchBase..nchannels {
+            let sel = scaleFactorSel[ch]
+            lastScaleIndex = 0
+            let t = (sf * 7 + ch) * 32
+            for band in 0..subbandVqStart[ch] {
+                if bitAllocation[ch * 64 + band] != 0 {
+                    let s = parseScale(lastScaleIndex, sel)
+                    if s < 0 {
+                        return fail("invalid scale factor index")
+                    }
+                    scaleFactors[(ch * 32 + band) * 2] = s
+                    if transitionMode[t + band] != 0 {
+                        let s2 = parseScale(lastScaleIndex, sel)
+                        if s2 < 0 {
+                            return fail("invalid scale factor index")
+                        }
+                        scaleFactors[(ch * 32 + band) * 2 + 1] = s2
+                    }
+                } else {
+                    scaleFactors[(ch * 32 + band) * 2] = 0
+                }
+            }
+            for band in subbandVqStart[ch]..max(nsubbands[ch], subbandVqStart[ch]) {
+                let s = parseScale(lastScaleIndex, sel)
+                if s < 0 {
+                    return fail("invalid scale factor index")
+                }
+                scaleFactors[(ch * 32 + band) * 2] = s
+            }
+        }
+        for ch in xchBase..nchannels {
+            if jointIntensityIndex[ch] != 0 {
+                jointScaleSel[ch] = br.bits(3)
+                if jointScaleSel[ch] == 7 {
+                    return fail("invalid joint scale factor code book")
+                }
+            }
+        }
+        for ch in xchBase..nchannels {
+            let src = jointIntensityIndex[ch] - 1
+            if src >= 0 {
+                let sel = jointScaleSel[ch]
+                for band in nsubbands[ch]..max(nsubbands[src], nsubbands[ch]) {
+                    let s = parseJointScale(sel)
+                    if s < 0 {
+                        return fail("invalid joint scale factor index")
+                    }
+                    jointScaleFactors[ch * 64 + band] = s
+                }
+            }
+        }
+        if drcPresent && header == 0 {
+            br.skip(8)
+        }
+        if crcPresent {
+            br.skip(16)
+        }
+        if vlcError {
+            return fail("bad Huffman code in side information")
+        }
+        0
+    }
+
+    // --- 5.5 Audio data ---
+
+    // Block codes: two codes each packing 4 samples in base `levels`.
+    fn parseBlockCodes(_ abits: Int) -> Int {
+        let nb = dtsBlockCodeBits[abits - 1]
+        var code1 = br.bits(nb)
+        var code2 = br.bits(nb)
+        let levels = dtsQuantLevels[abits]
+        let offset = (levels - 1) / 2
+        for n in 0..4 {
+            let d = code1 / levels
+            audio[n] = code1 - d * levels - offset
+            code1 = d
+        }
+        for n in 4..8 {
+            let d = code2 / levels
+            audio[n] = code2 - d * levels - offset
+            code2 = d
+        }
+        if (code1 | code2) != 0 {
+            return fail("bad block code")
+        }
+        0
+    }
+
+    // The 8 quantization indices of one subband (extract_audio): returns 1
+    // when they were Huffman coded, 0 otherwise, −1 on damage.
+    fn extractAudio(_ abits: Int, _ ch: Int) -> Int {
+        if abits == 0 {
+            for i in 0..8 {
+                audio[i] = 0
+            }
+            return 0
+        }
+        if abits <= 10 {
+            let sel = quantIndexSel[ch * 10 + abits - 1]
+            if sel < dtsQuantIndexGroupSize[abits - 1] {
+                let book = dtsQuantBookStart[abits - 1] + sel
+                for i in 0..8 {
+                    audio[i] = vlc(book)
+                }
+                return 1
+            }
+            if abits <= 7 {
+                return parseBlockCodes(abits)
+            }
+        }
+        for i in 0..8 {
+            audio[i] = br.signed(abits - 3)
+        }
+        0
+    }
+
+    // FFmpeg's ff_dca_core_dequantize: samples = clip23(index × step ×
+    // scale), with step × scale limited to 23 bits.
+    fn dequantize(_ at: Int, _ x96: Bool, _ stepSize: Int, _ scale: Int, _ residual: Bool) {
+        var stepScale = stepSize * scale
+        var shift = 0
+        if stepScale > (1 << 23) {
+            shift = dtsLog2(stepScale >> 23) + 1
+            stepScale = stepScale >> shift
+        }
+        let bits = 22 - shift
+        for n in 0..8 {
+            var v = audio[n] * stepScale
+            if bits > 0 {
+                v = (v + (1 << (bits - 1))) >> bits
+            }
+            v = dtsClip23(dtsWrap32(v))
+            if x96 {
+                x96Sub[at + n] = v
+            } else if residual {
+                sub[at + n] = sub[at + n] + v
+            } else {
+                sub[at + n] = v
+            }
+        }
+    }
+
+    fn inverseAdpcm(_ x96: Bool, _ ch: Int, _ sbStart: Int, _ sbEnd: Int, _ ofs: Int, _ len: Int) {
+        let vb = adpcmVb
+        for b in sbStart..sbEnd {
+            if predictionMode[ch * 64 + b] == 0 {
+                continue
+            }
+            let c = predictionVqIndex[ch * 64 + b] * 4
+            let base = (if x96 { ch * 64 + b } else { ch * 32 + b }) * dtsStride + 4 + ofs
+            for j in 0..len {
+                let p = base + j
+                if x96 {
+                    let pred = x96Sub[p - 1] * vb[c] + x96Sub[p - 2] * vb[c + 1] + x96Sub[p - 3] * vb[c + 2] + x96Sub[p - 4] * vb[c + 3]
+                    x96Sub[p] = dtsClip23(x96Sub[p] + dtsClip23(dtsWrap32((pred + 4096) >> 13)))
+                } else {
+                    let pred = sub[p - 1] * vb[c] + sub[p - 2] * vb[c + 1] + sub[p - 3] * vb[c + 2] + sub[p - 4] * vb[c + 3]
+                    sub[p] = dtsClip23(sub[p] + dtsClip23(dtsWrap32((pred + 4096) >> 13)))
+                }
+            }
+        }
+    }
+
+    // Joint intensity (decode_joint): bands the channel doesn't code are
+    // the source channel's, scaled.
+    fn decodeJoint(_ x96: Bool, _ ch: Int, _ src: Int, _ ofs: Int, _ len: Int) {
+        for b in nsubbands[ch]..max(nsubbands[src], nsubbands[ch]) {
+            let scale = jointScaleFactors[ch * 64 + b]
+            let nb = if x96 { 64 } else { 32 }
+            let d = (ch * nb + b) * dtsStride + 4 + ofs
+            let s = (src * nb + b) * dtsStride + 4 + ofs
+            for j in 0..len {
+                if x96 {
+                    x96Sub[d + j] = dtsClip23(dtsWrap32((x96Sub[s + j] * scale + 65536) >> 17))
+                } else {
+                    sub[d + j] = dtsClip23(dtsWrap32((sub[s + j] * scale + 65536) >> 17))
+                }
+            }
+        }
+    }
+
+    fn parseSubframeAudio(_ sf: Int, _ header: Int, _ xchBase: Int) -> Int {
+        let nsamples = nsubsubframes[sf] * 8
+        if subPos + nsamples > npcmblocks {
+            return fail("subband sample buffer overflow")
+        }
+        if br.left < 0 {
+            return fail("audio data past the end")
+        }
+        // High frequency VQ subbands (5.5.1): one 10-bit codebook index per
+        // band covers the subframe's samples.
+        let hf = hfVq
+        for ch in xchBase..nchannels {
+            for band in subbandVqStart[ch]..max(nsubbands[ch], subbandVqStart[ch]) {
+                vqIndex[band] = br.bits(10)
+            }
+            for band in subbandVqStart[ch]..max(nsubbands[ch], subbandVqStart[ch]) {
+                let coeff = vqIndex[band] * 32
+                let scale = scaleFactors[(ch * 32 + band) * 2]
+                let d = (ch * 32 + band) * dtsStride + 4 + subPos
+                for j in 0..nsamples {
+                    sub[d + j] = dtsClip23((hf[coeff + j] * scale + 8) >> 4)
+                }
+            }
+        }
+        // LFE samples (5.5.1): 8-bit values and an 8-bit scale index.
+        if lfePresent != 0 && header == 0 {
+            let n = 2 * lfePresent * nsubsubframes[sf]
+            for i in 0..n {
+                audio[i] = br.signed(8)
+            }
+            let index = br.bits(8)
+            if index >= 128 {
+                return fail("invalid LFE scale factor index")
+            }
+            // Quantizer step 0.035 in Q27.
+            let scale = (4697620 * dtsScaleQuant7[index] + 4194304) >> 23
+            for i in 0..n {
+                lfe[lfePos + i] = dtsClip23((audio[i] * scale) >> 4)
+            }
+            lfePos += n
+        }
+        // Subband samples, subsubframe by subsubframe.
+        var ofs = subPos
+        for ssf in 0..nsubsubframes[sf] {
+            for ch in xchBase..nchannels {
+                if br.left < 0 {
+                    return fail("audio data past the end")
+                }
+                for band in 0..subbandVqStart[ch] {
+                    let abits = bitAllocation[ch * 64 + band]
+                    let ret = extractAudio(abits, ch)
+                    if ret < 0 {
+                        return -1
+                    }
+                    let step = if bitRate == 3 { dtsLosslessQuant[abits] } else { dtsLossyQuant[abits] }
+                    let trans = transitionMode[(sf * 7 + ch) * 32 + band]
+                    var scale = if trans == 0 || ssf < trans { scaleFactors[(ch * 32 + band) * 2] } else { scaleFactors[(ch * 32 + band) * 2 + 1] }
+                    if ret > 0 {
+                        let adj = scaleFactorAdj[ch * 10 + abits - 1]
+                        scale = dtsClip23(dtsWrap32((adj * scale) >> 22))
+                    }
+                    dequantize((ch * 32 + band) * dtsStride + 4 + ofs, false, step, scale, false)
+                }
+            }
+            if ssf == nsubsubframes[sf] - 1 || syncSsf {
+                if br.bits(16) != 0xffff {
+                    return fail("DSYNC check failed")
+                }
+            }
+            ofs += 8
+        }
+        if vlcError {
+            return fail("bad Huffman code in audio data")
+        }
+        for ch in xchBase..nchannels {
+            inverseAdpcm(false, ch, 0, nsubbands[ch], subPos, nsamples)
+        }
+        for ch in xchBase..nchannels {
+            let src = jointIntensityIndex[ch] - 1
+            if src >= 0 {
+                decodeJoint(false, ch, src, subPos, nsamples)
+            }
+        }
+        subPos = ofs
+        0
+    }
+    subPos: Int = 0
+    lfePos: Int = 8
+
+    fn eraseAdpcmHistory() {
+        for cb in 0..(7 * 32) {
+            for k in 0..4 {
+                sub[cb * dtsStride + k] = 0
+            }
+        }
+    }
+
+    fn eraseX96AdpcmHistory() {
+        for cb in 0..(7 * 64) {
+            for k in 0..4 {
+                x96Sub[cb * dtsStride + k] = 0
+            }
+        }
+    }
+
+    fn parseFrameData(_ header: Int, _ xchBase: Int) -> Int {
+        if parseCodingHeader(header, xchBase) < 0 {
+            return -1
+        }
+        subPos = 0
+        lfePos = 8
+        for sf in 0..nsubframes {
+            if parseSubframeHeader(sf, header, xchBase) < 0 {
+                return -1
+            }
+            if parseSubframeAudio(sf, header, xchBase) < 0 {
+                return -1
+            }
+        }
+        for ch in xchBase..nchannels {
+            var nb = nsubbands[ch]
+            if jointIntensityIndex[ch] != 0 {
+                nb = max(nb, nsubbands[jointIntensityIndex[ch] - 1])
+            }
+            for band in 0..32 {
+                let b = (ch * 32 + band) * dtsStride
+                if band < nb {
+                    for k in 0..4 {
+                        sub[b + k] = sub[b + npcmblocks + k]
+                    }
+                } else {
+                    for k in 0..(4 + npcmblocks) {
+                        sub[b + k] = 0
+                    }
+                }
+            }
+        }
+        0
+    }
+
+    fn parseXchFrame(_ frameEnd: Int) -> Int {
+        if (chMask & (1 << dtsSpkCs)) != 0 {
+            return fail("XCh with a Cs speaker already present")
+        }
+        if parseFrameData(1, nchannels) < 0 {
+            return -1
+        }
+        if !seekBits(frameEnd) {
+            return fail("read past the end of the XCh frame")
+        }
+        0
+    }
+
+    fn parseXxchFrame() -> Int {
+        let headerPos = pos
+        if br.long(32) != 0x47004A03 {
+            return fail("invalid XXCH sync word")
+        }
+        let headerSize = br.bits(6) + 1
+        xxchCrcPresent = br.flag()
+        xxchMaskNbits = br.bits(5) + 1
+        if xxchMaskNbits <= dtsSpkCs {
+            return fail("invalid XXCH speaker mask size")
+        }
+        let nchsets = br.bits(2) + 1
+        if nchsets > 1 {
+            return fail("{nchsets} XXCH channel sets")
+        }
+        let frameSize0 = br.bits(14) + 1
+        xxchCoreMask = br.long(xxchMaskNbits)
+        var mask = chMask
+        if (mask & (1 << dtsSpkLs)) != 0 && (xxchCoreMask & (1 << dtsSpkLss)) != 0 {
+            mask = (mask & ~(1 << dtsSpkLs)) | (1 << dtsSpkLss)
+        }
+        if (mask & (1 << dtsSpkRs)) != 0 && (xxchCoreMask & (1 << dtsSpkRss)) != 0 {
+            mask = (mask & ~(1 << dtsSpkRs)) | (1 << dtsSpkRss)
+        }
+        if mask != xxchCoreMask {
+            return fail("XXCH core speaker mask disagrees with the core")
+        }
+        if !seekBits(headerPos + headerSize * 8) {
+            return fail("read past the end of the XXCH frame header")
+        }
+        if parseFrameData(2, nchannels) < 0 {
+            return -1
+        }
+        if !seekBits(headerPos + headerSize * 8 + frameSize0 * 8) {
+            return fail("read past the end of the XXCH channel set")
+        }
+        0
+    }
+
+    // --- XBR (DTS-HD high bit rate extension) ---
+
+    fn parseXbrSubframe(_ base: Int, _ end: Int, _ nsb: [Int], _ transitionOn: Bool, _ sf: Int) -> Int {
+        if subPos + nsubsubframes[sf] * 8 > npcmblocks {
+            return fail("subband sample buffer overflow")
+        }
+        if br.left < 0 {
+            return fail("XBR data past the end")
+        }
+        for ch in base..end {
+            xbrNabits[ch] = br.bits(2) + 2
+        }
+        for ch in base..end {
+            for band in 0..nsb[ch] {
+                xbrAlloc[ch * 32 + band] = br.bits(xbrNabits[ch])
+                if xbrAlloc[ch * 32 + band] > 26 {
+                    return fail("invalid XBR bit allocation index")
+                }
+            }
+        }
+        for ch in base..end {
+            xbrScaleBits[ch] = br.bits(3)
+            if xbrScaleBits[ch] == 0 {
+                return fail("invalid XBR scale factor bits")
+            }
+        }
+        for ch in base..end {
+            let seven = scaleFactorSel[ch] > 5
+            let size = if seven { 128 } else { 64 }
+            for band in 0..nsb[ch] {
+                if xbrAlloc[ch * 32 + band] != 0 {
+                    var i = br.bits(xbrScaleBits[ch])
+                    if i >= size {
+                        return fail("invalid XBR scale factor index")
+                    }
+                    xbrScale[(ch * 32 + band) * 2] = if seven { dtsScaleQuant7[i] } else { dtsScaleQuant6[i] }
+                    if transitionOn && transitionMode[(sf * 7 + ch) * 32 + band] != 0 {
+                        i = br.bits(xbrScaleBits[ch])
+                        if i >= size {
+                            return fail("invalid XBR scale factor index")
+                        }
+                        xbrScale[(ch * 32 + band) * 2 + 1] = if seven { dtsScaleQuant7[i] } else { dtsScaleQuant6[i] }
+                    }
+                }
+            }
+        }
+        var ofs = subPos
+        for ssf in 0..nsubsubframes[sf] {
+            for ch in base..end {
+                if br.left < 0 {
+                    return fail("XBR data past the end")
+                }
+                for band in 0..nsb[ch] {
+                    let abits = xbrAlloc[ch * 32 + band]
+                    if abits > 7 {
+                        for i in 0..8 {
+                            audio[i] = br.signed(abits - 3)
+                        }
+                    } else if abits > 0 {
+                        if parseBlockCodes(abits) < 0 {
+                            return -1
+                        }
+                    } else {
+                        continue
+                    }
+                    let step = dtsLosslessQuant[abits]
+                    let trans = if transitionOn { transitionMode[(sf * 7 + ch) * 32 + band] } else { 0 }
+                    let scale = if trans == 0 || ssf < trans { xbrScale[(ch * 32 + band) * 2] } else { xbrScale[(ch * 32 + band) * 2 + 1] }
+                    dequantize((ch * 32 + band) * dtsStride + 4 + ofs, false, step, scale, true)
+                }
+            }
+            if ssf == nsubsubframes[sf] - 1 || syncSsf {
+                if br.bits(16) != 0xffff {
+                    return fail("XBR DSYNC check failed")
+                }
+            }
+            ofs += 8
+        }
+        subPos = ofs
+        0
+    }
+
+    fn parseXbrFrame() -> Int {
+        var headerPos = pos
+        if br.long(32) != 0x655E315E {
+            return fail("invalid XBR sync word")
+        }
+        let headerSize = br.bits(6) + 1
+        let nchsets = br.bits(2) + 1
+        var sizes: [Int] = []
+        for _ in 0..nchsets {
+            sizes.append(br.bits(14) + 1)
+        }
+        let transitionOn = br.flag()
+        var nchs: [Int] = []
+        var nsb: [Int] = core.zeros(32)
+        var ch2 = 0
+        for _ in 0..nchsets {
+            let n = br.bits(3) + 1
+            nchs.append(n)
+            let bandBits = br.bits(2) + 5
+            for _ in 0..n {
+                if ch2 < 32 {
+                    nsb[ch2] = br.bits(bandBits) + 1
+                    if nsb[ch2] > 32 {
+                        return fail("invalid XBR subband count")
+                    }
+                }
+                ch2 += 1
+            }
+        }
+        if !seekBits(headerPos + headerSize * 8) {
+            return fail("read past the end of the XBR header")
+        }
+        var base = 0
+        for i in 0..nchsets {
+            headerPos = pos
+            if base + nchs[i] <= nchannels {
+                subPos = 0
+                for sf in 0..nsubframes {
+                    if parseXbrSubframe(base, base + nchs[i], nsb, transitionOn, sf) < 0 {
+                        return -1
+                    }
+                }
+            }
+            base += nchs[i]
+            if !seekBits(headerPos + sizes[i] * 8) {
+                return fail("read past the end of an XBR channel set")
+            }
+        }
+        0
+    }
+
+    // --- X96 (96 kHz extension) ---
+
+    // The X96 noise generator (a linear congruential generator).
+    fn randX96() -> Int {
+        x96Rand = (1103515245 * x96Rand + 12345) & 0xffffffff
+        (x96Rand & 0x7fffffff) - 0x40000000
+    }
+
+    fn parseX96SubframeAudio(_ sf: Int, _ xchBase: Int) -> Int {
+        let nsamples = nsubsubframes[sf] * 8
+        if subPos + nsamples > npcmblocks {
+            return fail("subband sample buffer overflow")
+        }
+        if br.left < 0 {
+            return fail("X96 data past the end")
+        }
+        let hf = hfVq
+        for ch in xchBase..x96Nchannels {
+            for band in x96SubbandStart..max(nsubbands[ch], x96SubbandStart) {
+                var p = (ch * 64 + band) * dtsStride + 4 + subPos
+                let scale = scaleFactors[(ch * 32 + (band >> 1)) * 2 + (band & 1)]
+                let alloc = bitAllocation[ch * 64 + band]
+                if alloc == 0 {
+                    if scale <= 1 {
+                        for n in 0..nsamples {
+                            x96Sub[p + n] = 0
+                        }
+                    } else {
+                        for n in 0..nsamples {
+                            x96Sub[p + n] = dtsWrap32((randX96() * scale + 1073741824) >> 31)
+                        }
+                    }
+                } else if alloc == 1 {
+                    for ssf in 0..((nsubsubframes[sf] + 1) / 2) {
+                        let vq = br.bits(10) * 32
+                        for n in 0..min(nsamples - ssf * 16, 16) {
+                            x96Sub[p] = dtsClip23((hf[vq + n] * scale + 8) >> 4)
+                            p += 1
+                        }
+                    }
+                }
+            }
+        }
+        var ofs = subPos
+        for ssf in 0..nsubsubframes[sf] {
+            for ch in xchBase..x96Nchannels {
+                if br.left < 0 {
+                    return fail("X96 data past the end")
+                }
+                for band in x96SubbandStart..max(nsubbands[ch], x96SubbandStart) {
+                    let abits = bitAllocation[ch * 64 + band] - 1
+                    if abits < 1 {
+                        continue
+                    }
+                    if extractAudio(abits, ch) < 0 {
+                        return -1
+                    }
+                    let step = if bitRate == 3 { dtsLosslessQuant[abits] } else { dtsLossyQuant[abits] }
+                    let scale = scaleFactors[(ch * 32 + (band >> 1)) * 2 + (band & 1)]
+                    dequantize((ch * 64 + band) * dtsStride + 4 + ofs, true, step, scale, false)
+                }
+            }
+            if ssf == nsubsubframes[sf] - 1 || syncSsf {
+                if br.bits(16) != 0xffff {
+                    return fail("X96 DSYNC check failed")
+                }
+            }
+            ofs += 8
+        }
+        if vlcError {
+            return fail("bad Huffman code in X96 data")
+        }
+        for ch in xchBase..x96Nchannels {
+            inverseAdpcm(true, ch, x96SubbandStart, nsubbands[ch], subPos, nsamples)
+        }
+        for ch in xchBase..x96Nchannels {
+            let src = jointIntensityIndex[ch] - 1
+            if src >= 0 {
+                decodeJoint(true, ch, src, subPos, nsamples)
+            }
+        }
+        subPos = ofs
+        0
+    }
+
+    fn parseX96SubframeHeader(_ xchBase: Int) -> Int {
+        if br.left < 0 {
+            return fail("X96 subframe header past the end")
+        }
+        for ch in xchBase..x96Nchannels {
+            for band in x96SubbandStart..max(nsubbands[ch], x96SubbandStart) {
+                predictionMode[ch * 64 + band] = br.bits(1)
+            }
+        }
+        for ch in xchBase..x96Nchannels {
+            for band in x96SubbandStart..max(nsubbands[ch], x96SubbandStart) {
+                if predictionMode[ch * 64 + band] != 0 {
+                    predictionVqIndex[ch * 64 + band] = br.bits(12)
+                }
+            }
+        }
+        let hr = if x96HighRes { 1 } else { 0 }
+        for ch in xchBase..x96Nchannels {
+            let sel = bitAllocationSel[ch]
+            var abits = 0
+            for band in x96SubbandStart..max(nsubbands[ch], x96SubbandStart) {
+                if sel < 7 {
+                    abits += vlc(dtsQuantBookStart[5 + 2 * hr] + sel)
+                } else {
+                    abits = br.bits(3 + hr)
+                }
+                if abits < 0 || abits > 7 + 8 * hr {
+                    return fail("invalid X96 bit allocation index")
+                }
+                bitAllocation[ch * 64 + band] = abits
+            }
+        }
+        for ch in xchBase..x96Nchannels {
+            let sel = scaleFactorSel[ch]
+            lastScaleIndex = 0
+            for band in x96SubbandStart..max(nsubbands[ch], x96SubbandStart) {
+                let s = parseScale(lastScaleIndex, sel)
+                if s < 0 {
+                    return fail("invalid X96 scale factor index")
+                }
+                scaleFactors[(ch * 32 + (band >> 1)) * 2 + (band & 1)] = s
+            }
+        }
+        for ch in xchBase..x96Nchannels {
+            if jointIntensityIndex[ch] != 0 {
+                jointScaleSel[ch] = br.bits(3)
+                if jointScaleSel[ch] == 7 {
+                    return fail("invalid X96 joint scale factor code book")
+                }
+            }
+        }
+        for ch in xchBase..x96Nchannels {
+            let src = jointIntensityIndex[ch] - 1
+            if src >= 0 {
+                let sel = jointScaleSel[ch]
+                for band in nsubbands[ch]..max(nsubbands[src], nsubbands[ch]) {
+                    let s = parseJointScale(sel)
+                    if s < 0 {
+                        return fail("invalid X96 joint scale factor index")
+                    }
+                    jointScaleFactors[ch * 64 + band] = s
+                }
+            }
+        }
+        if crcPresent {
+            br.skip(16)
+        }
+        if vlcError {
+            return fail("bad Huffman code in X96 side information")
+        }
+        0
+    }
+
+    fn parseX96CodingHeader(_ exss: Bool, _ xchBase: Int) -> Int {
+        let headerPos = pos
+        var headerSize = 0
+        if br.left < 0 {
+            return fail("X96 coding header past the end")
+        }
+        if exss {
+            headerSize = br.bits(7) + 1
+        }
+        x96HighRes = br.flag()
+        if x96RevNo < 8 {
+            x96SubbandStart = br.bits(5)
+            if x96SubbandStart > 27 {
+                return fail("invalid X96 subband start")
+            }
+        } else {
+            x96SubbandStart = 32
+        }
+        for ch in xchBase..x96Nchannels {
+            nsubbands[ch] = br.bits(6) + 1
+            if nsubbands[ch] < 32 {
+                return fail("invalid X96 subband count")
+            }
+        }
+        for ch in xchBase..x96Nchannels {
+            var n = br.bits(3)
+            if n != 0 && xchBase != 0 {
+                n += xchBase - 1
+            }
+            if n > x96Nchannels {
+                return fail("invalid X96 joint intensity index")
+            }
+            jointIntensityIndex[ch] = n
+        }
+        for ch in xchBase..x96Nchannels {
+            scaleFactorSel[ch] = br.bits(3)
+            if scaleFactorSel[ch] >= 6 {
+                return fail("invalid X96 scale factor code book")
+            }
+        }
+        for ch in xchBase..x96Nchannels {
+            bitAllocationSel[ch] = br.bits(3)
+        }
+        let books = if x96HighRes { 10 } else { 6 }
+        for n in 0..books {
+            for ch in xchBase..x96Nchannels {
+                quantIndexSel[ch * 10 + n] = br.bits(dtsQuantIndexSelBits[n])
+            }
+        }
+        if exss {
+            if !seekBits(headerPos + headerSize * 8) {
+                return fail("read past the end of the X96 channel set header")
+            }
+        } else if crcPresent {
+            br.skip(16)
+        }
+        0
+    }
+
+    fn parseX96FrameData(_ exss: Bool, _ xchBase: Int) -> Int {
+        if parseX96CodingHeader(exss, xchBase) < 0 {
+            return -1
+        }
+        subPos = 0
+        for sf in 0..nsubframes {
+            if parseX96SubframeHeader(xchBase) < 0 {
+                return -1
+            }
+            if parseX96SubframeAudio(sf, xchBase) < 0 {
+                return -1
+            }
+        }
+        for ch in xchBase..x96Nchannels {
+            var nb = nsubbands[ch]
+            if jointIntensityIndex[ch] != 0 {
+                nb = max(nb, nsubbands[jointIntensityIndex[ch] - 1])
+            }
+            for band in 0..64 {
+                let b = (ch * 64 + band) * dtsStride
+                if band >= x96SubbandStart && band < nb {
+                    for k in 0..4 {
+                        x96Sub[b + k] = x96Sub[b + npcmblocks + k]
+                    }
+                } else {
+                    for k in 0..(4 + npcmblocks) {
+                        x96Sub[b + k] = 0
+                    }
+                }
+            }
+        }
+        0
+    }
+
+    fn parseX96Frame(_ frameEnd: Int) -> Int {
+        x96RevNo = br.bits(4)
+        if x96RevNo < 1 || x96RevNo > 8 {
+            return fail("invalid X96 revision")
+        }
+        x96CrcPresent = false
+        x96Nchannels = nchannels
+        if !predictorHistory {
+            eraseX96AdpcmHistory()
+        }
+        if parseX96FrameData(false, 0) < 0 {
+            return -1
+        }
+        if !seekBits(frameEnd) {
+            return fail("read past the end of the X96 frame")
+        }
+        0
+    }
+
+    fn parseX96FrameExss() -> Int {
+        var headerPos = pos
+        if br.long(32) != 0x1D95F262 {
+            return fail("invalid X96 sync word")
+        }
+        let headerSize = br.bits(6) + 1
+        x96RevNo = br.bits(4)
+        if x96RevNo < 1 || x96RevNo > 8 {
+            return fail("invalid X96 revision")
+        }
+        x96CrcPresent = br.flag()
+        let nchsets = br.bits(2) + 1
+        var sizes: [Int] = []
+        for _ in 0..nchsets {
+            sizes.append(br.bits(12) + 1)
+        }
+        var nchs: [Int] = []
+        for _ in 0..nchsets {
+            nchs.append(br.bits(3) + 1)
+        }
+        if !seekBits(headerPos + headerSize * 8) {
+            return fail("read past the end of the X96 header")
+        }
+        if !predictorHistory {
+            eraseX96AdpcmHistory()
+        }
+        x96Nchannels = 0
+        var base = 0
+        for i in 0..nchsets {
+            headerPos = pos
+            if base + nchs[i] <= nchannels {
+                x96Nchannels = base + nchs[i]
+                if parseX96FrameData(true, base) < 0 {
+                    return -1
+                }
+            }
+            base += nchs[i]
+            if !seekBits(headerPos + sizes[i] * 8) {
+                return fail("read past the end of an X96 channel set")
+            }
+        }
+        0
+    }
+
+    // --- Auxiliary data and the search for core extensions (5.6) ---
+
+    fn parseAuxData() -> Int {
+        if br.left < 0 {
+            return -1
+        }
+        br.skip(6)
+        br.skip((-pos) & 31)
+        if br.long(32) != 0x9A1105A0 {
+            return -1
+        }
+        if br.flag() {
+            br.skip(47)
+        }
+        primDmixEmbedded = br.flag()
+        if primDmixEmbedded {
+            primDmixType = br.bits(3)
+            if primDmixType >= 7 {
+                return -1
+            }
+            let m = dtsDmixPrimaryNch[primDmixType]
+            let n = dtsChannelsForMode[audioMode] + (if lfePresent != 0 { 1 } else { 0 })
+            for _ in 0..(m * n) {
+                let code = br.bits(9)
+                if (code & 0xff) >= 242 {
+                    return -1
+                }
+            }
+        }
+        br.skip((-pos) & 7)
+        br.skip(16)
+        0
+    }
+
+    // Finds the XCh / X96 / XXCH frame at the end of the core frame
+    // (searching backwards from the end, on 4-byte boundaries, as sync
+    // words can occur inside audio data). data[from…to] is the input.
+    fn parseOptionalInfo(_ data: Data, _ from: Int, _ to: Int) {
+        if tsPresent {
+            br.skip(32)
+        }
+        var ok = -1
+        if auxPresent {
+            ok = parseAuxData()
+        }
+        if ok < 0 {
+            primDmixEmbedded = false
+        }
+        if !extAudioPresent {
+            return
+        }
+        var syncPos = min(frameSize / 4, (to - from) / 4) - 1
+        let lastPos = pos / 32
+        var w2 = 0
+        if extAudioType == 0 {
+            // XCh: the distance to the end of the core frame equals its size.
+            while syncPos >= lastPos {
+                let w1 = data.uint32(at: from + syncPos * 4, bigEndian: true)
+                if w1 == 0x5A5A5A5A {
+                    let size = (w2 >> 22) + 1
+                    let dist = frameSize - syncPos * 4
+                    if size >= 96 && (size == dist || size - 1 == dist) && ((w2 >> 15) & 0x7f) == 0x08 {
+                        xchPos = syncPos * 32 + 49
+                        break
+                    }
+                }
+                w2 = w1
+                syncPos -= 1
+            }
+        } else if extAudioType == 2 {
+            while syncPos >= lastPos {
+                let w1 = data.uint32(at: from + syncPos * 4, bigEndian: true)
+                if w1 == 0x1D95F262 {
+                    let size = (w2 >> 20) + 1
+                    let dist = frameSize - syncPos * 4
+                    if size >= 96 && size == dist {
+                        x96Pos = syncPos * 32 + 44
+                        break
+                    }
+                }
+                w2 = w1
+                syncPos -= 1
+            }
+        } else if extAudioType == 6 {
+            while syncPos >= lastPos {
+                let w1 = data.uint32(at: from + syncPos * 4, bigEndian: true)
+                if w1 == 0x47004A03 {
+                    let size = (w2 >> 26) + 1
+                    let dist = (to - from) - syncPos * 4
+                    let at = from + (syncPos + 1) * 4
+                    if size >= 11 && size <= dist && dtsCrc16(data, from: at, to: at + size - 4) == 0 {
+                        xxchPos = syncPos * 32
+                        break
+                    }
+                }
+                w2 = w1
+                syncPos -= 1
+            }
+        }
+    }
+
+    // Parses a core frame at data[from…to] (big-endian 16-bit form; `to`
+    // may run on into the extension substream). Returns 0 or −1.
+    fn parse(_ data: Data, from: Int, to: Int) -> Int {
+        error = ""
+        vlcError = false
+        extAudioMask = 0
+        xchPos = 0
+        xxchPos = 0
+        x96Pos = 0
+        setRange(data, from: from, to: to)
+        if parseFrameHeader() < 0 {
+            return -1
+        }
+        if npcmblocks > 128 {
+            return fail("too many PCM blocks")
+        }
+        if !predictorHistory {
+            eraseAdpcmHistory()
+        }
+        if parseFrameData(0, 0) < 0 {
+            return -1
+        }
+        parseOptionalInfo(data, from, to)
+        if frameSize > to - from {
+            frameSize = to - from
+        }
+        coreFrom = from
+        coreTo = to
+        0
+    }
+    coreFrom: Int = 0
+    coreTo: Int = 0
+
+    fn resetPrimary() {
+        nchannels = dtsChannelsForMode[audioMode]
+        chMask = dtsAudioModeMask[audioMode]
+        if lfePresent != 0 {
+            chMask = chMask | (1 << dtsSpkLfe1)
+        }
+    }
+
+    // The core extensions (ff_dca_core_parse_exss): XXCH / XCh, XBR, X96,
+    // from the extension substream asset (at data[exss…]) or from the core
+    // frame. Failures fall back to what decoded; they are returned as a
+    // warning text ("" when all went well).
+    fn parseExtensions(_ data: Data, exss: Int, asset: DtsAsset, xll: Bool) -> String {
+        var problem = ""
+        let mask = if asset.ok { asset.extensionMask } else { 0 }
+        var ret = 0
+        var ext = 0
+        if (mask & dtsExssXxch) != 0 {
+            error = ""
+            setRange(data, from: exss + asset.xxchOffset, to: exss + asset.xxchOffset + asset.xxchSize)
+            ret = parseXxchFrame()
+            ext = dtsExssXxch
+        } else if xxchPos != 0 {
+            error = ""
+            setRange(data, from: coreFrom, to: coreTo)
+            br.skip(xxchPos)
+            ret = parseXxchFrame()
+            ext = dtsCssXxch
+        } else if xchPos != 0 {
+            error = ""
+            setRange(data, from: coreFrom, to: coreTo)
+            br.skip(xchPos)
+            ret = parseXchFrame(frameSize * 8)
+            ext = dtsCssXch
+        }
+        if ret < 0 {
+            problem = error
+            resetPrimary()
+        } else {
+            extAudioMask = extAudioMask | ext
+        }
+        if (mask & dtsExssXbr) != 0 {
+            error = ""
+            setRange(data, from: exss + asset.xbrOffset, to: exss + asset.xbrOffset + asset.xbrSize)
+            if parseXbrFrame() < 0 {
+                problem = error
+            } else {
+                extAudioMask = extAudioMask | dtsExssXbr
+            }
+        }
+        if !xll {
+            if (mask & dtsExssX96) != 0 {
+                error = ""
+                setRange(data, from: exss + asset.x96Offset, to: exss + asset.x96Offset + asset.x96Size)
+                if parseX96FrameExss() < 0 {
+                    problem = error
+                } else {
+                    extAudioMask = extAudioMask | dtsExssX96
+                }
+            } else if x96Pos != 0 {
+                error = ""
+                setRange(data, from: coreFrom, to: coreTo)
+                br.skip(x96Pos)
+                if parseX96Frame(frameSize * 8) < 0 {
+                    problem = error
+                } else {
+                    extAudioMask = extAudioMask | dtsCssX96
+                }
+            }
+        }
+        problem
+    }
+
+    // The speaker of primary channel `ch` (map_prm_ch_to_spkr), or −1.
+    fn mapPrmChToSpkr(_ ch: Int) -> Int {
+        let p = dtsChannelsForMode[audioMode]
+        if ch < p {
+            let spkr = dtsPrmChToSpkr[audioMode * 5 + ch]
+            if (extAudioMask & (dtsCssXxch | dtsExssXxch)) != 0 {
+                if (xxchCoreMask & (1 << spkr)) != 0 {
+                    return spkr
+                }
+                if spkr == dtsSpkLs && (xxchCoreMask & (1 << dtsSpkLss)) != 0 {
+                    return dtsSpkLss
+                }
+                if spkr == dtsSpkRs && (xxchCoreMask & (1 << dtsSpkRss)) != 0 {
+                    return dtsSpkRss
+                }
+                return -1
+            }
+            return spkr
+        }
+        if (extAudioMask & dtsCssXch) != 0 && ch == p {
+            return dtsSpkCs
+        }
+        if (extAudioMask & (dtsCssXxch | dtsExssXxch)) != 0 {
+            var q = p
+            for spkr in dtsSpkCs..xxchMaskNbits {
+                if (xxchSpkrMask & (1 << spkr)) != 0 {
+                    if q == ch {
+                        return spkr
+                    }
+                    q += 1
+                }
+            }
+        }
+        -1
+    }
+
+    // ff_dca_core_map_spkr: a speaker of the core output (Lss/Rss may be
+    // served by Ls/Rs), or −1.
+    fn mapSpkr(_ spkr: Int) -> Int {
+        if (chMask & (1 << spkr)) != 0 {
+            return spkr
+        }
+        if spkr == dtsSpkLss && (chMask & (1 << dtsSpkLs)) != 0 {
+            return dtsSpkLs
+        }
+        if spkr == dtsSpkRss && (chMask & (1 << dtsSpkRs)) != 0 {
+            return dtsSpkRs
+        }
+        -1
+    }
+
+    fn setFilterMode(_ mode: Int) {
+        if filterMode != mode {
+            syn.clear()
+            filterMode = mode
+        }
+    }
+
+    // --- Filtering to PCM ---
+
+    // Fixed point (ff_dca_core_filter_fixed), into syn.pcmX by speaker.
+    // x96Synth: 1 forces 96 kHz synthesis (for XLL at 96 kHz), 0 uses X96
+    // when it was decoded, −1 never.
+    fn filterFixed(_ x96SynthIn: Int) -> Int {
+        syn.setUp()
+        var x96Synth = x96SynthIn
+        var x96Ch = 0
+        if x96Synth == 0 && (extAudioMask & (dtsCssX96 | dtsExssX96)) != 0 {
+            x96Ch = x96Nchannels
+            x96Synth = 1
+        }
+        if x96Synth < 0 {
+            x96Synth = 0
+        }
+        outputRate = sampleRate << x96Synth
+        npcmsamples = (npcmblocks * 32) << x96Synth
+        let nsamples = npcmsamples
+        setFilterMode(x96Synth | 2)
+        for ch in 0..nchannels {
+            let spkr = mapPrmChToSpkr(ch)
+            if spkr < 0 {
+                return fail("channel {ch} has no speaker")
+            }
+            syn.qmfFixed(ch: ch, spkr: spkr, sub: sub, base: ch * 32 * dtsStride + 4, stride: dtsStride, x96: x96Synth == 1, hi: x96Sub, hiBase: ch * 64 * dtsStride + 4, hasHi: ch < x96Ch, blocks: npcmblocks, perfect: filterPerfect)
+        }
+        if lfePresent != 0 {
+            if lfePresent == 1 {
+                return fail("fixed point mode doesn't support LFF=1")
+            }
+            let outOff = if x96Synth == 1 { nsamples / 2 } else { 0 }
+            syn.lfeFixed(spkr: dtsSpkLfe1, outOffset: outOff, lfe: lfe, base: 8, blocks: npcmblocks)
+            if x96Synth == 1 {
+                syn.lfeX96Fixed(spkr: dtsSpkLfe1, from: nsamples / 2, len: nsamples / 2)
+            }
+            let n = npcmblocks >> 1
+            var k = 7
+            while k >= 0 {
+                lfe[k] = lfe[n + k]
+                k -= 1
+            }
+        }
+        0
+    }
+
+    // The fixed point output's post-processing (filter_frame_fixed):
+    // undo embedded XCh/XXCH downmixes, sum/difference decoding.
+    fn finishFixed() -> Int {
+        let ns = npcmsamples
+        let m = dtsMaxFrameSamples
+        if esFormat && (extAudioMask & dtsCssXch) != 0 && audioMode >= 8 {
+            for n in 0..ns {
+                let cs = (syn.pcmX[dtsSpkCs * m + n] * 5931520 + 4194304) >> 23
+                syn.pcmX[dtsSpkLs * m + n] = dtsWrap32(syn.pcmX[dtsSpkLs * m + n] - cs)
+                syn.pcmX[dtsSpkRs * m + n] = dtsWrap32(syn.pcmX[dtsSpkRs * m + n] - cs)
+            }
+        }
+        if (extAudioMask & (dtsCssXxch | dtsExssXxch)) != 0 && xxchDmixEmbedded {
+            let scaleInv = xxchDmixScaleInv
+            let xchBase = dtsChannelsForMode[audioMode]
+            for spkr in 0..xxchMaskNbits {
+                if (xxchCoreMask & (1 << spkr)) != 0 {
+                    for n in 0..ns {
+                        syn.pcmX[spkr * m + n] = dtsWrap32((syn.pcmX[spkr * m + n] * scaleInv + 32768) >> 16)
+                    }
+                }
+            }
+            var cp = 0
+            for ch in xchBase..nchannels {
+                let src = mapPrmChToSpkr(ch)
+                if src < 0 {
+                    return fail("XXCH channel has no speaker")
+                }
+                for spkr in 0..xxchMaskNbits {
+                    if (xxchDmixMask[ch - xchBase] & (1 << spkr)) != 0 {
+                        let coeff = (xxchDmixCoeff[cp] * scaleInv + 32768) >> 16
+                        cp += 1
+                        if coeff != 0 {
+                            for n in 0..ns {
+                                let v = (syn.pcmX[src * m + n] * coeff + 16384) >> 15
+                                syn.pcmX[spkr * m + n] = dtsWrap32(syn.pcmX[spkr * m + n] - v)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if (extAudioMask & (dtsCssXxch | dtsCssXch | dtsExssXxch)) == 0 {
+            if (sumdiffFront && audioMode > 0) || audioMode == 3 {
+                butterfliesFixed(dtsSpkL, dtsSpkR, ns)
+            }
+            if sumdiffSurround && audioMode >= 8 {
+                butterfliesFixed(dtsSpkLs, dtsSpkRs, ns)
+            }
+        }
+        0
+    }
+
+    fn butterfliesFixed(_ a: Int, _ b: Int, _ ns: Int) {
+        let m = dtsMaxFrameSamples
+        for n in 0..ns {
+            let x = syn.pcmX[a * m + n]
+            let y = syn.pcmX[b * m + n]
+            syn.pcmX[a * m + n] = dtsWrap32(x + y)
+            syn.pcmX[b * m + n] = dtsWrap32(x - y)
+        }
+    }
+
+    // Floating point (filter_frame_float), into syn.pcmF by speaker.
+    fn filterFloat() -> Int {
+        syn.setUp()
+        var x96Synth = 0
+        var x96Ch = 0
+        if (extAudioMask & (dtsCssX96 | dtsExssX96)) != 0 {
+            x96Ch = x96Nchannels
+            x96Synth = 1
+        }
+        outputRate = sampleRate << x96Synth
+        npcmsamples = (npcmblocks * 32) << x96Synth
+        let ns = npcmsamples
+        setFilterMode(x96Synth)
+        for ch in 0..nchannels {
+            let spkr = mapPrmChToSpkr(ch)
+            if spkr < 0 {
+                return fail("channel {ch} has no speaker")
+            }
+            syn.qmfFloat(ch: ch, spkr: spkr, sub: sub, base: ch * 32 * dtsStride + 4, stride: dtsStride, x96: x96Synth == 1, hi: x96Sub, hiBase: ch * 64 * dtsStride + 4, hasHi: ch < x96Ch, blocks: npcmblocks, perfect: filterPerfect)
+        }
+        let m = dtsMaxFrameSamples
+        if lfePresent != 0 {
+            let dec128 = lfePresent == 1
+            let outOff = if x96Synth == 1 { ns / 2 } else { 0 }
+            syn.lfeFloat(spkr: dtsSpkLfe1, outOffset: outOff, lfe: lfe, base: 8, blocks: npcmblocks, dec128: dec128)
+            if x96Synth == 1 {
+                syn.lfeX96Float(spkr: dtsSpkLfe1, from: ns / 2, len: ns / 2)
+            }
+            let n = npcmblocks >> (if dec128 { 2 } else { 1 })
+            var k = 7
+            while k >= 0 {
+                lfe[k] = lfe[n + k]
+                k -= 1
+            }
+        }
+        if esFormat && (extAudioMask & dtsCssXch) != 0 && audioMode >= 8 {
+            let r = -0.70710678118654752
+            for n in 0..ns {
+                let cs = syn.pcmF[dtsSpkCs * m + n]
+                syn.pcmF[dtsSpkLs * m + n] = syn.pcmF[dtsSpkLs * m + n] + cs * r
+                syn.pcmF[dtsSpkRs * m + n] = syn.pcmF[dtsSpkRs * m + n] + cs * r
+            }
+        }
+        if (extAudioMask & (dtsCssXxch | dtsExssXxch)) != 0 && xxchDmixEmbedded {
+            let scaleInv = Float(xxchDmixScaleInv) / 65536.0
+            let xchBase = dtsChannelsForMode[audioMode]
+            var cp = 0
+            for ch in xchBase..nchannels {
+                let src = mapPrmChToSpkr(ch)
+                if src < 0 {
+                    return fail("XXCH channel has no speaker")
+                }
+                for spkr in 0..xxchMaskNbits {
+                    if (xxchDmixMask[ch - xchBase] & (1 << spkr)) != 0 {
+                        let coeff = xxchDmixCoeff[cp]
+                        cp += 1
+                        if coeff != 0 {
+                            let c = Float(coeff) * (-1.0 / 32768.0)
+                            for n in 0..ns {
+                                syn.pcmF[spkr * m + n] = syn.pcmF[spkr * m + n] + syn.pcmF[src * m + n] * c
+                            }
+                        }
+                    }
+                }
+            }
+            for spkr in 0..xxchMaskNbits {
+                if (xxchCoreMask & (1 << spkr)) != 0 {
+                    for n in 0..ns {
+                        syn.pcmF[spkr * m + n] = syn.pcmF[spkr * m + n] * scaleInv
+                    }
+                }
+            }
+        }
+        if (extAudioMask & (dtsCssXxch | dtsCssXch | dtsExssXxch)) == 0 {
+            if (sumdiffFront && audioMode > 0) || audioMode == 3 {
+                butterfliesFloat(dtsSpkL, dtsSpkR, ns)
+            }
+            if sumdiffSurround && audioMode >= 8 {
+                butterfliesFloat(dtsSpkLs, dtsSpkRs, ns)
+            }
+        }
+        0
+    }
+
+    fn butterfliesFloat(_ a: Int, _ b: Int, _ ns: Int) {
+        let m = dtsMaxFrameSamples
+        for n in 0..ns {
+            let x = syn.pcmF[a * m + n]
+            let y = syn.pcmF[b * m + n]
+            syn.pcmF[a * m + n] = x + y
+            syn.pcmF[b * m + n] = x - y
+        }
+    }
+
+    // After a seek (ff_dca_core_flush).
+    fn flushState() {
+        eraseAdpcmHistory()
+        for k in 0..8 {
+            lfe[k] = 0
+        }
+        eraseX96AdpcmHistory()
+        syn.clear()
+    }
+}
+
+let dtsAdpcmVb: [Int] = dtsUnpackInt16(dtsAdpcmVbText)
+let dtsHighFreqVq: [Int] = dtsUnpackInt8(dtsHighFreqVqText)
+
+fn dtsUnpackInt16(_ text: String) -> [Int] {
+    let d = decodeBase64(text) ?? Data()
+    var out: [Int] = []
+    var i = 0
+    while i + 2 <= d.count {
+        let v = d[i] | (d[i + 1] << 8)
+        out.append(if v >= 32768 { v - 65536 } else { v })
+        i += 2
+    }
+    out
+}
+
+fn dtsUnpackInt8(_ text: String) -> [Int] {
+    let d = decodeBase64(text) ?? Data()
+    var out: [Int] = []
+    for b in d.bytes {
+        out.append(if b >= 128 { b - 256 } else { b })
+    }
+    out
+}
+
+fn dtsPopcount(_ x: Int) -> Int {
+    var n = 0
+    var v = x
+    while v != 0 {
+        n += v & 1
+        v = v >> 1
+    }
+    n
+}
+
+// floor(log2(x)) for x > 0.
+fn dtsLog2(_ x: Int) -> Int {
+    var n = 0
+    var v = x
+    while v > 1 {
+        v = v >> 1
+        n += 1
+    }
+    n
+}
+
+// CRC-16-CCITT (polynomial 0x1021, initial value 0xFFFF), the checksum of
+// the DTS-HD headers; over a header including its CRC it is 0.
+public fn dtsCrc16(_ data: Data, from: Int, to: Int) -> Int {
+    var crc = 0xffff
+    var i = max(from, 0)
+    let end = min(to, data.count)
+    while i < end {
+        crc = crc ^ (data[i] << 8)
+        for _ in 0..8 {
+            crc = if (crc & 0x8000) != 0 { ((crc << 1) ^ 0x1021) & 0xffff } else { (crc << 1) & 0xffff }
+        }
+        i += 1
+    }
+    crc
+}

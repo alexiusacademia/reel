@@ -1,0 +1,224 @@
+// Preferences: every setting the app has, in one struct saved as JSON.
+// Fields missing from an older file take their defaults (fromJson fills
+// them), so new settings can be added without losing the user's others;
+// values out of range are brought back into range by `validated`.
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+// How subtitles look (text formats; ASS keeps its own styles unless
+// `overrideAss`). Colours are rgba packed r<<24|g<<16|b<<8|a, as subs.Span.
+public struct SubtitleStyle {
+    // 1.0 = the default size (a fraction of the video height).
+    fontScale: Float = 1.0
+    font: String = ""
+    bold: Bool = false
+    color: Int = 0xffffffff
+    outlineWidth: Float = 2.0
+    outlineColor: Int = 0x000000ff
+    shadow: Bool = true
+    shadowColor: Int = 0x00000080
+    // A box behind the text.
+    background: Bool = false
+    backgroundColor: Int = 0x000000ff
+    backgroundOpacity: Float = 0.5
+    // Distance from the bottom (or top) edge, as a fraction of the height.
+    marginV: Float = 0.05
+    // "bottom" or "top" for the first track; the second track goes to the
+    // other edge.
+    position: String = "bottom"
+    overrideAss: Bool = false
+}
+
+public struct Preferences {
+    // The preferences file's version (for future migrations).
+    version: Int = 1
+
+    // --- Library ---
+    libraryFolders: [String] = []
+    scanOnStart: Bool = true
+    // Read whole audio files up to this size during scans for their tags.
+    scanTagMB: Int = 50
+    historyEnabled: Bool = true
+    recentCount: Int = 12
+
+    // --- Playback ---
+    // "ask" (offer to continue for a few seconds), "always", "never".
+    resume: String = "ask"
+    // Positions under this aren't worth continuing from.
+    resumeMinSeconds: Float = 10.0
+    // Within this many seconds of the end (or past this fraction), a file
+    // counts as finished.
+    finishedMarginSeconds: Float = 20.0
+    finishedFraction: Float = 0.95
+    // Remember tracks, volume, delays … per file.
+    rememberPerFile: Bool = true
+    // At the end of an episode, play the next one.
+    autoNextEpisode: Bool = true
+    // 0 off, 1 all, 2 one.
+    loopMode: Int = 0
+    shuffle: Bool = false
+    // Seconds for the short, normal and long jumps.
+    jumpShort: Float = 3.0
+    jumpNormal: Float = 10.0
+    jumpLong: Float = 60.0
+    // Pause when the window is minimised.
+    pauseWhenHidden: Bool = false
+
+    // --- Audio ---
+    volume: Float = 1.0
+    volumeStep: Float = 0.05
+    // Preferred audio languages, first match wins (ISO 639 codes or names).
+    audioLanguages: [String] = []
+    // Loudness normalisation (fx): off by default; target in LUFS.
+    normalize: Bool = false
+    normalizeTarget: Float = -18.0
+    // "off" "track" "album": use ReplayGain tags instead of measuring.
+    replayGain: String = "off"
+    equalizerEnabled: Bool = false
+    equalizerPreset: String = "Flat"
+    // Custom equalizer: 10 bands in dB (31 Hz … 16 kHz) and the preamp.
+    equalizerBands: [Float] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    equalizerPreamp: Float = 0.0
+    // "stereo" "mono" "swap" "left" "right".
+    stereoMode: String = "stereo"
+    crossfeed: Bool = false
+
+    // --- Subtitles ---
+    subtitleLanguages: [String] = []
+    // "auto" (when the audio isn't in a preferred language), "always",
+    // "forced" (forced tracks only), "never".
+    subtitleMode: String = "auto"
+    // "auto" or an encoding name for subtitle files ("windows-1251" …).
+    subtitleEncoding: String = "auto"
+    // Load subtitle files found beside the video.
+    loadSiblingSubtitles: Bool = true
+    subtitleStyle: SubtitleStyle = SubtitleStyle()
+    // Languages for the second subtitle track (shown at the top), [] off.
+    secondarySubtitleLanguages: [String] = []
+
+    // --- Video ---
+    // "off" "auto" (by Picture.interlaced) "bob" "blend" "adaptive".
+    deinterlace: String = "auto"
+    // Deinterlace to double the frame rate (one picture per field).
+    deinterlaceDoubleRate: Bool = false
+    smoothScaling: Bool = true
+    // "" for the Pictures folder.
+    snapshotFolder: String = ""
+    // "png" or "jpg".
+    snapshotFormat: String = "png"
+
+    // --- Network ---
+    networkCacheSeconds: Float = 10.0
+    // 0: no limit for adaptive streams' picture height.
+    maxStreamHeight: Int = 0
+    userAgent: String = ""
+
+    // --- OpenSubtitles ---
+    openSubtitlesApiKey: String = ""
+    openSubtitlesUser: String = ""
+    // The token from logging in (not the password).
+    openSubtitlesToken: String = ""
+
+    // --- Interface ---
+    // "system" "dark" "light".
+    theme: String = "system"
+    showPlaylistOnStart: Bool = false
+    controlsHideSeconds: Float = 3.0
+    // Show the remaining time instead of the length.
+    showRemaining: Bool = false
+    // Thumbnail cache size limit.
+    thumbnailCacheMB: Int = 200
+    // The folder the open dialogs start in (last used).
+    lastFolder: String = ""
+
+    // --- Keys ---
+    // The user's changes to the default keys: action → combinations (see
+    // keymap.tsl; `keymapWith(overrides: prefs.keyOverrides)`).
+    keyOverrides: [String: [String]] = [:]
+}
+
+// The defaults.
+public fn defaultPreferences() -> Preferences {
+    Preferences()
+}
+
+let resumeModes = ["ask", "always", "never"]
+let subtitleModes = ["auto", "always", "forced", "never"]
+let deinterlaceModes = ["off", "auto", "bob", "blend", "adaptive"]
+let themes = ["system", "dark", "light"]
+let stereoModes = ["stereo", "mono", "swap", "left", "right"]
+let replayGainModes = ["off", "track", "album"]
+
+fn oneOf(_ v: String, _ allowed: [String]) -> String {
+    if allowed.contains(v) { v } else { allowed[0] }
+}
+
+// The preferences with every value brought into its range (unknown choice
+// words become the default; numbers are clamped).
+public fn validated(_ p0: Preferences) -> Preferences {
+    var p = p0
+    p.resume = oneOf(p.resume, resumeModes)
+    p.subtitleMode = oneOf(p.subtitleMode, subtitleModes)
+    p.deinterlace = oneOf(p.deinterlace, deinterlaceModes)
+    p.theme = oneOf(p.theme, themes)
+    p.stereoMode = oneOf(p.stereoMode, stereoModes)
+    p.replayGain = oneOf(p.replayGain, replayGainModes)
+    if p.snapshotFormat != "png" && p.snapshotFormat != "jpg" {
+        p.snapshotFormat = "png"
+    }
+    p.volume = p.volume.clamped(min: 0.0, max: 1.0)
+    p.volumeStep = p.volumeStep.clamped(min: 0.01, max: 0.5)
+    p.resumeMinSeconds = p.resumeMinSeconds.clamped(min: 0.0, max: 3600.0)
+    p.finishedMarginSeconds = p.finishedMarginSeconds.clamped(min: 0.0, max: 600.0)
+    p.finishedFraction = p.finishedFraction.clamped(min: 0.5, max: 1.0)
+    p.loopMode = p.loopMode.clamped(min: 0, max: 2)
+    p.jumpShort = p.jumpShort.clamped(min: 0.5, max: 600.0)
+    p.jumpNormal = p.jumpNormal.clamped(min: 0.5, max: 600.0)
+    p.jumpLong = p.jumpLong.clamped(min: 0.5, max: 3600.0)
+    p.normalizeTarget = p.normalizeTarget.clamped(min: -40.0, max: -5.0)
+    p.equalizerPreamp = p.equalizerPreamp.clamped(min: -12.0, max: 12.0)
+    var bands: [Float] = []
+    for i in 0..10 {
+        bands.append(if i < p.equalizerBands.count { p.equalizerBands[i].clamped(min: -12.0, max: 12.0) } else { 0.0 })
+    }
+    p.equalizerBands = bands
+    p.networkCacheSeconds = p.networkCacheSeconds.clamped(min: 0.5, max: 600.0)
+    p.maxStreamHeight = max(p.maxStreamHeight, 0)
+    p.controlsHideSeconds = p.controlsHideSeconds.clamped(min: 0.5, max: 60.0)
+    p.thumbnailCacheMB = p.thumbnailCacheMB.clamped(min: 1, max: 100000)
+    p.scanTagMB = p.scanTagMB.clamped(min: 0, max: 2000)
+    p.recentCount = p.recentCount.clamped(min: 0, max: 100)
+    p.subtitleStyle.fontScale = p.subtitleStyle.fontScale.clamped(min: 0.25, max: 4.0)
+    p.subtitleStyle.outlineWidth = p.subtitleStyle.outlineWidth.clamped(min: 0.0, max: 10.0)
+    p.subtitleStyle.backgroundOpacity = p.subtitleStyle.backgroundOpacity.clamped(min: 0.0, max: 1.0)
+    p.subtitleStyle.marginV = p.subtitleStyle.marginV.clamped(min: 0.0, max: 0.45)
+    if p.subtitleStyle.position != "top" {
+        p.subtitleStyle.position = "bottom"
+    }
+    p
+}
+
+// The preferences file in an app data folder.
+public fn preferencesPath(_ folder: String) -> String {
+    joinPath(folder, "preferences.json")
+}
+
+// Reads preferences: defaults when the file is missing; when it can't be
+// read as preferences (damaged, or a value of the wrong kind), it is kept
+// as preferences.bad.json and the defaults are used.
+public fn loadPreferences(_ path: String) -> Preferences {
+    if let text = readFile(path) {
+        let p: Preferences? = fromJson(text)
+        if let ok = p {
+            return validated(ok)
+        }
+        renameFile(from: path, to: path.replace(".json", with: ".bad.json"))
+    }
+    Preferences()
+}
+
+// Writes preferences (pretty JSON, so people can read it).
+public fn savePreferences(_ p: Preferences, path: String) -> Error? {
+    writeText(path: path, text: toJson(validated(p), pretty: true))
+}

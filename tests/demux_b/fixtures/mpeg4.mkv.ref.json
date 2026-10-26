@@ -1,0 +1,135 @@
+{
+ "format": "matroska,webm",
+ "duration": 0.4,
+ "tags": {
+  "encoder": "Lavf62.12.102"
+ },
+ "tracks": [
+  {
+   "index": 0,
+   "kind": "video",
+   "codec": "mpeg4",
+   "ffCodec": "mpeg4",
+   "profile": "Advanced Simple Profile",
+   "timescale": 1000,
+   "duration": -9223372036854775807,
+   "extraHex": "000001b0f1000001b5a913000001000000012008d48d0800cd02040614103f000001b24c61766336322e32382e313032",
+   "width": 64,
+   "height": 48,
+   "sarNum": 1,
+   "sarDen": 1,
+   "fpsNum": 25,
+   "fpsDen": 1,
+   "rotation": 0,
+   "pixFmt": "yuv420p",
+   "sampleRate": 0,
+   "channels": 0,
+   "channelLayout": "",
+   "bitsPerSample": 0,
+   "pcm": {
+    "bits": 16,
+    "float": false,
+    "bigEndian": false,
+    "signed": true
+   },
+   "language": "",
+   "title": "",
+   "isDefault": false,
+   "isCover": false,
+   "frames": -1
+  }
+ ],
+ "packets": [
+  {
+   "track": 0,
+   "pts": 0,
+   "dts": -40,
+   "duration": 40,
+   "key": true,
+   "pos": 606,
+   "size": 2090
+  },
+  {
+   "track": 0,
+   "pts": 80,
+   "dts": 0,
+   "duration": 40,
+   "key": false,
+   "pos": 2702,
+   "size": 18
+  },
+  {
+   "track": 0,
+   "pts": 40,
+   "dts": 40,
+   "duration": 40,
+   "key": false,
+   "pos": 2726,
+   "size": 16
+  },
+  {
+   "track": 0,
+   "pts": 160,
+   "dts": 80,
+   "duration": 40,
+   "key": false,
+   "pos": 2749,
+   "size": 150
+  },
+  {
+   "track": 0,
+   "pts": 120,
+   "dts": 120,
+   "duration": 40,
+   "key": false,
+   "pos": 2905,
+   "size": 17
+  },
+  {
+   "track": 0,
+   "pts": 240,
+   "dts": 160,
+   "duration": 40,
+   "key": false,
+   "pos": 2928,
+   "size": 59
+  },
+  {
+   "track": 0,
+   "pts": 200,
+   "dts": 200,
+   "duration": 40,
+   "key": false,
+   "pos": 2993,
+   "size": 23
+  },
+  {
+   "track": 0,
+   "pts": 320,
+   "dts": 240,
+   "duration": 40,
+   "key": false,
+   "pos": 3022,
+   "size": 60
+  },
+  {
+   "track": 0,
+   "pts": 280,
+   "dts": 280,
+   "duration": 40,
+   "key": false,
+   "pos": 3088,
+   "size": 27
+  },
+  {
+   "track": 0,
+   "pts": 360,
+   "dts": 320,
+   "duration": 40,
+   "key": false,
+   "pos": 3121,
+   "size": 58
+  }
+ ],
+ "chapters": []
+}

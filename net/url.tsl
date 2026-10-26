@@ -1,0 +1,318 @@
+// URLs: taking them apart and resolving relative references against a
+// base, as HLS playlists, DASH manifests (BaseURL) and feeds need.
+//
+// Follows RFC 3986: the generic syntax (§3), reference resolution (§5.2.2)
+// with merge (§5.2.3) and remove_dot_segments (§5.2.4). Local file paths
+// are turned into file:// URLs (RFC 8089) so the same code reads local
+// test playlists.
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+public struct Url {
+    scheme: String = ""
+    // Present (even when empty) only when the text had "//".
+    hasAuthority: Bool = false
+    authority: String = ""
+    path: String = ""
+    hasQuery: Bool = false
+    query: String = ""
+    hasFragment: Bool = false
+    fragment: String = ""
+
+    // The host without user info and port.
+    host: String {
+        var a = authority
+        if let at = a.findLast("@") {
+            a = a.substring(from: at + 1, to: a.count)
+        }
+        if a.hasPrefix("[") {
+            if let e = a.find("]") {
+                return a.substring(from: 1, to: e)
+            }
+        }
+        if let c = a.findLast(":") {
+            return a.substring(from: 0, to: c)
+        }
+        a
+    }
+
+    // The port, or -1 when the URL doesn't name one.
+    port: Int {
+        var a = authority
+        if let at = a.findLast("@") {
+            a = a.substring(from: at + 1, to: a.count)
+        }
+        if let b = a.findLast("]") {
+            a = a.substring(from: b + 1, to: a.count)
+        }
+        if let c = a.findLast(":") {
+            return parseInt(a.substring(from: c + 1, to: a.count)).valueOr(-1)
+        }
+        -1
+    }
+
+    // The URL as text (§5.3).
+    text: String {
+        var s = ""
+        if !scheme.isEmpty {
+            s += scheme + ":"
+        }
+        if hasAuthority {
+            s += "//" + authority
+        }
+        s += path
+        if hasQuery {
+            s += "?" + query
+        }
+        if hasFragment {
+            s += "#" + fragment
+        }
+        s
+    }
+}
+
+// Splits a URL reference into its five parts (RFC 3986 appendix B).
+public fn parseUrl(_ text: String) -> Url {
+    var u = Url()
+    var rest = text.trim()
+    if let h = rest.find("#") {
+        u.hasFragment = true
+        u.fragment = rest.substring(from: h + 1, to: rest.count)
+        rest = rest.substring(from: 0, to: h)
+    }
+    if let q = rest.find("?") {
+        u.hasQuery = true
+        u.query = rest.substring(from: q + 1, to: rest.count)
+        rest = rest.substring(from: 0, to: q)
+    }
+    // A scheme is letters, digits, + - . before the first ':' that comes
+    // before any '/'.
+    if let c = rest.find(":") {
+        let cand = rest.substring(from: 0, to: c)
+        let drive = cand.count == 1 && (rest.substring(from: c + 1, to: c + 2) == "/" || rest.substring(from: c + 1, to: c + 2) == "\\")
+        if !cand.isEmpty && urlIsScheme(cand) && !drive {
+            u.scheme = cand.lowercase()
+            rest = rest.substring(from: c + 1, to: rest.count)
+        }
+    }
+    if rest.hasPrefix("//") {
+        u.hasAuthority = true
+        let after = rest.substring(from: 2, to: rest.count)
+        if let s = after.find("/") {
+            u.authority = after.substring(from: 0, to: s)
+            rest = after.substring(from: s, to: after.count)
+        } else {
+            u.authority = after
+            rest = ""
+        }
+    }
+    u.path = rest
+    u
+}
+
+fn urlIsScheme(_ s: String) -> Bool {
+    let b = Data(text: s).bytes
+    for (i, c) in b.enumerated() {
+        let alpha = (c >= 65 && c <= 90) || (c >= 97 && c <= 122)
+        if i == 0 && !alpha {
+            return false
+        }
+        if !alpha && !(c >= 48 && c <= 57) && c != 43 && c != 45 && c != 46 {
+            return false
+        }
+    }
+    true
+}
+
+// Resolves `reference` against `base` (RFC 3986 §5.2.2). A base that is a
+// local path (no scheme) is taken as a file:// URL first.
+public fn resolveUrl(_ base: String, _ reference: String) -> String {
+    let r = parseUrl(reference)
+    if !r.scheme.isEmpty {
+        var t = r
+        t.path = urlRemoveDots(r.path)
+        return t.text
+    }
+    let b = parseUrl(asUrl(base))
+    var t = Url()
+    if r.hasAuthority {
+        t.hasAuthority = true
+        t.authority = r.authority
+        t.path = urlRemoveDots(r.path)
+        t.hasQuery = r.hasQuery
+        t.query = r.query
+    } else {
+        if r.path.isEmpty {
+            t.path = b.path
+            if r.hasQuery {
+                t.hasQuery = true
+                t.query = r.query
+            } else {
+                t.hasQuery = b.hasQuery
+                t.query = b.query
+            }
+        } else {
+            if r.path.hasPrefix("/") {
+                t.path = urlRemoveDots(r.path)
+            } else {
+                t.path = urlRemoveDots(urlMerge(b, r.path))
+            }
+            t.hasQuery = r.hasQuery
+            t.query = r.query
+        }
+        t.hasAuthority = b.hasAuthority
+        t.authority = b.authority
+    }
+    t.scheme = b.scheme
+    t.hasFragment = r.hasFragment
+    t.fragment = r.fragment
+    t.text
+}
+
+// §5.2.3 merge.
+fn urlMerge(_ b: Url, _ path: String) -> String {
+    if b.hasAuthority && b.path.isEmpty {
+        return "/" + path
+    }
+    if let s = b.path.findLast("/") {
+        return b.path.substring(from: 0, to: s + 1) + path
+    }
+    path
+}
+
+// §5.2.4 remove_dot_segments.
+fn urlRemoveDots(_ path: String) -> String {
+    if !path.contains(".") {
+        return path
+    }
+    var input = path
+    var out: [String] = []
+    while !input.isEmpty {
+        if input.hasPrefix("../") {
+            input = input.substring(from: 3, to: input.count)
+        } else if input.hasPrefix("./") {
+            input = input.substring(from: 2, to: input.count)
+        } else if input.hasPrefix("/./") {
+            input = input.substring(from: 2, to: input.count)
+        } else if input == "/." {
+            input = "/"
+        } else if input.hasPrefix("/../") {
+            input = input.substring(from: 3, to: input.count)
+            if !out.isEmpty {
+                out.removeLast()
+            }
+        } else if input == "/.." {
+            input = "/"
+            if !out.isEmpty {
+                out.removeLast()
+            }
+        } else if input == "." || input == ".." {
+            input = ""
+        } else {
+            // Move the first segment (with its leading '/') to the output.
+            var start = 0
+            if input.hasPrefix("/") {
+                start = 1
+            }
+            let tail = input.substring(from: start, to: input.count)
+            var cut = input.count
+            if let s = tail.find("/") {
+                cut = s + start
+            }
+            out.append(input.substring(from: 0, to: cut))
+            input = input.substring(from: cut, to: input.count)
+        }
+    }
+    out.joined(separator: "")
+}
+
+// A local path as a file:// URL; URLs are given back as they are.
+public fn asUrl(_ pathOrUrl: String) -> String {
+    let u = parseUrl(pathOrUrl)
+    if !u.scheme.isEmpty {
+        return pathOrUrl
+    }
+    var p = pathOrUrl
+    if !p.hasPrefix("/") {
+        p = joinPath(currentFolder(), p)
+    }
+    "file://" + urlEncodePath(p)
+}
+
+// The local path of a file:// URL ("" for other URLs).
+public fn filePath(_ url: String) -> String {
+    let u = parseUrl(url)
+    if u.scheme != "file" {
+        if u.scheme.isEmpty {
+            return url
+        }
+        return ""
+    }
+    percentDecode(u.path)
+}
+
+// Decodes %XX escapes (but, unlike urlDecoded, leaves '+' alone).
+public fn percentDecode(_ s: String) -> String {
+    if !s.contains("%") {
+        return s
+    }
+    let b = Data(text: s)
+    var out = Data()
+    var i = 0
+    while i < b.count {
+        if b[i] == 37 && i + 2 < b.count {
+            let h = urlHex(b[i + 1])
+            let l = urlHex(b[i + 2])
+            if h >= 0 && l >= 0 {
+                out.append(byte: h * 16 + l)
+                i += 3
+                continue
+            }
+        }
+        out.append(byte: b[i])
+        i += 1
+    }
+    out.text ?? s
+}
+
+fn urlHex(_ c: Int) -> Int {
+    if c >= 48 && c <= 57 {
+        return c - 48
+    }
+    if c >= 97 && c <= 102 {
+        return c - 87
+    }
+    if c >= 65 && c <= 70 {
+        return c - 55
+    }
+    -1
+}
+
+// Whether a URL is http:// or https://.
+public fn isHttp(_ url: String) -> Bool {
+    let s = parseUrl(url).scheme
+    s == "http" || s == "https"
+}
+
+// Percent-encodes the characters of a path that may not appear in a URL
+// (keeps '/', unreserved characters and sub-delims).
+fn urlEncodePath(_ p: String) -> String {
+    var out = ""
+    for part in p.split("/").enumerated() {
+        if part.0 > 0 {
+            out += "/"
+        }
+        out += part.1.urlEncoded
+    }
+    out
+}
+
+// The file name part of a URL's path, without query ("seg-1.ts").
+public fn urlFileName(_ url: String) -> String {
+    let u = parseUrl(url)
+    if let s = u.path.findLast("/") {
+        return u.path.substring(from: s + 1, to: u.path.count)
+    }
+    u.path
+}

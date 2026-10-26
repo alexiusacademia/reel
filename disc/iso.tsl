@@ -1,0 +1,193 @@
+// ISO 9660 (ECMA-119) and Joliet file listings of a disc image.
+//
+// ECMA-119: the volume descriptors start at sector 16 (2048-byte
+// sectors): type 1 primary (identifier "CD001", volume identifier at 40,
+// logical block size at 128 (both-endian 16-bit), root directory record
+// at 156), type 2 supplementary (Joliet when its escape sequences at 88
+// are "%/@", "%/C" or "%/E": names in UCS-2 big-endian), 255 terminator.
+// A directory is a run of directory records: length (1), extended
+// attribute length (1), extent location (both-endian 32-bit at 2), data
+// length (both-endian 32-bit at 10), date (7), flags (1 at 25: bit 1
+// directory, bit 7 the file goes on in the next record), …, name length
+// (1 at 32), name (33…). Records don't cross sectors: a 0 length byte
+// means "go on at the next sector". Names "VIDEO_TS.IFO;1" lose the
+// ";1" version and a trailing ".".
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+struct IsoDir {
+    name: String
+    at: Int
+    len: Int
+}
+
+// The files of an image's ISO 9660 tree (`joliet`: the Joliet tree when
+// there is one), with offsets into the image.
+public fn iso9660Files(_ d: Data, path: String = "", joliet: Bool = false) -> Result<DiscFs> {
+    var fs = DiscFs(root: path)
+    fs.iso = true
+    fs.image = d
+    fs.source = "iso9660"
+    var root = -1
+    var block = 2048
+    var sector = 16
+    while sector < 64 {
+        let at = sector * 2048
+        if at + 2048 > d.count {
+            break
+        }
+        let type = dU8(d, at)
+        if dAscii(d, at + 1, 5) != "CD001" {
+            break
+        }
+        if type == 255 {
+            break
+        }
+        if type == 1 && root < 0 {
+            fs.volumeName = dAscii(d, at + 40, 32)
+            block = dL16(d, at + 128)
+            root = at + 156
+        }
+        if type == 2 && joliet {
+            let esc = dAscii(d, at + 88, 3)
+            if esc == "%/@" || esc == "%/C" || esc == "%/E" {
+                block = dL16(d, at + 128)
+                root = at + 156
+                fs.source = "joliet"
+                let v = dUtf16be(d, at + 40, 32).trim()
+                if !v.isEmpty {
+                    fs.volumeName = v
+                }
+            }
+        }
+        sector += 1
+    }
+    if root < 0 {
+        return Result.failure(error: Error("no ISO 9660 volume descriptor"))
+    }
+    if block != 2048 && block != 512 && block != 1024 {
+        block = 2048
+    }
+    let ucs = fs.source == "joliet"
+    var queue: [IsoDir] = [IsoDir(name: "", at: dL32(d, root + 2) * block, len: dL32(d, root + 10))]
+    var seen: Set<Int> = []
+    var qi = 0
+    while qi < queue.count && fs.files.count < 200000 {
+        let dir = queue[qi]
+        qi += 1
+        if seen.contains(dir.at) || dir.at <= 0 || dir.at >= d.count {
+            continue
+        }
+        seen.insert(dir.at)
+        let end = min(d.count, dir.at + dir.len)
+        var p = dir.at
+        var lastName = ""
+        var lastMore = false
+        while p < end {
+            let rl = dU8(d, p)
+            if rl == 0 {
+                // Go on at the next sector.
+                p = (p / 2048 + 1) * 2048
+                continue
+            }
+            if rl < 34 || p + rl > end {
+                break
+            }
+            let nl = dU8(d, p + 32)
+            let flags = dU8(d, p + 25)
+            let ext = dL32(d, p + 2) * block
+            let size = dL32(d, p + 10)
+            let first = dU8(d, p + 33)
+            if nl == 1 && (first == 0 || first == 1) {
+                p += rl
+                continue
+            }
+            var name = if ucs { dUtf16be(d, p + 33, nl) } else { dAscii(d, p + 33, nl) }
+            if let semi = name.findLast(";") {
+                name = name.substring(from: 0, to: semi)
+            }
+            if name.hasSuffix(".") {
+                name = name.substring(from: 0, to: name.count - 1)
+            }
+            let full = if dir.name.isEmpty { name } else { dir.name + "/" + name }
+            if flags & 2 != 0 {
+                fs.files.append(DiscFile(name: full, path: path, offset: ext, folder: true))
+                if queue.count < 100000 {
+                    queue.append(IsoDir(name: full, at: ext, len: size))
+                }
+            } else if lastMore && name == lastName && !fs.files.isEmpty {
+                // Another extent of the same file (ISO 9660 level 3).
+                let k = fs.files.count - 1
+                var f = fs.files[k]
+                if f.extents.isEmpty {
+                    f.extents = [f.offset, f.size]
+                }
+                f.extents.append(ext)
+                f.extents.append(size)
+                f.size += size
+                fs.files[k] = discMergeExtents(f)
+            } else {
+                fs.files.append(DiscFile(name: full, path: path, offset: ext, size: size))
+            }
+            lastName = name
+            lastMore = flags & 0x80 != 0
+            p += rl
+        }
+    }
+    Result.ok(value: fs)
+}
+
+// Joins touching extents; a file in one run gets no extent list.
+fn discMergeExtents(_ f: DiscFile) -> DiscFile {
+    var out = f
+    var ex: [Int] = []
+    var i = 0
+    while i + 1 < f.extents.count {
+        let a = f.extents[i]
+        let n = f.extents[i + 1]
+        if ex.count >= 2 && ex[ex.count - 2] + ex[ex.count - 1] == a {
+            ex[ex.count - 1] += n
+        } else {
+            ex.append(a)
+            ex.append(n)
+        }
+        i += 2
+    }
+    if ex.count == 2 {
+        out.offset = ex[0]
+        out.extents = []
+    } else {
+        out.extents = ex
+        if ex.count >= 2 {
+            out.offset = ex[0]
+        }
+    }
+    out
+}
+
+// The files of an image: UDF when it has one (DVD and Blu-ray images), else
+// Joliet, else plain ISO 9660.
+public fn imageFs(_ d: Data, path: String = "") -> Result<DiscFs> {
+    let u = udfFiles(d, path: path)
+    if let fs = u.value() {
+        if !fs.files.isEmpty {
+            return u
+        }
+    }
+    let j = iso9660Files(d, path: path, joliet: true)
+    if j.isOk() {
+        return j
+    }
+    if let e = u.error() {
+        return Result.failure(error: Error("neither UDF ({e.message}) nor ISO 9660 found"))
+    }
+    j
+}
+
+// Reads an image file (whole: Tessel has no ranged local reads) and lists
+// its files.
+public fn isoFs(_ path: String) -> Result<DiscFs> {
+    let d = try readBytes(path)
+    imageFs(d, path: path)
+}

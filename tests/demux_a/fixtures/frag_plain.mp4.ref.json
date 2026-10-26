@@ -1,0 +1,342 @@
+{
+ "format": "mov,mp4,m4a,3gp,3g2,mj2",
+ "duration": 0.48,
+ "tags": {
+  "major_brand": "isom",
+  "minor_version": "512",
+  "compatible_brands": "isomiso6iso2avc1mp41",
+  "encoder": "Lavf62.12.102"
+ },
+ "tracks": [
+  {
+   "index": 0,
+   "kind": "video",
+   "codec": "h264",
+   "ffCodec": "h264",
+   "profile": "High",
+   "timescale": 12800,
+   "duration": 5120,
+   "extraHex": "0164000affe100186764000aacd9447b011000000300100000030320f122596001000668ebe3cb22c0fdf8f800",
+   "width": 64,
+   "height": 48,
+   "sarNum": 1,
+   "sarDen": 1,
+   "fpsNum": 25,
+   "fpsDen": 1,
+   "rotation": 0,
+   "pixFmt": "yuv420p",
+   "sampleRate": 0,
+   "channels": 0,
+   "channelLayout": "",
+   "bitsPerSample": 8,
+   "pcm": {
+    "bits": 16,
+    "float": false,
+    "bigEndian": false,
+    "signed": true
+   },
+   "language": "",
+   "title": "",
+   "isDefault": true,
+   "isCover": false,
+   "frames": -1
+  },
+  {
+   "index": 1,
+   "kind": "audio",
+   "codec": "aac",
+   "ffCodec": "aac",
+   "profile": "LC",
+   "timescale": 44100,
+   "duration": 21168,
+   "extraHex": "120856e500",
+   "width": 0,
+   "height": 0,
+   "sarNum": 1,
+   "sarDen": 1,
+   "fpsNum": 0,
+   "fpsDen": 0,
+   "rotation": 0,
+   "pixFmt": "",
+   "sampleRate": 44100,
+   "channels": 1,
+   "channelLayout": "mono",
+   "bitsPerSample": 0,
+   "pcm": {
+    "bits": 16,
+    "float": false,
+    "bigEndian": false,
+    "signed": true
+   },
+   "language": "",
+   "title": "",
+   "isDefault": true,
+   "isCover": false,
+   "frames": -1
+  }
+ ],
+ "packets": [
+  {
+   "track": 0,
+   "pts": 1024,
+   "dts": 0,
+   "duration": 512,
+   "key": true,
+   "pos": 1501,
+   "size": 1606
+  },
+  {
+   "track": 0,
+   "pts": 3072,
+   "dts": 512,
+   "duration": 512,
+   "key": false,
+   "pos": 3107,
+   "size": 62
+  },
+  {
+   "track": 0,
+   "pts": 2048,
+   "dts": 1024,
+   "duration": 512,
+   "key": false,
+   "pos": 3169,
+   "size": 13
+  },
+  {
+   "track": 1,
+   "pts": 0,
+   "dts": 0,
+   "duration": 3528,
+   "key": true,
+   "pos": 3182,
+   "size": 258
+  },
+  {
+   "track": 1,
+   "pts": 3528,
+   "dts": 3528,
+   "duration": 1024,
+   "key": true,
+   "pos": 3440,
+   "size": 258
+  },
+  {
+   "track": 0,
+   "pts": 1536,
+   "dts": 1536,
+   "duration": 512,
+   "key": false,
+   "pos": 3942,
+   "size": 12
+  },
+  {
+   "track": 0,
+   "pts": 2560,
+   "dts": 2048,
+   "duration": 512,
+   "key": false,
+   "pos": 3954,
+   "size": 13
+  },
+  {
+   "track": 0,
+   "pts": 5120,
+   "dts": 2560,
+   "duration": 512,
+   "key": false,
+   "pos": 3967,
+   "size": 32
+  },
+  {
+   "track": 1,
+   "pts": 4552,
+   "dts": 4552,
+   "duration": 1024,
+   "key": true,
+   "pos": 3999,
+   "size": 147
+  },
+  {
+   "track": 1,
+   "pts": 5576,
+   "dts": 5576,
+   "duration": 1024,
+   "key": true,
+   "pos": 4146,
+   "size": 184
+  },
+  {
+   "track": 1,
+   "pts": 6600,
+   "dts": 6600,
+   "duration": 1024,
+   "key": true,
+   "pos": 4330,
+   "size": 232
+  },
+  {
+   "track": 1,
+   "pts": 7624,
+   "dts": 7624,
+   "duration": 1024,
+   "key": true,
+   "pos": 4562,
+   "size": 243
+  },
+  {
+   "track": 1,
+   "pts": 8648,
+   "dts": 8648,
+   "duration": 1024,
+   "key": true,
+   "pos": 4805,
+   "size": 187
+  },
+  {
+   "track": 0,
+   "pts": 4096,
+   "dts": 3072,
+   "duration": 512,
+   "key": false,
+   "pos": 5236,
+   "size": 14
+  },
+  {
+   "track": 0,
+   "pts": 3584,
+   "dts": 3584,
+   "duration": 512,
+   "key": false,
+   "pos": 5250,
+   "size": 12
+  },
+  {
+   "track": 0,
+   "pts": 4608,
+   "dts": 4096,
+   "duration": 512,
+   "key": false,
+   "pos": 5262,
+   "size": 13
+  },
+  {
+   "track": 1,
+   "pts": 9672,
+   "dts": 9672,
+   "duration": 1024,
+   "key": true,
+   "pos": 5275,
+   "size": 171
+  },
+  {
+   "track": 1,
+   "pts": 10696,
+   "dts": 10696,
+   "duration": 1024,
+   "key": true,
+   "pos": 5446,
+   "size": 167
+  },
+  {
+   "track": 1,
+   "pts": 11720,
+   "dts": 11720,
+   "duration": 1024,
+   "key": true,
+   "pos": 5613,
+   "size": 213
+  },
+  {
+   "track": 1,
+   "pts": 12744,
+   "dts": 12744,
+   "duration": 1024,
+   "key": true,
+   "pos": 5826,
+   "size": 237
+  },
+  {
+   "track": 1,
+   "pts": 13768,
+   "dts": 13768,
+   "duration": 1024,
+   "key": true,
+   "pos": 6063,
+   "size": 242
+  },
+  {
+   "track": 0,
+   "pts": 5632,
+   "dts": 4608,
+   "duration": 512,
+   "key": false,
+   "pos": 6529,
+   "size": 24
+  },
+  {
+   "track": 1,
+   "pts": 14792,
+   "dts": 14792,
+   "duration": 1024,
+   "key": true,
+   "pos": 6553,
+   "size": 206
+  },
+  {
+   "track": 1,
+   "pts": 15816,
+   "dts": 15816,
+   "duration": 1024,
+   "key": true,
+   "pos": 6759,
+   "size": 162
+  },
+  {
+   "track": 1,
+   "pts": 16840,
+   "dts": 16840,
+   "duration": 1024,
+   "key": true,
+   "pos": 6921,
+   "size": 215
+  },
+  {
+   "track": 1,
+   "pts": 17864,
+   "dts": 17864,
+   "duration": 1024,
+   "key": true,
+   "pos": 7136,
+   "size": 188
+  },
+  {
+   "track": 1,
+   "pts": 18888,
+   "dts": 18888,
+   "duration": 1024,
+   "key": true,
+   "pos": 7324,
+   "size": 182
+  },
+  {
+   "track": 1,
+   "pts": 19912,
+   "dts": 19912,
+   "duration": 1024,
+   "key": true,
+   "pos": 7638,
+   "size": 266
+  },
+  {
+   "track": 1,
+   "pts": 20936,
+   "dts": 20936,
+   "duration": 232,
+   "key": true,
+   "pos": 7904,
+   "size": 5
+  }
+ ],
+ "chapters": []
+}

@@ -1,0 +1,218 @@
+// The decoder as two stages that can run at the same time in separate
+// background jobs: a Parser (NAL units, slice headers, CAVLC/CABAC
+// macroblock layer, motion vector and direct prediction, reference
+// marking; no samples) and a Reconstructor (intra prediction, motion
+// compensation, transforms, deblocking, the DPB and output order). The
+// parser hands each finished picture over as a ParsedPicture, plain data.
+// Both stages run the same decoded picture buffer logic (8.2.4, 8.2.5,
+// C.4.5.3) from the same slice headers, so they agree on every reference.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../core"
+
+// One picture as parsed: the operations to replay (packet starts, slices,
+// picture ends, end of stream), the slice headers with their parameter
+// sets, a record per macroblock in decoding order with its coefficients,
+// and the picture's macroblock and motion tables. hasPicture is false for
+// a record that only carries operations (the end of the stream).
+public struct ParsedPicture {
+    hasPicture: Bool = false
+    ops: [Int] = []
+    headers: [SliceHeader] = []
+    ppss: [Pps] = []
+    spss: [Sps] = []
+    rec: [Int] = []
+    coefs: [Int] = []
+    mbTypes: [Int] = []
+    qpTab: [Int] = []
+    cbpTab: [Int] = []
+    nzTab: [Int] = []
+    mvx0: [Int] = []
+    mvy0: [Int] = []
+    mvx1: [Int] = []
+    mvy1: [Int] = []
+    ref0: [Int] = []
+    ref1: [Int] = []
+    pic0: [Int] = []
+    pic1: [Int] = []
+    // Deblocking boundary strengths (empty for MBAFF frames).
+    bsTab: [Int] = []
+}
+
+// The first stage. parse() takes the packets in decoding order and
+// returns the pictures finished so far (usually one per packet).
+public struct Parser {
+    // When true, pictures nothing refers to (nal_ref_idc 0) are skipped.
+    skipNonReference: Bool = false
+    warnings: [String] = []
+    lengthSize: Int = 0
+    eng: Eng = Eng()
+
+    fn parse(_ packet: Data, pts: Int, dts: Int, key: Bool) -> [ParsedPicture] {
+        eng.skipNonRef = skipNonReference
+        eng.h264DecodePacket(packet, lengthSize, pts, key)
+        return take()
+    }
+
+    // End of stream: the last picture and a record that outputs the rest.
+    fn flush() -> [ParsedPicture] {
+        eng.h264Flush()
+        return take()
+    }
+
+    // After a seek (reset the Reconstructor too, and drop parsed pictures
+    // from before the seek that it hasn't had yet).
+    fn reset() {
+        eng.h264Reset()
+    }
+
+    fn take() -> [ParsedPicture] {
+        let done = eng.pDone
+        eng.pDone = []
+        if !eng.warnings.isEmpty {
+            for w in eng.warnings {
+                if warnings.count < 200 {
+                    warnings.append(w)
+                }
+            }
+            eng.warnings = []
+        }
+        done
+    }
+}
+
+// The second stage: give it every ParsedPicture in order; it returns the
+// pictures now ready for display, in display order.
+public struct Reconstructor {
+    warnings: [String] = []
+    eng: Eng = Eng()
+
+    fn reconstruct(_ p: ParsedPicture) -> [core.Picture] {
+        eng.h264Replay(p)
+        let out = eng.out
+        eng.out = []
+        if !eng.warnings.isEmpty {
+            for w in eng.warnings {
+                if warnings.count < 200 {
+                    warnings.append(w)
+                }
+            }
+            eng.warnings = []
+        }
+        if eng.timing && !p.hasPicture {
+            print("timing: reconstruct slices {Int(eng.tSlice * 1000.0)} ms (mc {Int(eng.tMc * 1000.0)}, intra {Int(eng.tC * 1000.0)}, records {Int(eng.tA * 1000.0)}, motion {Int(eng.tB * 1000.0)}), deblock {Int(eng.tDeblock * 1000.0)} ms")
+        }
+        out
+    }
+
+    fn reset() {
+        eng.h264Reset()
+    }
+}
+
+// Which planes a Reconstructor makes. Once parsed, the luma plane and the
+// chroma planes are reconstructed independently (prediction, residual and
+// deblocking of each plane only read that plane), so a .luma and a
+// .chroma reconstructor can run in two jobs at the same time; mergePlanes
+// puts their pictures together.
+public enum Planes { all, luma, chroma }
+
+public fn newReconstructor(_ planes: Planes) -> Reconstructor {
+    var r = Reconstructor()
+    r.eng = h264NewEng()
+    r.eng.mode = 2
+    match planes {
+        .all -> { r.eng.doLuma = true }
+        .luma -> { r.eng.doChroma = false }
+        .chroma -> { r.eng.doLuma = false }
+    }
+    r
+}
+
+// The pictures of a .luma and a .chroma reconstructor fed the same parsed
+// pictures (they come out alike, in the same order): luma planes from the
+// first, chroma planes from the second.
+public fn mergePlanes(_ luma: [core.Picture], _ chroma: [core.Picture]) -> [core.Picture] {
+    var out: [core.Picture] = []
+    for i in 0..min(luma.count, chroma.count) {
+        var p = luma[i]
+        let c = chroma[i]
+        p.chroma = c.chroma
+        p.u = c.u
+        p.v = c.v
+        p.cStride = c.cStride
+        p.cOffset = c.cOffset
+        out.append(p)
+    }
+    out
+}
+
+// Both stages for one "h264" track.
+public struct Pipeline {
+    parser: Parser = Parser()
+    reconstructor: Reconstructor = Reconstructor()
+}
+
+// Stages for an "h264" track. track.extra is the avcC (length prefixed
+// NAL units follow) or empty / Annex B parameter sets (start codes).
+public fn newPipeline(_ track: core.Track) -> Result<Pipeline> {
+    var p = Parser()
+    p.eng = h264NewEng()
+    p.eng.mode = 1
+    let r = newReconstructor(.all)
+    let x = track.extra
+    if x.isEmpty {
+        p.lengthSize = 0
+    } else if h264LooksAnnexB(x) {
+        p.lengthSize = 0
+        p.eng.h264DecodePacket(x, 0, core.noTime, false)
+    } else {
+        let a = parseAvcC(x)
+        if !a.valid {
+            return .failure(error: Error("h264: the avcC configuration can't be read"))
+        }
+        p.lengthSize = a.lengthSize
+        for s in a.sps {
+            p.eng.h264HandleNal(s, 0, s.count)
+        }
+        for q in a.pps {
+            p.eng.h264HandleNal(q, 0, q.count)
+        }
+    }
+    Result.ok(value: Pipeline(parser: p, reconstructor: r))
+}
+
+// For background jobs, which call top-level functions: one parse step
+// and one reconstruct step, each returning the stage's new state.
+public struct ParseStep {
+    parser: Parser = Parser()
+    pictures: [ParsedPicture] = []
+}
+
+public fn parseStep(_ parser: Parser, _ packet: Data, pts: Int, dts: Int, key: Bool) -> ParseStep {
+    var p = parser
+    let pics = p.parse(packet, pts: pts, dts: dts, key: key)
+    ParseStep(parser: p, pictures: pics)
+}
+
+public fn parseFlushStep(_ parser: Parser) -> ParseStep {
+    var p = parser
+    let pics = p.flush()
+    ParseStep(parser: p, pictures: pics)
+}
+
+public struct ReconstructStep {
+    reconstructor: Reconstructor = Reconstructor()
+    pictures: [core.Picture] = []
+}
+
+public fn reconstructStep(_ reconstructor: Reconstructor, _ parsed: [ParsedPicture]) -> ReconstructStep {
+    var r = reconstructor
+    var out: [core.Picture] = []
+    for p in parsed {
+        out += r.reconstruct(p)
+    }
+    ReconstructStep(reconstructor: r, pictures: out)
+}

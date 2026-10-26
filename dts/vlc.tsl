@@ -1,0 +1,135 @@
+// Huffman decoding for the DTS core: the quantization index codebooks
+// (ETSI TS 102 114 Annex D.5–D.7, "A" to "G" variants for each ABITS), the
+// bit allocation codebooks (D.4.1), the scale factor codebooks (D.3) and
+// the transient mode codebooks (D.2).
+//
+// The codebooks come from bigtables.tsl as (symbol, code length) pairs in
+// the order of their codes: the first entry gets code 0…0 of its length,
+// each next entry the next code of its own length (the codes of a prefix
+// code tree read left to right). From these we build two-level lookup
+// tables: the first level is indexed by the next 9 bits (or fewer for
+// short books); a code longer than that points at a second-level table
+// indexed by the bits after them.
+//
+// A table entry is an Int:
+//   > 0   a leaf: ((symbol + 512) << 5) | code length
+//   < 0   a second-level table: −((start << 5) | its index bits)
+//   0     no code starts with these bits (damaged data)
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../core"
+
+// Book numbers in the flat tables: quantization index books for ABITS
+// 1…10 and their variants first (dtsQuantBook), then these.
+let dtsBookBitAlloc = 48
+let dtsBookScale = 53
+let dtsBookTransition = 58
+let dtsBookCount = 62
+
+// The first quantization index book of each ABITS (1…10, here 0…9).
+let dtsQuantBookStart: [Int] = [0, 1, 4, 7, 10, 13, 20, 27, 34, 41]
+
+struct DtsVlcTables {
+    // All books' entries, one after the other.
+    table: [Int] = []
+    // Where each book's first level starts, and its index bits.
+    base: [Int] = []
+    firstBits: [Int] = []
+}
+
+let dtsVlc: DtsVlcTables = dtsBuildVlcTables()
+
+fn dtsBuildVlcTables() -> DtsVlcTables {
+    let src = (decodeBase64(dtsVlcSourceText) ?? Data()).bytes
+    var t = DtsVlcTables()
+    var pos = 0
+    // Quantization index books: ABITS 1…10, each with its variants.
+    for i in 0..10 {
+        for _ in 0..dtsQuantIndexGroupSize[i] {
+            dtsAddBook(t, src, pos, dtsBitallocSizes[i], dtsBitallocOffsets[i])
+            pos += dtsBitallocSizes[i]
+        }
+    }
+    // Bit allocation books (12 symbols, values 1…12).
+    for _ in 0..5 {
+        dtsAddBook(t, src, pos, 12, 1)
+        pos += 12
+    }
+    // Scale factor books (129 symbols, differences −64…64).
+    for _ in 0..5 {
+        dtsAddBook(t, src, pos, 129, -64)
+        pos += 129
+    }
+    // Transient mode books (4 symbols).
+    for _ in 0..4 {
+        dtsAddBook(t, src, pos, 4, 0)
+        pos += 4
+    }
+    t
+}
+
+// Adds one book: `count` (symbol, length) pairs from src[2·first…].
+fn dtsAddBook(_ t: bind DtsVlcTables, _ src: [Int], _ first: Int, _ count: Int, _ offset: Int) {
+    var maxLen = 0
+    for i in 0..count {
+        maxLen = max(maxLen, src[2 * (first + i) + 1])
+    }
+    let fb = min(maxLen, 9)
+    let base = t.table.count
+    t.base.append(base)
+    t.firstBits.append(fb)
+    for _ in 0..(1 << fb) {
+        t.table.append(0)
+    }
+    // Codes (left aligned in 16 bits) of each entry, in order.
+    var codes: [Int] = []
+    var code = 0
+    for i in 0..count {
+        let len = src[2 * (first + i) + 1]
+        codes.append(code >> (16 - len))
+        code += 1 << (16 - len)
+    }
+    // The longest code below each first-level prefix, for second levels.
+    var subLen: [Int] = []
+    for _ in 0..(1 << fb) {
+        subLen.append(0)
+    }
+    for i in 0..count {
+        let len = src[2 * (first + i) + 1]
+        if len > fb {
+            let top = codes[i] >> (len - fb)
+            subLen[top] = max(subLen[top], len - fb)
+        }
+    }
+    for top in 0..(1 << fb) {
+        if subLen[top] > 0 {
+            let start = t.table.count
+            for _ in 0..(1 << subLen[top]) {
+                t.table.append(0)
+            }
+            t.table[base + top] = -((start << 5) | subLen[top])
+        }
+    }
+    for i in 0..count {
+        let len = src[2 * (first + i) + 1]
+        let sym = src[2 * (first + i)] + offset
+        if len <= fb {
+            let from = codes[i] << (fb - len)
+            for k in 0..(1 << (fb - len)) {
+                t.table[base + from + k] = ((sym + 512) << 5) | len
+            }
+        } else {
+            let top = codes[i] >> (len - fb)
+            let e = -t.table[base + top]
+            let start = e >> 5
+            let sb = e & 31
+            let rest = len - fb
+            let from = (codes[i] & ((1 << rest) - 1)) << (sb - rest)
+            for k in 0..(1 << (sb - rest)) {
+                t.table[start + from + k] = ((sym + 512) << 5) | rest
+            }
+        }
+    }
+}

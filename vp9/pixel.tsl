@@ -1,0 +1,2010 @@
+// The sample-level work of the VP9 reconstructor, on one plane at a time:
+// intra prediction (8.5.1, with FFmpeg's edge rules), the inverse DCT,
+// ADST and Walsh-Hadamard transforms (8.7.1, 8.7.2), the 8-tap and
+// bilinear motion compensation filters (8.5.2.3), and the loop filter
+// (8.8.2). The plane being worked on is the field `pl` (the reconstructor
+// moves each plane in and out), so writes are in place.
+//
+// The arithmetic is FFmpeg's vp9dsp_template.c, which matches libvpx.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+struct Vp9Px {
+    pl: [Int] = []
+    // The frame's three planes; the one being worked on is in `pl` (its
+    // own field then holds an empty list), so writes are in place.
+    sY: [Int] = []
+    sU: [Int] = []
+    sV: [Int] = []
+    active: Int = -1
+    maxV: Int = 255
+    bitDepth: Int = 8
+    // Coefficient block (raster order) and transform scratch.
+    blk: [Int] = []
+    tmp: [Int] = []
+    o: [Int] = []
+    // Intra edges: et[0] the top-left sample, et[1 + k] above sample k
+    // (extended to 2n); el the left samples bottom-up as FFmpeg keeps them,
+    // eln the left samples top-down (extended).
+    et: [Int] = []
+    el: [Int] = []
+    eln: [Int] = []
+    vv: [Int] = []
+    // Motion compensation scratch.
+    mcTmp: [Int] = []
+    emu: [Int] = []
+    filters: [Int] = []
+    // Loop filter limits by level.
+    limLut: [Int] = []
+    mblimLut: [Int] = []
+    sharp: Int = -1
+
+    fn setup() {
+        if blk.isEmpty {
+            blk = vp9Zeros(1024)
+            tmp = vp9Zeros(1024)
+            o = vp9Zeros(64)
+            et = vp9Zeros(160)
+            el = vp9Zeros(64)
+            eln = vp9Zeros(160)
+            vv = vp9Zeros(160)
+            mcTmp = vp9Zeros(64 * 140)
+            emu = vp9Zeros(288 * 144)
+            filters = vp9SubpelFilters
+            limLut = vp9Zeros(64)
+            mblimLut = vp9Zeros(64)
+        }
+    }
+
+    fn swapPlane(_ p: Int) {
+        if p == 0 {
+            let t = sY
+            sY = pl
+            pl = t
+        } else if p == 1 {
+            let t = sU
+            sU = pl
+            pl = t
+        } else {
+            let t = sV
+            sV = pl
+            pl = t
+        }
+    }
+
+    fn use(_ p: Int) {
+        if p == active {
+            return
+        }
+        if active >= 0 {
+            swapPlane(active)
+        }
+        swapPlane(p)
+        active = p
+    }
+
+    // Puts the working plane back in its field.
+    fn settle() {
+        if active >= 0 {
+            swapPlane(active)
+            active = -1
+        }
+    }
+
+    fn setDepth(_ bd: Int) {
+        bitDepth = bd
+        maxV = (1 << bd) - 1
+    }
+
+    fn clip(_ v: Int) -> Int {
+        if v < 0 {
+            return 0
+        }
+        if v > maxV {
+            return maxV
+        }
+        v
+    }
+
+    // ---- intra prediction --------------------------------------------
+
+    // Gathers the edges of a transform block at plane offset `at` (FFmpeg's
+    // check_intra_mode) and returns the prediction mode to use.
+    //   haveTop/haveLeft/haveRight  availability
+    //   pxHaveT  samples available to the right on the row above
+    //   pxHaveL  samples available below on the left column
+    fn edges(_ mode0: Int, _ at: Int, _ stride: Int, _ tx: Int, _ haveTop: Bool, _ haveLeft: Bool,
+             _ haveRight: Bool, _ pxHaveT: Int, _ pxHaveL: Int) -> Int {
+        let mode = vp9ConvMode(mode0, haveLeft, haveTop)
+        let flags = vp9EdgeFlags(mode)
+        let needL = (flags & 1) != 0
+        let needT = (flags & 2) != 0
+        let needTl = (flags & 4) != 0
+        let needTr = (flags & 8) != 0
+        let invL = (flags & 16) != 0
+        let n = 4 << tx
+        let base = 1 << (bitDepth - 8)
+        if needT {
+            let needTrN = if tx == 0 && needTr && haveRight { 4 } else { 0 }
+            let topAt = at - stride
+            if haveTop && (!needTl || haveLeft) && (tx != 0 || !needTr || haveRight) && n + needTrN <= pxHaveT {
+                // Read straight from the row above.
+                var k = 0
+                let cnt = n + needTrN
+                while k < cnt {
+                    et[1 + k] = pl[topAt + k]
+                    k += 1
+                }
+                if needTl {
+                    et[0] = pl[topAt - 1]
+                }
+            } else {
+                if haveTop {
+                    if n <= pxHaveT {
+                        for k in 0..n {
+                            et[1 + k] = pl[topAt + k]
+                        }
+                    } else {
+                        for k in 0..pxHaveT {
+                            et[1 + k] = pl[topAt + k]
+                        }
+                        let last = et[pxHaveT]
+                        for k in pxHaveT..n {
+                            et[1 + k] = last
+                        }
+                    }
+                } else {
+                    for k in 0..n {
+                        et[1 + k] = 128 * base - 1
+                    }
+                }
+                if needTl {
+                    if haveLeft && haveTop {
+                        et[0] = pl[topAt - 1]
+                    } else {
+                        et[0] = if haveTop { 128 * base + 1 } else { 128 * base - 1 }
+                    }
+                }
+                if tx == 0 && needTr {
+                    if haveTop && haveRight && n + needTrN <= pxHaveT {
+                        for k in 4..8 {
+                            et[1 + k] = pl[topAt + k]
+                        }
+                    } else {
+                        let v = et[4]
+                        for k in 4..8 {
+                            et[1 + k] = v
+                        }
+                    }
+                }
+            }
+            if tx > 0 {
+                // Larger blocks never use the above-right: extend by the
+                // last sample (as the predictors effectively do).
+                let v = et[n]
+                for k in n..(2 * n) {
+                    et[1 + k] = v
+                }
+            }
+        }
+        if needL {
+            if haveLeft {
+                let la = at - 1
+                let cnt = min(n, pxHaveL)
+                if invL {
+                    for i in 0..cnt {
+                        eln[i] = pl[la + i * stride]
+                    }
+                    if cnt < n {
+                        let v = eln[cnt - 1]
+                        for i in cnt..n {
+                            eln[i] = v
+                        }
+                    }
+                } else {
+                    for i in 0..cnt {
+                        el[n - 1 - i] = pl[la + i * stride]
+                    }
+                    if cnt < n {
+                        let v = el[n - cnt]
+                        for i in 0..(n - cnt) {
+                            el[i] = v
+                        }
+                    }
+                }
+            } else {
+                for i in 0..n {
+                    el[i] = 128 * base + 1
+                    eln[i] = 128 * base + 1
+                }
+            }
+            if invL {
+                let v = eln[n - 1]
+                for i in n..(2 * n + 2) {
+                    eln[i] = v
+                }
+            }
+        }
+        mode
+    }
+
+    // Predicts an n x n block at plane offset `at` with the edges gathered
+    // by edges() (8.5.1.1 … 8.5.1.4 as FFmpeg's intra_pred).
+    fn predict(_ mode: Int, _ at: Int, _ stride: Int, _ tx: Int) {
+        let n = 4 << tx
+        let base = 1 << (bitDepth - 8)
+        if mode == 0 {
+            // V
+            for y in 0..n {
+                let d = at + y * stride
+                for x in 0..n {
+                    pl[d + x] = et[1 + x]
+                }
+            }
+        } else if mode == 1 {
+            // H
+            for y in 0..n {
+                let d = at + y * stride
+                let v = el[n - 1 - y]
+                for x in 0..n {
+                    pl[d + x] = v
+                }
+            }
+        } else if mode == 2 || mode == 10 || mode == 11 {
+            var sum = 0
+            var sh = tx + 2
+            if mode != 11 {
+                for i in 0..n {
+                    sum += el[i]
+                }
+            }
+            if mode != 10 {
+                for i in 0..n {
+                    sum += et[1 + i]
+                }
+            }
+            if mode == 2 {
+                sh += 1
+            }
+            let v = (sum + (1 << (sh - 1))) >> sh
+            fillBlock(at, stride, n, v)
+        } else if mode == 12 {
+            fillBlock(at, stride, n, 128 * base)
+        } else if mode == 13 {
+            fillBlock(at, stride, n, 128 * base - 1)
+        } else if mode == 14 {
+            fillBlock(at, stride, n, 128 * base + 1)
+        } else if mode == 9 {
+            // TM
+            let tl = et[0]
+            for y in 0..n {
+                let d = at + y * stride
+                let lm = el[n - 1 - y] - tl
+                for x in 0..n {
+                    pl[d + x] = clip(et[1 + x] + lm)
+                }
+            }
+        } else if mode == 3 {
+            // D45 (diagonal down left): v[k] along the anti-diagonals.
+            let last = et[2 * n]
+            for k in 0..(2 * n - 2) {
+                vv[k] = (et[1 + k] + 2 * et[2 + k] + et[3 + k] + 2) >> 2
+            }
+            vv[2 * n - 2] = last
+            copyRows(at, stride, n, 0, 1, 0)
+        } else if mode == 7 {
+            // D63 (vertical left): even rows from ve, odd rows from vo.
+            let m = n / 2 + n
+            for k in 0..m {
+                vv[k] = (et[1 + k] + et[2 + k] + 1) >> 1
+                vv[80 + k] = (et[1 + k] + 2 * et[2 + k] + et[3 + k] + 2) >> 2
+            }
+            for y in 0..n {
+                let d = at + y * stride
+                let base = (y >> 1) + (if (y & 1) == 0 { 0 } else { 80 })
+                for x in 0..n {
+                    pl[d + x] = vv[base + x]
+                }
+            }
+        } else if mode == 4 {
+            // D135 (diagonal down right) over e = left (bottom-up),
+            // top-left, top.
+            for i in 0..(2 * n - 1) {
+                vv[i] = (edgeE(i, n) + 2 * edgeE(i + 1, n) + edgeE(i + 2, n) + 2) >> 2
+            }
+            copyRows(at, stride, n, n - 1, -1, 0)
+        } else if mode == 5 {
+            // D117 (vertical right)
+            let h = n / 2
+            let m = h + n - 1
+            for i in 0..m {
+                vv[i] = d117e(i, n)
+                vv[80 + i] = d117o(i, n)
+            }
+            for y in 0..n {
+                let d = at + y * stride
+                let base = h - 1 - (y >> 1) + (if (y & 1) == 0 { 0 } else { 80 })
+                for x in 0..n {
+                    pl[d + x] = vv[base + x]
+                }
+            }
+        } else if mode == 6 {
+            // D153 (horizontal down)
+            for i in 0..(3 * n - 2) {
+                vv[i] = d153v(i, n)
+            }
+            copyRows(at, stride, n, 2 * n - 2, -2, 0)
+        } else if mode == 8 {
+            // D207 (horizontal up) over the top-down left column.
+            for idx in 0..(3 * n - 2) {
+                let i = idx >> 1
+                if (idx & 1) == 0 {
+                    vv[idx] = (eln[i] + eln[i + 1] + 1) >> 1
+                } else {
+                    vv[idx] = (eln[i] + 2 * eln[i + 1] + eln[i + 2] + 2) >> 2
+                }
+            }
+            copyRows(at, stride, n, 0, 2, 0)
+        }
+    }
+
+    // Row y of the block is vv[start + y * step …].
+    fn copyRows(_ at: Int, _ stride: Int, _ n: Int, _ start: Int, _ step: Int, _ unused: Int) {
+        for y in 0..n {
+            let d = at + y * stride
+            let b = start + y * step
+            for x in 0..n {
+                pl[d + x] = vv[b + x]
+            }
+        }
+    }
+
+    fn fillBlock(_ at: Int, _ stride: Int, _ n: Int, _ v: Int) {
+        for y in 0..n {
+            let d = at + y * stride
+            for x in 0..n {
+                pl[d + x] = v
+            }
+        }
+    }
+
+    // The joined edge left (bottom-up) · top-left · top for D135.
+    fn edgeE(_ i: Int, _ n: Int) -> Int {
+        if i < n {
+            return el[i]
+        }
+        et[i - n]
+    }
+
+    // FFmpeg's ve / vo arrays of vert_right.
+    fn d117e(_ i: Int, _ n: Int) -> Int {
+        let h = n / 2
+        if i < h - 2 {
+            return (el[i * 2 + 4] + el[i * 2 + 3] * 2 + el[i * 2 + 2] + 2) >> 2
+        }
+        if i == h - 2 {
+            return (et[0] + el[n - 1] * 2 + el[n - 2] + 2) >> 2
+        }
+        if i == h - 1 {
+            return (et[0] + et[1] + 1) >> 1
+        }
+        let k = i - h
+        (et[1 + k] + et[2 + k] + 1) >> 1
+    }
+
+    fn d117o(_ i: Int, _ n: Int) -> Int {
+        let h = n / 2
+        if i < h - 2 {
+            return (el[i * 2 + 3] + el[i * 2 + 2] * 2 + el[i * 2 + 1] + 2) >> 2
+        }
+        if i == h - 2 {
+            return (el[n - 1] + el[n - 2] * 2 + el[n - 3] + 2) >> 2
+        }
+        if i == h - 1 {
+            return (el[n - 1] + et[0] * 2 + et[1] + 2) >> 2
+        }
+        let k = i - h
+        (et[k] + et[1 + k] * 2 + et[2 + k] + 2) >> 2
+    }
+
+    // FFmpeg's v array of hor_down.
+    fn d153v(_ i: Int, _ n: Int) -> Int {
+        if i >= 2 * n {
+            let k = i - 2 * n
+            return (et[k] + et[1 + k] * 2 + et[2 + k] + 2) >> 2
+        }
+        if i == 2 * n - 1 {
+            return (et[1] + et[0] * 2 + el[n - 1] + 2) >> 2
+        }
+        if i == 2 * n - 2 {
+            return (et[0] + el[n - 1] + 1) >> 1
+        }
+        if i == 2 * n - 3 {
+            return (et[0] + el[n - 1] * 2 + el[n - 2] + 2) >> 2
+        }
+        if i == 2 * n - 4 {
+            return (el[n - 1] + el[n - 2] + 1) >> 1
+        }
+        let k = i >> 1
+        if (i & 1) == 0 {
+            return (el[k + 1] + el[k] + 1) >> 1
+        }
+        (el[k + 2] + el[k + 1] * 2 + el[k] + 2) >> 2
+    }
+
+    // ---- inverse transforms --------------------------------------------
+
+    // Adds the inverse transform of the coefficient entries
+    // coefs[from + 1 … from + cnt] (value * 1024 + position) to the n x n
+    // block at plane offset `at`. kind: 0…3 the FFmpeg transform type
+    // (DCT_DCT, DCT_ADST, ADST_DCT, ADST_ADST), 4 the lossless WHT.
+    fn itxAdd(_ coefs: [Int], _ from: Int, _ cnt: Int, _ at: Int, _ stride: Int, _ tx: Int, _ kind0: Int) {
+        let n = 4 << tx
+        // 32x32 blocks always use the DCT.
+        let kind = if tx == 3 { 0 } else { kind0 }
+        // DC only, DCT: one value for the whole block.
+        if kind == 0 && cnt == 1 && (coefs[from + 1] & 1023) == 0 {
+            let dc = coefs[from + 1] >> 10
+            let t = (((dc * 11585 + 8192) >> 14) * 11585 + 8192) >> 14
+            let bits = if tx == 0 { 4 } else if tx == 1 { 5 } else { 6 }
+            let add = (t + (1 << (bits - 1))) >> bits
+            for y in 0..n {
+                let d = at + y * stride
+                for x in 0..n {
+                    pl[d + x] = clip(pl[d + x] + add)
+                }
+            }
+            return
+        }
+        if tx == 0 {
+            itx4(coefs, from, cnt, at, stride, kind)
+            return
+        }
+        if tx == 1 {
+            itx8(coefs, from, cnt, at, stride, kind)
+            return
+        }
+        // Scatter the coefficients; note the columns that have any.
+        var colMask = 0
+        for k in 0..cnt {
+            let e = coefs[from + 1 + k]
+            let pos = e & 1023
+            blk[pos] = e >> 10
+            colMask = colMask | (1 << (pos & (n - 1)))
+        }
+        let k1 = if kind == 4 { 2 } else if kind == 1 || kind == 3 { 1 } else { 0 }
+        let k2 = if kind == 4 { 2 } else if kind >= 2 { 1 } else { 0 }
+        // Pass 1 over each column i of blk (stride n) into row i of tmp.
+        for i in 0..n {
+            if ((colMask >> i) & 1) == 0 {
+                for j in 0..n {
+                    tmp[i * n + j] = 0
+                }
+            } else {
+                tx1d(k1, n, true, i, n, 0)
+                for j in 0..n {
+                    tmp[i * n + j] = o[j]
+                }
+            }
+        }
+        // Clear the coefficients for the next block.
+        for k in 0..cnt {
+            blk[coefs[from + 1 + k] & 1023] = 0
+        }
+        // Pass 2 over each column of tmp, added to the picture.
+        let bits = if kind == 4 { 0 } else if tx == 0 { 4 } else if tx == 1 { 5 } else { 6 }
+        let rnd = if bits > 0 { 1 << (bits - 1) } else { 0 }
+        for i in 0..n {
+            tx1d(k2, n, false, i, n, 1)
+            for j in 0..n {
+                let d = at + j * stride + i
+                pl[d] = clip(pl[d] + ((o[j] + rnd) >> bits))
+            }
+        }
+    }
+
+    // The 4x4 transforms with everything in locals.
+    fn itx4(_ coefs: [Int], _ from: Int, _ cnt: Int, _ at: Int, _ stride: Int, _ kind: Int) {
+        for k in 0..cnt {
+            let e = coefs[from + 1 + k]
+            blk[e & 15] = e >> 10
+        }
+        let c0 = blk[0]
+        let c1 = blk[1]
+        let c2 = blk[2]
+        let c3 = blk[3]
+        let c4 = blk[4]
+        let c5 = blk[5]
+        let c6 = blk[6]
+        let c7 = blk[7]
+        let c8 = blk[8]
+        let c9 = blk[9]
+        let c10 = blk[10]
+        let c11 = blk[11]
+        let c12 = blk[12]
+        let c13 = blk[13]
+        let c14 = blk[14]
+        let c15 = blk[15]
+        for k in 0..cnt {
+            blk[coefs[from + 1 + k] & 15] = 0
+        }
+        // Pass 1 over the columns (FFmpeg's first pass), row i of tmp.
+        let a1 = kind == 1 || kind == 3
+        let a2 = kind >= 2 && kind != 4
+        let w = kind == 4
+        var r0 = (0, 0, 0, 0)
+        var r1 = (0, 0, 0, 0)
+        var r2 = (0, 0, 0, 0)
+        var r3 = (0, 0, 0, 0)
+        if w {
+            r0 = vp9Iwht4(c0 >> 2, c4 >> 2, c8 >> 2, c12 >> 2)
+            r1 = vp9Iwht4(c1 >> 2, c5 >> 2, c9 >> 2, c13 >> 2)
+            r2 = vp9Iwht4(c2 >> 2, c6 >> 2, c10 >> 2, c14 >> 2)
+            r3 = vp9Iwht4(c3 >> 2, c7 >> 2, c11 >> 2, c15 >> 2)
+        } else if a1 {
+            r0 = vp9Iadst4(c0, c4, c8, c12)
+            r1 = vp9Iadst4(c1, c5, c9, c13)
+            r2 = vp9Iadst4(c2, c6, c10, c14)
+            r3 = vp9Iadst4(c3, c7, c11, c15)
+        } else {
+            r0 = vp9Idct4(c0, c4, c8, c12)
+            r1 = vp9Idct4(c1, c5, c9, c13)
+            r2 = vp9Idct4(c2, c6, c10, c14)
+            r3 = vp9Idct4(c3, c7, c11, c15)
+        }
+        // Pass 2 over the columns of tmp: column i is (r0.i, r1.i, r2.i, r3.i).
+        var o0 = (0, 0, 0, 0)
+        var o1 = (0, 0, 0, 0)
+        var o2 = (0, 0, 0, 0)
+        var o3 = (0, 0, 0, 0)
+        if w {
+            o0 = vp9Iwht4(r0.0, r1.0, r2.0, r3.0)
+            o1 = vp9Iwht4(r0.1, r1.1, r2.1, r3.1)
+            o2 = vp9Iwht4(r0.2, r1.2, r2.2, r3.2)
+            o3 = vp9Iwht4(r0.3, r1.3, r2.3, r3.3)
+        } else if a2 {
+            o0 = vp9Iadst4(r0.0, r1.0, r2.0, r3.0)
+            o1 = vp9Iadst4(r0.1, r1.1, r2.1, r3.1)
+            o2 = vp9Iadst4(r0.2, r1.2, r2.2, r3.2)
+            o3 = vp9Iadst4(r0.3, r1.3, r2.3, r3.3)
+        } else {
+            o0 = vp9Idct4(r0.0, r1.0, r2.0, r3.0)
+            o1 = vp9Idct4(r0.1, r1.1, r2.1, r3.1)
+            o2 = vp9Idct4(r0.2, r1.2, r2.2, r3.2)
+            o3 = vp9Idct4(r0.3, r1.3, r2.3, r3.3)
+        }
+        let rnd = if w { 0 } else { 8 }
+        let sh = if w { 0 } else { 4 }
+        // Column i of the output is o_i; its sample j goes to row j.
+        add4(at, 0, o0, rnd, sh, stride)
+        add4(at, 1, o1, rnd, sh, stride)
+        add4(at, 2, o2, rnd, sh, stride)
+        add4(at, 3, o3, rnd, sh, stride)
+    }
+
+    // The 8x8 transforms with everything in locals.
+    fn itx8(_ coefs: [Int], _ from: Int, _ cnt: Int, _ at: Int, _ stride: Int, _ kind: Int) {
+        for k in 0..cnt {
+            let e = coefs[from + 1 + k]
+            blk[e & 63] = e >> 10
+        }
+        let c0 = blk[0]
+        let c1 = blk[1]
+        let c2 = blk[2]
+        let c3 = blk[3]
+        let c4 = blk[4]
+        let c5 = blk[5]
+        let c6 = blk[6]
+        let c7 = blk[7]
+        let c8 = blk[8]
+        let c9 = blk[9]
+        let c10 = blk[10]
+        let c11 = blk[11]
+        let c12 = blk[12]
+        let c13 = blk[13]
+        let c14 = blk[14]
+        let c15 = blk[15]
+        let c16 = blk[16]
+        let c17 = blk[17]
+        let c18 = blk[18]
+        let c19 = blk[19]
+        let c20 = blk[20]
+        let c21 = blk[21]
+        let c22 = blk[22]
+        let c23 = blk[23]
+        let c24 = blk[24]
+        let c25 = blk[25]
+        let c26 = blk[26]
+        let c27 = blk[27]
+        let c28 = blk[28]
+        let c29 = blk[29]
+        let c30 = blk[30]
+        let c31 = blk[31]
+        let c32 = blk[32]
+        let c33 = blk[33]
+        let c34 = blk[34]
+        let c35 = blk[35]
+        let c36 = blk[36]
+        let c37 = blk[37]
+        let c38 = blk[38]
+        let c39 = blk[39]
+        let c40 = blk[40]
+        let c41 = blk[41]
+        let c42 = blk[42]
+        let c43 = blk[43]
+        let c44 = blk[44]
+        let c45 = blk[45]
+        let c46 = blk[46]
+        let c47 = blk[47]
+        let c48 = blk[48]
+        let c49 = blk[49]
+        let c50 = blk[50]
+        let c51 = blk[51]
+        let c52 = blk[52]
+        let c53 = blk[53]
+        let c54 = blk[54]
+        let c55 = blk[55]
+        let c56 = blk[56]
+        let c57 = blk[57]
+        let c58 = blk[58]
+        let c59 = blk[59]
+        let c60 = blk[60]
+        let c61 = blk[61]
+        let c62 = blk[62]
+        let c63 = blk[63]
+        for k in 0..cnt {
+            blk[coefs[from + 1 + k] & 63] = 0
+        }
+        let a1 = kind == 1 || kind == 3
+        let a2 = kind >= 2
+        var r0 = (0, 0, 0, 0, 0, 0, 0, 0)
+        var r1 = (0, 0, 0, 0, 0, 0, 0, 0)
+        var r2 = (0, 0, 0, 0, 0, 0, 0, 0)
+        var r3 = (0, 0, 0, 0, 0, 0, 0, 0)
+        var r4 = (0, 0, 0, 0, 0, 0, 0, 0)
+        var r5 = (0, 0, 0, 0, 0, 0, 0, 0)
+        var r6 = (0, 0, 0, 0, 0, 0, 0, 0)
+        var r7 = (0, 0, 0, 0, 0, 0, 0, 0)
+        if a1 {
+            r0 = vp9Iadst8(c0, c8, c16, c24, c32, c40, c48, c56)
+            r1 = vp9Iadst8(c1, c9, c17, c25, c33, c41, c49, c57)
+            r2 = vp9Iadst8(c2, c10, c18, c26, c34, c42, c50, c58)
+            r3 = vp9Iadst8(c3, c11, c19, c27, c35, c43, c51, c59)
+            r4 = vp9Iadst8(c4, c12, c20, c28, c36, c44, c52, c60)
+            r5 = vp9Iadst8(c5, c13, c21, c29, c37, c45, c53, c61)
+            r6 = vp9Iadst8(c6, c14, c22, c30, c38, c46, c54, c62)
+            r7 = vp9Iadst8(c7, c15, c23, c31, c39, c47, c55, c63)
+        } else {
+            r0 = vp9Idct8(c0, c8, c16, c24, c32, c40, c48, c56)
+            r1 = vp9Idct8(c1, c9, c17, c25, c33, c41, c49, c57)
+            r2 = vp9Idct8(c2, c10, c18, c26, c34, c42, c50, c58)
+            r3 = vp9Idct8(c3, c11, c19, c27, c35, c43, c51, c59)
+            r4 = vp9Idct8(c4, c12, c20, c28, c36, c44, c52, c60)
+            r5 = vp9Idct8(c5, c13, c21, c29, c37, c45, c53, c61)
+            r6 = vp9Idct8(c6, c14, c22, c30, c38, c46, c54, c62)
+            r7 = vp9Idct8(c7, c15, c23, c31, c39, c47, c55, c63)
+        }
+        var o0 = (0, 0, 0, 0, 0, 0, 0, 0)
+        var o1 = (0, 0, 0, 0, 0, 0, 0, 0)
+        var o2 = (0, 0, 0, 0, 0, 0, 0, 0)
+        var o3 = (0, 0, 0, 0, 0, 0, 0, 0)
+        var o4 = (0, 0, 0, 0, 0, 0, 0, 0)
+        var o5 = (0, 0, 0, 0, 0, 0, 0, 0)
+        var o6 = (0, 0, 0, 0, 0, 0, 0, 0)
+        var o7 = (0, 0, 0, 0, 0, 0, 0, 0)
+        if a2 {
+            o0 = vp9Iadst8(r0.0, r1.0, r2.0, r3.0, r4.0, r5.0, r6.0, r7.0)
+            o1 = vp9Iadst8(r0.1, r1.1, r2.1, r3.1, r4.1, r5.1, r6.1, r7.1)
+            o2 = vp9Iadst8(r0.2, r1.2, r2.2, r3.2, r4.2, r5.2, r6.2, r7.2)
+            o3 = vp9Iadst8(r0.3, r1.3, r2.3, r3.3, r4.3, r5.3, r6.3, r7.3)
+            o4 = vp9Iadst8(r0.4, r1.4, r2.4, r3.4, r4.4, r5.4, r6.4, r7.4)
+            o5 = vp9Iadst8(r0.5, r1.5, r2.5, r3.5, r4.5, r5.5, r6.5, r7.5)
+            o6 = vp9Iadst8(r0.6, r1.6, r2.6, r3.6, r4.6, r5.6, r6.6, r7.6)
+            o7 = vp9Iadst8(r0.7, r1.7, r2.7, r3.7, r4.7, r5.7, r6.7, r7.7)
+        } else {
+            o0 = vp9Idct8(r0.0, r1.0, r2.0, r3.0, r4.0, r5.0, r6.0, r7.0)
+            o1 = vp9Idct8(r0.1, r1.1, r2.1, r3.1, r4.1, r5.1, r6.1, r7.1)
+            o2 = vp9Idct8(r0.2, r1.2, r2.2, r3.2, r4.2, r5.2, r6.2, r7.2)
+            o3 = vp9Idct8(r0.3, r1.3, r2.3, r3.3, r4.3, r5.3, r6.3, r7.3)
+            o4 = vp9Idct8(r0.4, r1.4, r2.4, r3.4, r4.4, r5.4, r6.4, r7.4)
+            o5 = vp9Idct8(r0.5, r1.5, r2.5, r3.5, r4.5, r5.5, r6.5, r7.5)
+            o6 = vp9Idct8(r0.6, r1.6, r2.6, r3.6, r4.6, r5.6, r6.6, r7.6)
+            o7 = vp9Idct8(r0.7, r1.7, r2.7, r3.7, r4.7, r5.7, r6.7, r7.7)
+        }
+        add8(at + 0, o0, stride)
+        add8(at + 1, o1, stride)
+        add8(at + 2, o2, stride)
+        add8(at + 3, o3, stride)
+        add8(at + 4, o4, stride)
+        add8(at + 5, o5, stride)
+        add8(at + 6, o6, stride)
+        add8(at + 7, o7, stride)
+    }
+
+    fn add8(_ d: Int, _ o: (Int, Int, Int, Int, Int, Int, Int, Int), _ stride: Int) {
+        let mv = maxV
+        let v0 = pl[d + 0 * stride] + ((o.0 + 16) >> 5)
+        pl[d + 0 * stride] = if v0 < 0 { 0 } else if v0 > mv { mv } else { v0 }
+        let v1 = pl[d + 1 * stride] + ((o.1 + 16) >> 5)
+        pl[d + 1 * stride] = if v1 < 0 { 0 } else if v1 > mv { mv } else { v1 }
+        let v2 = pl[d + 2 * stride] + ((o.2 + 16) >> 5)
+        pl[d + 2 * stride] = if v2 < 0 { 0 } else if v2 > mv { mv } else { v2 }
+        let v3 = pl[d + 3 * stride] + ((o.3 + 16) >> 5)
+        pl[d + 3 * stride] = if v3 < 0 { 0 } else if v3 > mv { mv } else { v3 }
+        let v4 = pl[d + 4 * stride] + ((o.4 + 16) >> 5)
+        pl[d + 4 * stride] = if v4 < 0 { 0 } else if v4 > mv { mv } else { v4 }
+        let v5 = pl[d + 5 * stride] + ((o.5 + 16) >> 5)
+        pl[d + 5 * stride] = if v5 < 0 { 0 } else if v5 > mv { mv } else { v5 }
+        let v6 = pl[d + 6 * stride] + ((o.6 + 16) >> 5)
+        pl[d + 6 * stride] = if v6 < 0 { 0 } else if v6 > mv { mv } else { v6 }
+        let v7 = pl[d + 7 * stride] + ((o.7 + 16) >> 5)
+        pl[d + 7 * stride] = if v7 < 0 { 0 } else if v7 > mv { mv } else { v7 }
+    }
+
+    fn add4(_ at: Int, _ i: Int, _ o: (Int, Int, Int, Int), _ rnd: Int, _ sh: Int, _ stride: Int) {
+        let mv = maxV
+        let d = at + i
+        var v = pl[d] + ((o.0 + rnd) >> sh)
+        pl[d] = if v < 0 { 0 } else if v > mv { mv } else { v }
+        v = pl[d + stride] + ((o.1 + rnd) >> sh)
+        pl[d + stride] = if v < 0 { 0 } else if v > mv { mv } else { v }
+        v = pl[d + 2 * stride] + ((o.2 + rnd) >> sh)
+        pl[d + 2 * stride] = if v < 0 { 0 } else if v > mv { mv } else { v }
+        v = pl[d + 3 * stride] + ((o.3 + rnd) >> sh)
+        pl[d + 3 * stride] = if v < 0 { 0 } else if v > mv { mv } else { v }
+    }
+
+    // One 1-D transform of n (16 or 32) inputs src[off + k * st] (src = blk
+    // when fromBlk, else tmp) into o[0 … n-1]. kind 0 DCT, 1 ADST.
+    fn tx1d(_ kind: Int, _ n: Int, _ fromBlk: Bool, _ off: Int, _ st: Int, _ pass: Int) {
+        if n == 16 {
+            if fromBlk {
+                if kind == 0 { idct16(blk, off, st) } else { iadst16(blk, off, st) }
+            } else {
+                if kind == 0 { idct16(tmp, off, st) } else { iadst16(tmp, off, st) }
+            }
+            return
+        }
+        if fromBlk {
+            idct32(blk, off, st)
+        } else {
+            idct32(tmp, off, st)
+        }
+    }
+
+    fn idct16(_ src: [Int], _ off: Int, _ st: Int) {
+        let i0 = src[off + 0 * st]
+        let i1 = src[off + 1 * st]
+        let i2 = src[off + 2 * st]
+        let i3 = src[off + 3 * st]
+        let i4 = src[off + 4 * st]
+        let i5 = src[off + 5 * st]
+        let i6 = src[off + 6 * st]
+        let i7 = src[off + 7 * st]
+        let i8 = src[off + 8 * st]
+        let i9 = src[off + 9 * st]
+        let i10 = src[off + 10 * st]
+        let i11 = src[off + 11 * st]
+        let i12 = src[off + 12 * st]
+        let i13 = src[off + 13 * st]
+        let i14 = src[off + 14 * st]
+        let i15 = src[off + 15 * st]
+        var t0a = ((i0 + i8) * 11585 + 8192) >> 14
+        var t1a = ((i0 - i8) * 11585 + 8192) >> 14
+        var t2a = (i4 * 6270 - i12 * 15137 + 8192) >> 14
+        var t3a = (i4 * 15137 + i12 * 6270 + 8192) >> 14
+        var t4a = (i2 * 3196 - i14 * 16069 + 8192) >> 14
+        var t7a = (i2 * 16069 + i14 * 3196 + 8192) >> 14
+        var t5a = (i10 * 13623 - i6 * 9102 + 8192) >> 14
+        var t6a = (i10 * 9102 + i6 * 13623 + 8192) >> 14
+        var t8a = (i1 * 1606 - i15 * 16305 + 8192) >> 14
+        var t15a = (i1 * 16305 + i15 * 1606 + 8192) >> 14
+        var t9a = (i9 * 12665 - i7 * 10394 + 8192) >> 14
+        var t14a = (i9 * 10394 + i7 * 12665 + 8192) >> 14
+        var t10a = (i5 * 7723 - i11 * 14449 + 8192) >> 14
+        var t13a = (i5 * 14449 + i11 * 7723 + 8192) >> 14
+        var t11a = (i13 * 15679 - i3 * 4756 + 8192) >> 14
+        var t12a = (i13 * 4756 + i3 * 15679 + 8192) >> 14
+
+        let t0 = t0a + t3a
+        let t1 = t1a + t2a
+        let t2 = t1a - t2a
+        let t3 = t0a - t3a
+        var t4 = t4a + t5a
+        var t5 = t4a - t5a
+        var t6 = t7a - t6a
+        var t7 = t7a + t6a
+        let t8 = t8a + t9a
+        var t9 = t8a - t9a
+        var t10 = t11a - t10a
+        var t11 = t11a + t10a
+        var t12 = t12a + t13a
+        var t13 = t12a - t13a
+        var t14 = t15a - t14a
+        let t15 = t15a + t14a
+
+        t5a = ((t6 - t5) * 11585 + 8192) >> 14
+        t6a = ((t6 + t5) * 11585 + 8192) >> 14
+        t9a = (t14 * 6270 - t9 * 15137 + 8192) >> 14
+        t14a = (t14 * 15137 + t9 * 6270 + 8192) >> 14
+        t10a = (-(t13 * 15137 + t10 * 6270) + 8192) >> 14
+        t13a = (t13 * 6270 - t10 * 15137 + 8192) >> 14
+
+        t0a = t0 + t7
+        t1a = t1 + t6a
+        t2a = t2 + t5a
+        t3a = t3 + t4
+        t4 = t3 - t4
+        t5 = t2 - t5a
+        t6 = t1 - t6a
+        t7 = t0 - t7
+        t8a = t8 + t11
+        t9 = t9a + t10a
+        t10 = t9a - t10a
+        t11a = t8 - t11
+        t12a = t15 - t12
+        t13 = t14a - t13a
+        t14 = t14a + t13a
+        t15a = t15 + t12
+
+        t10a = ((t13 - t10) * 11585 + 8192) >> 14
+        t13a = ((t13 + t10) * 11585 + 8192) >> 14
+        t11 = ((t12a - t11a) * 11585 + 8192) >> 14
+        t12 = ((t12a + t11a) * 11585 + 8192) >> 14
+
+        o[0] = t0a + t15a
+        o[1] = t1a + t14
+        o[2] = t2a + t13a
+        o[3] = t3a + t12
+        o[4] = t4 + t11
+        o[5] = t5 + t10a
+        o[6] = t6 + t9
+        o[7] = t7 + t8a
+        o[8] = t7 - t8a
+        o[9] = t6 - t9
+        o[10] = t5 - t10a
+        o[11] = t4 - t11
+        o[12] = t3a - t12
+        o[13] = t2a - t13a
+        o[14] = t1a - t14
+        o[15] = t0a - t15a
+    }
+
+    fn iadst16(_ src: [Int], _ off: Int, _ st: Int) {
+        let i0 = src[off + 0 * st]
+        let i1 = src[off + 1 * st]
+        let i2 = src[off + 2 * st]
+        let i3 = src[off + 3 * st]
+        let i4 = src[off + 4 * st]
+        let i5 = src[off + 5 * st]
+        let i6 = src[off + 6 * st]
+        let i7 = src[off + 7 * st]
+        let i8 = src[off + 8 * st]
+        let i9 = src[off + 9 * st]
+        let i10 = src[off + 10 * st]
+        let i11 = src[off + 11 * st]
+        let i12 = src[off + 12 * st]
+        let i13 = src[off + 13 * st]
+        let i14 = src[off + 14 * st]
+        let i15 = src[off + 15 * st]
+        var t0 = i15 * 16364 + i0 * 804
+        var t1 = i15 * 804 - i0 * 16364
+        var t2 = i13 * 15893 + i2 * 3981
+        var t3 = i13 * 3981 - i2 * 15893
+        var t4 = i11 * 14811 + i4 * 7005
+        var t5 = i11 * 7005 - i4 * 14811
+        var t6 = i9 * 13160 + i6 * 9760
+        var t7 = i9 * 9760 - i6 * 13160
+        var t8 = i7 * 11003 + i8 * 12140
+        var t9 = i7 * 12140 - i8 * 11003
+        var t10 = i5 * 8423 + i10 * 14053
+        var t11 = i5 * 14053 - i10 * 8423
+        var t12 = i3 * 5520 + i12 * 15426
+        var t13 = i3 * 15426 - i12 * 5520
+        var t14 = i1 * 2404 + i14 * 16207
+        var t15 = i1 * 16207 - i14 * 2404
+
+        let t0a = (8192 + t0 + t8) >> 14
+        let t1a = (8192 + t1 + t9) >> 14
+        let t2a = (8192 + t2 + t10) >> 14
+        let t3a = (8192 + t3 + t11) >> 14
+        let t4a = (8192 + t4 + t12) >> 14
+        let t5a = (8192 + t5 + t13) >> 14
+        let t6a = (8192 + t6 + t14) >> 14
+        let t7a = (8192 + t7 + t15) >> 14
+        let t8a = (8192 + t0 - t8) >> 14
+        let t9a = (8192 + t1 - t9) >> 14
+        let t10a = (8192 + t2 - t10) >> 14
+        let t11a = (8192 + t3 - t11) >> 14
+        let t12a = (8192 + t4 - t12) >> 14
+        let t13a = (8192 + t5 - t13) >> 14
+        let t14a = (8192 + t6 - t14) >> 14
+        let t15a = (8192 + t7 - t15) >> 14
+
+        t8 = t8a * 16069 + t9a * 3196
+        t9 = t8a * 3196 - t9a * 16069
+        t10 = t10a * 9102 + t11a * 13623
+        t11 = t10a * 13623 - t11a * 9102
+        t12 = t13a * 16069 - t12a * 3196
+        t13 = t13a * 3196 + t12a * 16069
+        t14 = t15a * 9102 - t14a * 13623
+        t15 = t15a * 13623 + t14a * 9102
+
+        t0 = t0a + t4a
+        t1 = t1a + t5a
+        t2 = t2a + t6a
+        t3 = t3a + t7a
+        t4 = t0a - t4a
+        t5 = t1a - t5a
+        t6 = t2a - t6a
+        t7 = t3a - t7a
+        let s8a = (8192 + t8 + t12) >> 14
+        let s9a = (8192 + t9 + t13) >> 14
+        let s10a = (8192 + t10 + t14) >> 14
+        let s11a = (8192 + t11 + t15) >> 14
+        let s12a = (8192 + t8 - t12) >> 14
+        let s13a = (8192 + t9 - t13) >> 14
+        let s14a = (8192 + t10 - t14) >> 14
+        let s15a = (8192 + t11 - t15) >> 14
+
+        let s4a = t4 * 15137 + t5 * 6270
+        let s5a = t4 * 6270 - t5 * 15137
+        let s6a = t7 * 15137 - t6 * 6270
+        let s7a = t7 * 6270 + t6 * 15137
+        let s12 = s12a * 15137 + s13a * 6270
+        let s13 = s12a * 6270 - s13a * 15137
+        let s14 = s15a * 15137 - s14a * 6270
+        let s15 = s15a * 6270 + s14a * 15137
+
+        o[0] = t0 + t2
+        o[15] = -(t1 + t3)
+        let u2a = t0 - t2
+        let u3a = t1 - t3
+        o[3] = -((8192 + s4a + s6a) >> 14)
+        o[12] = (8192 + s5a + s7a) >> 14
+        let u6 = (8192 + s4a - s6a) >> 14
+        let u7 = (8192 + s5a - s7a) >> 14
+        o[1] = -(s8a + s10a)
+        o[14] = s9a + s11a
+        let u10 = s8a - s10a
+        let u11 = s9a - s11a
+        o[2] = (8192 + s12 + s14) >> 14
+        o[13] = -((8192 + s13 + s15) >> 14)
+        let u14a = (8192 + s12 - s14) >> 14
+        let u15a = (8192 + s13 - s15) >> 14
+
+        o[7] = ((-(u2a + u3a)) * 11585 + 8192) >> 14
+        o[8] = ((u2a - u3a) * 11585 + 8192) >> 14
+        o[4] = ((u7 + u6) * 11585 + 8192) >> 14
+        o[11] = ((u7 - u6) * 11585 + 8192) >> 14
+        o[6] = ((u11 + u10) * 11585 + 8192) >> 14
+        o[9] = ((u11 - u10) * 11585 + 8192) >> 14
+        o[5] = ((-(u14a + u15a)) * 11585 + 8192) >> 14
+        o[10] = ((u14a - u15a) * 11585 + 8192) >> 14
+    }
+
+    fn idct32(_ src: [Int], _ off: Int, _ st: Int) {
+        let i0 = src[off + 0 * st]
+        let i1 = src[off + 1 * st]
+        let i2 = src[off + 2 * st]
+        let i3 = src[off + 3 * st]
+        let i4 = src[off + 4 * st]
+        let i5 = src[off + 5 * st]
+        let i6 = src[off + 6 * st]
+        let i7 = src[off + 7 * st]
+        let i8 = src[off + 8 * st]
+        let i9 = src[off + 9 * st]
+        let i10 = src[off + 10 * st]
+        let i11 = src[off + 11 * st]
+        let i12 = src[off + 12 * st]
+        let i13 = src[off + 13 * st]
+        let i14 = src[off + 14 * st]
+        let i15 = src[off + 15 * st]
+        let i16 = src[off + 16 * st]
+        let i17 = src[off + 17 * st]
+        let i18 = src[off + 18 * st]
+        let i19 = src[off + 19 * st]
+        let i20 = src[off + 20 * st]
+        let i21 = src[off + 21 * st]
+        let i22 = src[off + 22 * st]
+        let i23 = src[off + 23 * st]
+        let i24 = src[off + 24 * st]
+        let i25 = src[off + 25 * st]
+        let i26 = src[off + 26 * st]
+        let i27 = src[off + 27 * st]
+        let i28 = src[off + 28 * st]
+        let i29 = src[off + 29 * st]
+        let i30 = src[off + 30 * st]
+        let i31 = src[off + 31 * st]
+        var t0a = ((i0 + i16) * 11585 + 8192) >> 14
+        var t1a = ((i0 - i16) * 11585 + 8192) >> 14
+        var t2a = (i8 * 6270 - i24 * 15137 + 8192) >> 14
+        var t3a = (i8 * 15137 + i24 * 6270 + 8192) >> 14
+        var t4a = (i4 * 3196 - i28 * 16069 + 8192) >> 14
+        var t7a = (i4 * 16069 + i28 * 3196 + 8192) >> 14
+        var t5a = (i20 * 13623 - i12 * 9102 + 8192) >> 14
+        var t6a = (i20 * 9102 + i12 * 13623 + 8192) >> 14
+        var t8a = (i2 * 1606 - i30 * 16305 + 8192) >> 14
+        var t15a = (i2 * 16305 + i30 * 1606 + 8192) >> 14
+        var t9a = (i18 * 12665 - i14 * 10394 + 8192) >> 14
+        var t14a = (i18 * 10394 + i14 * 12665 + 8192) >> 14
+        var t10a = (i10 * 7723 - i22 * 14449 + 8192) >> 14
+        var t13a = (i10 * 14449 + i22 * 7723 + 8192) >> 14
+        var t11a = (i26 * 15679 - i6 * 4756 + 8192) >> 14
+        var t12a = (i26 * 4756 + i6 * 15679 + 8192) >> 14
+        var t16a = (i1 * 804 - i31 * 16364 + 8192) >> 14
+        var t31a = (i1 * 16364 + i31 * 804 + 8192) >> 14
+        var t17a = (i17 * 12140 - i15 * 11003 + 8192) >> 14
+        var t30a = (i17 * 11003 + i15 * 12140 + 8192) >> 14
+        var t18a = (i9 * 7005 - i23 * 14811 + 8192) >> 14
+        var t29a = (i9 * 14811 + i23 * 7005 + 8192) >> 14
+        var t19a = (i25 * 15426 - i7 * 5520 + 8192) >> 14
+        var t28a = (i25 * 5520 + i7 * 15426 + 8192) >> 14
+        var t20a = (i5 * 3981 - i27 * 15893 + 8192) >> 14
+        var t27a = (i5 * 15893 + i27 * 3981 + 8192) >> 14
+        var t21a = (i21 * 14053 - i11 * 8423 + 8192) >> 14
+        var t26a = (i21 * 8423 + i11 * 14053 + 8192) >> 14
+        var t22a = (i13 * 9760 - i19 * 13160 + 8192) >> 14
+        var t25a = (i13 * 13160 + i19 * 9760 + 8192) >> 14
+        var t23a = (i29 * 16207 - i3 * 2404 + 8192) >> 14
+        var t24a = (i29 * 2404 + i3 * 16207 + 8192) >> 14
+
+        var t0 = t0a + t3a
+        var t1 = t1a + t2a
+        var t2 = t1a - t2a
+        var t3 = t0a - t3a
+        var t4 = t4a + t5a
+        var t5 = t4a - t5a
+        var t6 = t7a - t6a
+        var t7 = t7a + t6a
+        var t8 = t8a + t9a
+        var t9 = t8a - t9a
+        var t10 = t11a - t10a
+        var t11 = t11a + t10a
+        var t12 = t12a + t13a
+        var t13 = t12a - t13a
+        var t14 = t15a - t14a
+        var t15 = t15a + t14a
+        var t16 = t16a + t17a
+        var t17 = t16a - t17a
+        var t18 = t19a - t18a
+        var t19 = t19a + t18a
+        var t20 = t20a + t21a
+        var t21 = t20a - t21a
+        var t22 = t23a - t22a
+        var t23 = t23a + t22a
+        var t24 = t24a + t25a
+        var t25 = t24a - t25a
+        var t26 = t27a - t26a
+        var t27 = t27a + t26a
+        var t28 = t28a + t29a
+        var t29 = t28a - t29a
+        var t30 = t31a - t30a
+        var t31 = t31a + t30a
+
+        t5a = ((t6 - t5) * 11585 + 8192) >> 14
+        t6a = ((t6 + t5) * 11585 + 8192) >> 14
+        t9a = (t14 * 6270 - t9 * 15137 + 8192) >> 14
+        t14a = (t14 * 15137 + t9 * 6270 + 8192) >> 14
+        t10a = (-(t13 * 15137 + t10 * 6270) + 8192) >> 14
+        t13a = (t13 * 6270 - t10 * 15137 + 8192) >> 14
+        t17a = (t30 * 3196 - t17 * 16069 + 8192) >> 14
+        t30a = (t30 * 16069 + t17 * 3196 + 8192) >> 14
+        t18a = (-(t29 * 16069 + t18 * 3196) + 8192) >> 14
+        t29a = (t29 * 3196 - t18 * 16069 + 8192) >> 14
+        t21a = (t26 * 13623 - t21 * 9102 + 8192) >> 14
+        t26a = (t26 * 9102 + t21 * 13623 + 8192) >> 14
+        t22a = (-(t25 * 9102 + t22 * 13623) + 8192) >> 14
+        t25a = (t25 * 13623 - t22 * 9102 + 8192) >> 14
+
+        t0a = t0 + t7
+        t1a = t1 + t6a
+        t2a = t2 + t5a
+        t3a = t3 + t4
+        t4a = t3 - t4
+        t5 = t2 - t5a
+        t6 = t1 - t6a
+        t7a = t0 - t7
+        t8a = t8 + t11
+        t9 = t9a + t10a
+        t10 = t9a - t10a
+        t11a = t8 - t11
+        t12a = t15 - t12
+        t13 = t14a - t13a
+        t14 = t14a + t13a
+        t15a = t15 + t12
+        t16a = t16 + t19
+        t17 = t17a + t18a
+        t18 = t17a - t18a
+        t19a = t16 - t19
+        t20a = t23 - t20
+        t21 = t22a - t21a
+        t22 = t22a + t21a
+        t23a = t23 + t20
+        t24a = t24 + t27
+        t25 = t25a + t26a
+        t26 = t25a - t26a
+        t27a = t24 - t27
+        t28a = t31 - t28
+        t29 = t30a - t29a
+        t30 = t30a + t29a
+        t31a = t31 + t28
+
+        t10a = ((t13 - t10) * 11585 + 8192) >> 14
+        t13a = ((t13 + t10) * 11585 + 8192) >> 14
+        t11 = ((t12a - t11a) * 11585 + 8192) >> 14
+        t12 = ((t12a + t11a) * 11585 + 8192) >> 14
+        t18a = (t29 * 6270 - t18 * 15137 + 8192) >> 14
+        t29a = (t29 * 15137 + t18 * 6270 + 8192) >> 14
+        t19 = (t28a * 6270 - t19a * 15137 + 8192) >> 14
+        t28 = (t28a * 15137 + t19a * 6270 + 8192) >> 14
+        t20 = (-(t27a * 15137 + t20a * 6270) + 8192) >> 14
+        t27 = (t27a * 6270 - t20a * 15137 + 8192) >> 14
+        t21a = (-(t26 * 15137 + t21 * 6270) + 8192) >> 14
+        t26a = (t26 * 6270 - t21 * 15137 + 8192) >> 14
+
+        t0 = t0a + t15a
+        t1 = t1a + t14
+        t2 = t2a + t13a
+        t3 = t3a + t12
+        t4 = t4a + t11
+        t5a = t5 + t10a
+        t6a = t6 + t9
+        t7 = t7a + t8a
+        t8 = t7a - t8a
+        t9a = t6 - t9
+        t10 = t5 - t10a
+        t11a = t4a - t11
+        t12a = t3a - t12
+        t13 = t2a - t13a
+        t14a = t1a - t14
+        t15 = t0a - t15a
+        t16 = t16a + t23a
+        t17a = t17 + t22
+        t18 = t18a + t21a
+        t19a = t19 + t20
+        t20a = t19 - t20
+        t21 = t18a - t21a
+        t22a = t17 - t22
+        t23 = t16a - t23a
+        t24 = t31a - t24a
+        t25a = t30 - t25
+        t26 = t29a - t26a
+        t27a = t28 - t27
+        t28a = t28 + t27
+        t29 = t29a + t26a
+        t30a = t30 + t25
+        t31 = t31a + t24a
+
+        t20 = ((t27a - t20a) * 11585 + 8192) >> 14
+        t27 = ((t27a + t20a) * 11585 + 8192) >> 14
+        t21a = ((t26 - t21) * 11585 + 8192) >> 14
+        t26a = ((t26 + t21) * 11585 + 8192) >> 14
+        t22 = ((t25a - t22a) * 11585 + 8192) >> 14
+        t25 = ((t25a + t22a) * 11585 + 8192) >> 14
+        t23a = ((t24 - t23) * 11585 + 8192) >> 14
+        t24a = ((t24 + t23) * 11585 + 8192) >> 14
+
+        o[0] = t0 + t31
+        o[1] = t1 + t30a
+        o[2] = t2 + t29
+        o[3] = t3 + t28a
+        o[4] = t4 + t27
+        o[5] = t5a + t26a
+        o[6] = t6a + t25
+        o[7] = t7 + t24a
+        o[8] = t8 + t23a
+        o[9] = t9a + t22
+        o[10] = t10 + t21a
+        o[11] = t11a + t20
+        o[12] = t12a + t19a
+        o[13] = t13 + t18
+        o[14] = t14a + t17a
+        o[15] = t15 + t16
+        o[16] = t15 - t16
+        o[17] = t14a - t17a
+        o[18] = t13 - t18
+        o[19] = t12a - t19a
+        o[20] = t11a - t20
+        o[21] = t10 - t21a
+        o[22] = t9a - t22
+        o[23] = t8 - t23a
+        o[24] = t7 - t24a
+        o[25] = t6a - t25
+        o[26] = t5a - t26a
+        o[27] = t4 - t27
+        o[28] = t3 - t28a
+        o[29] = t2 - t29
+        o[30] = t1 - t30a
+        o[31] = t0 - t31
+    }
+
+    // ---- motion compensation ------------------------------------------------
+
+    // Predicts a bw x bh block into pl[dOff] (rows dStride apart) from the
+    // reference plane `ref` (rw x rh visible samples, rows rStride apart)
+    // at integer position (x, y) plus phase (mx, my) in 1/16 sample.
+    // Samples outside the visible reference repeat its edges. avg: average
+    // with what is already there (the second prediction of a compound
+    // block). filt: 0 smooth, 1 regular, 2 sharp, 3 bilinear.
+    fn mc(_ ref: [Int], _ rStride: Int, _ rw: Int, _ rh: Int, _ x: Int, _ y: Int, _ mx: Int, _ my: Int,
+          _ dOff: Int, _ dStride: Int, _ bw: Int, _ bh: Int, _ filt: Int, _ avg: Bool) {
+        let hx = if mx != 0 { 1 } else { 0 }
+        let hy = if my != 0 { 1 } else { 0 }
+        if x - 3 * hx >= 0 && y - 3 * hy >= 0 && x + bw + 4 * hx <= rw && y + bh + 4 * hy <= rh {
+            mcFilter(ref, y * rStride + x, rStride, mx, my, dOff, dStride, bw, bh, filt, avg)
+            return
+        }
+        // Copy the area with edge clamping (emulated_edge_mc).
+        let ew = bw + 7 * hx
+        let eh = bh + 7 * hy
+        let x0 = x - 3 * hx
+        let y0 = y - 3 * hy
+        for j in 0..eh {
+            let sy = vp9Clip(y0 + j, 0, rh - 1) * rStride
+            let e = j * 160
+            for i in 0..ew {
+                emu[e + i] = ref[sy + vp9Clip(x0 + i, 0, rw - 1)]
+            }
+        }
+        let e = emu
+        mcFilter(e, 3 * hy * 160 + 3 * hx, 160, mx, my, dOff, dStride, bw, bh, filt, avg)
+    }
+
+    fn mcFilter(_ src: [Int], _ sOff: Int, _ sStride: Int, _ mx: Int, _ my: Int,
+                _ dOff: Int, _ dStride: Int, _ bw: Int, _ bh: Int, _ filt: Int, _ avg: Bool) {
+        let mv = maxV
+        if mx == 0 && my == 0 {
+            for y in 0..bh {
+                let s = sOff + y * sStride
+                let d = dOff + y * dStride
+                if avg {
+                    for x in 0..bw {
+                        pl[d + x] = (pl[d + x] + src[s + x] + 1) >> 1
+                    }
+                } else {
+                    for x in 0..bw {
+                        pl[d + x] = src[s + x]
+                    }
+                }
+            }
+            return
+        }
+        if filt == 3 {
+            mcBilin(src, sOff, sStride, mx, my, dOff, dStride, bw, bh, avg)
+            return
+        }
+        // The 8-tap filters work on two samples at once: sample x in the low
+        // 32 bits of an Int and sample x + 1 in the high bits (every sum
+        // stays far inside 32 bits, so the halves don't mix).
+        let f = filters
+        let rnd = 64 + (64 << 32)
+        if my == 0 {
+            let fb = filt * 128 + mx * 8
+            let f0 = f[fb]
+            let f1 = f[fb + 1]
+            let f2 = f[fb + 2]
+            let f3 = f[fb + 3]
+            let f4 = f[fb + 4]
+            let f5 = f[fb + 5]
+            let f6 = f[fb + 6]
+            let f7 = f[fb + 7]
+            for y in 0..bh {
+                let s = sOff + y * sStride - 3
+                let d = dOff + y * dStride
+                let c2 = src[s + 2]
+                var p0 = src[s] + (src[s + 1] << 32)
+                var p1 = src[s + 1] + (c2 << 32)
+                var p2 = c2 + (src[s + 3] << 32)
+                var p3 = src[s + 3] + (src[s + 4] << 32)
+                var p4 = src[s + 4] + (src[s + 5] << 32)
+                var c7 = src[s + 7]
+                var p5 = src[s + 5] + (src[s + 6] << 32)
+                var p6 = src[s + 6] + (c7 << 32)
+                var x = 0
+                var k = s + 8
+                while x < bw {
+                    let c8 = src[k]
+                    let p7 = c7 + (c8 << 32)
+                    let sum = f0 * p0 + f1 * p1 + f2 * p2 + f3 * p3 + f4 * p4 + f5 * p5 + f6 * p6 + f7 * p7 + rnd
+                    let lo = ((sum & 0xffffffff) ^ 0x80000000) - 0x80000000
+                    var v0 = lo >> 7
+                    var v1 = (sum - lo) >> 39
+                    if v0 < 0 { v0 = 0 } else if v0 > mv { v0 = mv }
+                    if v1 < 0 { v1 = 0 } else if v1 > mv { v1 = mv }
+                    if avg {
+                        pl[d + x] = (pl[d + x] + v0 + 1) >> 1
+                        pl[d + x + 1] = (pl[d + x + 1] + v1 + 1) >> 1
+                    } else {
+                        pl[d + x] = v0
+                        pl[d + x + 1] = v1
+                    }
+                    p0 = p2
+                    p1 = p3
+                    p2 = p4
+                    p3 = p5
+                    p4 = p6
+                    p5 = p7
+                    x += 2
+                    if x < bw {
+                        let c9 = src[k + 1]
+                        p6 = c8 + (c9 << 32)
+                        c7 = c9
+                    }
+                    k += 2
+                }
+            }
+            return
+        }
+        let gb = filt * 128 + my * 8
+        let g0 = f[gb]
+        let g1 = f[gb + 1]
+        let g2 = f[gb + 2]
+        let g3 = f[gb + 3]
+        let g4 = f[gb + 4]
+        let g5 = f[gb + 5]
+        let g6 = f[gb + 6]
+        let g7 = f[gb + 7]
+        if mx == 0 {
+            // Vertical only: down each pair of columns.
+            var x = 0
+            while x < bw {
+                let b0 = sOff + x - 3 * sStride
+                var q0 = src[b0] + (src[b0 + 1] << 32)
+                var q1 = src[b0 + sStride] + (src[b0 + sStride + 1] << 32)
+                var q2 = src[b0 + 2 * sStride] + (src[b0 + 2 * sStride + 1] << 32)
+                var q3 = src[b0 + 3 * sStride] + (src[b0 + 3 * sStride + 1] << 32)
+                var q4 = src[b0 + 4 * sStride] + (src[b0 + 4 * sStride + 1] << 32)
+                var q5 = src[b0 + 5 * sStride] + (src[b0 + 5 * sStride + 1] << 32)
+                var q6 = src[b0 + 6 * sStride] + (src[b0 + 6 * sStride + 1] << 32)
+                var r = b0 + 7 * sStride
+                var d = dOff + x
+                var y = 0
+                while y < bh {
+                    let q7 = src[r] + (src[r + 1] << 32)
+                    let sum = g0 * q0 + g1 * q1 + g2 * q2 + g3 * q3 + g4 * q4 + g5 * q5 + g6 * q6 + g7 * q7 + rnd
+                    let lo = ((sum & 0xffffffff) ^ 0x80000000) - 0x80000000
+                    var v0 = lo >> 7
+                    var v1 = (sum - lo) >> 39
+                    if v0 < 0 { v0 = 0 } else if v0 > mv { v0 = mv }
+                    if v1 < 0 { v1 = 0 } else if v1 > mv { v1 = mv }
+                    if avg {
+                        pl[d] = (pl[d] + v0 + 1) >> 1
+                        pl[d + 1] = (pl[d + 1] + v1 + 1) >> 1
+                    } else {
+                        pl[d] = v0
+                        pl[d + 1] = v1
+                    }
+                    q0 = q1
+                    q1 = q2
+                    q2 = q3
+                    q3 = q4
+                    q4 = q5
+                    q5 = q6
+                    q6 = q7
+                    r += sStride
+                    d += dStride
+                    y += 1
+                }
+                x += 2
+            }
+            return
+        }
+        // Two passes: horizontal into mcTmp (rows -3 … bh + 3, pairs packed,
+        // 32 pairs a row), then vertical down each pair of columns.
+        let fb = filt * 128 + mx * 8
+        let f0 = f[fb]
+        let f1 = f[fb + 1]
+        let f2 = f[fb + 2]
+        let f3 = f[fb + 3]
+        let f4 = f[fb + 4]
+        let f5 = f[fb + 5]
+        let f6 = f[fb + 6]
+        let f7 = f[fb + 7]
+        let hw = bw >> 1
+        for y in 0..(bh + 7) {
+            let s = sOff + (y - 3) * sStride - 3
+            let t = y * 32
+            let c2 = src[s + 2]
+            var p0 = src[s] + (src[s + 1] << 32)
+            var p1 = src[s + 1] + (c2 << 32)
+            var p2 = c2 + (src[s + 3] << 32)
+            var p3 = src[s + 3] + (src[s + 4] << 32)
+            var p4 = src[s + 4] + (src[s + 5] << 32)
+            var c7 = src[s + 7]
+            var p5 = src[s + 5] + (src[s + 6] << 32)
+            var p6 = src[s + 6] + (c7 << 32)
+            var x = 0
+            var k = s + 8
+            while x < hw {
+                let c8 = src[k]
+                let p7 = c7 + (c8 << 32)
+                let sum = f0 * p0 + f1 * p1 + f2 * p2 + f3 * p3 + f4 * p4 + f5 * p5 + f6 * p6 + f7 * p7 + rnd
+                let lo = ((sum & 0xffffffff) ^ 0x80000000) - 0x80000000
+                var v0 = lo >> 7
+                var v1 = (sum - lo) >> 39
+                if v0 < 0 { v0 = 0 } else if v0 > mv { v0 = mv }
+                if v1 < 0 { v1 = 0 } else if v1 > mv { v1 = mv }
+                mcTmp[t + x] = v0 + (v1 << 32)
+                p0 = p2
+                p1 = p3
+                p2 = p4
+                p3 = p5
+                p4 = p6
+                p5 = p7
+                x += 1
+                if x < hw {
+                    let c9 = src[k + 1]
+                    p6 = c8 + (c9 << 32)
+                    c7 = c9
+                }
+                k += 2
+            }
+        }
+        for x in 0..hw {
+            var a0 = mcTmp[x]
+            var a1 = mcTmp[x + 32]
+            var a2 = mcTmp[x + 64]
+            var a3 = mcTmp[x + 96]
+            var a4 = mcTmp[x + 128]
+            var a5 = mcTmp[x + 160]
+            var a6 = mcTmp[x + 192]
+            var r = x + 224
+            var d = dOff + 2 * x
+            var y = 0
+            while y < bh {
+                let a7 = mcTmp[r]
+                let sum = g0 * a0 + g1 * a1 + g2 * a2 + g3 * a3 + g4 * a4 + g5 * a5 + g6 * a6 + g7 * a7 + rnd
+                let lo = ((sum & 0xffffffff) ^ 0x80000000) - 0x80000000
+                var v0 = lo >> 7
+                var v1 = (sum - lo) >> 39
+                if v0 < 0 { v0 = 0 } else if v0 > mv { v0 = mv }
+                if v1 < 0 { v1 = 0 } else if v1 > mv { v1 = mv }
+                if avg {
+                    pl[d] = (pl[d] + v0 + 1) >> 1
+                    pl[d + 1] = (pl[d + 1] + v1 + 1) >> 1
+                } else {
+                    pl[d] = v0
+                    pl[d + 1] = v1
+                }
+                a0 = a1
+                a1 = a2
+                a2 = a3
+                a3 = a4
+                a4 = a5
+                a5 = a6
+                a6 = a7
+                r += 32
+                d += dStride
+                y += 1
+            }
+        }
+    }
+
+    fn mcBilin(_ src: [Int], _ sOff: Int, _ sStride: Int, _ mx: Int, _ my: Int,
+               _ dOff: Int, _ dStride: Int, _ bw: Int, _ bh: Int, _ avg: Bool) {
+        if my == 0 {
+            for y in 0..bh {
+                let s = sOff + y * sStride
+                let d = dOff + y * dStride
+                for x in 0..bw {
+                    let a = src[s + x]
+                    let v = a + ((mx * (src[s + x + 1] - a) + 8) >> 4)
+                    pl[d + x] = if avg { (pl[d + x] + v + 1) >> 1 } else { v }
+                }
+            }
+            return
+        }
+        if mx == 0 {
+            for y in 0..bh {
+                let s = sOff + y * sStride
+                let d = dOff + y * dStride
+                for x in 0..bw {
+                    let a = src[s + x]
+                    let v = a + ((my * (src[s + x + sStride] - a) + 8) >> 4)
+                    pl[d + x] = if avg { (pl[d + x] + v + 1) >> 1 } else { v }
+                }
+            }
+            return
+        }
+        for y in 0..(bh + 1) {
+            let s = sOff + y * sStride
+            let t = y * 64
+            for x in 0..bw {
+                let a = src[s + x]
+                mcTmp[t + x] = a + ((mx * (src[s + x + 1] - a) + 8) >> 4)
+            }
+        }
+        for y in 0..bh {
+            let d = dOff + y * dStride
+            let t = y * 64
+            for x in 0..bw {
+                let a = mcTmp[t + x]
+                let v = a + ((my * (mcTmp[t + x + 64] - a) + 8) >> 4)
+                pl[d + x] = if avg { (pl[d + x] + v + 1) >> 1 } else { v }
+            }
+        }
+    }
+
+    // Scaled prediction (8.5.2.3 with a reference of another size):
+    // (x, y) the integer and (mx, my) the 1/16 phase of the first sample,
+    // (dx, dy) the step per output sample in 1/16.
+    fn mcScaled(_ ref: [Int], _ rStride: Int, _ rw: Int, _ rh: Int, _ x: Int, _ y: Int, _ mx: Int, _ my: Int,
+                _ dx: Int, _ dy: Int, _ dOff: Int, _ dStride: Int, _ bw: Int, _ bh: Int, _ filt: Int, _ avg: Bool) {
+        let refbw = ((bw - 1) * dx + mx) >> 4
+        let refbh = ((bh - 1) * dy + my) >> 4
+        var src = ref
+        var sOff = y * rStride + x
+        var sStride = rStride
+        if x < 3 || y < 3 || x + 4 >= rw - refbw || y + 5 >= rh - refbh {
+            let ew = refbw + 8
+            let eh = refbh + 8
+            let x0 = x - 3
+            let y0 = y - 3
+            for j in 0..eh {
+                let sy = vp9Clip(y0 + j, 0, rh - 1) * rStride
+                let e = j * 288
+                for i in 0..ew {
+                    emu[e + i] = ref[sy + vp9Clip(x0 + i, 0, rw - 1)]
+                }
+            }
+            src = emu
+            sOff = 3 * 288 + 3
+            sStride = 288
+        }
+        let f = filters
+        if filt == 3 {
+            let th = (((bh - 1) * dy + my) >> 4) + 2
+            for yy in 0..th {
+                let s = sOff + yy * sStride
+                let t = yy * 64
+                var imx = mx
+                var ioff = 0
+                for xx in 0..bw {
+                    let a = src[s + ioff]
+                    mcTmp[t + xx] = a + ((imx * (src[s + ioff + 1] - a) + 8) >> 4)
+                    imx += dx
+                    ioff += imx >> 4
+                    imx = imx & 15
+                }
+            }
+            var t = 0
+            var m = my
+            for yy in 0..bh {
+                let d = dOff + yy * dStride
+                for xx in 0..bw {
+                    let a = mcTmp[t + xx]
+                    let v = a + ((m * (mcTmp[t + xx + 64] - a) + 8) >> 4)
+                    pl[d + xx] = if avg { (pl[d + xx] + v + 1) >> 1 } else { v }
+                }
+                m += dy
+                t += (m >> 4) * 64
+                m = m & 15
+            }
+            return
+        }
+        let th = (((bh - 1) * dy + my) >> 4) + 8
+        for yy in 0..th {
+            let s = sOff + (yy - 3) * sStride - 3
+            let t = yy * 64
+            var imx = mx
+            var ioff = 0
+            for xx in 0..bw {
+                let fb = filt * 128 + imx * 8
+                let a = s + ioff
+                mcTmp[t + xx] = clip((f[fb] * src[a] + f[fb + 1] * src[a + 1] + f[fb + 2] * src[a + 2] + f[fb + 3] * src[a + 3] + f[fb + 4] * src[a + 4] + f[fb + 5] * src[a + 5] + f[fb + 6] * src[a + 6] + f[fb + 7] * src[a + 7] + 64) >> 7)
+                imx += dx
+                ioff += imx >> 4
+                imx = imx & 15
+            }
+        }
+        var t = 3 * 64
+        var m = my
+        for yy in 0..bh {
+            let d = dOff + yy * dStride
+            let gb = filt * 128 + m * 8
+            for xx in 0..bw {
+                let a = t + xx
+                let v = clip((f[gb] * mcTmp[a - 192] + f[gb + 1] * mcTmp[a - 128] + f[gb + 2] * mcTmp[a - 64] + f[gb + 3] * mcTmp[a] + f[gb + 4] * mcTmp[a + 64] + f[gb + 5] * mcTmp[a + 128] + f[gb + 6] * mcTmp[a + 192] + f[gb + 7] * mcTmp[a + 256] + 64) >> 7)
+                pl[d + xx] = if avg { (pl[d + xx] + v + 1) >> 1 } else { v }
+            }
+            m += dy
+            t += (m >> 4) * 64
+            m = m & 15
+        }
+    }
+
+    // ---- loop filter (8.8) -------------------------------------------------
+
+    fn setSharpness(_ s: Int) {
+        if s == sharp {
+            return
+        }
+        sharp = s
+        for i in 1..64 {
+            var limit = i
+            if s > 0 {
+                limit = limit >> ((s + 3) >> 2)
+                limit = min(limit, 9 - s)
+            }
+            limit = max(limit, 1)
+            limLut[i] = limit
+            mblimLut[i] = 2 * (i + 2) + limit
+        }
+    }
+
+    // One 8-sample edge segment at plane offset `at`: sa steps along the
+    // edge, sb across it. wd 4, 8 or 16 (FFmpeg's loop_filter).
+    fn lf(_ at: Int, _ level: Int, _ sa: Int, _ sb: Int, _ wd: Int) {
+        let sh = bitDepth - 8
+        let e = mblimLut[level] << sh
+        let ii = limLut[level] << sh
+        let hh = (level >> 4) << sh
+        let fl = 1 << sh
+        let lo = -(1 << (bitDepth - 1))
+        let hi = (1 << (bitDepth - 1)) - 1
+        var d = at
+        for _ in 0..8 {
+            let p3 = pl[d - 4 * sb]
+            let p2 = pl[d - 3 * sb]
+            let p1 = pl[d - 2 * sb]
+            let p0 = pl[d - sb]
+            let q0 = pl[d]
+            let q1 = pl[d + sb]
+            let q2 = pl[d + 2 * sb]
+            let q3 = pl[d + 3 * sb]
+            let m1 = max(max(abs(p3 - p2), abs(p2 - p1)), max(abs(p1 - p0), abs(q1 - q0)))
+            let m2 = max(abs(q2 - q1), abs(q3 - q2))
+            let fm = max(m1, m2) <= ii && abs(p0 - q0) * 2 + (abs(p1 - q1) >> 1) <= e
+            if fm {
+                var flat8in = false
+                if wd >= 8 {
+                    flat8in = max(max(max(abs(p3 - p0), abs(p2 - p0)), max(abs(p1 - p0), abs(q1 - q0))), max(abs(q2 - q0), abs(q3 - q0))) <= fl
+                }
+                var flat8out = false
+                if wd >= 16 && flat8in {
+                    let p7 = pl[d - 8 * sb]
+                    let p6 = pl[d - 7 * sb]
+                    let p5 = pl[d - 6 * sb]
+                    let p4 = pl[d - 5 * sb]
+                    let q4 = pl[d + 4 * sb]
+                    let q5 = pl[d + 5 * sb]
+                    let q6 = pl[d + 6 * sb]
+                    let q7 = pl[d + 7 * sb]
+                    flat8out = abs(p7 - p0) <= fl && abs(p6 - p0) <= fl && abs(p5 - p0) <= fl && abs(p4 - p0) <= fl &&
+                        abs(q4 - q0) <= fl && abs(q5 - q0) <= fl && abs(q6 - q0) <= fl && abs(q7 - q0) <= fl
+                    if flat8out {
+                        // The 15-tap filter as a running sum.
+                        var t = p7 * 7 + p6 * 2 + p5 + p4 + p3 + p2 + p1 + p0 + q0 + 8
+                        pl[d - 7 * sb] = t >> 4
+                        t += p5 + q1 - p7 - p6
+                        pl[d - 6 * sb] = t >> 4
+                        t += p4 + q2 - p7 - p5
+                        pl[d - 5 * sb] = t >> 4
+                        t += p3 + q3 - p7 - p4
+                        pl[d - 4 * sb] = t >> 4
+                        t += p2 + q4 - p7 - p3
+                        pl[d - 3 * sb] = t >> 4
+                        t += p1 + q5 - p7 - p2
+                        pl[d - 2 * sb] = t >> 4
+                        t += p0 + q6 - p7 - p1
+                        pl[d - sb] = t >> 4
+                        t += q0 + q7 - p7 - p0
+                        pl[d] = t >> 4
+                        t += q1 + q7 - p6 - q0
+                        pl[d + sb] = t >> 4
+                        t += q2 + q7 - p5 - q1
+                        pl[d + 2 * sb] = t >> 4
+                        t += q3 + q7 - p4 - q2
+                        pl[d + 3 * sb] = t >> 4
+                        t += q4 + q7 - p3 - q3
+                        pl[d + 4 * sb] = t >> 4
+                        t += q5 + q7 - p2 - q4
+                        pl[d + 5 * sb] = t >> 4
+                        t += q6 + q7 - p1 - q5
+                        pl[d + 6 * sb] = t >> 4
+                    }
+                }
+                if flat8out {
+                    // done above
+                } else if flat8in {
+                    var t = p3 * 3 + 2 * p2 + p1 + p0 + q0 + 4
+                    pl[d - 3 * sb] = t >> 3
+                    t += p1 + q1 - p3 - p2
+                    pl[d - 2 * sb] = t >> 3
+                    t += p0 + q2 - p3 - p1
+                    pl[d - sb] = t >> 3
+                    t += q0 + q3 - p3 - p0
+                    pl[d] = t >> 3
+                    t += q1 + q3 - p2 - q0
+                    pl[d + sb] = t >> 3
+                    t += q2 + q3 - p1 - q1
+                    pl[d + 2 * sb] = t >> 3
+                } else {
+                    let hev = abs(p1 - p0) > hh || abs(q1 - q0) > hh
+                    if hev {
+                        var f = vp9Clip(p1 - q1, lo, hi)
+                        f = vp9Clip(3 * (q0 - p0) + f, lo, hi)
+                        let f1 = min(f + 4, hi) >> 3
+                        let f2 = min(f + 3, hi) >> 3
+                        pl[d - sb] = clip(p0 + f2)
+                        pl[d] = clip(q0 - f1)
+                    } else {
+                        let f = vp9Clip(3 * (q0 - p0), lo, hi)
+                        let f1 = min(f + 4, hi) >> 3
+                        let f2 = min(f + 3, hi) >> 3
+                        pl[d - sb] = clip(p0 + f2)
+                        pl[d] = clip(q0 - f1)
+                        let f3 = (f1 + 1) >> 1
+                        pl[d - 2 * sb] = clip(p1 + f3)
+                        pl[d + sb] = clip(q1 - f3)
+                    }
+                }
+            }
+            d += sa
+        }
+    }
+
+    // FFmpeg's filter_plane_cols for one superblock: the vertical edges.
+    //   mask  the plane's masks (… [y][4] for this direction) at mBase
+    //   lv    the superblock's 64 levels at lBase
+    fn planeCols(_ mask: [Int], _ mBase: Int, _ lv: [Int], _ lBase: Int, _ col: Int, _ ssH: Int, _ ssV: Int, _ at0: Int, _ ls: Int) {
+        var y = 0
+        var dst = at0
+        var lvl = lBase
+        while y < 8 {
+            var ptr = dst
+            var l = lvl
+            let m1 = mBase + y * 4
+            let m2 = mBase + (y + 1 + ssV) * 4
+            let hm1 = mask[m1] | mask[m1 + 1] | mask[m1 + 2]
+            let hm13 = mask[m1 + 3]
+            let hm2 = mask[m2 + 1] | mask[m2 + 2]
+            let hm23 = mask[m2 + 3]
+            let hm = hm1 | hm2 | hm13 | hm23
+            var x = 1
+            while (hm & ~(x - 1)) != 0 {
+                if col != 0 || x > 1 {
+                    if (hm1 & x) != 0 {
+                        let lL = lv[l]
+                        if (mask[m1] & x) != 0 {
+                            if (mask[m2] & x) != 0 {
+                                lf(ptr, lL, ls, 1, 16)
+                                lf(ptr + 8 * ls, lL, ls, 1, 16)
+                            } else {
+                                lf(ptr, lL, ls, 1, 16)
+                            }
+                        } else if (hm2 & x) != 0 {
+                            let l2 = lv[l + (8 << ssV)]
+                            lf(ptr, lL, ls, 1, if (mask[m1 + 1] & x) != 0 { 8 } else { 4 })
+                            lf(ptr + 8 * ls, l2, ls, 1, if (mask[m2 + 1] & x) != 0 { 8 } else { 4 })
+                        } else {
+                            lf(ptr, lL, ls, 1, if (mask[m1 + 1] & x) != 0 { 8 } else { 4 })
+                        }
+                    } else if (hm2 & x) != 0 {
+                        let l2 = lv[l + (8 << ssV)]
+                        lf(ptr + 8 * ls, l2, ls, 1, if (mask[m2 + 1] & x) != 0 { 8 } else { 4 })
+                    }
+                }
+                if ssH == 1 {
+                    if (x & 0xAA) != 0 {
+                        l += 2
+                    }
+                } else {
+                    if (hm13 & x) != 0 {
+                        let lL = lv[l]
+                        if (hm23 & x) != 0 {
+                            let l2 = lv[l + (8 << ssV)]
+                            lf(ptr + 4, lL, ls, 1, 4)
+                            lf(ptr + 4 + 8 * ls, l2, ls, 1, 4)
+                        } else {
+                            lf(ptr + 4, lL, ls, 1, 4)
+                        }
+                    } else if (hm23 & x) != 0 {
+                        let l2 = lv[l + (8 << ssV)]
+                        lf(ptr + 8 * ls + 4, l2, ls, 1, 4)
+                    }
+                    l += 1
+                }
+                x = x << 1
+                ptr += 8 >> ssH
+            }
+            y += 2 << ssV
+            dst += 16 * ls
+            lvl += 16 << ssV
+        }
+    }
+
+    // FFmpeg's filter_plane_rows: the horizontal edges.
+    fn planeRows(_ mask: [Int], _ mBase: Int, _ lv: [Int], _ lBase: Int, _ row: Int, _ ssH: Int, _ ssV: Int, _ at0: Int, _ ls: Int) {
+        var y = 0
+        var dst = at0
+        var lvl = lBase
+        while y < 8 {
+            var ptr = dst
+            var l = lvl
+            let mb = mBase + y * 4
+            let vm = mask[mb] | mask[mb + 1] | mask[mb + 2]
+            let vm3 = mask[mb + 3]
+            var x = 1
+            while (vm & ~(x - 1)) != 0 {
+                let x2 = x << (1 + ssH)
+                if row != 0 || y != 0 {
+                    if (vm & x) != 0 {
+                        let lL = lv[l]
+                        if (mask[mb] & x) != 0 {
+                            if (mask[mb] & x2) != 0 {
+                                lf(ptr, lL, 1, ls, 16)
+                                lf(ptr + 8, lL, 1, ls, 16)
+                            } else {
+                                lf(ptr, lL, 1, ls, 16)
+                            }
+                        } else if (vm & x2) != 0 {
+                            let l2 = lv[l + 1 + ssH]
+                            lf(ptr, lL, 1, ls, if (mask[mb + 1] & x) != 0 { 8 } else { 4 })
+                            lf(ptr + 8, l2, 1, ls, if (mask[mb + 1] & x2) != 0 { 8 } else { 4 })
+                        } else {
+                            lf(ptr, lL, 1, ls, if (mask[mb + 1] & x) != 0 { 8 } else { 4 })
+                        }
+                    } else if (vm & x2) != 0 {
+                        let l2 = lv[l + 1 + ssH]
+                        lf(ptr + 8, l2, 1, ls, if (mask[mb + 1] & x2) != 0 { 8 } else { 4 })
+                    }
+                }
+                if ssV == 0 {
+                    if (vm3 & x) != 0 {
+                        let lL = lv[l]
+                        if (vm3 & x2) != 0 {
+                            let l2 = lv[l + 1 + ssH]
+                            lf(ptr + ls * 4, lL, 1, ls, 4)
+                            lf(ptr + ls * 4 + 8, l2, 1, ls, 4)
+                        } else {
+                            lf(ptr + ls * 4, lL, 1, ls, 4)
+                        }
+                    } else if (vm3 & x2) != 0 {
+                        let l2 = lv[l + 1 + ssH]
+                        lf(ptr + ls * 4 + 8, l2, 1, ls, 4)
+                    }
+                }
+                x = x << (2 << ssH)
+                ptr += 16
+                l += 2 << ssH
+            }
+            if ssV == 1 {
+                if (y & 1) == 1 {
+                    lvl += 16
+                }
+            } else {
+                lvl += 8
+            }
+            y += 1
+            dst += (8 * ls) >> ssV
+        }
+    }
+}
+
+// The 4-point inverse transforms (8.7.1.x) on four values.
+fn vp9Idct4(_ i0: Int, _ i1: Int, _ i2: Int, _ i3: Int) -> (Int, Int, Int, Int) {
+    let t0 = ((i0 + i2) * 11585 + 8192) >> 14
+    let t1 = ((i0 - i2) * 11585 + 8192) >> 14
+    let t2 = (i1 * 6270 - i3 * 15137 + 8192) >> 14
+    let t3 = (i1 * 15137 + i3 * 6270 + 8192) >> 14
+    (t0 + t3, t1 + t2, t1 - t2, t0 - t3)
+}
+
+fn vp9Iadst4(_ i0: Int, _ i1: Int, _ i2: Int, _ i3: Int) -> (Int, Int, Int, Int) {
+    let t0 = 5283 * i0 + 15212 * i2 + 9929 * i3
+    let t1 = 9929 * i0 - 5283 * i2 - 15212 * i3
+    let t2 = 13377 * (i0 - i2 + i3)
+    let t3 = 13377 * i1
+    ((t0 + t3 + 8192) >> 14, (t1 + t3 + 8192) >> 14, (t2 + 8192) >> 14, (t0 + t1 - t3 + 8192) >> 14)
+}
+
+// The 8-point inverse DCT and ADST on eight values (FFmpeg's idct8_1d,
+// iadst8_1d).
+fn vp9Idct8(_ i0: Int, _ i1: Int, _ i2: Int, _ i3: Int, _ i4: Int, _ i5: Int, _ i6: Int, _ i7: Int) -> (Int, Int, Int, Int, Int, Int, Int, Int) {
+    let t0a = ((i0 + i4) * 11585 + 8192) >> 14
+    let t1a = ((i0 - i4) * 11585 + 8192) >> 14
+    let t2a = (i2 * 6270 - i6 * 15137 + 8192) >> 14
+    let t3a = (i2 * 15137 + i6 * 6270 + 8192) >> 14
+    let t4a = (i1 * 3196 - i7 * 16069 + 8192) >> 14
+    let t5a = (i5 * 13623 - i3 * 9102 + 8192) >> 14
+    let t6a = (i5 * 9102 + i3 * 13623 + 8192) >> 14
+    let t7a = (i1 * 16069 + i7 * 3196 + 8192) >> 14
+    let t0 = t0a + t3a
+    let t1 = t1a + t2a
+    let t2 = t1a - t2a
+    let t3 = t0a - t3a
+    let t4 = t4a + t5a
+    let t5b = t4a - t5a
+    let t7 = t7a + t6a
+    let t6b = t7a - t6a
+    let t5 = ((t6b - t5b) * 11585 + 8192) >> 14
+    let t6 = ((t6b + t5b) * 11585 + 8192) >> 14
+    (t0 + t7, t1 + t6, t2 + t5, t3 + t4, t3 - t4, t2 - t5, t1 - t6, t0 - t7)
+}
+
+fn vp9Iadst8(_ i0: Int, _ i1: Int, _ i2: Int, _ i3: Int, _ i4: Int, _ i5: Int, _ i6: Int, _ i7: Int) -> (Int, Int, Int, Int, Int, Int, Int, Int) {
+    let t0a = 16305 * i7 + 1606 * i0
+    let t1a = 1606 * i7 - 16305 * i0
+    let t2a = 14449 * i5 + 7723 * i2
+    let t3a = 7723 * i5 - 14449 * i2
+    let t4a = 10394 * i3 + 12665 * i4
+    let t5a = 12665 * i3 - 10394 * i4
+    let t6a = 4756 * i1 + 15679 * i6
+    let t7a = 15679 * i1 - 4756 * i6
+    let t0 = (t0a + t4a + 8192) >> 14
+    let t1 = (t1a + t5a + 8192) >> 14
+    let t2 = (t2a + t6a + 8192) >> 14
+    let t3 = (t3a + t7a + 8192) >> 14
+    let t4 = (t0a - t4a + 8192) >> 14
+    let t5 = (t1a - t5a + 8192) >> 14
+    let t6 = (t2a - t6a + 8192) >> 14
+    let t7 = (t3a - t7a + 8192) >> 14
+    let u4 = 15137 * t4 + 6270 * t5
+    let u5 = 6270 * t4 - 15137 * t5
+    let u6 = 15137 * t7 - 6270 * t6
+    let u7 = 6270 * t7 + 15137 * t6
+    let v2 = t0 - t2
+    let v3 = t1 - t3
+    let v6 = (8192 + u4 - u6) >> 14
+    let v7 = (8192 + u5 - u7) >> 14
+    (t0 + t2, -((8192 + u4 + u6) >> 14), ((v6 + v7) * 11585 + 8192) >> 14, -(((v2 + v3) * 11585 + 8192) >> 14),
+     ((v2 - v3) * 11585 + 8192) >> 14, -(((v6 - v7) * 11585 + 8192) >> 14), (8192 + u5 + u7) >> 14, -(t1 + t3))
+}
+
+// The Walsh-Hadamard transform (lossless); inputs already shifted in the
+// first pass.
+fn vp9Iwht4(_ a: Int, _ b: Int, _ c: Int, _ d: Int) -> (Int, Int, Int, Int) {
+    var t0 = a
+    var t1 = d
+    var t2 = b
+    var t3 = c
+    t0 += t2
+    t3 -= t1
+    let t4 = (t0 - t3) >> 1
+    t1 = t4 - t1
+    t2 = t4 - t2
+    t0 -= t1
+    t3 += t2
+    (t0, t1, t2, t3)
+}
+
+// mode_conv of check_intra_mode: the mode used when edges are missing.
+fn vp9ConvMode(_ mode: Int, _ haveLeft: Bool, _ haveTop: Bool) -> Int {
+    if mode == 0 || mode == 3 || mode == 7 {
+        return if haveTop { mode } else { 13 }
+    }
+    if mode == 1 || mode == 8 {
+        return if haveLeft { mode } else { 14 }
+    }
+    if mode == 2 {
+        if haveLeft {
+            return if haveTop { 2 } else { 10 }
+        }
+        return if haveTop { 11 } else { 12 }
+    }
+    if mode == 9 {
+        if haveLeft {
+            return if haveTop { 9 } else { 1 }
+        }
+        return if haveTop { 0 } else { 14 }
+    }
+    mode
+}
+
+// Edges a mode needs: 1 left, 2 top, 4 top-left, 8 top-right, 16 left
+// read top-down (FFmpeg's invert_left).
+fn vp9EdgeFlags(_ mode: Int) -> Int {
+    if mode == 0 { return 2 }
+    if mode == 1 { return 1 }
+    if mode == 2 { return 3 }
+    if mode == 3 { return 10 }
+    if mode == 4 || mode == 5 || mode == 6 || mode == 9 { return 7 }
+    if mode == 7 { return 10 }
+    if mode == 8 { return 17 }
+    if mode == 10 { return 1 }
+    if mode == 11 { return 2 }
+    0
+}

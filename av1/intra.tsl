@@ -1,0 +1,631 @@
+// AV1 intra prediction for the reconstructor: the intra prediction
+// process of the AV1 specification 7.11.2 (edge preparation, Paeth,
+// recursive filter intra, directional prediction with the intra edge
+// filter, corner filter and edge upsampling, DC, smooth), palette
+// prediction (7.11.4) and chroma from luma (7.11.5). Each call runs one
+// opIntra or opPalette record of ParsedFrame.ops (av1/frame.tsl) on the
+// plane in `pl`; predictions are written straight into the plane.
+//
+// AboveRow and LeftCol live in the fields `ab` and `lc` with the spec's
+// index i at ab[ipO + i], so the -1 and -2 entries the corner and the
+// upsampling use need no special cases.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+let ipO = 16
+
+public struct Av1Intra {
+    pl: [Int] = []
+    luma: [Int] = []
+    ops: [Int] = []
+    palette: [Int] = []
+
+    ab: [Int] = []
+    lc: [Int] = []
+    edge: [Int] = []
+    cflL: [Int] = []
+    // Smooth weights: the weights of size n at sm[n ..< 2n].
+    sm: [Int] = []
+    modeAngle: [Int] = []
+    drDeriv: [Int] = []
+    filterTaps: [Int] = []
+    edgeKernel: [Int] = []
+    ready: Bool = false
+
+    fn setup() {
+        if ready {
+            return
+        }
+        ready = true
+        ab = ipZeros(320)
+        lc = ipZeros(320)
+        edge = ipZeros(320)
+        cflL = ipZeros(1024)
+        sm = ipZeros(4) + av1SmWeightsTx4x4 + av1SmWeightsTx8x8 + av1SmWeightsTx16x16 + av1SmWeightsTx32x32 + av1SmWeightsTx64x64
+        modeAngle = av1ModeToAngle
+        drDeriv = av1DrIntraDerivative
+        filterTaps = av1IntraFilterTaps
+        edgeKernel = av1IntraEdgeKernel
+    }
+
+    // The opIntra record at ops[at] (7.11.2), then predict chroma from
+    // luma (7.11.5) when the record says so.
+    fn predictIntra(_ at: Int, _ stride: Int, _ lumaStride: Int, _ maxX: Int, _ maxY: Int,
+                    _ subX: Int, _ subY: Int, _ bitDepth: Int, _ enableEdgeFilter: Bool) {
+        let plane = ops[at + 1]
+        let x = ops[at + 2]
+        let y = ops[at + 3]
+        let log2W = ops[at + 4]
+        let log2H = ops[at + 5]
+        let mode = ops[at + 6]
+        let angleDelta = ops[at + 7]
+        let haveLeft = ops[at + 8] != 0
+        let haveAbove = ops[at + 9] != 0
+        let haveAboveRight = ops[at + 10] != 0
+        let haveBelowLeft = ops[at + 11] != 0
+        let filterMode = ops[at + 12]
+        let filterType = ops[at + 13]
+        let w = 1 << log2W
+        let h = 1 << log2H
+        let maxV = (1 << bitDepth) - 1
+        let n = w + h
+        let at0 = y * stride + x
+
+        // AboveRow[ i ] for i = 0 .. w + h - 1.
+        if !haveAbove && haveLeft {
+            let v = pl[at0 - 1]
+            for i in 0..n {
+                ab[ipO + i] = v
+            }
+        } else if !haveAbove && !haveLeft {
+            let v = (1 << (bitDepth - 1)) - 1
+            for i in 0..n {
+                ab[ipO + i] = v
+            }
+        } else {
+            let aboveLimit = min(maxX, x + (if haveAboveRight { 2 * w } else { w }) - 1)
+            let rowAt = at0 - stride - x
+            for i in 0..n {
+                ab[ipO + i] = pl[rowAt + min(aboveLimit, x + i)]
+            }
+        }
+        // LeftCol[ i ].
+        if !haveLeft && haveAbove {
+            let v = pl[at0 - stride]
+            for i in 0..n {
+                lc[ipO + i] = v
+            }
+        } else if !haveLeft && !haveAbove {
+            let v = (1 << (bitDepth - 1)) + 1
+            for i in 0..n {
+                lc[ipO + i] = v
+            }
+        } else {
+            let leftLimit = min(maxY, y + (if haveBelowLeft { 2 * h } else { h }) - 1)
+            let colAt = x - 1
+            for i in 0..n {
+                lc[ipO + i] = pl[min(leftLimit, y + i) * stride + colAt]
+            }
+        }
+        // AboveRow[ -1 ] and LeftCol[ -1 ].
+        var corner = 1 << (bitDepth - 1)
+        if haveAbove && haveLeft {
+            corner = pl[at0 - stride - 1]
+        } else if haveAbove {
+            corner = pl[at0 - stride]
+        } else if haveLeft {
+            corner = pl[at0 - 1]
+        }
+        ab[ipO - 1] = corner
+        lc[ipO - 1] = corner
+
+        let directional = mode >= 1 && mode <= 8
+        if plane == 0 && filterMode >= 0 {
+            recursive(at0, stride, w, h, filterMode, maxV)
+        } else if directional {
+            directionalPred(at0, stride, x, y, haveLeft, haveAbove, mode, angleDelta, w, h, maxX, maxY,
+                            filterType, maxV, enableEdgeFilter)
+        } else if mode == 9 || mode == 10 || mode == 11 {
+            smooth(at0, stride, mode, w, h)
+        } else if mode == 0 {
+            dcPred(at0, stride, haveLeft, haveAbove, log2W, log2H, w, h, bitDepth)
+        } else {
+            paeth(at0, stride, w, h)
+        }
+        if ops[at + 15] != 0 {
+            cfl(x, y, stride, lumaStride, w, h, log2W + log2H, ops[at + 14], ops[at + 16], ops[at + 17], subX, subY, maxV)
+        }
+    }
+
+    // 7.11.2.2 (Paeth).
+    fn paeth(_ at0: Int, _ stride: Int, _ w: Int, _ h: Int) {
+        let tl = ab[ipO - 1]
+        for i in 0..h {
+            let left = lc[ipO + i]
+            let rowAt = at0 + i * stride
+            for j in 0..w {
+                let top = ab[ipO + j]
+                let base = top + left - tl
+                let pLeft = ipAbs(base - left)
+                let pTop = ipAbs(base - top)
+                let pTopLeft = ipAbs(base - tl)
+                if pLeft <= pTop && pLeft <= pTopLeft {
+                    pl[rowAt + j] = left
+                } else if pTop <= pTopLeft {
+                    pl[rowAt + j] = top
+                } else {
+                    pl[rowAt + j] = tl
+                }
+            }
+        }
+    }
+
+    // 7.11.2.3 recursive intra prediction (filter intra), written straight
+    // into the plane (later 4x2 cells read the earlier ones from there).
+    fn recursive(_ at0: Int, _ stride: Int, _ w: Int, _ h: Int, _ fmode: Int, _ maxV: Int) {
+        let w4 = w >> 2
+        let h2 = h >> 1
+        let tb = fmode * 56
+        var p0 = 0
+        var p1 = 0
+        var p2 = 0
+        var p3 = 0
+        var p4 = 0
+        var p5 = 0
+        var p6 = 0
+        for i2 in 0..h2 {
+            let r = i2 << 1
+            for j4 in 0..w4 {
+                let c = j4 << 2
+                if i2 == 0 {
+                    p0 = ab[ipO + c - 1]
+                    p1 = ab[ipO + c]
+                    p2 = ab[ipO + c + 1]
+                    p3 = ab[ipO + c + 2]
+                    p4 = ab[ipO + c + 3]
+                } else {
+                    let up = at0 + (r - 1) * stride + c
+                    if j4 == 0 {
+                        p0 = lc[ipO + r - 1]
+                    } else {
+                        p0 = pl[up - 1]
+                    }
+                    p1 = pl[up]
+                    p2 = pl[up + 1]
+                    p3 = pl[up + 2]
+                    p4 = pl[up + 3]
+                }
+                if j4 == 0 {
+                    p5 = lc[ipO + r]
+                    p6 = lc[ipO + r + 1]
+                } else {
+                    p5 = pl[at0 + r * stride + c - 1]
+                    p6 = pl[at0 + (r + 1) * stride + c - 1]
+                }
+                for i1 in 0..2 {
+                    let rowAt = at0 + (r + i1) * stride + c
+                    for j1 in 0..4 {
+                        let t = tb + ((i1 << 2) + j1) * 7
+                        let pr = filterTaps[t] * p0 + filterTaps[t + 1] * p1 + filterTaps[t + 2] * p2 +
+                            filterTaps[t + 3] * p3 + filterTaps[t + 4] * p4 + filterTaps[t + 5] * p5 +
+                            filterTaps[t + 6] * p6
+                        var v = 0
+                        if pr >= 0 {
+                            v = (pr + 8) >> 4
+                        } else {
+                            v = -((-pr + 8) >> 4)
+                        }
+                        if v < 0 {
+                            v = 0
+                        } else if v > maxV {
+                            v = maxV
+                        }
+                        pl[rowAt + j1] = v
+                    }
+                }
+            }
+        }
+    }
+
+    // 7.11.2.4 directional intra prediction.
+    fn directionalPred(_ at0: Int, _ stride: Int, _ x: Int, _ y: Int, _ haveLeft: Bool, _ haveAbove: Bool,
+                       _ mode: Int, _ angleDelta: Int, _ w: Int, _ h: Int, _ maxX: Int, _ maxY: Int,
+                       _ filterType: Int, _ maxV: Int, _ enableEdgeFilter: Bool) {
+        let pAngle = modeAngle[mode] + angleDelta * 3
+        var upA = 0
+        var upL = 0
+        if enableEdgeFilter {
+            if pAngle != 90 && pAngle != 180 {
+                if pAngle > 90 && pAngle < 180 && (w + h) >= 24 {
+                    let s = lc[ipO] * 5 + ab[ipO - 1] * 6 + ab[ipO] * 5
+                    let v = (s + 8) >> 4
+                    lc[ipO - 1] = v
+                    ab[ipO - 1] = v
+                }
+                if haveAbove {
+                    let strength = ipStrength(w, h, filterType, pAngle - 90)
+                    let numPx = min(w, maxX - x + 1) + (if pAngle < 90 { h } else { 0 }) + 1
+                    edgeFilter(numPx, strength, false)
+                }
+                if haveLeft {
+                    let strength = ipStrength(w, h, filterType, pAngle - 180)
+                    let numPx = min(h, maxY - y + 1) + (if pAngle > 180 { w } else { 0 }) + 1
+                    edgeFilter(numPx, strength, true)
+                }
+            }
+            upA = ipUseUpsample(w, h, filterType, pAngle - 90)
+            if upA == 1 {
+                upsample(w + (if pAngle < 90 { h } else { 0 }), false, maxV)
+            }
+            upL = ipUseUpsample(w, h, filterType, pAngle - 180)
+            if upL == 1 {
+                upsample(h + (if pAngle > 180 { w } else { 0 }), true, maxV)
+            }
+        }
+        if pAngle < 90 {
+            let dx = drDeriv[pAngle]
+            let maxBaseX = (w + h - 1) << upA
+            let last = ab[ipO + maxBaseX]
+            for i in 0..h {
+                let idx = (i + 1) * dx
+                let shift = ((idx << upA) >> 1) & 0x1F
+                let base0 = idx >> (6 - upA)
+                let rowAt = at0 + i * stride
+                for j in 0..w {
+                    let base = base0 + (j << upA)
+                    if base < maxBaseX {
+                        pl[rowAt + j] = (ab[ipO + base] * (32 - shift) + ab[ipO + base + 1] * shift + 16) >> 5
+                    } else {
+                        pl[rowAt + j] = last
+                    }
+                }
+            }
+        } else if pAngle > 90 && pAngle < 180 {
+            let dx = drDeriv[180 - pAngle]
+            let dy = drDeriv[pAngle - 90]
+            let minBase = -(1 << upA)
+            for i in 0..h {
+                let rowAt = at0 + i * stride
+                for j in 0..w {
+                    let idx = (j << 6) - (i + 1) * dx
+                    let base = idx >> (6 - upA)
+                    if base >= minBase {
+                        let shift = ((idx << upA) >> 1) & 0x1F
+                        pl[rowAt + j] = (ab[ipO + base] * (32 - shift) + ab[ipO + base + 1] * shift + 16) >> 5
+                    } else {
+                        let idx2 = (i << 6) - (j + 1) * dy
+                        let base2 = idx2 >> (6 - upL)
+                        let shift2 = ((idx2 << upL) >> 1) & 0x1F
+                        pl[rowAt + j] = (lc[ipO + base2] * (32 - shift2) + lc[ipO + base2 + 1] * shift2 + 16) >> 5
+                    }
+                }
+            }
+        } else if pAngle > 180 {
+            let dy = drDeriv[270 - pAngle]
+            for j in 0..w {
+                let idx = (j + 1) * dy
+                let base0 = idx >> (6 - upL)
+                let shift = ((idx << upL) >> 1) & 0x1F
+                for i in 0..h {
+                    let base = base0 + (i << upL)
+                    pl[at0 + i * stride + j] = (lc[ipO + base] * (32 - shift) + lc[ipO + base + 1] * shift + 16) >> 5
+                }
+            }
+        } else if pAngle == 90 {
+            for i in 0..h {
+                let rowAt = at0 + i * stride
+                for j in 0..w {
+                    pl[rowAt + j] = ab[ipO + j]
+                }
+            }
+        } else {
+            for i in 0..h {
+                let v = lc[ipO + i]
+                let rowAt = at0 + i * stride
+                for j in 0..w {
+                    pl[rowAt + j] = v
+                }
+            }
+        }
+    }
+
+    // 7.11.2.12 intra edge filter of AboveRow (left false) or LeftCol.
+    fn edgeFilter(_ sz: Int, _ strength: Int, _ left: Bool) {
+        if strength == 0 {
+            return
+        }
+        for i in 0..sz {
+            edge[i] = if left { lc[ipO + i - 1] } else { ab[ipO + i - 1] }
+        }
+        let kb = (strength - 1) * 5
+        let k0 = edgeKernel[kb]
+        let k1 = edgeKernel[kb + 1]
+        let k2 = edgeKernel[kb + 2]
+        let k3 = edgeKernel[kb + 3]
+        let k4 = edgeKernel[kb + 4]
+        let last = sz - 1
+        for i in 1..sz {
+            let a = edge[max(i - 2, 0)]
+            let b = edge[i - 1]
+            let c = edge[i]
+            let d = edge[min(i + 1, last)]
+            let e = edge[min(i + 2, last)]
+            let s = k0 * a + k1 * b + k2 * c + k3 * d + k4 * e
+            if left {
+                lc[ipO + i - 1] = (s + 8) >> 4
+            } else {
+                ab[ipO + i - 1] = (s + 8) >> 4
+            }
+        }
+    }
+
+    // 7.11.2.11 intra edge upsample of AboveRow (left false) or LeftCol.
+    fn upsample(_ numPx: Int, _ left: Bool, _ maxV: Int) {
+        // dup[ 0 ] = buf[ -1 ], dup[ i + 2 ] = buf[ i ], dup[ numPx + 2 ] = buf[ numPx - 1 ]
+        for i in -1..numPx {
+            edge[i + 2] = if left { lc[ipO + i] } else { ab[ipO + i] }
+        }
+        edge[0] = edge[1]
+        edge[numPx + 2] = edge[numPx + 1]
+        if left {
+            lc[ipO - 2] = edge[0]
+        } else {
+            ab[ipO - 2] = edge[0]
+        }
+        for i in 0..numPx {
+            var s = -edge[i] + 9 * edge[i + 1] + 9 * edge[i + 2] - edge[i + 3]
+            s = (s + 8) >> 4
+            if s < 0 {
+                s = 0
+            } else if s > maxV {
+                s = maxV
+            }
+            if left {
+                lc[ipO + 2 * i - 1] = s
+                lc[ipO + 2 * i] = edge[i + 2]
+            } else {
+                ab[ipO + 2 * i - 1] = s
+                ab[ipO + 2 * i] = edge[i + 2]
+            }
+        }
+    }
+
+    // 7.11.2.5 DC prediction.
+    fn dcPred(_ at0: Int, _ stride: Int, _ haveLeft: Bool, _ haveAbove: Bool, _ log2W: Int, _ log2H: Int,
+              _ w: Int, _ h: Int, _ bitDepth: Int) {
+        var avg = 1 << (bitDepth - 1)
+        if haveLeft && haveAbove {
+            var sum = 0
+            for k in 0..h {
+                sum += lc[ipO + k]
+            }
+            for k in 0..w {
+                sum += ab[ipO + k]
+            }
+            sum += (w + h) >> 1
+            avg = sum / (w + h)
+        } else if haveLeft {
+            var sum = 0
+            for k in 0..h {
+                sum += lc[ipO + k]
+            }
+            avg = min((sum + (h >> 1)) >> log2H, (1 << bitDepth) - 1)
+        } else if haveAbove {
+            var sum = 0
+            for k in 0..w {
+                sum += ab[ipO + k]
+            }
+            avg = min((sum + (w >> 1)) >> log2W, (1 << bitDepth) - 1)
+        }
+        for i in 0..h {
+            let rowAt = at0 + i * stride
+            for j in 0..w {
+                pl[rowAt + j] = avg
+            }
+        }
+    }
+
+    // 7.11.2.6 smooth, smooth vertical and smooth horizontal prediction.
+    fn smooth(_ at0: Int, _ stride: Int, _ mode: Int, _ w: Int, _ h: Int) {
+        let bottom = lc[ipO + h - 1]
+        let right = ab[ipO + w - 1]
+        if mode == 9 {
+            for i in 0..h {
+                let wy = sm[h + i]
+                let left = lc[ipO + i]
+                let rowAt = at0 + i * stride
+                let rowPart = (256 - wy) * bottom
+                for j in 0..w {
+                    let wx = sm[w + j]
+                    let s = wy * ab[ipO + j] + rowPart + wx * left + (256 - wx) * right
+                    pl[rowAt + j] = (s + 256) >> 9
+                }
+            }
+        } else if mode == 10 {
+            for i in 0..h {
+                let wy = sm[h + i]
+                let rowAt = at0 + i * stride
+                let rowPart = (256 - wy) * bottom
+                for j in 0..w {
+                    pl[rowAt + j] = (wy * ab[ipO + j] + rowPart + 128) >> 8
+                }
+            }
+        } else {
+            for i in 0..h {
+                let left = lc[ipO + i]
+                let rowAt = at0 + i * stride
+                for j in 0..w {
+                    let wx = sm[w + j]
+                    pl[rowAt + j] = (wx * left + (256 - wx) * right + 128) >> 8
+                }
+            }
+        }
+    }
+
+    // 7.11.5 predict chroma from luma, on top of the DC prediction in pl.
+    fn cfl(_ startX: Int, _ startY: Int, _ stride: Int, _ lumaStride: Int, _ w: Int, _ h: Int, _ log2WH: Int,
+           _ alpha: Int, _ maxLumaW: Int, _ maxLumaH: Int, _ subX: Int, _ subY: Int, _ maxV: Int) {
+        var lumaAvg = 0
+        let sh = 3 - subX - subY
+        let limY = maxLumaH - (1 << subY)
+        let limX = maxLumaW - (1 << subX)
+        var k = 0
+        for i in 0..h {
+            let lumaY = min((startY + i) << subY, limY)
+            let r0 = lumaY * lumaStride
+            let r1 = r0 + lumaStride
+            for j in 0..w {
+                let lumaX = min((startX + j) << subX, limX)
+                var t = luma[r0 + lumaX]
+                if subX == 1 {
+                    t += luma[r0 + lumaX + 1]
+                }
+                if subY == 1 {
+                    t += luma[r1 + lumaX]
+                    if subX == 1 {
+                        t += luma[r1 + lumaX + 1]
+                    }
+                }
+                let v = t << sh
+                cflL[k] = v
+                lumaAvg += v
+                k += 1
+            }
+        }
+        lumaAvg = (lumaAvg + (1 << (log2WH - 1))) >> log2WH
+        k = 0
+        for i in 0..h {
+            let rowAt = (startY + i) * stride + startX
+            for j in 0..w {
+                let d = alpha * (cflL[k] - lumaAvg)
+                var scaled = 0
+                if d >= 0 {
+                    scaled = (d + 32) >> 6
+                } else {
+                    scaled = -((-d + 32) >> 6)
+                }
+                var v = pl[rowAt + j] + scaled
+                if v < 0 {
+                    v = 0
+                } else if v > maxV {
+                    v = maxV
+                }
+                pl[rowAt + j] = v
+                k += 1
+            }
+        }
+    }
+
+    // The opPalette record at ops[at] (7.11.4).
+    fn predictPalette(_ at: Int, _ stride: Int) {
+        let x = ops[at + 2]
+        let y = ops[at + 3]
+        let w = 1 << ops[at + 4]
+        let h = 1 << ops[at + 5]
+        let off = ops[at + 6]
+        let bx = ops[at + 7] * 4
+        let by = ops[at + 8] * 4
+        let n = palette[off]
+        let mapStride = palette[off + 1]
+        let colors = off + 2
+        let map = colors + n
+        for i in 0..h {
+            let rowAt = (y + i) * stride + x
+            let mapAt = map + (by + i) * mapStride + bx
+            for j in 0..w {
+                pl[rowAt + j] = palette[colors + palette[mapAt + j]]
+            }
+        }
+    }
+}
+
+// 7.11.2.9 intra edge filter strength selection.
+fn ipStrength(_ w: Int, _ h: Int, _ filterType: Int, _ delta: Int) -> Int {
+    let d = ipAbs(delta)
+    let blkWh = w + h
+    var strength = 0
+    if filterType == 0 {
+        if blkWh <= 8 {
+            if d >= 56 {
+                strength = 1
+            }
+        } else if blkWh <= 12 {
+            if d >= 40 {
+                strength = 1
+            }
+        } else if blkWh <= 16 {
+            if d >= 40 {
+                strength = 1
+            }
+        } else if blkWh <= 24 {
+            if d >= 8 {
+                strength = 1
+            }
+            if d >= 16 {
+                strength = 2
+            }
+            if d >= 32 {
+                strength = 3
+            }
+        } else if blkWh <= 32 {
+            strength = 1
+            if d >= 4 {
+                strength = 2
+            }
+            if d >= 32 {
+                strength = 3
+            }
+        } else {
+            strength = 3
+        }
+    } else {
+        if blkWh <= 8 {
+            if d >= 40 {
+                strength = 1
+            }
+            if d >= 64 {
+                strength = 2
+            }
+        } else if blkWh <= 16 {
+            if d >= 20 {
+                strength = 1
+            }
+            if d >= 48 {
+                strength = 2
+            }
+        } else if blkWh <= 24 {
+            if d >= 4 {
+                strength = 3
+            }
+        } else {
+            strength = 3
+        }
+    }
+    strength
+}
+
+// 7.11.2.10 intra edge upsample selection.
+fn ipUseUpsample(_ w: Int, _ h: Int, _ filterType: Int, _ delta: Int) -> Int {
+    let d = ipAbs(delta)
+    let blkWh = w + h
+    if d <= 0 || d >= 40 {
+        return 0
+    }
+    if filterType == 0 {
+        return if blkWh <= 16 { 1 } else { 0 }
+    }
+    if blkWh <= 8 { 1 } else { 0 }
+}
+
+fn ipAbs(_ v: Int) -> Int {
+    if v < 0 { -v } else { v }
+}
+
+fn ipZeros(_ n: Int) -> [Int] {
+    var out: [Int] = []
+    for _ in 0..n {
+        out.append(0)
+    }
+    out
+}

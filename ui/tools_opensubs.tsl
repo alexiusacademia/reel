@@ -1,0 +1,334 @@
+// The OpenSubtitles window: a search form (title, season, episode,
+// languages, match by the file's hash), the results in a table (title,
+// release, language, downloads, a badge for subtitles made for this very
+// file, and flags for hearing-impaired, forced, AI- and machine-
+// translated), a Download button, and a login sheet that the app opens
+// when a download needs an account. It sends nothing itself: searching,
+// logging in and downloading are the app's callbacks (subs/opensubtitles.tsl
+// has the calls), and the answers come back as values.
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+import "../subs"
+
+// What the search form holds, as typed.
+public struct SubtitleSearchForm {
+    title: String = ""
+    season: String = ""
+    episode: String = ""
+    // Codes or names, separated by commas or spaces: "en, pt-br", "French".
+    languages: String = ""
+    // Look for subtitles made for this exact file (its OpenSubtitles hash).
+    useHash: Bool = true
+}
+
+// A form filled in from a video's file name ("The.Show.S02E05.mkv" →
+// "The Show", 2, 5) and the preferred languages (codes).
+public fn subtitleSearchForm(videoPath: String, languages: [String] = []) -> SubtitleSearchForm {
+    let (title, season, episode) = subs.osGuessTitle(videoPath.fileName)
+    SubtitleSearchForm(title: if title == title.lowercase() { title.capitalized() } else { title }, season: if season > 0 { "{season}" } else { "" }, episode: if episode > 0 { "{episode}" } else { "" }, languages: languages.joined(separator: ", "))
+}
+
+// The words of the languages field.
+fn toolsLangWords(_ text: String) -> [String] {
+    text.replace(",", with: " ").replace(";", with: " ").words()
+}
+
+// The ISO 639-1 codes of the languages field (regions kept: "pt-br"),
+// in order, without repeats; words that aren't languages are left out.
+public fn subtitleLanguageCodes(_ text: String) -> [String] {
+    var out: [String] = []
+    for w in toolsLangWords(text) {
+        let l = w.lowercase().replace("_", with: "-")
+        let base = subs.languageCode(l)
+        if base.isEmpty {
+            continue
+        }
+        // Keep a region the user typed with a code ("pt-br", "zh-tw").
+        let code = if l.contains("-") && l.hasPrefix(base + "-") { l } else { base }
+        if !out.contains(code) {
+            out.append(code)
+        }
+    }
+    out
+}
+
+// The words of the languages field that aren't languages.
+public fn subtitleLanguageProblems(_ text: String) -> [String] {
+    var out: [String] = []
+    for w in toolsLangWords(text) {
+        if subs.languageCode(w).isEmpty {
+            out.append(w)
+        }
+    }
+    out
+}
+
+// The API query for a form; `movieHash` is the file's
+// (subs.movieHash), used when the form asks for it.
+public fn subtitleQuery(_ form: SubtitleSearchForm, movieHash: String = "") -> subs.OsQuery {
+    var q = subs.OsQuery(query: form.title.trim(), languages: subtitleLanguageCodes(form.languages))
+    if form.useHash {
+        q.movieHash = movieHash
+    }
+    let season = Int(form.season.trim()) ?? 0
+    let episode = Int(form.episode.trim()) ?? 0
+    q.season = max(0, season)
+    q.episode = max(0, episode)
+    if q.season > 0 || q.episode > 0 {
+        q.type = "episode"
+    }
+    q
+}
+
+// Why the form can't be searched yet, or "".
+public fn subtitleFormProblem(_ form: SubtitleSearchForm, hasHash: Bool) -> String {
+    if form.title.trim().isEmpty && !(form.useHash && hasHash) {
+        return "Type a title to search for."
+    }
+    if !form.season.trim().isEmpty && Int(form.season.trim()) == nil {
+        return "The season should be a number."
+    }
+    if !form.episode.trim().isEmpty && Int(form.episode.trim()) == nil {
+        return "The episode should be a number."
+    }
+    let bad = subtitleLanguageProblems(form.languages)
+    if !bad.isEmpty {
+        return "Not a language: {bad.joined(separator: ", ")}"
+    }
+    ""
+}
+
+// The result's title: "Movie (2019)", "Show S02E05".
+public fn subtitleTitleText(_ s: subs.OsSubtitle) -> String {
+    var t = if s.title.isEmpty { "Untitled" } else { s.title }
+    if s.season > 0 || s.episode > 0 {
+        let se = "{s.season}".padStart(2, with: "0")
+        let ep = "{s.episode}".padStart(2, with: "0")
+        t += " S{se}E{ep}"
+    } else if s.year > 0 {
+        t += " ({s.year})"
+    }
+    t
+}
+
+// The release name, or the first file's name.
+public fn subtitleReleaseText(_ s: subs.OsSubtitle) -> String {
+    if !s.release.isEmpty {
+        return s.release
+    }
+    if !s.files.isEmpty {
+        return s.files[0].fileName
+    }
+    ""
+}
+
+// The flags shown as badges, in order.
+public fn subtitleFlags(_ s: subs.OsSubtitle) -> [String] {
+    var out: [String] = []
+    if s.hearingImpaired {
+        out.append("HI")
+    }
+    if s.foreignPartsOnly {
+        out.append("Forced")
+    }
+    if s.aiTranslated {
+        out.append("AI")
+    }
+    if s.machineTranslated {
+        out.append("MT")
+    }
+    if s.files.count > 1 {
+        out.append("{s.files.count} CDs")
+    }
+    out
+}
+
+// The tooltip of a flag.
+fn toolsFlagTip(_ f: String) -> String {
+    match f {
+        "HI" -> "For the hearing impaired (sounds described)"
+        "Forced" -> "Foreign parts only (forced subtitles)"
+        "AI" -> "Translated by AI"
+        "MT" -> "Machine translated"
+        _ -> "The subtitles come in several files"
+    }
+}
+
+// "1,234,567".
+public fn formatCount(_ n: Int) -> String {
+    let digits = "{max(0, n)}"
+    var out = ""
+    for (i, c) in digits.characters.enumerated() {
+        if i > 0 && (digits.count - i) % 3 == 0 {
+            out += ","
+        }
+        out += c
+    }
+    out
+}
+
+// The account line: who is logged in and the downloads left.
+public fn subtitleQuotaText(_ user: subs.OsUser, loggedIn: Bool) -> String {
+    if !loggedIn {
+        return "Not logged in: searching works without an account, downloading needs one."
+    }
+    var t = if user.vip { "Logged in (VIP)" } else if user.level.isEmpty { "Logged in" } else { "Logged in ({user.level})" }
+    if user.remainingDownloads >= 0 {
+        if user.allowedDownloads > 0 {
+            t += " · {user.remainingDownloads} of {user.allowedDownloads} downloads left today"
+        } else {
+            t += " · {user.remainingDownloads} downloads left today"
+        }
+    }
+    t
+}
+
+// `form`: the search form (the app builds the query with subtitleQuery);
+// `results`: the subtitles found (rank them with subs.osRank first);
+// `hasHash`: the file's hash is known; `busy`: a search or download is
+// under way (buttons wait); `message`/`error`: what happened, shown under
+// the table; `user`/`loggedIn`: the account; `loginNeeded`: shows the
+// login sheet (the app sets it when a download answers 401, and clears it
+// when a login worked); `loginError`: why the last login failed.
+// Callbacks: `onSearch()` search with the form; `onDownload(sub)` download
+// a result; `onLogin(username, password)` log in; `onLogout()`.
+public view SubtitleSearchView(form: bind SubtitleSearchForm, results: [subs.OsSubtitle], hasHash: Bool = true, busy: Bool = false, message: String = "", error: String = "", user: subs.OsUser = subs.OsUser(), loggedIn: Bool = false, loginNeeded: bind Bool, loginError: String = "", onSearch: fn(), onDownload: fn(subs.OsSubtitle), onLogin: fn(String, String), onLogout: fn()) {
+    state picked: [Int] = []
+
+    let problem = subtitleFormProblem(form, hasHash: hasHash)
+    let chosen = chosenRow()
+
+    fn chosenRow() -> Int {
+        if picked.count == 1 && picked[0] < results.count { picked[0] } else { -1 }
+    }
+
+    fn search() {
+        if subtitleFormProblem(form, hasHash: hasHash).isEmpty && !busy {
+            picked = []
+            onSearch()
+        }
+    }
+
+    fn downloadChosen() {
+        let chosen = chosenRow()
+        if chosen >= 0 && !busy {
+            onDownload(results[chosen])
+        }
+    }
+
+    VStack(spacing: 10, alignment: .leading) {
+        Grid(spacing: 8) {
+            GridRow {
+                Text("Title").gridColumnAlignment(.trailing)
+                TextField("Film or show", text: form.title).onSubmit { search() }
+                Text("Season")
+                TextField("", text: form.season).frame(width: 44).onSubmit { search() }.accessibilityLabel("Season")
+                Text("Episode")
+                TextField("", text: form.episode).frame(width: 44).onSubmit { search() }.accessibilityLabel("Episode")
+            }
+            GridRow {
+                Text("Languages")
+                TextField("en, fr, pt-br", text: form.languages).onSubmit { search() }.accessibilityLabel("Languages")
+                Toggle("Made for this file", isOn: form.useHash)
+                    .gridCellColumns(4)
+                    .disabled(!hasHash)
+                    .tooltip("Look for subtitles made for exactly this file (by its OpenSubtitles hash)")
+            }
+        }
+        HStack {
+            Text(problem).font(size: 12).color(.secondary)
+            Spacer()
+            if busy {
+                Text("Working…").font(size: 12).color(.secondary)
+            }
+            Button("Search") { search() }.disabled(!problem.isEmpty || busy)
+        }
+        Table(rows: results.count, rowHeight: 26, selection: picked, multiple: false, onOpen: { i in
+            picked = [i]
+            if !busy {
+                onDownload(results[i])
+            }
+        }) {
+            TableColumn("Title", width: 170) { i in
+                HStack(spacing: 4) {
+                    if results[i].hashMatch {
+                        ToolsBadge(text: "Matches file", color: .green).tooltip("Made for exactly this file")
+                    }
+                    Text(subtitleTitleText(results[i])).lineLimit(1)
+                }
+            }
+            TableColumn("Release") { i in
+                Text(subtitleReleaseText(results[i])).lineLimit(1).color(.secondary)
+            }
+            TableColumn("Language", width: 110) { i in
+                Text(subs.languageName(results[i].language)).lineLimit(1)
+            }
+            TableColumn("Downloads", width: 80, alignment: .trailing) { i in
+                Text(formatCount(results[i].downloads))
+            }
+            TableColumn("Flags", width: 120) { i in
+                HStack(spacing: 3) {
+                    for f in subtitleFlags(results[i]) {
+                        ToolsBadge(text: f, color: if f == "AI" || f == "MT" { .gray } else { .blue }).tooltip(toolsFlagTip(f))
+                    }
+                }
+            }
+        }
+        .frame(minHeight: 160, maxHeight: .infinity)
+        if results.isEmpty && !busy {
+            Text(if message.isEmpty { "Search to see subtitles here." } else { message }).font(size: 12).color(.secondary)
+        } else if !message.isEmpty {
+            Text(message).font(size: 12).color(.secondary)
+        }
+        if !error.isEmpty {
+            Text(error).font(size: 12).color(.red).selectable()
+        }
+        HStack {
+            Text(subtitleQuotaText(user, loggedIn: loggedIn)).font(size: 11).color(.secondary).lineLimit(2)
+            Spacer()
+            if loggedIn {
+                Button("Log Out") { onLogout() }.disabled(busy)
+            } else {
+                Button("Log In…") { loginNeeded = true }
+            }
+            Button("Download") { downloadChosen() }.disabled(chosen < 0 || busy)
+        }
+    }
+    .padding(14)
+    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    .sheet(isPresented: loginNeeded) {
+        ToolsLoginSheet(error: loginError, busy: busy, onLogin: onLogin)
+    }
+}
+
+// The login card: user name, password (hidden), Cancel / Log In.
+view ToolsLoginSheet(error: String, busy: Bool, onLogin: fn(String, String)) {
+    state username = ""
+    state password = ""
+
+    fn go() {
+        if !username.trim().isEmpty && !password.isEmpty && !busy {
+            onLogin(username.trim(), password)
+        }
+    }
+
+    VStack(spacing: 10, alignment: .leading) {
+        Text("Log in to OpenSubtitles").font(size: 15, weight: .semibold)
+        Text("Downloading subtitles needs a free opensubtitles.com account.").font(size: 12).color(.secondary)
+        TextField("User name", text: username).autofocus().onSubmit { go() }
+        TextField("Password", text: password, secure: true).onSubmit { go() }
+        if !error.isEmpty {
+            Text(error).font(size: 12).color(.red)
+        }
+        HStack {
+            Link("Create an account", url: "https://www.opensubtitles.com/en/users/sign_up").font(size: 12)
+            Spacer()
+            Button("Cancel") { dismiss() }
+            Button("Log In") { go() }.disabled(username.trim().isEmpty || password.isEmpty || busy)
+        }
+    }
+    .padding(4)
+    .frame(width: 320)
+}

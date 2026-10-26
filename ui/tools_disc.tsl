@@ -1,0 +1,217 @@
+// The titles of a DVD or Blu-ray (disc/types.tsl): a table with each
+// title's length, chapters, angles and audio/subtitle languages, the main
+// feature marked and chosen at first, short titles (menus, logos) hidden
+// unless asked for; below it the chosen title's streams, an angle picker
+// for multi-angle titles, and Play.
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+import "../core"
+import "../disc"
+import "../subs"
+
+// A stream's language as a short code: "EN", "FR"; "?" when unknown.
+fn toolsStreamLang(_ s: disc.Stream) -> String {
+    if !s.languageCode.isEmpty {
+        return s.languageCode.uppercase()
+    }
+    if !s.language.isEmpty {
+        let c = subs.languageCode(s.language)
+        return if c.isEmpty { s.language.uppercase() } else { c.uppercase() }
+    }
+    "?"
+}
+
+// The languages of a title's streams of one kind, in disc order without
+// repeats: "EN, FR, DE"; "" when it has none.
+public fn discTitleLanguages(_ t: disc.Title, kind: core.TrackKind) -> String {
+    var seen: [String] = []
+    for s in t.streams {
+        if s.kind == kind {
+            let l = toolsStreamLang(s)
+            if !seen.contains(l) {
+                seen.append(l)
+            }
+        }
+    }
+    seen.joined(separator: ", ")
+}
+
+// The titles to list (indexes of disc.titles): all, or without the ones
+// shorter than `shortSeconds` (the main feature always stays).
+public fn discShownTitles(_ d: disc.Disc, hideShort: Bool, shortSeconds: Float = 60.0) -> [Int] {
+    var out: [Int] = []
+    for (i, t) in d.titles.enumerated() {
+        if !hideShort || t.duration >= shortSeconds || i == d.main || t.mainFeature {
+            out.append(i)
+        }
+    }
+    out
+}
+
+// "DVD-Video · MY_FILM · 12 titles".
+public fn discSummary(_ d: disc.Disc) -> String {
+    let kind = if d.kind == "bluray" { "Blu-ray" } else { "DVD-Video" }
+    var parts = [kind]
+    if !d.volumeName.isEmpty {
+        parts.append(d.volumeName)
+    }
+    parts.append(if d.titles.count == 1 { "1 title" } else { "{d.titles.count} titles" })
+    parts.joined(separator: " · ")
+}
+
+// A line for one stream of the details: "AC-3 5.1 · English · Director's comments".
+public fn discStreamText(_ s: disc.Stream) -> String {
+    var parts = [codecTitle(s.codec)]
+    if s.kind == .video && s.width > 0 {
+        parts.append("{s.width}×{s.height}" + (if s.aspect.isEmpty { "" } else { " {s.aspect}" }))
+    }
+    if s.kind == .audio && s.channels > 0 {
+        parts.append(channelsText(s.channels))
+    }
+    let lang = if !s.languageCode.isEmpty { subs.languageName(s.languageCode) } else { subs.languageName(s.language) }
+    if !lang.isEmpty {
+        parts.append(lang)
+    }
+    if !s.note.isEmpty {
+        parts.append(s.note)
+    }
+    if s.forced {
+        parts.append("forced")
+    }
+    parts.joined(separator: " · ")
+}
+
+// `disc`: the opened disc; `onPlay(title, angle)`: play disc.titles[title]
+// at an angle (1-based); `onClose()`: the Close button.
+public view DiscTitlesView(disc: disc.Disc, onPlay: fn(Int, Int), onClose: fn()) {
+    state hideShort = true
+    state picked: [Int] = []
+    state angle = 1
+    state started = false
+
+    let shown = discShownTitles(disc, hideShort: hideShort)
+    let row = if picked.count == 1 && picked[0] < shown.count { picked[0] } else { -1 }
+    let chosen = if row >= 0 { shown[row] } else { -1 }
+
+    fn chosenTitle() -> Int {
+        let list = discShownTitles(disc, hideShort: hideShort)
+        if picked.count == 1 && picked[0] < list.count { list[picked[0]] } else { -1 }
+    }
+
+    fn play() {
+        let i = chosenTitle()
+        if i >= 0 {
+            onPlay(i, max(1, min(angle, disc.titles[i].angles)))
+        }
+    }
+
+    // Shows or hides short titles, keeping the same title chosen.
+    fn toggleShort() {
+        let keep = chosenTitle()
+        hideShort = !hideShort
+        let list = discShownTitles(disc, hideShort: hideShort)
+        if let r = list.index(of: keep) {
+            picked = [r]
+        } else {
+            picked = []
+        }
+    }
+
+    // The main feature is chosen when the view opens.
+    fn start() {
+        let list = discShownTitles(disc, hideShort: hideShort)
+        if let r = list.index(of: disc.main) {
+            picked = [r]
+        } else if !list.isEmpty {
+            picked = [0]
+        }
+    }
+
+    VStack(spacing: 10, alignment: .leading) {
+        HStack {
+            Text(discSummary(disc)).font(size: 15, weight: .semibold)
+            Spacer()
+            Button(if hideShort { "Show All Titles" } else { "Hide Short Titles" }) { toggleShort() }
+                .tooltip("Titles under a minute are usually menus and logos")
+        }
+        Table(rows: shown.count, rowHeight: 26, selection: picked, multiple: false, onOpen: { r in
+            picked = [r]
+            play()
+        }) {
+            TableColumn("Title", width: 120) { r in
+                HStack(spacing: 5) {
+                    Text("{disc.titles[shown[r]].number}")
+                    if shown[r] == disc.main || disc.titles[shown[r]].mainFeature {
+                        ToolsBadge(text: "Main", color: .green).tooltip("The disc's main feature")
+                    }
+                }
+            }
+            TableColumn("Length", width: 70, alignment: .trailing) { r in
+                Text(formatClock(disc.titles[shown[r]].duration))
+            }
+            TableColumn("Chapters", width: 70, alignment: .trailing) { r in
+                Text("{disc.titles[shown[r]].chapters.count}")
+            }
+            TableColumn("Angles", width: 56, alignment: .trailing) { r in
+                Text("{disc.titles[shown[r]].angles}")
+            }
+            TableColumn("Audio") { r in
+                Text(discTitleLanguages(disc.titles[shown[r]], kind: .audio)).lineLimit(1).color(.secondary)
+            }
+            TableColumn("Subtitles") { r in
+                Text(discTitleLanguages(disc.titles[shown[r]], kind: .subtitle)).lineLimit(1).color(.secondary)
+            }
+        }
+        .frame(minHeight: 140, maxHeight: .infinity)
+        if chosen >= 0 {
+            ToolsDiscDetails(title: disc.titles[chosen], angle: angle)
+        } else {
+            Text(if disc.titles.isEmpty { "This disc has no titles Reel can play." } else { "Choose a title." }).font(size: 12).color(.secondary)
+        }
+        if !disc.warnings.isEmpty {
+            Text(disc.warnings.prefix(3).joined(separator: "\n")).font(size: 11).color(.orange).lineLimit(3)
+        }
+        HStack {
+            if chosen >= 0 && disc.titles[chosen].angles > 1 {
+                Text("Angle")
+                Picker(selection: angle) {
+                    for a in 1..(disc.titles[chosen].angles + 1) {
+                        Text("{a}").tag(a)
+                    }
+                }
+            }
+            Spacer()
+            Button("Close") { onClose() }
+            Button("Play") { play() }.disabled(chosen < 0)
+        }
+    }
+    .padding(14)
+    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    .onAppear { start() }
+}
+
+view ToolsDiscDetails(title: disc.Title, angle: Int) {
+    VStack(spacing: 3, alignment: .leading) {
+        Text("Title {title.number}" + (if title.name.isEmpty { "" } else { ": {title.name}" }) + " · {formatClock(title.duration)} · " + (if title.chapters.count == 1 { "1 chapter" } else { "{title.chapters.count} chapters" }) + (if title.angles > 1 { " · angle {min(angle, title.angles)} of {title.angles}" } else { "" }))
+            .font(size: 12, weight: .semibold)
+        for s in title.streams {
+            HStack(spacing: 6) {
+                Text(match s.kind {
+                    .video -> "Video"
+                    .audio -> "Audio"
+                    .subtitle -> "Subtitles"
+                    .other -> "Other"
+                })
+                .font(size: 11)
+                .color(.secondary)
+                .frame(width: 60, alignment: .leading)
+                Text(discStreamText(s)).font(size: 11).lineLimit(1)
+            }
+        }
+    }
+    .padding(8)
+    .frame(maxWidth: .infinity, alignment: .topLeading)
+    .background(.sidebar, radius: 6)
+}

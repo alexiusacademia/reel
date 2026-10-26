@@ -1,0 +1,133 @@
+// SubRip (.srt) files: numbered blocks of a timing line
+// "00:01:02,345 --> 00:01:04,000" and text lines, separated by blank
+// lines. There is no formal spec; this follows what VLC and ffmpeg accept:
+// '.' or ',' before the milliseconds, hours left out, coordinates after the
+// timing ("X1:… Y1:…", ignored), missing or extra blank lines, missing
+// numbers, and the inline tags <b> <i> <u> <s> <font color= face= size=>
+// plus ASS override blocks like {\an8} (see inline.tsl).
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+// The start and end of an SRT timing line, or nil.
+fn srtTiming(_ line: String) -> (Float, Float)? {
+    let arrow = line.find("-->") ?? -1
+    if arrow < 0 {
+        return nil
+    }
+    let left = line.substring(from: 0, to: arrow).trim()
+    let rest = line.substring(from: arrow + 3, to: line.count).trim()
+    let words = rest.words()
+    if words.isEmpty {
+        return nil
+    }
+    let s = subsClock(left)
+    let e = subsClock(words[0])
+    if s < 0.0 || e < 0.0 {
+        return nil
+    }
+    (s, e)
+}
+
+fn srtIsIndex(_ line: String) -> Bool {
+    let t = line.trim()
+    if t.isEmpty {
+        return false
+    }
+    for c in t.characters {
+        if !subsIsDigit(c) {
+            return false
+        }
+    }
+    true
+}
+
+// A cue as SRT/text cues start: the default style.
+fn subsPlainBuilder(start: Float, end: Float) -> SubsBuilder {
+    let cue = Cue(start: start, end: end)
+    let base = Span(text: "")
+    SubsBuilder(cue: cue, cur: base, base: base)
+}
+
+// One SRT cue's text (also Matroska S_TEXT/UTF8 blocks).
+fn srtCue(_ text: String, start: Float, end: Float) -> Cue {
+    var b = subsPlainBuilder(start: start, end: end)
+    b = subsHtmlText(b, text, vtt: false)
+    b.finish()
+}
+
+fn subsSplitLines(_ text: String) -> [String] {
+    text.replace("\r\n", with: "\n").replace("\r", with: "\n").split("\n")
+}
+
+fn parseSrt(_ text: String) -> SubTrack {
+    var track = SubTrack(format: "srt")
+    let lines = subsSplitLines(text)
+    let n = lines.count
+    var i = 0
+    var id = 1
+    while i < n {
+        let timing = srtTiming(lines[i])
+        if timing == nil {
+            let t = lines[i].trim()
+            if !t.isEmpty && !srtIsIndex(t) {
+                track.warnings.append("line {i + 1} is outside a cue: {t}")
+            }
+            i += 1
+            continue
+        }
+        let (start, end) = timing ?? (0.0, 0.0)
+        var body: [String] = []
+        var j = i + 1
+        while j < n {
+            let line = lines[j]
+            if srtTiming(line) != nil {
+                break
+            }
+            if line.trim().isEmpty {
+                // The cue ends at a blank line followed by the next cue
+                // (or the end); a blank line inside the text is kept.
+                var k = j
+                while k < n && lines[k].trim().isEmpty {
+                    k += 1
+                }
+                if k >= n || srtTiming(lines[k]) != nil || (k + 1 < n && srtIsIndex(lines[k]) && srtTiming(lines[k + 1]) != nil) {
+                    j = k
+                    break
+                }
+                body.append("")
+                j += 1
+                continue
+            }
+            if srtIsIndex(line) && j + 1 < n && srtTiming(lines[j + 1]) != nil {
+                break
+            }
+            body.append(line)
+            j += 1
+        }
+        while !body.isEmpty && body[body.count - 1].trim().isEmpty {
+            body.removeLast()
+        }
+        var cue = srtCue(body.joined(separator: "\n"), start: start, end: end)
+        cue.id = id
+        id += 1
+        // An end before the start (a typo in the file) runs to the next
+        // cue, as ffmpeg reads it; zero-length cues are never shown.
+        if end != start && !cue.spans.isEmpty {
+            track.cues.append(cue)
+        }
+        i = j
+    }
+    for k in 0..track.cues.count {
+        if track.cues[k].end < track.cues[k].start {
+            let s = track.cues[k].start
+            var e = s + 2.0
+            if k + 1 < track.cues.count && track.cues[k + 1].start > s {
+                e = track.cues[k + 1].start
+            }
+            track.cues[k].end = e
+        }
+    }
+    track.cues = track.cues.sorted(by: { a, b in a.start < b.start })
+    track
+}

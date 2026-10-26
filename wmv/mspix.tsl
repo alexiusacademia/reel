@@ -1,0 +1,806 @@
+// The pictures of the MS-MPEG4 / WMV1 / WMV2 decoder and the work done on
+// them per macroblock, as ffmpeg 8.1 does it (so pictures match its output
+// bit for bit):
+//   - motion compensation with half-sample vectors (H.263 style, as
+//     mpegvideo_motion.c mpeg_motion_internal: chroma vectors are the luma
+//     ones halved, with a half-sample position whenever the luma vector has
+//     any fraction) with or without rounding (no_rounding), and WMV2's
+//     "mspel" quarter-sample-ish luma filter (wmv2dec.c ff_mspel_motion);
+//     reference samples outside the macroblock-aligned picture take the
+//     nearest edge sample (ffmpeg's emulated_edge_mc);
+//   - the inverse DCTs: ffmpeg's ARM64 (NEON) simple IDCT for MS-MPEG4 and
+//     WMV1 (the IDCT ffmpeg runs on Apple silicon), WMV2's own IDCT
+//     (wmv2dsp.c), and WMV2's 8×4 / 4×8 "ABT" transforms (simple_idct.c
+//     ff_simple_idct84_add / ff_simple_idct48_add, C versions);
+//   - the H.263 deblocking loop filter WMV2 can turn on (h263.c
+//     ff_h263_loop_filter, h263dsp.c).
+//
+// Planes are macroblock aligned (mbw·16 × mbh·16 luma); a picture shows the
+// visible part. Coefficient blocks are 64 Ints in raster order; `blk`
+// holds the 6 blocks of a macroblock and, after them, the 6 second halves
+// of WMV2 ABT blocks.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../core"
+
+struct MsPix {
+    curY: [Int] = []
+    curU: [Int] = []
+    curV: [Int] = []
+    refY: [Int] = []
+    refU: [Int] = []
+    refV: [Int] = []
+    ys: Int = 0
+    cs: Int = 0
+    // Macroblock-aligned size (ffmpeg's h_edge_pos, v_edge_pos).
+    ew: Int = 0
+    eh: Int = 0
+    // Visible size (WMV2's mspel clips vectors to it).
+    width: Int = 0
+    height: Int = 0
+    blk: [Int] = []
+    // Reference area of a prediction and the prediction itself.
+    fb: [Int] = []
+    pred: [Int] = []
+    tmp: [Int] = []
+    tmp2: [Int] = []
+
+    fn setup(width: Int, height: Int, mbw: Int, mbh: Int) {
+        self.width = width
+        self.height = height
+        ys = mbw * 16
+        cs = mbw * 8
+        ew = mbw * 16
+        eh = mbh * 16
+        // ffmpeg's dummy reference (no keyframe yet) is grey.
+        refY = core.filled(ys * eh, 128)
+        refU = core.filled(cs * (eh / 2), 128)
+        refV = refU
+        curY = refY
+        curU = refU
+        curV = refU
+        blk = core.zeros(12 * 64)
+        fb = core.zeros(20 * 20)
+        pred = core.zeros(16 * 16)
+        tmp = core.zeros(16 * 16)
+        tmp2 = core.zeros(16 * 16)
+    }
+
+    // The new picture takes the older reference's buffers (every
+    // macroblock of it is written); the reference stays.
+    fn startPicture() {
+        let a = curY
+        curY = refY
+        refY = a
+        let b = curU
+        curU = refU
+        refU = b
+        let c = curV
+        curV = refV
+        refV = c
+    }
+
+    // The decoded picture becomes the reference.
+    fn endPicture() {
+        refY = curY
+        refU = curU
+        refV = curV
+    }
+
+    // --- Fetching reference areas ---
+
+    // Copies the w×h area at (x, y) of reference plane `plane` (0 Y, 1 U,
+    // 2 V) into fb (row stride w), clamping positions to the plane.
+    fn fetch(_ plane: Int, _ x: Int, _ y: Int, _ w: Int, _ h: Int) {
+        let pw = if plane == 0 { ew } else { ew >> 1 }
+        let ph = if plane == 0 { eh } else { eh >> 1 }
+        let stride = if plane == 0 { ys } else { cs }
+        if plane == 0 {
+            fetchFrom(refY, stride, pw, ph, x, y, w, h)
+        } else if plane == 1 {
+            fetchFrom(refU, stride, pw, ph, x, y, w, h)
+        } else {
+            fetchFrom(refV, stride, pw, ph, x, y, w, h)
+        }
+    }
+
+    fn fetchFrom(_ src: [Int], _ stride: Int, _ pw: Int, _ ph: Int, _ x: Int, _ y: Int, _ w: Int, _ h: Int) {
+        if x >= 0 && y >= 0 && x + w <= pw && y + h <= ph {
+            var o = 0
+            var s = y * stride + x
+            for _ in 0..h {
+                for c in 0..w {
+                    fb[o + c] = src[s + c]
+                }
+                o += w
+                s += stride
+            }
+            return
+        }
+        var o = 0
+        for r in 0..h {
+            let yy = min(max(y + r, 0), ph - 1)
+            let s = yy * stride
+            for c in 0..w {
+                fb[o + c] = src[s + min(max(x + c, 0), pw - 1)]
+            }
+            o += w
+        }
+    }
+
+    // Half sample prediction (hpeldsp put_pixels / put_no_rnd_pixels) of a
+    // w×h block from fb ((w+1)×(h+1) samples, stride w+1) into pred
+    // (stride w). dxy: bit 0 horizontal half, bit 1 vertical half.
+    fn hpel(_ w: Int, _ h: Int, _ dxy: Int, noRound: Bool) {
+        let ts = w + 1
+        var d = 0
+        var s = 0
+        if dxy == 0 {
+            for _ in 0..h {
+                for c in 0..w {
+                    pred[d + c] = fb[s + c]
+                }
+                d += w
+                s += ts
+            }
+        } else if dxy == 1 || dxy == 2 {
+            let r = if noRound { 0 } else { 1 }
+            let o = if dxy == 1 { 1 } else { ts }
+            for _ in 0..h {
+                for c in 0..w {
+                    pred[d + c] = (fb[s + c] + fb[s + c + o] + r) >> 1
+                }
+                d += w
+                s += ts
+            }
+        } else {
+            let r = if noRound { 1 } else { 2 }
+            for _ in 0..h {
+                for c in 0..w {
+                    let p = s + c
+                    pred[d + c] = (fb[p] + fb[p + 1] + fb[p + ts] + fb[p + ts + 1] + r) >> 2
+                }
+                d += w
+                s += ts
+            }
+        }
+    }
+
+    // Writes pred (w×h, stride w) into the current plane at off.
+    fn putPred(_ plane: Int, _ off: Int, _ w: Int, _ h: Int) {
+        var d = off
+        var s = 0
+        if plane == 0 {
+            for _ in 0..h {
+                for c in 0..w {
+                    curY[d + c] = pred[s + c]
+                }
+                d += ys
+                s += w
+            }
+        } else if plane == 1 {
+            for _ in 0..h {
+                for c in 0..w {
+                    curU[d + c] = pred[s + c]
+                }
+                d += cs
+                s += w
+            }
+        } else {
+            for _ in 0..h {
+                for c in 0..w {
+                    curV[d + c] = pred[s + c]
+                }
+                d += cs
+                s += w
+            }
+        }
+    }
+
+    // One 16×16 half-sample motion vector for macroblock (mbx, mby), luma
+    // and chroma (mpeg_motion_internal for FMT_H263).
+    fn motion(_ mbx: Int, _ mby: Int, _ mx: Int, _ my: Int, noRound: Bool) {
+        let dxy = ((my & 1) << 1) | (mx & 1)
+        let sx = mbx * 16 + (mx >> 1)
+        let sy = mby * 16 + (my >> 1)
+        fetch(0, sx, sy, 17, 17)
+        hpel(16, 16, dxy, noRound: noRound)
+        putPred(0, mby * 16 * ys + mbx * 16, 16, 16)
+        let uvdxy = dxy | (my & 2) | ((mx & 2) >> 1)
+        let ux = sx >> 1
+        let uy = sy >> 1
+        let co = mby * 8 * cs + mbx * 8
+        fetch(1, ux, uy, 9, 9)
+        hpel(8, 8, uvdxy, noRound: noRound)
+        putPred(1, co, 8, 8)
+        fetch(2, ux, uy, 9, 9)
+        hpel(8, 8, uvdxy, noRound: noRound)
+        putPred(2, co, 8, 8)
+    }
+
+    // A macroblock copied from the reference (skipped, or concealed).
+    fn copyMb(_ mbx: Int, _ mby: Int) {
+        var d = mby * 16 * ys + mbx * 16
+        for _ in 0..16 {
+            for c in 0..16 {
+                curY[d + c] = refY[d + c]
+            }
+            d += ys
+        }
+        d = mby * 8 * cs + mbx * 8
+        for _ in 0..8 {
+            for c in 0..8 {
+                curU[d + c] = refU[d + c]
+                curV[d + c] = refV[d + c]
+            }
+            d += cs
+        }
+    }
+
+    // --- WMV2 mspel motion (wmv2dec.c ff_mspel_motion) ---
+
+    // The 4-tap "mspel" lowpass (9·(b+c) − (a+d) + 8) >> 4, clipped.
+    fn mspelClip(_ v: Int) -> Int {
+        let x = (v + 8) >> 4
+        if x < 0 {
+            return 0
+        }
+        if x > 255 {
+            return 255
+        }
+        x
+    }
+
+    // One 8×8 luma block of mspel prediction: fb holds the 19×19 area whose
+    // (1, 1) is the block's (0, 0) source sample for the whole macroblock;
+    // (bx, by) is the block's offset in it (0 or 8). Result into pred at
+    // (bx, by), stride 16.
+    fn mspel8(_ bx: Int, _ by: Int, _ dxy: Int) {
+        let fs = 19
+        let base = (by + 1) * fs + bx + 1
+        if dxy == 0 {
+            for r in 0..8 {
+                for c in 0..8 {
+                    pred[(by + r) * 16 + bx + c] = fb[base + r * fs + c]
+                }
+            }
+            return
+        }
+        if dxy == 1 || dxy == 2 || dxy == 3 {
+            // Horizontal half (mc20), averaged with the full sample on
+            // the left (mc10) or right (mc30).
+            for r in 0..8 {
+                for c in 0..8 {
+                    let p = base + r * fs + c
+                    let half = mspelClip(9 * (fb[p] + fb[p + 1]) - (fb[p - 1] + fb[p + 2]))
+                    var v = half
+                    if dxy == 1 {
+                        v = (fb[p] + half + 1) >> 1
+                    } else if dxy == 3 {
+                        v = (fb[p + 1] + half + 1) >> 1
+                    }
+                    pred[(by + r) * 16 + bx + c] = v
+                }
+            }
+            return
+        }
+        if dxy == 4 {
+            for r in 0..8 {
+                for c in 0..8 {
+                    let p = base + r * fs + c
+                    pred[(by + r) * 16 + bx + c] = mspelClip(9 * (fb[p] + fb[p + fs]) - (fb[p - fs] + fb[p + 2 * fs]))
+                }
+            }
+            return
+        }
+        // dxy 5, 6, 7: halfH over 11 rows (from row −1), then vertical.
+        for r in 0..11 {
+            for c in 0..8 {
+                let p = base + (r - 1) * fs + c
+                tmp[r * 8 + c] = mspelClip(9 * (fb[p] + fb[p + 1]) - (fb[p - 1] + fb[p + 2]))
+            }
+        }
+        for r in 0..8 {
+            for c in 0..8 {
+                let q = (r + 1) * 8 + c
+                let hv = mspelClip(9 * (tmp[q] + tmp[q + 8]) - (tmp[q - 8] + tmp[q + 16]))
+                var v = hv
+                if dxy != 6 {
+                    // mc12 / mc32: average with the vertical half of the
+                    // full samples at column 0 or +1.
+                    let p = base + r * fs + c + (if dxy == 7 { 1 } else { 0 })
+                    let hvV = mspelClip(9 * (fb[p] + fb[p + fs]) - (fb[p - fs] + fb[p + 2 * fs]))
+                    v = (hvV + hv + 1) >> 1
+                }
+                pred[(by + r) * 16 + bx + c] = v
+            }
+        }
+    }
+
+    // WMV2's motion for a macroblock when mspel is on.
+    fn mspelMotion(_ mbx: Int, _ mby: Int, _ mx: Int, _ my: Int, _ hshift: Int, noRound: Bool) {
+        var dxy = ((my & 1) << 1) | (mx & 1)
+        dxy = 2 * dxy + hshift
+        var sx = mbx * 16 + (mx >> 1)
+        var sy = mby * 16 + (my >> 1)
+        sx = min(max(sx, -16), width)
+        sy = min(max(sy, -16), height)
+        if sx <= -16 || sx >= width {
+            dxy = dxy & ~3
+        }
+        if sy <= -16 || sy >= height {
+            dxy = dxy & ~4
+        }
+        fetch(0, sx - 1, sy - 1, 19, 19)
+        mspel8(0, 0, dxy)
+        mspel8(8, 0, dxy)
+        mspel8(0, 8, dxy)
+        mspel8(8, 8, dxy)
+        putPred(0, mby * 16 * ys + mbx * 16, 16, 16)
+        var cdxy = 0
+        if (mx & 3) != 0 {
+            cdxy = cdxy | 1
+        }
+        if (my & 3) != 0 {
+            cdxy = cdxy | 2
+        }
+        var ux = mbx * 8 + (mx >> 2)
+        var uy = mby * 8 + (my >> 2)
+        ux = min(max(ux, -8), width >> 1)
+        if ux == (width >> 1) {
+            cdxy = cdxy & ~1
+        }
+        uy = min(max(uy, -8), height >> 1)
+        if uy == (height >> 1) {
+            cdxy = cdxy & ~2
+        }
+        let co = mby * 8 * cs + mbx * 8
+        fetch(1, ux, uy, 9, 9)
+        hpel(8, 8, cdxy, noRound: noRound)
+        putPred(1, co, 8, 8)
+        fetch(2, ux, uy, 9, 9)
+        hpel(8, 8, cdxy, noRound: noRound)
+        putPred(2, co, 8, 8)
+    }
+
+    // --- Writing blocks ---
+
+    // Writes (or adds) the 8×8 values of block b into plane 0, 1 or 2 at
+    // off, clipped to 0…255, and clears the block.
+    fn storeBlock(_ b: Int, _ plane: Int, _ off: Int, add: Bool) {
+        var d = off
+        var s = b * 64
+        let stride = if plane == 0 { ys } else { cs }
+        if plane == 0 {
+            for _ in 0..8 {
+                for c in 0..8 {
+                    curY[d + c] = msClip(blk[s + c] + (if add { curY[d + c] } else { 0 }))
+                    blk[s + c] = 0
+                }
+                d += stride
+                s += 8
+            }
+        } else if plane == 1 {
+            for _ in 0..8 {
+                for c in 0..8 {
+                    curU[d + c] = msClip(blk[s + c] + (if add { curU[d + c] } else { 0 }))
+                    blk[s + c] = 0
+                }
+                d += stride
+                s += 8
+            }
+        } else {
+            for _ in 0..8 {
+                for c in 0..8 {
+                    curV[d + c] = msClip(blk[s + c] + (if add { curV[d + c] } else { 0 }))
+                    blk[s + c] = 0
+                }
+                d += stride
+                s += 8
+            }
+        }
+    }
+
+    // Sets block b to zeros.
+    fn clearBlock(_ b: Int) {
+        let o = b * 64
+        for i in 0..64 {
+            blk[o + i] = 0
+        }
+    }
+
+    // --- ffmpeg's ARM64 simple IDCT (see mpeg4/idct.tsl: the NEON
+    // version has no DC-only row shortcut) ---
+
+    fn idctRow(_ o: Int) {
+        let r0 = blk[o]
+        let r1 = blk[o + 1]
+        let r2 = blk[o + 2]
+        let r3 = blk[o + 3]
+        let r4 = blk[o + 4]
+        let r5 = blk[o + 5]
+        let r6 = blk[o + 6]
+        let r7 = blk[o + 7]
+        if (r1 | r2 | r3 | r4 | r5 | r6 | r7) == 0 {
+            if r0 != 0 {
+                let dc = (msW4 * r0 + 1024) >> 11
+                for k in 0..8 {
+                    blk[o + k] = dc
+                }
+            }
+            return
+        }
+        var a0 = msW4 * r0 + 1024
+        var a1 = a0
+        var a2 = a0
+        var a3 = a0
+        a0 += msW2 * r2
+        a1 += msW6 * r2
+        a2 -= msW6 * r2
+        a3 -= msW2 * r2
+        var b0 = msW1 * r1 + msW3 * r3
+        var b1 = msW3 * r1 - msW7 * r3
+        var b2 = msW5 * r1 - msW1 * r3
+        var b3 = msW7 * r1 - msW5 * r3
+        if (r4 | r5 | r6 | r7) != 0 {
+            a0 += msW4 * r4 + msW6 * r6
+            a1 += -msW4 * r4 - msW2 * r6
+            a2 += -msW4 * r4 + msW2 * r6
+            a3 += msW4 * r4 - msW6 * r6
+            b0 += msW5 * r5 + msW7 * r7
+            b1 += -msW1 * r5 - msW5 * r7
+            b2 += msW7 * r5 + msW3 * r7
+            b3 += msW3 * r5 - msW1 * r7
+        }
+        blk[o] = (a0 + b0) >> 11
+        blk[o + 7] = (a0 - b0) >> 11
+        blk[o + 1] = (a1 + b1) >> 11
+        blk[o + 6] = (a1 - b1) >> 11
+        blk[o + 2] = (a2 + b2) >> 11
+        blk[o + 5] = (a2 - b2) >> 11
+        blk[o + 3] = (a3 + b3) >> 11
+        blk[o + 4] = (a3 - b3) >> 11
+    }
+
+    fn idctCol(_ c: Int) {
+        let c0 = blk[c]
+        let c1 = blk[c + 8]
+        let c2 = blk[c + 16]
+        let c3 = blk[c + 24]
+        let c4 = blk[c + 32]
+        let c5 = blk[c + 40]
+        let c6 = blk[c + 48]
+        let c7 = blk[c + 56]
+        var a0 = msW4 * (c0 + 32)
+        var a1 = a0
+        var a2 = a0
+        var a3 = a0
+        a0 += msW2 * c2
+        a1 += msW6 * c2
+        a2 -= msW6 * c2
+        a3 -= msW2 * c2
+        var b0 = msW1 * c1 + msW3 * c3
+        var b1 = msW3 * c1 - msW7 * c3
+        var b2 = msW5 * c1 - msW1 * c3
+        var b3 = msW7 * c1 - msW5 * c3
+        if c4 != 0 {
+            a0 += msW4 * c4
+            a1 -= msW4 * c4
+            a2 -= msW4 * c4
+            a3 += msW4 * c4
+        }
+        if c5 != 0 {
+            b0 += msW5 * c5
+            b1 -= msW1 * c5
+            b2 += msW7 * c5
+            b3 += msW3 * c5
+        }
+        if c6 != 0 {
+            a0 += msW6 * c6
+            a1 -= msW2 * c6
+            a2 += msW2 * c6
+            a3 -= msW6 * c6
+        }
+        if c7 != 0 {
+            b0 += msW7 * c7
+            b1 -= msW5 * c7
+            b2 += msW3 * c7
+            b3 -= msW1 * c7
+        }
+        blk[c] = (a0 + b0) >> 20
+        blk[c + 8] = (a1 + b1) >> 20
+        blk[c + 16] = (a2 + b2) >> 20
+        blk[c + 24] = (a3 + b3) >> 20
+        blk[c + 32] = (a3 - b3) >> 20
+        blk[c + 40] = (a2 - b2) >> 20
+        blk[c + 48] = (a1 - b1) >> 20
+        blk[c + 56] = (a0 - b0) >> 20
+    }
+
+    // The simple IDCT of block b written (put) or added into a plane.
+    fn simpleIdct(_ b: Int, _ plane: Int, _ off: Int, add: Bool) {
+        let o = b * 64
+        var acs = 0
+        for i in 1..64 {
+            acs = acs | blk[o + i]
+        }
+        if acs == 0 {
+            // Rows: (W4·r0 + 2^10) >> 11 everywhere; columns: W4·(that +
+            // 32) >> 20.
+            let v = (msW4 * (((msW4 * blk[o] + 1024) >> 11) + 32)) >> 20
+            for i in 0..64 {
+                blk[o + i] = v
+            }
+            storeBlock(b, plane, off, add: add)
+            return
+        }
+        for r in 0..8 {
+            idctRow(o + r * 8)
+        }
+        for c in 0..8 {
+            idctCol(o + c)
+        }
+        storeBlock(b, plane, off, add: add)
+    }
+
+    // --- WMV2's IDCT (wmv2dsp.c) ---
+
+    fn wmv2Row(_ o: Int) {
+        let a1 = 2841 * blk[o + 1] + 565 * blk[o + 7]
+        let a7 = 565 * blk[o + 1] - 2841 * blk[o + 7]
+        let a5 = 1609 * blk[o + 5] + 2408 * blk[o + 3]
+        let a3 = 2408 * blk[o + 5] - 1609 * blk[o + 3]
+        let a2 = 2676 * blk[o + 2] + 1108 * blk[o + 6]
+        let a6 = 1108 * blk[o + 2] - 2676 * blk[o + 6]
+        let a0 = 2048 * blk[o] + 2048 * blk[o + 4]
+        let a4 = 2048 * blk[o] - 2048 * blk[o + 4]
+        let s1 = (181 * (a1 - a5 + a7 - a3) + 128) >> 8
+        let s2 = (181 * (a1 - a5 - a7 + a3) + 128) >> 8
+        blk[o] = msI16((a0 + a2 + a1 + a5 + 128) >> 8)
+        blk[o + 1] = msI16((a4 + a6 + s1 + 128) >> 8)
+        blk[o + 2] = msI16((a4 - a6 + s2 + 128) >> 8)
+        blk[o + 3] = msI16((a0 - a2 + a7 + a3 + 128) >> 8)
+        blk[o + 4] = msI16((a0 - a2 - a7 - a3 + 128) >> 8)
+        blk[o + 5] = msI16((a4 - a6 - s2 + 128) >> 8)
+        blk[o + 6] = msI16((a4 + a6 - s1 + 128) >> 8)
+        blk[o + 7] = msI16((a0 + a2 - a1 - a5 + 128) >> 8)
+    }
+
+    fn wmv2Col(_ o: Int) {
+        let a1 = (2841 * blk[o + 8] + 565 * blk[o + 56] + 4) >> 3
+        let a7 = (565 * blk[o + 8] - 2841 * blk[o + 56] + 4) >> 3
+        let a5 = (1609 * blk[o + 40] + 2408 * blk[o + 24] + 4) >> 3
+        let a3 = (2408 * blk[o + 40] - 1609 * blk[o + 24] + 4) >> 3
+        let a2 = (2676 * blk[o + 16] + 1108 * blk[o + 48] + 4) >> 3
+        let a6 = (1108 * blk[o + 16] - 2676 * blk[o + 48] + 4) >> 3
+        let a0 = (2048 * blk[o] + 2048 * blk[o + 32]) >> 3
+        let a4 = (2048 * blk[o] - 2048 * blk[o + 32]) >> 3
+        let s1 = (181 * (a1 - a5 + a7 - a3) + 128) >> 8
+        let s2 = (181 * (a1 - a5 - a7 + a3) + 128) >> 8
+        blk[o] = msI16((a0 + a2 + a1 + a5 + 8192) >> 14)
+        blk[o + 8] = msI16((a4 + a6 + s1 + 8192) >> 14)
+        blk[o + 16] = msI16((a4 - a6 + s2 + 8192) >> 14)
+        blk[o + 24] = msI16((a0 - a2 + a7 + a3 + 8192) >> 14)
+        blk[o + 32] = msI16((a0 - a2 - a7 - a3 + 8192) >> 14)
+        blk[o + 40] = msI16((a4 - a6 - s2 + 8192) >> 14)
+        blk[o + 48] = msI16((a4 + a6 - s1 + 8192) >> 14)
+        blk[o + 56] = msI16((a0 + a2 - a1 - a5 + 8192) >> 14)
+    }
+
+    fn wmv2Idct(_ b: Int, _ plane: Int, _ off: Int, add: Bool) {
+        let o = b * 64
+        for r in 0..8 {
+            wmv2Row(o + r * 8)
+        }
+        for c in 0..8 {
+            wmv2Col(o + c)
+        }
+        storeBlock(b, plane, off, add: add)
+    }
+
+    // --- WMV2 ABT: 8×4 and 4×8 transforms (simple_idct.c, C) ---
+
+    // ffmpeg's C simple IDCT row (idctRowCondDC, 8-bit, extra_shift 0),
+    // with its DC-only shortcut (r0 · 8 as int16).
+    fn cRow(_ o: Int) {
+        let r0 = blk[o]
+        let r1 = blk[o + 1]
+        let r2 = blk[o + 2]
+        let r3 = blk[o + 3]
+        let r4 = blk[o + 4]
+        let r5 = blk[o + 5]
+        let r6 = blk[o + 6]
+        let r7 = blk[o + 7]
+        if (r1 | r2 | r3 | r4 | r5 | r6 | r7) == 0 {
+            let dc = msI16(r0 * 8)
+            for k in 0..8 {
+                blk[o + k] = dc
+            }
+            return
+        }
+        idctRow(o)
+    }
+
+    // idct4col_add of the 8x4 transform: column c of rows 0…3 of block b,
+    // added at plane offset off (stride of the plane).
+    fn idct4ColAdd(_ o: Int, _ plane: Int, _ off: Int) {
+        // C_FIX(x) = (int)(x · √2 · 4096 + 0.5): 0.6532814824 → 3784,
+        // 0.2705980501 → 1567, 0.5 → 2896; C_SHIFT = 17.
+        let k1 = 3784
+        let k2 = 1567
+        let k3 = 2896
+        let a0 = blk[o]
+        let a1 = blk[o + 8]
+        let a2 = blk[o + 16]
+        let a3 = blk[o + 24]
+        let e0 = (a0 + a2) * k3 + 65536
+        let e2 = (a0 - a2) * k3 + 65536
+        let e1 = a1 * k1 + a3 * k2
+        let e3 = a1 * k2 - a3 * k1
+        addPixel(plane, off, (e0 + e1) >> 17, 0)
+        addPixel(plane, off, (e2 + e3) >> 17, 1)
+        addPixel(plane, off, (e2 - e3) >> 17, 2)
+        addPixel(plane, off, (e0 - e1) >> 17, 3)
+    }
+
+    // Adds v to the sample `row` rows below off in a plane, clipped.
+    fn addPixel(_ plane: Int, _ off: Int, _ v: Int, _ row: Int) {
+        if plane == 0 {
+            let i = off + row * ys
+            curY[i] = msClip(curY[i] + v)
+        } else if plane == 1 {
+            let i = off + row * cs
+            curU[i] = msClip(curU[i] + v)
+        } else {
+            let i = off + row * cs
+            curV[i] = msClip(curV[i] + v)
+        }
+    }
+
+    // ff_simple_idct84_add of block b at off.
+    fn idct84Add(_ b: Int, _ plane: Int, _ off: Int) {
+        let o = b * 64
+        for r in 0..4 {
+            cRow(o + r * 8)
+        }
+        for c in 0..8 {
+            idct4ColAdd(o + c, plane, off + c)
+        }
+        clearBlock(b)
+    }
+
+    // idct4row of the 4x8 transform, row at o.
+    fn idct4Row(_ o: Int) {
+        // R_FIX(x) = (int)(x · √2 · 32768 + 0.5)
+        let r1 = 30274
+        let r2 = 12540
+        let r3 = 23170
+        let a0 = blk[o]
+        let a1 = blk[o + 1]
+        let a2 = blk[o + 2]
+        let a3 = blk[o + 3]
+        let c0 = (a0 + a2) * r3 + 1024
+        let c2 = (a0 - a2) * r3 + 1024
+        let c1 = a1 * r1 + a3 * r2
+        let c3 = a1 * r2 - a3 * r1
+        blk[o] = msI16((c0 + c1) >> 11)
+        blk[o + 1] = msI16((c2 + c3) >> 11)
+        blk[o + 2] = msI16((c2 - c3) >> 11)
+        blk[o + 3] = msI16((c0 - c1) >> 11)
+    }
+
+    // ff_simple_idct48_add of block b at off: rows of 4, then the C
+    // idctSparseColAdd on columns 0…3.
+    fn idct48Add(_ b: Int, _ plane: Int, _ off: Int) {
+        let o = b * 64
+        for r in 0..8 {
+            idct4Row(o + r * 8)
+        }
+        for c in 0..4 {
+            idctCol(o + c)
+            for r in 0..8 {
+                addPixel(plane, off + c, blk[o + c + r * 8], r)
+            }
+        }
+        clearBlock(b)
+    }
+
+    // --- H.263 loop filter (h263dsp.c) across a horizontal edge (v)
+    // or vertical edge (h) of 8 samples at off. ---
+
+    fn h263Filter(_ plane: Int, _ off: Int, _ step: Int, _ along: Int, _ qscale: Int) {
+        let strength = msLoopStrength[qscale]
+        for k in 0..8 {
+            let p = off + k * along
+            let p0 = getSample(plane, p - 2 * step)
+            var p1 = getSample(plane, p - step)
+            var p2 = getSample(plane, p)
+            let p3 = getSample(plane, p + step)
+            let d = (p0 - p3 + 4 * (p2 - p1)) / 8
+            var d1 = 0
+            if d < -2 * strength {
+                d1 = 0
+            } else if d < -strength {
+                d1 = -2 * strength - d
+            } else if d < strength {
+                d1 = d
+            } else if d < 2 * strength {
+                d1 = 2 * strength - d
+            }
+            p1 += d1
+            p2 -= d1
+            if (p1 & 256) != 0 {
+                p1 = ~(p1 >> 31) & 255
+            }
+            if (p2 & 256) != 0 {
+                p2 = ~(p2 >> 31) & 255
+            }
+            setSample(plane, p - step, p1)
+            setSample(plane, p, p2)
+            let ad1 = abs(d1) >> 1
+            let d2 = min(max((p0 - p3) / 4, -ad1), ad1)
+            setSample(plane, p - 2 * step, (p0 - d2) & 255)
+            setSample(plane, p + step, (p3 + d2) & 255)
+        }
+    }
+
+    fn getSample(_ plane: Int, _ i: Int) -> Int {
+        if plane == 0 {
+            return curY[i]
+        }
+        if plane == 1 {
+            return curU[i]
+        }
+        curV[i]
+    }
+
+    fn setSample(_ plane: Int, _ i: Int, _ v: Int) {
+        if plane == 0 {
+            curY[i] = v
+        } else if plane == 1 {
+            curU[i] = v
+        } else {
+            curV[i] = v
+        }
+    }
+
+    // h263_v_loop_filter: the edge above the 8 samples at off.
+    fn vFilter(_ plane: Int, _ off: Int, _ q: Int) {
+        let stride = if plane == 0 { ys } else { cs }
+        h263Filter(plane, off, stride, 1, q)
+    }
+
+    // h263_h_loop_filter: the edge left of the 8 rows at off.
+    fn hFilter(_ plane: Int, _ off: Int, _ q: Int) {
+        let stride = if plane == 0 { ys } else { cs }
+        h263Filter(plane, off, 1, stride, q)
+    }
+}
+
+// cos(k·π/16)·√2·2^14, rounded (the simple IDCT's constants).
+let msW1 = 22725
+let msW2 = 21407
+let msW3 = 19266
+let msW4 = 16383
+let msW5 = 12873
+let msW6 = 8867
+let msW7 = 4520
+
+let msLoopStrength: [Int] = [0, 1, 1, 2, 2, 3, 3, 4, 4, 4, 5, 5, 6, 6, 7, 7, 7, 8, 8, 8, 9, 9, 9, 10, 10, 10, 11, 11, 11, 12, 12, 12]
+
+fn msClip(_ v: Int) -> Int {
+    if v < 0 {
+        return 0
+    }
+    if v > 255 {
+        return 255
+    }
+    v
+}
+
+// Wraps to a 16-bit signed value (the C code's int16_t stores).
+fn msI16(_ v: Int) -> Int {
+    ((v + 32768) & 65535) - 32768
+}

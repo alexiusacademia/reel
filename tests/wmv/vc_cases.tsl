@@ -1,0 +1,252 @@
+// The WMV9 (VC-1 Simple/Main) and VC-1 Advanced cases of the wmv test,
+// and the VcDecoder's extra checks.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../../wmv"
+import "../../core"
+import "../../testkit"
+
+let vcConf = "build/conformance/wmv"
+
+fn vcCase(_ name: String, timing: Bool = false, limit: Int = 0) -> WmvCase {
+    WmvCase(name: "conf " + name, path: joinPath(vcConf, name), limit: limit, timing: timing)
+}
+
+fn vcCases() -> [WmvCase] {
+    [
+        vcCase("wmv3_simple.mkv"),
+        vcCase("wmv3_main.mkv"),
+        vcCase("wmv3_complex.mkv"),
+        vcCase("wmv3_sbspl.avi"),
+        vcCase("wmv3_sbmain.avi"),
+        vcCase("wmv3_sbadv.avi"),
+        vcCase("wmv3_smm0005.mkv"),
+        vcCase("wmv3_smm0015.mkv"),
+        vcCase("wmv3_bframes.mkv"),
+        vcCase("wmv3_biframes.mkv"),
+        vcCase("wmv3_smoothing.mkv"),
+        vcCase("wmv3_niceday.mkv"),
+        vcCase("wmv3_x8.mkv"),
+        // Picture 18 of this clip is damaged; ffmpeg conceals the rest of
+        // it with its error resilience (motion guessing), which Reel
+        // doesn't copy, so only the pictures before it are compared.
+        vcCase("wmv3_nokia.mkv", limit: 18),
+        vcCase("wmv3_720p.mkv", timing: true),
+        vcCase("wmv3_1080p.mkv", timing: true),
+        vcCase("vc1_sa00040.mkv"),
+        vcCase("vc1_sa00050.mkv"),
+        vcCase("vc1_sa10091.mkv"),
+        vcCase("vc1_sa20021.mkv"),
+        vcCase("vc1_sa10143.mkv"),
+        vcCase("vc1_ism.mkv"),
+        vcCase("vc1_wmva.mkv"),
+        vcCase("vc1_ts_SA00040.ts"),
+        vcCase("vc1_ts_SA10091.ts"),
+        vcCase("vc1_480i.mkv"),
+        vcCase("vc1_twomv.mkv"),
+        vcCase("vc1_glitch.avi", timing: true),
+        vcCase("vc1_1080i.mkv", timing: true),
+        vcCase("vc1_ibframes.mkv", timing: true),
+        vcCase("vc1_ibframes.ts"),
+        // Whole ASF files through demux.open (the first 60 pictures).
+        vcCase("asf/sample-wmv9-main-MP_LL.wmv", limit: 60),
+        vcCase("asf/bloodyback.wmv", limit: 60),
+        vcCase("asf/vc1.cmplx.wmv", limit: 60),
+        vcCase("asf/wmva-smpl-bdsm.wmv", limit: 60),
+        vcCase("asf/vc1-480i.wmv")
+    ]
+}
+
+// Seek (reset), skipping B pictures, damaged packets, streamInfo.
+fn vcExtraChecks(_ t: bind Tally, _ only: String) {
+    if !only.isEmpty && !only.hasPrefix("vc") && !only.hasPrefix("wmv3") {
+        return
+    }
+    // A seek: after reset() decoding starts again at a later keyframe and
+    // matches ffmpeg from there.
+    let seek = wmvOpenClip(joinPath(vcConf, "wmv3_niceday.mkv"))
+    if seek.ok {
+        let want = wmvRefMd5s(joinPath(vcConf, "wmv3_niceday.mkv.framemd5"))
+        var k = -1
+        for i in 1..seek.keys.count {
+            if seek.keys[i] && k < 0 {
+                k = i
+            }
+        }
+        var d = wmv.newDecoder(seek.track).valueOr(wmv.Decoder())
+        for i in 0..5 {
+            d.decode(seek.packets[i], pts: seek.pts[i], dts: seek.dts[i], key: seek.keys[i])
+        }
+        d.reset()
+        var got: [String] = []
+        if k > 0 {
+            for i in k..seek.packets.count {
+                for p in d.decode(seek.packets[i], pts: seek.pts[i], dts: seek.dts[i], key: seek.keys[i]) {
+                    got.append(testkit.pictureMd5(p))
+                }
+            }
+            for p in d.flush() {
+                got.append(testkit.pictureMd5(p))
+            }
+        }
+        var same = k > 0 && got.count == seek.packets.count - k
+        for i in 0..got.count {
+            if k + i >= want.count || got[i] != want[k + i] {
+                same = false
+            }
+        }
+        t.check(same, "wmv3 seek to keyframe {k}: {got.count} pictures match ffmpeg's from there")
+    }
+    let main = wmvOpenClip(joinPath(vcConf, "wmv3_main.mkv"))
+    if main.ok {
+        let want = wmvRefMd5s(joinPath(vcConf, "wmv3_main.mkv.framemd5"))
+
+        // A damaged packet: half of a P picture's bytes replaced; decoding
+        // goes on, warns, and every packet still gives a picture.
+        var hurt = main
+        let p = hurt.packets[3]
+        var bad = p.slice(from: 0, to: p.count / 3)
+        for i in 0..(p.count - p.count / 3) {
+            bad.append(byte: (i * 37 + 11) & 255)
+        }
+        hurt.packets[3] = bad
+        hurt.packets[6] = p.slice(from: 0, to: 2)
+        let r = wmvDecodeClip(hurt, limit: 0)
+        t.check(r.ok && r.md5s.count >= main.packets.count - 1, "damaged wmv3 packets: {r.md5s.count} pictures of {main.packets.count}, {r.warnings.count} warnings")
+        t.check(r.md5s.count > 3 && r.md5s[2] == want[2], "pictures before the damage are untouched")
+    }
+    // skipNonReference: B pictures (which nothing refers to) are left out;
+    // the rest are ffmpeg's.
+    let bf = wmvOpenClip(joinPath(vcConf, "wmv3_bframes.mkv"))
+    if bf.ok {
+        let want = wmvRefMd5s(joinPath(vcConf, "wmv3_bframes.mkv.framemd5"))
+        let r = wmvDecodeClip(bf, limit: 0, skipNonReference: true)
+        var allKnown = true
+        for m in r.md5s {
+            if !want.contains(m) {
+                allKnown = false
+            }
+        }
+        t.check(r.md5s.count > 0 && r.md5s.count < want.count && allKnown, "skipNonReference: {r.md5s.count} of {want.count} pictures, all ffmpeg's")
+    }
+    // An Advanced stream through MPEG-TS (headers in the stream, no extra)
+    // and a stream without its sequence header refused cleanly.
+    var tr = core.Track(index: 0, kind: .video, codec: "wmv3")
+    tr.width = 320
+    tr.height = 240
+    t.check(wmv.newDecoder(tr).error() != nil, "wmv3 without STRUCT_C is refused")
+    var adv = core.Track(index: 0, kind: .video, codec: "vc1")
+    adv.extra = core.Track(index: 0, kind: .video, codec: "").extra
+    var dv = wmv.newDecoder(adv).valueOr(wmv.Decoder())
+    let none = dv.decode(Data(bytes: [1, 2, 3, 4, 5]), pts: 0, dts: 0, key: true)
+    t.check(none.isEmpty, "vc1 data before any sequence header gives no picture")
+    let ts = wmvOpenClip(joinPath(vcConf, "vc1_ts_SA10091.ts"))
+    if ts.ok {
+        let info = wmv.streamInfo(ts.track)
+        print("streamInfo {info}")
+    }
+    let wv = wmvOpenClip(joinPath(vcConf, "vc1_wmva.mkv"))
+    if wv.ok {
+        let info = wmv.streamInfo(wv.track)
+        t.check(info.hasPrefix("VC-1 Advanced"), "streamInfo vc1: {info}")
+    }
+    vcInterlacedChecks(t)
+}
+
+// Interlaced streams: the staged pipeline gives what the decoder gives
+// (field pairs are two ParsedFrames), B fields can be skipped, damaged
+// field pairs don't stop decoding, and a seek restarts at a keyframe.
+fn vcInterlacedChecks(_ t: bind Tally) {
+    let clip = wmvOpenClip(joinPath(vcConf, "vc1_sa10143.mkv"))
+    if !clip.ok {
+        return
+    }
+    let want = wmvRefMd5s(joinPath(vcConf, "vc1_sa10143.mkv.framemd5"))
+    let made = wmv.newPipeline(clip.track)
+    t.check(made.error() == nil, "newPipeline for an interlaced vc1 track")
+    let pl = made.valueOr(wmv.Pipeline())
+    var parser = pl.parser
+    var recon = pl.reconstructor
+    var got: [String] = []
+    var fieldPairs = 0
+    for i in 0..clip.packets.count {
+        let step = wmv.parseStep(parser, clip.packets[i], pts: clip.pts[i], dts: clip.dts[i], key: clip.keys[i])
+        parser = step.parser
+        if step.frames.count == 2 {
+            fieldPairs += 1
+        }
+        let rs = wmv.reconstructStep(recon, step.frames)
+        recon = rs.reconstructor
+        for p in rs.pictures {
+            got.append(testkit.pictureMd5(p))
+        }
+    }
+    let end = wmv.reconstructStep(recon, parser.flush())
+    for p in end.pictures {
+        got.append(testkit.pictureMd5(p))
+    }
+    t.check(got == want, "staged pipeline on field pairs: {got.count} pictures ({fieldPairs} packets of two fields) match ffmpeg")
+    let notB = wmv.newPipeline(core.Track(index: 0, kind: .video, codec: "wmv2"))
+    t.check(notB.error() != nil, "newPipeline refuses wmv2")
+
+    // skipNonReference: the B field pairs are left out, the rest are
+    // ffmpeg's pictures.
+    let r = wmvDecodeClip(clip, limit: 0, skipNonReference: true)
+    var known = true
+    for m in r.md5s {
+        if !want.contains(m) {
+            known = false
+        }
+    }
+    t.check(r.md5s.count > 0 && r.md5s.count < want.count && known, "interlaced skipNonReference: {r.md5s.count} of {want.count} pictures, all ffmpeg's")
+
+    // Damage: a field pair cut in the middle of its second field, another
+    // filled with noise after its first bytes.
+    var hurt = clip
+    let p4 = hurt.packets[4]
+    hurt.packets[4] = p4.slice(from: 0, to: p4.count * 3 / 4)
+    let p7 = hurt.packets[7]
+    var bad = p7.slice(from: 0, to: 40)
+    for i in 0..(p7.count - 40) {
+        bad.append(byte: (i * 53 + 7) & 255)
+    }
+    hurt.packets[7] = bad
+    let h = wmvDecodeClip(hurt, limit: 0)
+    t.check(h.ok && h.md5s.count >= clip.packets.count - 2 && h.md5s.count > 3 && h.md5s[0] == want[0], "damaged field pairs: {h.md5s.count} pictures of {clip.packets.count}, {h.warnings.count} warnings")
+
+    // A seek in a frame-interlaced stream with B frames: reset, then from
+    // the next keyframe on the pictures are ffmpeg's (the B pictures right
+    // after it refer to the picture before the keyframe and aren't shown).
+    let ib = wmvOpenClip(joinPath(vcConf, "vc1_ibframes.mkv"))
+    if ib.ok {
+        let wantIb = wmvRefMd5s(joinPath(vcConf, "vc1_ibframes.mkv.framemd5"))
+        var k = -1
+        for i in 1..ib.keys.count {
+            if ib.keys[i] && k < 0 {
+                k = i
+            }
+        }
+        var d = wmv.newDecoder(ib.track).valueOr(wmv.Decoder())
+        for i in 0..2 {
+            d.decode(ib.packets[i], pts: ib.pts[i], dts: ib.dts[i], key: ib.keys[i])
+        }
+        d.reset()
+        var seen: [String] = []
+        if k > 0 {
+            for i in k..min(ib.packets.count, k + 12) {
+                for p in d.decode(ib.packets[i], pts: ib.pts[i], dts: ib.dts[i], key: ib.keys[i]) {
+                    seen.append(testkit.pictureMd5(p))
+                }
+            }
+        }
+        var ok = seen.count > 4
+        for m in seen {
+            if !wantIb.contains(m) {
+                ok = false
+            }
+        }
+        t.check(ok, "frame-interlaced seek to keyframe {k}: {seen.count} pictures, all ffmpeg's")
+    }
+}

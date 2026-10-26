@@ -1,0 +1,170 @@
+// The AAC filterbank's transform (ISO/IEC 14496-3 4.6.11.3.1): the
+// inverse MDCT, computed through a DCT-IV, which in turn is computed with a
+// complex FFT of a quarter of the window length. Also the sine and
+// Kaiser-Bessel-derived windows (4.6.11.3.2).
+//
+// For M coefficients X[k] the IMDCT gives 2M samples
+//     y[n] = 1/M * sum_k X[k] cos(pi/M (n + M/2 + 1/2)(k + 1/2)),
+// which is the DCT-IV u[j] = sum_k X[k] cos(pi/M (j + 1/2)(k + 1/2))
+// read at j = n + M/2, using its symmetries u[2M-1-j] = -u[j] and
+// u[2M+j] = -u[j]. The DCT-IV takes M/2 complex values
+// (X[2p] + i X[M-1-2p]) twisted by e^(-i pi (p + 1/4)/M), an FFT of M/2
+// points, a twist by e^(-i pi q/M), and reads u[2q] = Re, u[M-1-2q] = -Im.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+// A DCT-IV of one size with its tables and buffers. Put the input in
+// `inp` (M values), call run(), read `out` (M values).
+struct AacDct4 {
+    m: Int = 0
+    half: Int = 0
+    // e^(-i pi (p + 1/4)/M) and e^(-i pi q/M), p, q < M/2.
+    preCos: [Float] = []
+    preSin: [Float] = []
+    postCos: [Float] = []
+    postSin: [Float] = []
+    // FFT of M/2 points: bit reversed order and twiddles e^(-2 pi i k/(M/2)).
+    rev: [Int] = []
+    twCos: [Float] = []
+    twSin: [Float] = []
+    re: [Float] = []
+    im: [Float] = []
+    inp: [Float] = []
+    out: [Float] = []
+
+    fn run() {
+        let h = half
+        // Pre-twist, stored in bit-reversed order for the FFT.
+        for p in 0..h {
+            let a = inp[2 * p]
+            let b = inp[m - 1 - 2 * p]
+            let c = preCos[p]
+            let s = preSin[p]
+            let q = rev[p]
+            re[q] = a * c - b * s
+            im[q] = a * s + b * c
+        }
+        // Radix-2 decimation-in-time FFT (forward, e^(-2 pi i pq/h)).
+        var size = 2
+        while size <= h {
+            let halfSize = size / 2
+            let step = h / size
+            var start = 0
+            while start < h {
+                var k = 0
+                for j in start..(start + halfSize) {
+                    let wc = twCos[k]
+                    let ws = twSin[k]
+                    let l = j + halfSize
+                    let tr = re[l] * wc - im[l] * ws
+                    let ti = re[l] * ws + im[l] * wc
+                    re[l] = re[j] - tr
+                    im[l] = im[j] - ti
+                    re[j] = re[j] + tr
+                    im[j] = im[j] + ti
+                    k += step
+                }
+                start += size
+            }
+            size *= 2
+        }
+        // Post-twist and unfold.
+        for q in 0..h {
+            let c = postCos[q]
+            let s = postSin[q]
+            let wr = re[q] * c - im[q] * s
+            let wi = re[q] * s + im[q] * c
+            out[2 * q] = wr
+            out[m - 1 - 2 * q] = -wi
+        }
+    }
+}
+
+fn aacNewDct4(_ m: Int) -> AacDct4 {
+    var d = AacDct4(m: m, half: m / 2)
+    let h = m / 2
+    for p in 0..h {
+        let a = -pi * (Float(p) + 0.25) / Float(m)
+        d.preCos.append(cos(a))
+        d.preSin.append(sin(a))
+        let b = -pi * Float(p) / Float(m)
+        d.postCos.append(cos(b))
+        d.postSin.append(sin(b))
+        let t = -2.0 * pi * Float(p) / Float(h)
+        d.twCos.append(cos(t))
+        d.twSin.append(sin(t))
+        d.re.append(0.0)
+        d.im.append(0.0)
+    }
+    var bits = 0
+    while (1 << bits) < h {
+        bits += 1
+    }
+    for p in 0..h {
+        var r = 0
+        for b in 0..bits {
+            if (p >> b) & 1 == 1 {
+                r = r | (1 << (bits - 1 - b))
+            }
+        }
+        d.rev.append(r)
+    }
+    for _ in 0..m {
+        d.inp.append(0.0)
+        d.out.append(0.0)
+    }
+    d
+}
+
+// Rising half of the sine window of length 2n: sin(pi/(2n) (i + 1/2)).
+fn aacSineWindow(_ n: Int) -> [Float] {
+    var w: [Float] = []
+    for i in 0..n {
+        w.append(sin(pi / Float(2 * n) * (Float(i) + 0.5)))
+    }
+    w
+}
+
+// Zeroth-order modified Bessel function of the first kind, by its series.
+fn aacBesselI0(_ x: Float) -> Float {
+    var sum = 1.0
+    var term = 1.0
+    let q = x * x / 4.0
+    var k = 1
+    while k < 500 {
+        term = term * q / (Float(k) * Float(k))
+        sum += term
+        if term < sum * 1e-17 {
+            break
+        }
+        k += 1
+    }
+    sum
+}
+
+// Rising half (n values) of the Kaiser-Bessel-derived window of length 2n
+// with the given alpha (4 for long windows, 6 for short): the square root
+// of the running sum of a Kaiser window of n + 1 points over its total.
+fn aacKbdWindow(_ n: Int, alpha: Float) -> [Float] {
+    var kaiser: [Float] = []
+    var total = 0.0
+    for i in 0..(n + 1) {
+        let r = (Float(i) - Float(n) / 2.0) / (Float(n) / 2.0)
+        let v = aacBesselI0(pi * alpha * sqrt(max(0.0, 1.0 - r * r)))
+        kaiser.append(v)
+        total += v
+    }
+    var w: [Float] = []
+    var sum = 0.0
+    for i in 0..n {
+        sum += kaiser[i]
+        w.append(sqrt(sum / total))
+    }
+    w
+}
+
+let aacSineLong = aacSineWindow(1024)
+let aacSineShort = aacSineWindow(128)
+let aacKbdLong = aacKbdWindow(1024, alpha: 4.0)
+let aacKbdShort = aacKbdWindow(128, alpha: 6.0)

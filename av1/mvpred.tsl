@@ -1,0 +1,1207 @@
+// AV1 motion vector prediction (spec 7.10): the reference MV stack of a
+// block (find_mv_stack 7.10.2 with its scan row/col/point, temporal scan,
+// sorting, extra search and context/clamping processes), the contexts it
+// gives (NewMvContext, RefMvContext, ZeroMvContext, DrlCtxStack),
+// has_overlappable_candidates (7.10.3), find_warp_samples (7.10.4), the
+// warp estimation and setup shear processes (7.11.3.6–8, run by the
+// parser so the reconstructor gets ready LocalWarpParams), and the motion
+// field estimation (7.9) and motion vector storage (7.19) processes.
+//
+// Av1Mvp owns the per-4x4 mode info grids that MV prediction and many
+// parser contexts read (MiSizes, RefFrames, Mvs, YModes, IsInters …);
+// the parser writes them as it decodes each block.
+//
+// Motion vectors are pairs (row, col) in 1/8 sample units; in lists a
+// pair takes two Ints, row first.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+let mvInvalid = -32768
+
+struct Av1Mvp {
+    miCols: Int = 0
+    miRows: Int = 0
+    // Mode info grids, index row * miCols + col.
+    gMiSize: [Int] = []
+    gRef0: [Int] = []
+    gRef1: [Int] = []
+    gMvR0: [Int] = []
+    gMvC0: [Int] = []
+    gMvR1: [Int] = []
+    gMvC1: [Int] = []
+    gYMode: [Int] = []
+    gIsInter: [Int] = []
+    // Frame number when the 4x4 block was last written ("has been
+    // written for this frame").
+    gStamp: [Int] = []
+    stamp: Int = 0
+
+    // Frame parameters.
+    gmType: [Int] = [0, 0, 0, 0, 0, 0, 0, 0]
+    gmParams: [Int] = []
+    allowHighPrecisionMv: Bool = false
+    forceIntegerMv: Bool = false
+    signBias: [Int] = [0, 0, 0, 0, 0, 0, 0, 0]
+    useRefFrameMvs: Bool = false
+    // MotionFieldMvs[ ref ][ y8 ][ x8 ] at (ref * h8 + y8) * w8 + x8, row
+    // and col in two lists; mvInvalid rows mark holes.
+    mfRow: [Int] = []
+    mfCol: [Int] = []
+    mfInvalid: [Int] = []
+    w8: Int = 0
+    h8: Int = 0
+
+    // The tile.
+    miRowStart: Int = 0
+    miRowEnd: Int = 0
+    miColStart: Int = 0
+    miColEnd: Int = 0
+
+    // The block.
+    miRow: Int = 0
+    miCol: Int = 0
+    miSize: Int = 0
+    bw4: Int = 1
+    bh4: Int = 1
+    refFrame0: Int = 0
+    refFrame1: Int = -1
+
+    // Outputs of find_mv_stack.
+    numMvFound: Int = 0
+    newMvCount: Int = 0
+    // RefStackMv[ idx ][ list ][ comp ] at idx * 4 + list * 2 + comp.
+    stack: [Int] = []
+    weight: [Int] = []
+    globalMvs: [Int] = [0, 0, 0, 0]
+    drlCtxStack: [Int] = []
+    newMvContext: Int = 0
+    refMvContext: Int = 0
+    zeroMvContext: Int = 0
+    foundMatch: Int = 0
+    closeMatches: Int = 0
+    totalMatches: Int = 0
+    // Extra search scratch.
+    refIdCount: [Int] = [0, 0]
+    refDiffCount: [Int] = [0, 0]
+    refIdMvs: [Int] = []
+    refDiffMvs: [Int] = []
+    cand: [Int] = [0, 0, 0, 0]
+
+    // Warp samples (7.10.4): CandList[ i ][ 0 … 3 ] at i * 4.
+    numSamples: Int = 0
+    numSamplesScanned: Int = 0
+    candList: [Int] = []
+    localValid: Bool = false
+    localWarpParams: [Int] = [0, 0, 65536, 0, 0, 65536]
+
+    // Tables.
+    tW4: [Int] = []
+    tH4: [Int] = []
+    tDivMult: [Int] = []
+    tDivLut: [Int] = []
+
+    fn setup() {
+        if tW4.isEmpty {
+            tW4 = av1Num4x4BlocksWide
+            tH4 = av1Num4x4BlocksHigh
+            tDivMult = av1DivMult
+            tDivLut = av1DivLut
+            stack = av1Zeros(40)
+            weight = av1Zeros(10)
+            drlCtxStack = av1Zeros(10)
+            refIdMvs = av1Zeros(8)
+            refDiffMvs = av1Zeros(8)
+            candList = av1Zeros(40)
+            gmParams = av1DefaultGm()
+        }
+    }
+
+    // Grids for a frame of miCols x miRows.
+    fn beginFrame(_ cols: Int, _ rows: Int) {
+        setup()
+        stamp += 1
+        if cols != miCols || rows != miRows || gMiSize.isEmpty {
+            miCols = cols
+            miRows = rows
+            let n = cols * rows
+            gMiSize = av1Zeros(n)
+            gRef0 = av1Zeros(n)
+            gRef1 = av1Zeros(n)
+            gMvR0 = av1Zeros(n)
+            gMvC0 = av1Zeros(n)
+            gMvR1 = av1Zeros(n)
+            gMvC1 = av1Zeros(n)
+            gYMode = av1Zeros(n)
+            gIsInter = av1Zeros(n)
+            gStamp = av1Zeros(n)
+        }
+    }
+
+    fn isInside(_ r: Int, _ c: Int) -> Bool {
+        c >= miColStart && c < miColEnd && r >= miRowStart && r < miRowEnd
+    }
+
+    // lower_mv_precision (7.10.2.10) of one component.
+    fn lowerPrec(_ v: Int) -> Int {
+        if allowHighPrecisionMv {
+            return v
+        }
+        if forceIntegerMv {
+            let a = abs(v)
+            let aInt = (a + 3) >> 3
+            if v > 0 {
+                return aInt << 3
+            }
+            return -(aInt << 3)
+        }
+        if (v & 1) != 0 {
+            if v > 0 {
+                return v - 1
+            }
+            return v + 1
+        }
+        v
+    }
+
+    // Setup global mv process (7.10.2.1) for refList; writes globalMvs.
+    fn setupGlobalMv(_ refList: Int) {
+        let ref = if refList == 0 { refFrame0 } else { refFrame1 }
+        var mv0 = 0
+        var mv1 = 0
+        var typ = 0
+        if ref > 0 {
+            typ = gmType[ref]
+        }
+        let bw = tW4[miSize] * 4
+        let bh = tH4[miSize] * 4
+        if ref <= 0 || typ == 0 {
+            mv0 = 0
+            mv1 = 0
+        } else if typ == 1 {
+            mv0 = gmParams[ref * 6] >> 13
+            mv1 = gmParams[ref * 6 + 1] >> 13
+        } else {
+            let x = miCol * 4 + bw / 2 - 1
+            let y = miRow * 4 + bh / 2 - 1
+            let g = ref * 6
+            let xc = (gmParams[g + 2] - 65536) * x + gmParams[g + 3] * y + gmParams[g]
+            let yc = gmParams[g + 4] * x + (gmParams[g + 5] - 65536) * y + gmParams[g + 1]
+            if allowHighPrecisionMv {
+                mv0 = av1Round2Signed(yc, 13)
+                mv1 = av1Round2Signed(xc, 13)
+            } else {
+                mv0 = av1Round2Signed(yc, 14) * 2
+                mv1 = av1Round2Signed(xc, 14) * 2
+            }
+        }
+        globalMvs[refList * 2] = lowerPrec(mv0)
+        globalMvs[refList * 2 + 1] = lowerPrec(mv1)
+    }
+
+    // find_mv_stack( isCompound ) (7.10.2).
+    fn findMvStack(_ isCompound: Bool) {
+        numMvFound = 0
+        newMvCount = 0
+        globalMvs[2] = 0
+        globalMvs[3] = 0
+        setupGlobalMv(0)
+        if isCompound {
+            setupGlobalMv(1)
+        }
+        foundMatch = 0
+        scanRow(-1, isCompound)
+        var foundAboveMatch = foundMatch
+        foundMatch = 0
+        scanCol(-1, isCompound)
+        var foundLeftMatch = foundMatch
+        foundMatch = 0
+        if max(bw4, bh4) <= 16 {
+            scanPoint(-1, bw4, isCompound)
+        }
+        if foundMatch == 1 {
+            foundAboveMatch = 1
+        }
+        closeMatches = foundAboveMatch + foundLeftMatch
+        let numNearest = numMvFound
+        let numNew = newMvCount
+        if numNearest > 0 {
+            for idx in 0..numNearest {
+                weight[idx] += 640
+            }
+        }
+        zeroMvContext = 0
+        if useRefFrameMvs {
+            temporalScan(isCompound)
+        }
+        foundMatch = 0
+        scanPoint(-1, -1, isCompound)
+        if foundMatch == 1 {
+            foundAboveMatch = 1
+        }
+        foundMatch = 0
+        scanRow(-3, isCompound)
+        if foundMatch == 1 {
+            foundAboveMatch = 1
+        }
+        foundMatch = 0
+        scanCol(-3, isCompound)
+        if foundMatch == 1 {
+            foundLeftMatch = 1
+        }
+        foundMatch = 0
+        if bh4 > 1 {
+            scanRow(-5, isCompound)
+        }
+        if foundMatch == 1 {
+            foundAboveMatch = 1
+        }
+        foundMatch = 0
+        if bw4 > 1 {
+            scanCol(-5, isCompound)
+        }
+        if foundMatch == 1 {
+            foundLeftMatch = 1
+        }
+        totalMatches = foundAboveMatch + foundLeftMatch
+        sortStack(0, numNearest, isCompound)
+        sortStack(numNearest, numMvFound, isCompound)
+        if numMvFound < 2 {
+            extraSearch(isCompound)
+        }
+        contextAndClamping(isCompound, numNew)
+    }
+
+    // Scan row process (7.10.2.2).
+    fn scanRow(_ deltaRow0: Int, _ isCompound: Bool) {
+        var deltaRow = deltaRow0
+        let end4 = min(min(bw4, miCols - miCol), 16)
+        var deltaCol = 0
+        let useStep16 = bw4 >= 16
+        if abs(deltaRow) > 1 {
+            deltaRow += miRow & 1
+            deltaCol = 1 - (miCol & 1)
+        }
+        var i = 0
+        while i < end4 {
+            let mvRow = miRow + deltaRow
+            let mvCol = miCol + deltaCol + i
+            if !isInside(mvRow, mvCol) {
+                break
+            }
+            var len = min(bw4, tW4[gMiSize[mvRow * miCols + mvCol]])
+            if abs(deltaRow) > 1 {
+                len = max(2, len)
+            }
+            if useStep16 {
+                len = max(4, len)
+            }
+            addRefMvCandidate(mvRow, mvCol, isCompound, len * 2)
+            i += len
+        }
+    }
+
+    // Scan col process (7.10.2.3).
+    fn scanCol(_ deltaCol0: Int, _ isCompound: Bool) {
+        var deltaCol = deltaCol0
+        let end4 = min(min(bh4, miRows - miRow), 16)
+        var deltaRow = 0
+        let useStep16 = bh4 >= 16
+        if abs(deltaCol) > 1 {
+            deltaRow = 1 - (miRow & 1)
+            deltaCol += miCol & 1
+        }
+        var i = 0
+        while i < end4 {
+            let mvRow = miRow + deltaRow + i
+            let mvCol = miCol + deltaCol
+            if !isInside(mvRow, mvCol) {
+                break
+            }
+            var len = min(bh4, tH4[gMiSize[mvRow * miCols + mvCol]])
+            if abs(deltaCol) > 1 {
+                len = max(2, len)
+            }
+            if useStep16 {
+                len = max(4, len)
+            }
+            addRefMvCandidate(mvRow, mvCol, isCompound, len * 2)
+            i += len
+        }
+    }
+
+    // Scan point process (7.10.2.4).
+    fn scanPoint(_ deltaRow: Int, _ deltaCol: Int, _ isCompound: Bool) {
+        let mvRow = miRow + deltaRow
+        let mvCol = miCol + deltaCol
+        if isInside(mvRow, mvCol) && gStamp[mvRow * miCols + mvCol] == stamp {
+            addRefMvCandidate(mvRow, mvCol, isCompound, 4)
+        }
+    }
+
+    // Temporal scan process (7.10.2.5).
+    fn temporalScan(_ isCompound: Bool) {
+        let stepW4 = if bw4 >= 16 { 4 } else { 2 }
+        let stepH4 = if bh4 >= 16 { 4 } else { 2 }
+        var deltaRow = 0
+        while deltaRow < min(bh4, 16) {
+            var deltaCol = 0
+            while deltaCol < min(bw4, 16) {
+                addTplRefMv(deltaRow, deltaCol, isCompound)
+                deltaCol += stepW4
+            }
+            deltaRow += stepH4
+        }
+        let allowExtension = bh4 >= 2 && bh4 < 16 && bw4 >= 2 && bw4 < 16
+        if allowExtension {
+            for i in 0..3 {
+                var dr = bh4
+                var dc = -2
+                if i == 1 {
+                    dc = bw4
+                } else if i == 2 {
+                    dr = bh4 - 2
+                    dc = bw4
+                }
+                // check_sb_border
+                let row = (miRow & 15) + dr
+                let col = (miCol & 15) + dc
+                if row >= 0 && row < 16 && col >= 0 && col < 16 {
+                    addTplRefMv(dr, dc, isCompound)
+                }
+            }
+        }
+    }
+
+    // Temporal sample process (7.10.2.6).
+    fn addTplRefMv(_ deltaRow: Int, _ deltaCol: Int, _ isCompound: Bool) {
+        let mvRow = (miRow + deltaRow) | 1
+        let mvCol = (miCol + deltaCol) | 1
+        if !isInside(mvRow, mvCol) {
+            return
+        }
+        let x8 = mvCol >> 1
+        let y8 = mvRow >> 1
+        if deltaRow == 0 && deltaCol == 0 {
+            zeroMvContext = 1
+        }
+        if !isCompound {
+            let at = (refFrame0 * h8 + y8) * w8 + x8
+            let r0 = mfRow[at]
+            if r0 == mvInvalid {
+                return
+            }
+            let c0 = lowerPrec(mfCol[at])
+            let rr = lowerPrec(r0)
+            if deltaRow == 0 && deltaCol == 0 {
+                if abs(rr - globalMvs[0]) >= 16 || abs(c0 - globalMvs[1]) >= 16 {
+                    zeroMvContext = 1
+                } else {
+                    zeroMvContext = 0
+                }
+            }
+            var idx = 0
+            while idx < numMvFound {
+                if rr == stack[idx * 4] && c0 == stack[idx * 4 + 1] {
+                    break
+                }
+                idx += 1
+            }
+            if idx < numMvFound {
+                weight[idx] += 2
+            } else if numMvFound < 8 {
+                stack[numMvFound * 4] = rr
+                stack[numMvFound * 4 + 1] = c0
+                weight[numMvFound] = 2
+                numMvFound += 1
+            }
+        } else {
+            let at0 = (refFrame0 * h8 + y8) * w8 + x8
+            if mfRow[at0] == mvInvalid {
+                return
+            }
+            let at1 = (refFrame1 * h8 + y8) * w8 + x8
+            if mfRow[at1] == mvInvalid {
+                return
+            }
+            let r0 = lowerPrec(mfRow[at0])
+            let c0 = lowerPrec(mfCol[at0])
+            let r1 = lowerPrec(mfRow[at1])
+            let c1 = lowerPrec(mfCol[at1])
+            if deltaRow == 0 && deltaCol == 0 {
+                if abs(r0 - globalMvs[0]) >= 16 || abs(c0 - globalMvs[1]) >= 16 || abs(r1 - globalMvs[2]) >= 16 || abs(c1 - globalMvs[3]) >= 16 {
+                    zeroMvContext = 1
+                } else {
+                    zeroMvContext = 0
+                }
+            }
+            var idx = 0
+            while idx < numMvFound {
+                let k = idx * 4
+                if r0 == stack[k] && c0 == stack[k + 1] && r1 == stack[k + 2] && c1 == stack[k + 3] {
+                    break
+                }
+                idx += 1
+            }
+            if idx < numMvFound {
+                weight[idx] += 2
+            } else if numMvFound < 8 {
+                let k = numMvFound * 4
+                stack[k] = r0
+                stack[k + 1] = c0
+                stack[k + 2] = r1
+                stack[k + 3] = c1
+                weight[numMvFound] = 2
+                numMvFound += 1
+            }
+        }
+    }
+
+    // Add reference motion vector process (7.10.2.7).
+    fn addRefMvCandidate(_ mvRow: Int, _ mvCol: Int, _ isCompound: Bool, _ w: Int) {
+        let at = mvRow * miCols + mvCol
+        if gIsInter[at] == 0 {
+            return
+        }
+        if !isCompound {
+            if gRef0[at] == refFrame0 {
+                searchStack(at, 0, w)
+            }
+            if gRef1[at] == refFrame0 {
+                searchStack(at, 1, w)
+            }
+        } else {
+            if gRef0[at] == refFrame0 && gRef1[at] == refFrame1 {
+                compoundSearchStack(at, w)
+            }
+        }
+    }
+
+    // Search stack process (7.10.2.8).
+    fn searchStack(_ at: Int, _ candList: Int, _ w: Int) {
+        let candMode = gYMode[at]
+        let candSize = gMiSize[at]
+        let large = min(tW4[candSize], tH4[candSize]) >= 2
+        var r = 0
+        var c = 0
+        if (candMode == 16 || candMode == 24) && gmType[refFrame0] > 1 && large {
+            r = globalMvs[0]
+            c = globalMvs[1]
+        } else if candList == 0 {
+            r = gMvR0[at]
+            c = gMvC0[at]
+        } else {
+            r = gMvR1[at]
+            c = gMvC1[at]
+        }
+        r = lowerPrec(r)
+        c = lowerPrec(c)
+        if av1HasNewmv(candMode) {
+            newMvCount += 1
+        }
+        foundMatch = 1
+        var idx = 0
+        while idx < numMvFound {
+            if stack[idx * 4] == r && stack[idx * 4 + 1] == c {
+                break
+            }
+            idx += 1
+        }
+        if idx < numMvFound {
+            weight[idx] += w
+        } else if numMvFound < 8 {
+            stack[numMvFound * 4] = r
+            stack[numMvFound * 4 + 1] = c
+            weight[numMvFound] = w
+            numMvFound += 1
+        }
+    }
+
+    // Compound search stack process (7.10.2.9).
+    fn compoundSearchStack(_ at: Int, _ w: Int) {
+        var r0 = gMvR0[at]
+        var c0 = gMvC0[at]
+        var r1 = gMvR1[at]
+        var c1 = gMvC1[at]
+        let candMode = gYMode[at]
+        if candMode == 24 {
+            if gmType[refFrame0] > 1 {
+                r0 = globalMvs[0]
+                c0 = globalMvs[1]
+            }
+            if gmType[refFrame1] > 1 {
+                r1 = globalMvs[2]
+                c1 = globalMvs[3]
+            }
+        }
+        r0 = lowerPrec(r0)
+        c0 = lowerPrec(c0)
+        r1 = lowerPrec(r1)
+        c1 = lowerPrec(c1)
+        foundMatch = 1
+        var idx = 0
+        while idx < numMvFound {
+            let k = idx * 4
+            if stack[k] == r0 && stack[k + 1] == c0 && stack[k + 2] == r1 && stack[k + 3] == c1 {
+                break
+            }
+            idx += 1
+        }
+        if idx < numMvFound {
+            weight[idx] += w
+        } else if numMvFound < 8 {
+            let k = numMvFound * 4
+            stack[k] = r0
+            stack[k + 1] = c0
+            stack[k + 2] = r1
+            stack[k + 3] = c1
+            weight[numMvFound] = w
+            numMvFound += 1
+        }
+        if av1HasNewmv(candMode) {
+            newMvCount += 1
+        }
+    }
+
+    // Sorting process (7.10.2.11).
+    fn sortStack(_ start: Int, _ end0: Int, _ isCompound: Bool) {
+        var end = end0
+        while end > start {
+            var newEnd = start
+            var idx = start + 1
+            while idx < end {
+                if weight[idx - 1] < weight[idx] {
+                    let t = weight[idx - 1]
+                    weight[idx - 1] = weight[idx]
+                    weight[idx] = t
+                    for k in 0..4 {
+                        let a = (idx - 1) * 4 + k
+                        let b = idx * 4 + k
+                        let tt = stack[a]
+                        stack[a] = stack[b]
+                        stack[b] = tt
+                    }
+                    newEnd = idx
+                }
+                idx += 1
+            }
+            end = newEnd
+        }
+    }
+
+    // Extra search process (7.10.2.12).
+    fn extraSearch(_ isCompound: Bool) {
+        refIdCount[0] = 0
+        refIdCount[1] = 0
+        refDiffCount[0] = 0
+        refDiffCount[1] = 0
+        var w4 = min(16, bw4)
+        var h4 = min(16, bh4)
+        w4 = min(w4, miCols - miCol)
+        h4 = min(h4, miRows - miRow)
+        let num4x4 = min(w4, h4)
+        for pass in 0..2 {
+            var idx = 0
+            while idx < num4x4 && numMvFound < 2 {
+                var mvRow = 0
+                var mvCol = 0
+                if pass == 0 {
+                    mvRow = miRow - 1
+                    mvCol = miCol + idx
+                } else {
+                    mvRow = miRow + idx
+                    mvCol = miCol - 1
+                }
+                if !isInside(mvRow, mvCol) {
+                    break
+                }
+                addExtraMvCandidate(mvRow, mvCol, isCompound)
+                if pass == 0 {
+                    idx += tW4[gMiSize[mvRow * miCols + mvCol]]
+                } else {
+                    idx += tH4[gMiSize[mvRow * miCols + mvCol]]
+                }
+            }
+        }
+        if isCompound {
+            // combinedMvs[ compCount ][ list ][ comp ] at
+            // compCount * 4 + list * 2 + comp.
+            var combined: [Int] = [0, 0, 0, 0, 0, 0, 0, 0]
+            for list in 0..2 {
+                var compCount = 0
+                for idx in 0..refIdCount[list] {
+                    combined[compCount * 4 + list * 2] = refIdMvs[list * 4 + idx * 2]
+                    combined[compCount * 4 + list * 2 + 1] = refIdMvs[list * 4 + idx * 2 + 1]
+                    compCount += 1
+                }
+                var idx = 0
+                while idx < refDiffCount[list] && compCount < 2 {
+                    combined[compCount * 4 + list * 2] = refDiffMvs[list * 4 + idx * 2]
+                    combined[compCount * 4 + list * 2 + 1] = refDiffMvs[list * 4 + idx * 2 + 1]
+                    compCount += 1
+                    idx += 1
+                }
+                while compCount < 2 {
+                    combined[compCount * 4 + list * 2] = globalMvs[list * 2]
+                    combined[compCount * 4 + list * 2 + 1] = globalMvs[list * 2 + 1]
+                    compCount += 1
+                }
+            }
+            if numMvFound == 1 {
+                let k = numMvFound * 4
+                if combined[0] == stack[0] && combined[1] == stack[1] && combined[2] == stack[2] && combined[3] == stack[3] {
+                    for j in 0..4 {
+                        stack[k + j] = combined[4 + j]
+                    }
+                } else {
+                    for j in 0..4 {
+                        stack[k + j] = combined[j]
+                    }
+                }
+                weight[numMvFound] = 2
+                numMvFound += 1
+            } else {
+                for idx in 0..2 {
+                    let k = numMvFound * 4
+                    for j in 0..4 {
+                        stack[k + j] = combined[idx * 4 + j]
+                    }
+                    weight[numMvFound] = 2
+                    numMvFound += 1
+                }
+            }
+        } else {
+            var idx = numMvFound
+            while idx < 2 {
+                stack[idx * 4] = globalMvs[0]
+                stack[idx * 4 + 1] = globalMvs[1]
+                idx += 1
+            }
+        }
+    }
+
+    // Add extra mv candidate process (7.10.2.13).
+    fn addExtraMvCandidate(_ mvRow: Int, _ mvCol: Int, _ isCompound: Bool) {
+        let at = mvRow * miCols + mvCol
+        if isCompound {
+            for candList in 0..2 {
+                let candRef = if candList == 0 { gRef0[at] } else { gRef1[at] }
+                if candRef > 0 {
+                    for list in 0..2 {
+                        var r = if candList == 0 { gMvR0[at] } else { gMvR1[at] }
+                        var c = if candList == 0 { gMvC0[at] } else { gMvC1[at] }
+                        let rf = if list == 0 { refFrame0 } else { refFrame1 }
+                        if candRef == rf && refIdCount[list] < 2 {
+                            refIdMvs[list * 4 + refIdCount[list] * 2] = r
+                            refIdMvs[list * 4 + refIdCount[list] * 2 + 1] = c
+                            refIdCount[list] += 1
+                        } else if refDiffCount[list] < 2 {
+                            if signBias[candRef] != signBias[rf] {
+                                r = -r
+                                c = -c
+                            }
+                            refDiffMvs[list * 4 + refDiffCount[list] * 2] = r
+                            refDiffMvs[list * 4 + refDiffCount[list] * 2 + 1] = c
+                            refDiffCount[list] += 1
+                        }
+                    }
+                }
+            }
+        } else {
+            for candList in 0..2 {
+                let candRef = if candList == 0 { gRef0[at] } else { gRef1[at] }
+                if candRef > 0 {
+                    var r = if candList == 0 { gMvR0[at] } else { gMvR1[at] }
+                    var c = if candList == 0 { gMvC0[at] } else { gMvC1[at] }
+                    if signBias[candRef] != signBias[refFrame0] {
+                        r = -r
+                        c = -c
+                    }
+                    var idx = 0
+                    while idx < numMvFound {
+                        if r == stack[idx * 4] && c == stack[idx * 4 + 1] {
+                            break
+                        }
+                        idx += 1
+                    }
+                    if idx == numMvFound {
+                        stack[idx * 4] = r
+                        stack[idx * 4 + 1] = c
+                        weight[idx] = 2
+                        numMvFound += 1
+                    }
+                }
+            }
+        }
+    }
+
+    // Context and clamping process (7.10.2.14).
+    fn contextAndClamping(_ isCompound: Bool, _ numNew: Int) {
+        let bw = bw4 * 4
+        let bh = bh4 * 4
+        let numLists = if isCompound { 2 } else { 1 }
+        for idx in 0..numMvFound {
+            var z = 0
+            if idx + 1 < numMvFound {
+                let w0 = weight[idx]
+                let w1 = weight[idx + 1]
+                if w0 >= 640 {
+                    if w1 < 640 {
+                        z = 1
+                    }
+                } else {
+                    z = 2
+                }
+            }
+            drlCtxStack[idx] = z
+        }
+        for list in 0..numLists {
+            for idx in 0..numMvFound {
+                let k = idx * 4 + list * 2
+                stack[k] = clampMvRow(stack[k], 128 + bh * 8)
+                stack[k + 1] = clampMvCol(stack[k + 1], 128 + bw * 8)
+            }
+        }
+        if closeMatches == 0 {
+            newMvContext = min(totalMatches, 1)
+            refMvContext = totalMatches
+        } else if closeMatches == 1 {
+            newMvContext = 3 - min(numNew, 1)
+            refMvContext = 2 + totalMatches
+        } else {
+            newMvContext = 5 - min(numNew, 1)
+            refMvContext = 5
+        }
+    }
+
+    fn clampMvRow(_ mvec: Int, _ border: Int) -> Int {
+        let mbToTopEdge = -((miRow * 4) * 8)
+        let mbToBottomEdge = ((miRows - bh4 - miRow) * 4) * 8
+        min(max(mvec, mbToTopEdge - border), mbToBottomEdge + border)
+    }
+
+    fn clampMvCol(_ mvec: Int, _ border: Int) -> Int {
+        let mbToLeftEdge = -((miCol * 4) * 8)
+        let mbToRightEdge = ((miCols - bw4 - miCol) * 4) * 8
+        min(max(mvec, mbToLeftEdge - border), mbToRightEdge + border)
+    }
+
+    // has_overlappable_candidates( ) (7.10.3).
+    fn hasOverlappableCandidates(_ availU: Bool, _ availL: Bool) -> Bool {
+        if availU {
+            var x4 = miCol
+            while x4 < min(miCols, miCol + bw4) {
+                if gRef0[(miRow - 1) * miCols + (x4 | 1)] > 0 {
+                    return true
+                }
+                x4 += 2
+            }
+        }
+        if availL {
+            var y4 = miRow
+            while y4 < min(miRows, miRow + bh4) {
+                if gRef0[(y4 | 1) * miCols + miCol - 1] > 0 {
+                    return true
+                }
+                y4 += 2
+            }
+        }
+        false
+    }
+
+    // Find warp samples process (7.10.4) for the block's Mv[ 0 ].
+    fn findWarpSamples(_ availU: Bool, _ availL: Bool, _ mvR: Int, _ mvC: Int) {
+        numSamples = 0
+        numSamplesScanned = 0
+        let w4 = bw4
+        let h4 = bh4
+        var doTopLeft = true
+        var doTopRight = true
+        if availU {
+            let srcSize = gMiSize[(miRow - 1) * miCols + miCol]
+            let srcW = tW4[srcSize]
+            if w4 <= srcW {
+                let colOffset = -(miCol & (srcW - 1))
+                if colOffset < 0 {
+                    doTopLeft = false
+                }
+                if colOffset + srcW > w4 {
+                    doTopRight = false
+                }
+                addSample(-1, 0, mvR, mvC)
+            } else {
+                var i = 0
+                while i < min(w4, miCols - miCol) {
+                    let sz = gMiSize[(miRow - 1) * miCols + miCol + i]
+                    let step = min(w4, tW4[sz])
+                    addSample(-1, i, mvR, mvC)
+                    i += step
+                }
+            }
+        }
+        if availL {
+            let srcSize = gMiSize[miRow * miCols + miCol - 1]
+            let srcH = tH4[srcSize]
+            if h4 <= srcH {
+                let rowOffset = -(miRow & (srcH - 1))
+                if rowOffset < 0 {
+                    doTopLeft = false
+                }
+                addSample(0, -1, mvR, mvC)
+            } else {
+                var i = 0
+                while i < min(h4, miRows - miRow) {
+                    let sz = gMiSize[(miRow + i) * miCols + miCol - 1]
+                    let step = min(h4, tH4[sz])
+                    addSample(i, -1, mvR, mvC)
+                    i += step
+                }
+            }
+        }
+        if doTopLeft {
+            addSample(-1, -1, mvR, mvC)
+        }
+        if doTopRight {
+            if max(w4, h4) <= 16 {
+                addSample(-1, w4, mvR, mvC)
+            }
+        }
+        if numSamples == 0 && numSamplesScanned > 0 {
+            numSamples = 1
+        }
+    }
+
+    // Add sample process (7.10.4.2).
+    fn addSample(_ deltaRow: Int, _ deltaCol: Int, _ mvR: Int, _ mvC: Int) {
+        if numSamplesScanned >= 8 {
+            return
+        }
+        let mvRow = miRow + deltaRow
+        let mvCol = miCol + deltaCol
+        if !isInside(mvRow, mvCol) {
+            return
+        }
+        let at = mvRow * miCols + mvCol
+        if gStamp[at] != stamp {
+            return
+        }
+        if gRef0[at] != refFrame0 {
+            return
+        }
+        if gRef1[at] != -1 {
+            return
+        }
+        let candSz = gMiSize[at]
+        let candW4 = tW4[candSz]
+        let candH4 = tH4[candSz]
+        let candRow = mvRow & ~(candH4 - 1)
+        let candCol = mvCol & ~(candW4 - 1)
+        let midY = candRow * 4 + candH4 * 2 - 1
+        let midX = candCol * 4 + candW4 * 2 - 1
+        let threshold = min(max(max(bw4 * 4, bh4 * 4), 16), 112)
+        let cat = candRow * miCols + candCol
+        let mvDiffRow = abs(gMvR0[cat] - mvR)
+        let mvDiffCol = abs(gMvC0[cat] - mvC)
+        let valid = (mvDiffRow + mvDiffCol) <= threshold
+        numSamplesScanned += 1
+        if !valid && numSamplesScanned > 1 {
+            return
+        }
+        let k = numSamples * 4
+        candList[k] = midY * 8
+        candList[k + 1] = midX * 8
+        candList[k + 2] = midY * 8 + gMvR0[cat]
+        candList[k + 3] = midX * 8 + gMvC0[cat]
+        if valid {
+            numSamples += 1
+        }
+    }
+
+    // Warp estimation process (7.11.3.8) and setup shear (7.11.3.6):
+    // sets localValid and localWarpParams for Mv[ 0 ] = (mvR, mvC).
+    fn warpEstimation(_ mvR: Int, _ mvC: Int) {
+        var a00 = 0
+        var a01 = 0
+        var a11 = 0
+        var bx0 = 0
+        var bx1 = 0
+        var by0 = 0
+        var by1 = 0
+        let midY = miRow * 4 + bh4 * 2 - 1
+        let midX = miCol * 4 + bw4 * 2 - 1
+        let suy = midY * 8
+        let sux = midX * 8
+        let duy = suy + mvR
+        let dux = sux + mvC
+        for i in 0..numSamples {
+            let sy = candList[i * 4] - suy
+            let sx = candList[i * 4 + 1] - sux
+            let dy = candList[i * 4 + 2] - duy
+            let dx = candList[i * 4 + 3] - dux
+            if abs(sx - dx) < 256 && abs(sy - dy) < 256 {
+                a00 += av1LsProduct(sx, sx) + 8
+                a01 += av1LsProduct(sx, sy) + 4
+                a11 += av1LsProduct(sy, sy) + 8
+                bx0 += av1LsProduct(sx, dx) + 8
+                bx1 += av1LsProduct(sy, dx) + 4
+                by0 += av1LsProduct(sx, dy) + 4
+                by1 += av1LsProduct(sy, dy) + 8
+            }
+        }
+        let det = a00 * a11 - a01 * a01
+        if det == 0 {
+            localValid = false
+            return
+        }
+        localValid = true
+        var (divShift, divFactor) = av1ResolveDivisor(det, tDivLut)
+        divShift -= 16
+        if divShift < 0 {
+            divFactor = divFactor << (-divShift)
+            divShift = 0
+        }
+        var p: [Int] = [0, 0, 0, 0, 0, 0]
+        p[2] = av1WarpDiag(a11 * bx0 - a01 * bx1, divFactor, divShift)
+        p[3] = av1WarpNondiag(-a01 * bx0 + a00 * bx1, divFactor, divShift)
+        p[4] = av1WarpNondiag(a11 * by0 - a01 * by1, divFactor, divShift)
+        p[5] = av1WarpDiag(-a01 * by0 + a00 * by1, divFactor, divShift)
+        let vx = mvC * (1 << 13) - (midX * (p[2] - 65536) + midY * p[3])
+        let vy = mvR * (1 << 13) - (midX * p[4] + midY * (p[5] - 65536))
+        p[0] = min(max(vx, -(1 << 23)), (1 << 23) - 1)
+        p[1] = min(max(vy, -(1 << 23)), (1 << 23) - 1)
+        localWarpParams = p
+        if !av1ShearValid(p, tDivLut) {
+            localValid = false
+        }
+    }
+
+    // Motion field estimation (7.9) for the frame: srcRefs etc. come from
+    // the parser (the slots' saved motion vectors).
+    //   orderHint, orderHints[ref], refIdx[i] = ref_frame_idx[i]
+    //   slotMiRows/Cols[slot], slotIntra[slot] (KEY or INTRA_ONLY),
+    //   slotOrderHints[slot * 8 + ref] = SavedOrderHints,
+    //   savedRef/savedMvR/savedMvC[slot] = SavedRefFrames / SavedMvs grids.
+    fn motionFieldEstimation(_ orderHint: Int, _ orderHints: [Int], _ refIdx: [Int], _ slotMiRows: [Int],
+                             _ slotMiCols: [Int], _ slotIntra: [Int], _ slotOrderHints: [Int],
+                             _ savedRef: [[Int]], _ savedMvR: [[Int]], _ savedMvC: [[Int]],
+                             _ enable: Bool, _ bits: Int) {
+        w8 = miCols >> 1
+        h8 = miRows >> 1
+        let n = 8 * h8 * w8
+        if mfInvalid.count != n {
+            var t: [Int] = []
+            for _ in 0..n {
+                t.append(mvInvalid)
+            }
+            mfInvalid = t
+        }
+        // Copies of the invalid template (copy-on-write: one fast copy at
+        // the first write).
+        mfRow = mfInvalid
+        mfCol = mfInvalid
+        let lastIdx = refIdx[0]
+        let curGoldOrderHint = orderHints[4]
+        let lastAltOrderHint = slotOrderHints[lastIdx * 8 + 7]
+        let useLast = lastAltOrderHint != curGoldOrderHint
+        if useLast {
+            mfProject(1, -1, orderHint, orderHints, refIdx, slotMiRows, slotMiCols, slotIntra, slotOrderHints, savedRef, savedMvR, savedMvC, enable, bits)
+        }
+        var refStamp = 3 - 2
+        if av1RelDist(orderHints[5], orderHint, enable, bits) > 0 {
+            if mfProject(5, 1, orderHint, orderHints, refIdx, slotMiRows, slotMiCols, slotIntra, slotOrderHints, savedRef, savedMvR, savedMvC, enable, bits) {
+                refStamp -= 1
+            }
+        }
+        if av1RelDist(orderHints[6], orderHint, enable, bits) > 0 {
+            if mfProject(6, 1, orderHint, orderHints, refIdx, slotMiRows, slotMiCols, slotIntra, slotOrderHints, savedRef, savedMvR, savedMvC, enable, bits) {
+                refStamp -= 1
+            }
+        }
+        if av1RelDist(orderHints[7], orderHint, enable, bits) > 0 && refStamp >= 0 {
+            if mfProject(7, 1, orderHint, orderHints, refIdx, slotMiRows, slotMiCols, slotIntra, slotOrderHints, savedRef, savedMvR, savedMvC, enable, bits) {
+                refStamp -= 1
+            }
+        }
+        if refStamp >= 0 {
+            mfProject(2, -1, orderHint, orderHints, refIdx, slotMiRows, slotMiCols, slotIntra, slotOrderHints, savedRef, savedMvR, savedMvC, enable, bits)
+        }
+    }
+
+    // Projection process (7.9.2).
+    fn mfProject(_ src: Int, _ dstSign: Int, _ orderHint: Int, _ orderHints: [Int], _ refIdx: [Int],
+                 _ slotMiRows: [Int], _ slotMiCols: [Int], _ slotIntra: [Int], _ slotOrderHints: [Int],
+                 _ savedRef: [[Int]], _ savedMvR: [[Int]], _ savedMvC: [[Int]],
+                 _ enable: Bool, _ bits: Int) -> Bool {
+        let srcIdx = refIdx[src - 1]
+        if slotMiRows[srcIdx] != miRows || slotMiCols[srcIdx] != miCols || slotIntra[srcIdx] == 1 {
+            return false
+        }
+        let sRef = savedRef[srcIdx]
+        let sR = savedMvR[srcIdx]
+        let sC = savedMvC[srcIdx]
+        if sRef.count < miRows * miCols {
+            return false
+        }
+        let dm = tDivMult
+        // Per source reference: refOffset; per destination: refToDst.
+        let refToCur = av1RelDist(orderHints[src], orderHint, enable, bits)
+        var refOffsets: [Int] = [0, 0, 0, 0, 0, 0, 0, 0]
+        for k in 1..8 {
+            refOffsets[k] = av1RelDist(orderHints[src], slotOrderHints[srcIdx * 8 + k], enable, bits)
+        }
+        var toDst: [Int] = [0, 0, 0, 0, 0, 0, 0, 0]
+        for dst in 1..8 {
+            toDst[dst] = min(max(av1RelDist(orderHint, orderHints[dst], enable, bits), -31), 31)
+        }
+        let num = min(max(refToCur * dstSign, -31), 31)
+        let curOk = abs(refToCur) <= 31
+        let lim = (1 << 14) - 1
+        let plane = h8 * w8
+        let mr8 = miRows >> 1
+        let mc8 = miCols >> 1
+        var mfr = mfRow
+        var mfc = mfCol
+        mfRow = []
+        mfCol = []
+        for y8 in 0..h8 {
+            let rowAt = (2 * y8 + 1) * miCols
+            let base8y = (y8 >> 3) << 3
+            for x8 in 0..w8 {
+                let at = rowAt + 2 * x8 + 1
+                let srcRef = sRef[at]
+                if srcRef <= 0 || !curOk {
+                    continue
+                }
+                let refOffset = refOffsets[srcRef]
+                if refOffset <= 0 || refOffset > 31 {
+                    continue
+                }
+                let dmul = dm[refOffset]
+                let mr = sR[at]
+                let mc = sC[at]
+                // get_mv_projection with refToCur * dstSign.
+                var pr = av1Round2Signed(mr * num * dmul, 14)
+                var pc = av1Round2Signed(mc * num * dmul, 14)
+                pr = min(max(pr, -lim), lim)
+                pc = min(max(pc, -lim), lim)
+                // get_block_position (7.9.4).
+                let offY = if pr >= 0 { pr >> 6 } else { -((-pr) >> 6) }
+                let posY8 = y8 + dstSign * offY
+                if posY8 < 0 || posY8 >= mr8 || posY8 < base8y || posY8 >= base8y + 8 {
+                    continue
+                }
+                let base8x = (x8 >> 3) << 3
+                let offX = if pc >= 0 { pc >> 6 } else { -((-pc) >> 6) }
+                let posX8 = x8 + dstSign * offX
+                if posX8 < 0 || posX8 >= mc8 || posX8 < base8x - 8 || posX8 >= base8x + 16 {
+                    continue
+                }
+                let k0 = posY8 * w8 + posX8
+                for dst in 1..8 {
+                    let d = toDst[dst]
+                    let k = dst * plane + k0
+                    mfr[k] = min(max(av1Round2Signed(mr * d * dmul, 14), -lim), lim)
+                    mfc[k] = min(max(av1Round2Signed(mc * d * dmul, 14), -lim), lim)
+                }
+            }
+        }
+        mfRow = mfr
+        mfCol = mfc
+        true
+    }
+}
+
+fn av1HasNewmv(_ mode: Int) -> Bool {
+    mode == 17 || mode == 25 || mode == 22 || mode == 23 || mode == 20 || mode == 21
+}
+
+fn av1Round2Signed(_ x: Int, _ n: Int) -> Int {
+    if n == 0 {
+        return x
+    }
+    if x >= 0 {
+        return (x + (1 << (n - 1))) >> n
+    }
+    -((-x + (1 << (n - 1))) >> n)
+}
+
+fn av1Round2(_ x: Int, _ n: Int) -> Int {
+    if n == 0 {
+        return x
+    }
+    (x + (1 << (n - 1))) >> n
+}
+
+fn av1LsProduct(_ a: Int, _ b: Int) -> Int {
+    ((a * b) >> 2) + (a + b)
+}
+
+// Resolve divisor process (7.11.3.7): (divShift, divFactor).
+fn av1ResolveDivisor(_ d: Int, _ lut: [Int]) -> (Int, Int) {
+    let n = av1FloorLog2(abs(d))
+    let e = abs(d) - (1 << n)
+    var f = 0
+    if n > 8 {
+        f = av1Round2(e, n - 8)
+    } else {
+        f = e << (8 - n)
+    }
+    let divShift = n + 14
+    let divFactor = if d < 0 { -lut[f] } else { lut[f] }
+    (divShift, divFactor)
+}
+
+fn av1WarpNondiag(_ v: Int, _ divFactor: Int, _ divShift: Int) -> Int {
+    min(max(av1Round2Signed(v * divFactor, divShift), -(1 << 13) + 1), (1 << 13) - 1)
+}
+
+fn av1WarpDiag(_ v: Int, _ divFactor: Int, _ divShift: Int) -> Int {
+    min(max(av1Round2Signed(v * divFactor, divShift), 65536 - (1 << 13) + 1), 65536 + (1 << 13) - 1)
+}
+
+// warpValid of the setup shear process (7.11.3.6).
+fn av1ShearValid(_ p: [Int], _ lut: [Int]) -> Bool {
+    let alpha0 = min(max(p[2] - 65536, -32768), 32767)
+    let beta0 = min(max(p[3], -32768), 32767)
+    let (divShift, divFactor) = av1ResolveDivisor(p[2], lut)
+    let v = p[4] << 16
+    let gamma0 = min(max(av1Round2Signed(v * divFactor, divShift), -32768), 32767)
+    let w = p[3] * p[4]
+    let delta0 = min(max(p[5] - av1Round2Signed(w * divFactor, divShift) - 65536, -32768), 32767)
+    let alpha = av1Round2Signed(alpha0, 6) << 6
+    let beta = av1Round2Signed(beta0, 6) << 6
+    let gamma = av1Round2Signed(gamma0, 6) << 6
+    let delta = av1Round2Signed(delta0, 6) << 6
+    if 4 * abs(alpha) + 7 * abs(beta) >= 65536 {
+        return false
+    }
+    if 4 * abs(gamma) + 4 * abs(delta) >= 65536 {
+        return false
+    }
+    true
+}
+
+// Get mv projection process (7.9.3) for one component.
+fn av1MvProjection(_ mv: Int, _ numerator: Int, _ denominator: Int, _ divMult: [Int]) -> Int {
+    let clippedDen = min(31, denominator)
+    let clippedNum = min(max(numerator, -31), 31)
+    let scaled = av1Round2Signed(mv * clippedNum * divMult[clippedDen], 14)
+    min(max(scaled, -(1 << 14) + 1), (1 << 14) - 1)
+}
+
+// project( ) of the get block position process (7.9.4); -1 when the
+// position is not valid.
+fn av1MfProject(_ v8: Int, _ delta: Int, _ dstSign: Int, _ max8: Int, _ maxOff8: Int) -> Int {
+    let base8 = (v8 >> 3) << 3
+    var offset8 = 0
+    if delta >= 0 {
+        offset8 = delta >> 6
+    } else {
+        offset8 = -((-delta) >> 6)
+    }
+    let v = v8 + dstSign * offset8
+    if v < 0 || v >= max8 || v < base8 - maxOff8 || v >= base8 + 8 + maxOff8 {
+        return -1
+    }
+    v
+}

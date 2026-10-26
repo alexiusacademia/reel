@@ -1,0 +1,83 @@
+{
+ "format": "flac",
+ "duration": 0.4,
+ "tags": {
+  "artist": "Flac Artist",
+  "comment": "hello",
+  "encoder": "Lavf62.12.102"
+ },
+ "tracks": [
+  {
+   "index": 0,
+   "kind": "audio",
+   "codec": "flac",
+   "ffCodec": "flac",
+   "profile": "",
+   "timescale": 44100,
+   "duration": 17640,
+   "extraHex": "120012000004100004e30ac440f0000044e80e805556262c18a45fce5781dab5fcb7",
+   "width": 0,
+   "height": 0,
+   "sarNum": 1,
+   "sarDen": 1,
+   "fpsNum": 0,
+   "fpsDen": 0,
+   "rotation": 0,
+   "pixFmt": "",
+   "sampleRate": 44100,
+   "channels": 1,
+   "channelLayout": "mono",
+   "bitsPerSample": 16,
+   "pcm": {
+    "bits": 16,
+    "float": false,
+    "bigEndian": false,
+    "signed": true
+   },
+   "language": "",
+   "title": "",
+   "isDefault": false,
+   "isCover": false,
+   "frames": -1
+  }
+ ],
+ "packets": [
+  {
+   "track": 0,
+   "pts": 0,
+   "dts": 0,
+   "duration": 4608,
+   "key": true,
+   "pos": 8331,
+   "size": 1251
+  },
+  {
+   "track": 0,
+   "pts": 4608,
+   "dts": 4608,
+   "duration": 4608,
+   "key": true,
+   "pos": 9582,
+   "size": 1246
+  },
+  {
+   "track": 0,
+   "pts": 9216,
+   "dts": 9216,
+   "duration": 4608,
+   "key": true,
+   "pos": 10828,
+   "size": 1247
+  },
+  {
+   "track": 0,
+   "pts": 13824,
+   "dts": 13824,
+   "duration": 3816,
+   "key": true,
+   "pos": 12075,
+   "size": 1040
+  }
+ ],
+ "chapters": []
+}

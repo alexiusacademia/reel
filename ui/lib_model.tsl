@@ -1,0 +1,858 @@
+// The data side of the library views: a thumbnail value (RGBA pixels the
+// app passes in), `LibraryModel` (what the Library window shows — the
+// group, search, sort and the level it's at — and the query results it
+// caches so that scrolling a long list doesn't touch SQLite), the data
+// of the Home screen, and the small pure helpers the views use for text
+// and layout (times, sizes, progress, grid maths, reordering), which
+// tests/ui_library checks.
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+import "../library"
+import "../core"
+
+// A small picture: packed RGBA pixels r<<24|g<<16|b<<8|a, row by row (as
+// vfx.thumbnail and library.ThumbCache.load give them). Empty: none.
+public struct LibThumb {
+    width: Int = 0
+    height: Int = 0
+    pixels: [Int] = []
+
+    isEmpty: Bool {
+        width <= 0 || height <= 0 || pixels.count < width * height
+    }
+}
+
+// A thumbnail from what ThumbCache.load returns.
+public fn libThumbOf(_ t: (Int, Int, [Int])?) -> LibThumb {
+    if let (w, h, px) = t {
+        return LibThumb(width: w, height: h, pixels: px)
+    }
+    LibThumb()
+}
+
+// The library's groups, in sidebar order, with their titles.
+public let libGroups = ["movies", "tv", "music", "other", "history", "playlists"]
+
+public fn libGroupTitle(_ group: String) -> String {
+    match group {
+        "movies" -> "Movies"
+        "tv" -> "TV Shows"
+        "music" -> "Music"
+        "other" -> "Other"
+        "history" -> "History"
+        "playlists" -> "Playlists"
+        _ -> "Library"
+    }
+}
+
+// The sort keys a list of files offers (library.Library.items keys) and
+// their titles.
+public fn libSortOptions(_ group: String) -> [(String, String)] {
+    if group == "music" {
+        return [("title", "Title"), ("artist", "Artist"), ("album", "Album"), ("year", "Year"), ("added", "Date Added"), ("played", "Last Played"), ("duration", "Length"), ("name", "File Name")]
+    }
+    [("title", "Title"), ("year", "Year"), ("added", "Date Added"), ("played", "Last Played"), ("duration", "Length"), ("size", "Size"), ("name", "File Name")]
+}
+
+public fn libSortTitle(_ group: String, _ key: String) -> String {
+    for (k, t) in libSortOptions(group) {
+        if k == key {
+            return t
+        }
+    }
+    "Title"
+}
+
+// --- Text ---
+
+// "1:02:03", "2:03", or "" when unknown (negative).
+public fn libDurationText(_ seconds: Float) -> String {
+    if seconds < 0.0 {
+        return ""
+    }
+    library.clockText(seconds)
+}
+
+// "42 min left", "1 h 5 min left", "Less than a minute left"; "" when the
+// length isn't known.
+public fn libTimeLeftText(position: Float, duration: Float) -> String {
+    if duration <= 0.0 {
+        return ""
+    }
+    let left = max(0.0, duration - max(position, 0.0))
+    if left < 60.0 {
+        return "Less than a minute left"
+    }
+    let minutes = Int(left / 60.0 + 0.5)
+    if minutes < 60 {
+        return "{minutes} min left"
+    }
+    let h = minutes / 60
+    let m = minutes % 60
+    if m == 0 {
+        return "{h} h left"
+    }
+    "{h} h {m} min left"
+}
+
+// How far into a file, 0…1 (0 when the length isn't known).
+public fn libProgress(position: Float, duration: Float) -> Float {
+    if duration <= 0.0 || position <= 0.0 {
+        return 0.0
+    }
+    min(1.0, position / duration)
+}
+
+// "S01E02", "S01" (no episode), "" (not an episode); a dated episode
+// gives its date.
+public fn libEpisodeCode(season: Int, episode: Int, date: String = "") -> String {
+    if !date.isEmpty && episode < 0 {
+        return date
+    }
+    if season < 0 && episode < 0 {
+        return ""
+    }
+    let s = "{max(season, 0)}".padStart(2, with: "0")
+    if episode < 0 {
+        return "S{s}"
+    }
+    "S{s}E{"{episode}".padStart(2, with: "0")}"
+}
+
+// "Season 1", "Specials" (season 0), "Episodes" (no season).
+public fn libSeasonTitle(_ season: Int) -> String {
+    if season == 0 {
+        return "Specials"
+    }
+    if season < 0 {
+        return "Episodes"
+    }
+    "Season {season}"
+}
+
+// "740 KB", "12.5 MB", "1.2 GB" (decimal units, as Finder shows them).
+public fn libSizeText(_ bytes: Int) -> String {
+    if bytes < 1000 {
+        return "{max(bytes, 0)} bytes"
+    }
+    let units = ["KB", "MB", "GB", "TB"]
+    var scale = 1000
+    var u = 0
+    while u < 3 && bytes >= scale * 1000 {
+        scale *= 1000
+        u += 1
+    }
+    let tenths = (bytes * 10 + scale / 2) / scale
+    // One decimal below 100 ("12.5 MB"), none when it's .0 or above.
+    if tenths >= 1000 || tenths % 10 == 0 {
+        return "{(tenths + 5) / 10} {units[u]}"
+    }
+    "{tenths / 10}.{tenths % 10} {units[u]}"
+}
+
+// "Today", "Yesterday", "3 days ago", or the date ("12 Mar 2026"); "" for
+// 0 (never).
+public fn libAgoText(_ time: Float, now: Float) -> String {
+    if time <= 0.0 {
+        return ""
+    }
+    let days = daysBetween(time, now)
+    if days <= 0 {
+        return "Today"
+    }
+    if days == 1 {
+        return "Yesterday"
+    }
+    if days < 7 {
+        return "{days} days ago"
+    }
+    formatDate(time, format: "d MMM yyyy")
+}
+
+// "2 seasons · 24 episodes · 5 unwatched".
+public fn libShowSubtitle(_ s: library.ShowSummary) -> String {
+    let seasons = s.seasons.filter { x in x >= 0 }.count
+    var parts: [String] = []
+    if seasons > 1 {
+        parts.append("{seasons} seasons")
+    }
+    parts.append(if s.episodes == 1 { "1 episode" } else { "{s.episodes} episodes" })
+    if s.unwatched == 0 {
+        parts.append("all watched")
+    } else if s.unwatched < s.episodes {
+        parts.append("{s.unwatched} unwatched")
+    }
+    parts.joined(separator: " · ")
+}
+
+// "2004 · 12 tracks · 48:10".
+public fn libAlbumSubtitle(_ a: library.AlbumSummary) -> String {
+    var parts: [String] = []
+    if a.year > 0 {
+        parts.append("{a.year}")
+    }
+    parts.append(if a.tracks == 1 { "1 track" } else { "{a.tracks} tracks" })
+    if a.duration > 0.0 {
+        parts.append(libDurationText(a.duration))
+    }
+    parts.joined(separator: " · ")
+}
+
+// The second line under an item: what's known about it for the list it's
+// in ("2004 · 1:48:02 · 1.4 GB", the artist, the episode code…).
+public fn libItemSubtitle(_ i: library.MediaItem, level: String, now: Float = 0.0) -> String {
+    var parts: [String] = []
+    if level == "history" {
+        // What it is, then when it was played (the row shows the progress).
+        if i.group == "tv" && !i.series.isEmpty {
+            let code = libEpisodeCode(season: i.season, episode: i.episode, date: i.episodeDate)
+            parts.append(if code.isEmpty { i.series } else { "{i.series} {code}" })
+        } else if !i.artist.isEmpty {
+            parts.append(i.artist)
+        }
+        let ago = libAgoText(i.lastPlayed, now: now)
+        if !ago.isEmpty {
+            parts.append("played {ago.lowercase()}")
+        }
+        if i.playCount > 1 {
+            parts.append("{i.playCount} times")
+        }
+        return parts.joined(separator: " · ")
+    }
+    if i.group == "music" || i.kind == "audio" {
+        if !i.artist.isEmpty {
+            parts.append(i.artist)
+        }
+        if !i.album.isEmpty && level != "tracks" {
+            parts.append(i.album)
+        }
+    } else if i.group == "tv" && level != "episodes" {
+        let code = libEpisodeCode(season: i.season, episode: i.episode, date: i.episodeDate)
+        parts.append(if code.isEmpty { i.series } else { "{i.series} {code}" })
+    } else if i.year > 0 {
+        parts.append("{i.year}")
+    }
+    if i.duration > 0.0 {
+        parts.append(libDurationText(i.duration))
+    }
+    if level != "tracks" && i.size > 0 && i.kind != "audio" {
+        parts.append(libSizeText(i.size))
+    }
+    parts.joined(separator: " · ")
+}
+
+// --- Layout ---
+
+// How many grid columns of `cell` points (with `spacing` between) fit in
+// `width`; at least 1.
+public fn libGridColumns(width: Float, cell: Float, spacing: Float) -> Int {
+    if cell <= 0.0 {
+        return 1
+    }
+    max(1, Int(floor((width + spacing) / (cell + spacing))))
+}
+
+// The rows a grid of `count` items in `columns` takes.
+public fn libGridRows(count: Int, columns: Int) -> Int {
+    if count <= 0 {
+        return 0
+    }
+    let c = max(columns, 1)
+    (count + c - 1) / c
+}
+
+// The items of grid row `row`: from, to (to not included).
+public fn libGridRowRange(row: Int, columns: Int, count: Int) -> (Int, Int) {
+    let c = max(columns, 1)
+    let from = min(max(row, 0) * c, count)
+    (from, min(from + c, count))
+}
+
+// The width each of `columns` cells gets in `width` (spacing between).
+public fn libCellWidth(width: Float, columns: Int, spacing: Float) -> Float {
+    let c = max(columns, 1)
+    max(1.0, (width - spacing * Float(c - 1)) / Float(c))
+}
+
+// The selection moved by a key in a grid of `columns` (a list: 1):
+// "left" "right" "up" "down" "home" "end" "pageup" "pagedown" (`page`
+// rows). −1 stays −1 except that any move from nothing selects the first.
+public fn libMoveSelection(_ index: Int, key: String, count: Int, columns: Int = 1, page: Int = 10) -> Int {
+    if count <= 0 {
+        return -1
+    }
+    if index < 0 {
+        return if key == "end" { count - 1 } else { 0 }
+    }
+    let c = max(columns, 1)
+    let to = match key {
+        "left" -> index - 1
+        "right" -> index + 1
+        "up" -> index - c
+        "down" -> index + c
+        "home" -> 0
+        "end" -> count - 1
+        "pageup" -> index - c * page
+        "pagedown" -> index + c * page
+        _ -> index
+    }
+    if key == "up" && to < 0 {
+        return index
+    }
+    if key == "down" && to >= count {
+        // Down from the next-to-last row lands on the last item.
+        let row = index / c
+        if row < (count - 1) / c {
+            return count - 1
+        }
+        return index
+    }
+    max(0, min(to, count - 1))
+}
+
+// Where the seek preview box (`box` points wide) goes for the pointer at
+// `x` over a bar `barWidth` wide: centred on x, kept inside the bar.
+public fn libPreviewLeft(x: Float, barWidth: Float, box: Float) -> Float {
+    if barWidth <= box {
+        return 0.0
+    }
+    max(0.0, min(x - box / 2.0, barWidth - box))
+}
+
+// The time under x on a seek bar `width` wide with `margin` points of
+// track inset at each end (main.tsl's bar has 10).
+public fn libTimeAtX(_ x: Float, width: Float, duration: Float, margin: Float = 10.0) -> Float {
+    let w = max(width - 2.0 * margin, 1.0)
+    max(0.0, min((x - margin) / w, 1.0)) * max(duration, 0.0)
+}
+
+// The scene (or chapter, or bookmark) playing at `t`, from start times in
+// order: the last one starting at or before t; −1 before the first.
+public fn libCurrentIndex(_ starts: [Float], at: Float) -> Int {
+    var best = -1
+    for (i, s) in starts.enumerated() {
+        if s <= at + 0.001 {
+            best = i
+        } else {
+            break
+        }
+    }
+    best
+}
+
+// A file name without its extension ("Movie (2001).mkv" → "Movie (2001)").
+public fn libStem(_ name: String) -> String {
+    let n = name.fileName
+    if let dot = n.findLast(".") {
+        if dot > 0 {
+            return n.substring(from: 0, to: dot)
+        }
+    }
+    n
+}
+
+// The chapter's title, or "Chapter n" (n from 1).
+public fn libChapterTitle(_ c: core.Chapter, index: Int) -> String {
+    let t = c.title.trim()
+    if t.isEmpty { "Chapter {index + 1}" } else { t }
+}
+
+// --- Reordering (the playlist) ---
+
+// The list with the item at `from` moved to the drop slot `to` (0…count:
+// before the item that was at `to`; count: at the end).
+public fn libMoved<T>(_ list: [T], from: Int, to: Int) -> [T] {
+    if from < 0 || from >= list.count {
+        return list
+    }
+    var out = list
+    let x = out.remove(at: from)
+    let dest = if to > from { to - 1 } else { to }
+    out.insert(x, at: max(0, min(dest, out.count)))
+    out
+}
+
+// Where the item at `index` is after the move of libMoved (to follow the
+// one playing).
+public fn libMovedIndex(_ index: Int, from: Int, to: Int, count: Int) -> Int {
+    if from < 0 || from >= count || index < 0 {
+        return index
+    }
+    let dest = max(0, min(if to > from { to - 1 } else { to }, count - 1))
+    if index == from {
+        return dest
+    }
+    var i = index
+    if from < i {
+        i -= 1
+    }
+    if dest <= i {
+        i += 1
+    }
+    i
+}
+
+// Where `index` is after the item at `removed` is taken out (−1 when it
+// was that item).
+public fn libIndexAfterRemove(_ index: Int, removed: Int) -> Int {
+    if index == removed {
+        return -1
+    }
+    if removed < index { index - 1 } else { index }
+}
+
+// The total length of known durations, and how many are unknown.
+public fn libTotalDuration(_ durations: [Float]) -> (Float, Int) {
+    var total = 0.0
+    var unknown = 0
+    for d in durations {
+        if d > 0.0 {
+            total += d
+        } else {
+            unknown += 1
+        }
+    }
+    (total, unknown)
+}
+
+// --- The Library window's model ---
+
+// What the Library window shows and the results it has read for it. The
+// window changes the choices (group, query, sort, the show or album
+// opened) and calls `reload(lib)`; the app calls `reload` too after a scan
+// or when files were played.
+public struct LibraryModel {
+    // "movies" "tv" "music" "other" "history" "playlists".
+    group: String = "movies"
+    query: String = ""
+    // A library.Library.items sort key.
+    sort: String = "title"
+    descending: Bool = false
+    // "grid" or "list".
+    layout: String = "grid"
+    // TV: the show opened (its series key; "" for the list of shows), and
+    // its season (−2 all).
+    showKey: String = ""
+    showName: String = ""
+    season: Int = -2
+    // Music: an artist opened ("" with artistChosen: all albums), then an
+    // album.
+    artistChosen: Bool = false
+    artist: String = ""
+    albumChosen: Bool = false
+    album: String = ""
+    albumArtist: String = ""
+    // The selected file (its path), show key or album key.
+    selected: String = ""
+
+    // --- Read by reload ---
+    counts: [String: Int] = [:]
+    historyCount: Int = 0
+    // The files of the level shown (movies, search results, episodes,
+    // tracks, history).
+    items: [library.MediaItem] = []
+    shows: [library.ShowSummary] = []
+    // A show's seasons and the first episode of each show (for posters).
+    seasons: [Int] = []
+    showFirst: [String: library.MediaItem] = [:]
+    // The episode to continue with in the show opened ("" none).
+    nextEpisodePath: String = ""
+    nextEpisode: library.MediaItem? = nil
+    artists: [String] = []
+    albums: [library.AlbumSummary] = []
+    // The first track of each album ("album|artist"), for covers.
+    albumFirst: [String: library.MediaItem] = [:]
+    // Bumped on every reload.
+    revision: Int = 0
+    // When reload read the history (for "Yesterday" texts).
+    loadedAt: Float = 0.0
+    historyLimit: Int = 500
+
+    // What's shown: "items" "shows" "episodes" "artists" "albums" "tracks"
+    // "history" "playlists".
+    fn level() -> String {
+        if group == "history" {
+            return "history"
+        }
+        if group == "playlists" {
+            return "playlists"
+        }
+        if !query.trim().isEmpty {
+            return "items"
+        }
+        if group == "tv" {
+            return if showKey.isEmpty { "shows" } else { "episodes" }
+        }
+        if group == "music" {
+            if albumChosen {
+                return "tracks"
+            }
+            return if artistChosen { "albums" } else { "artists" }
+        }
+        "items"
+    }
+
+    // Whether there's a level above this one (Back).
+    canGoBack: Bool {
+        let l = level()
+        l == "episodes" || l == "albums" || l == "tracks"
+    }
+
+    // The title over the content: the group, show, artist or album.
+    fn title() -> String {
+        match level() {
+            "episodes" -> showName
+            "albums" -> if artist.isEmpty { "All Albums" } else { artist }
+            "tracks" -> if album.isEmpty { "Unknown Album" } else { album }
+            _ -> {
+                if !query.trim().isEmpty {
+                    return "{libGroupTitle(group)}: “{query.trim()}”"
+                }
+                libGroupTitle(group)
+            }
+        }
+    }
+
+    // A string that changes whenever what to read changes (the window
+    // reloads when it does).
+    fn queryKey() -> String {
+        "{group}|{query}|{sort}|{descending}|{showKey}|{season}|{artistChosen}|{artist}|{albumChosen}|{album}|{albumArtist}"
+    }
+
+    fn choose(_ g: String) {
+        group = g
+        showKey = ""
+        showName = ""
+        season = -2
+        artistChosen = false
+        albumChosen = false
+        artist = ""
+        album = ""
+        albumArtist = ""
+        selected = ""
+    }
+
+    fn openShow(_ s: library.ShowSummary) {
+        showKey = s.key
+        showName = s.name
+        season = -2
+        selected = ""
+    }
+
+    fn openArtist(_ name: String) {
+        artistChosen = true
+        artist = name
+        albumChosen = false
+        selected = ""
+    }
+
+    fn openAlbum(_ a: library.AlbumSummary) {
+        albumChosen = true
+        album = a.album
+        albumArtist = a.artist
+        selected = ""
+    }
+
+    // One level up.
+    fn back() {
+        let l = level()
+        if l == "episodes" {
+            selected = showKey
+            showKey = ""
+            showName = ""
+            season = -2
+        } else if l == "tracks" {
+            selected = "{album}|{albumArtist}"
+            albumChosen = false
+        } else if l == "albums" {
+            selected = artist
+            artistChosen = false
+        }
+    }
+
+    // How many things the level shows (cells or rows).
+    fn shownCount() -> Int {
+        match level() {
+            "shows" -> shows.count
+            "artists" -> artists.count + 1
+            "albums" -> albums.count
+            "playlists" -> 0
+            _ -> items.count
+        }
+    }
+
+    // The selection's key at index i of the level (for keyboard moves).
+    fn keyAt(_ i: Int) -> String {
+        if i < 0 {
+            return ""
+        }
+        match level() {
+            "shows" -> if i < shows.count { shows[i].key } else { "" }
+            "artists" -> if i == 0 { "*all*" } else if i - 1 < artists.count { artists[i - 1] } else { "" }
+            "albums" -> if i < albums.count { "{albums[i].album}|{albums[i].artist}" } else { "" }
+            _ -> if i < items.count { items[i].path } else { "" }
+        }
+    }
+
+    // The index of the selection in the level, or −1.
+    fn selectedIndex() -> Int {
+        if selected.isEmpty {
+            return -1
+        }
+        let n = shownCount()
+        for i in 0..n {
+            if keyAt(i) == selected {
+                return i
+            }
+        }
+        -1
+    }
+
+    // The file shown with this path, or nil.
+    fn item(path: String) -> library.MediaItem? {
+        items.first(where: { i in i.path == path })
+    }
+
+    // The files of the group last read for the "items" level, kept so that
+    // sorting and searching don't read the database again ("" none), and
+    // their search texts (made when first searched).
+    cacheKey: String = ""
+    cacheItems: [library.MediaItem] = []
+    cacheHay: [String] = []
+
+    // Reads what the current level shows from the library again (after a
+    // scan, or when files were played or marked).
+    fn reload(_ lib: library.Library) {
+        cacheKey = ""
+        cacheItems = []
+        cacheHay = []
+        update(lib)
+    }
+
+    // Shows what the choices ask for: a new sort or search of the same
+    // group's files works on the files read before; other levels are read.
+    fn update(_ lib: library.Library) {
+        counts = lib.groupCounts()
+        let hist = lib.history(limit: historyLimit)
+        historyCount = hist.count
+        loadedAt = now()
+        let q = query.trim()
+        let g = if group == "movies" || group == "tv" || group == "music" || group == "other" { group } else { "" }
+        let l = level()
+        items = []
+        match l {
+            "items" -> {
+                if cacheKey != "g:" + g {
+                    cacheItems = lib.items(group: g, sort: "name")
+                    cacheHay = []
+                    cacheKey = "g:" + g
+                }
+                var list = cacheItems
+                if !q.isEmpty {
+                    if cacheHay.count != cacheItems.count {
+                        var hay: [String] = []
+                        for it in cacheItems {
+                            hay.append(libSearchText(it))
+                        }
+                        cacheHay = hay
+                    }
+                    let words = library.searchWords(q)
+                    var found: [library.MediaItem] = []
+                    for (i, h) in cacheHay.enumerated() {
+                        if libHasWords(h, words) {
+                            found.append(cacheItems[i])
+                        }
+                    }
+                    list = found
+                }
+                items = if sort == "name" && !descending { list } else { library.sortItems(list, sort: sort, descending: descending) }
+            }
+            "shows" -> {
+                shows = lib.shows()
+                showFirst = [:]
+                for e in lib.items(group: "tv", sort: "episode") {
+                    if showFirst[e.seriesKey] == nil {
+                        showFirst[e.seriesKey] = e
+                    }
+                }
+            }
+            "episodes" -> {
+                let all = lib.episodes(key: showKey)
+                var ss: [Int] = []
+                for e in all {
+                    if !ss.contains(e.season) {
+                        ss.append(e.season)
+                    }
+                }
+                seasons = ss.sorted()
+                nextEpisode = lib.nextUnwatched(key: showKey)
+                nextEpisodePath = nextEpisode?.path ?? ""
+                items = if season == -2 { all } else { all.filter { e in e.season == season } }
+            }
+            "artists" -> {
+                artists = lib.artists()
+            }
+            "albums" -> {
+                albums = lib.albums(artist: artist)
+                albumFirst = [:]
+                for t in lib.items(group: "music", sort: "album") {
+                    let a = if t.albumArtist.isEmpty { t.artist } else { t.albumArtist }
+                    let k = "{t.album}|{a}"
+                    if albumFirst[k] == nil {
+                        albumFirst[k] = t
+                    }
+                }
+            }
+            "tracks" -> {
+                items = lib.albumTracks(album: album, artist: albumArtist)
+            }
+            "history" -> {
+                var out: [library.MediaItem] = []
+                for h in hist {
+                    var it = lib.item(h.path) ?? library.MediaItem(id: -1, path: h.path, name: h.name, size: h.size, kind: library.mediaKindOf(h.path), duration: h.duration)
+                    it.lastPlayed = h.lastPlayed
+                    it.playCount = h.playCount
+                    it.position = h.position
+                    it.finished = h.finished
+                    if it.duration <= 0.0 {
+                        it.duration = h.duration
+                    }
+                    if q.isEmpty || library.matchesSearch(it.displayTitle + " " + h.path.fileName + " " + it.artist + " " + it.series, query: q) {
+                        out.append(it)
+                    }
+                }
+                items = out
+            }
+            _ -> {}
+        }
+        if !selected.isEmpty && selectedIndex() < 0 {
+            selected = ""
+        }
+        revision += 1
+    }
+}
+
+// The words a file is found by (as the library's search: title, file
+// name, artist, album, show), folded, space-separated with a space first.
+public fn libSearchText(_ i: library.MediaItem) -> String {
+    let words = library.searchWords("{libStem(i.name)} {i.title} {i.artist} {i.album} {i.albumArtist} {i.series}")
+    " " + words.joined(separator: " ")
+}
+
+// Whether a search text has every word (the library's rule: each word
+// appears in it, also inside a longer word).
+public fn libHasWords(_ hay: String, _ words: [String]) -> Bool {
+    for w in words {
+        if !hay.contains(w) {
+            return false
+        }
+    }
+    true
+}
+
+// --- The Home screen's data ---
+
+// One card of the Home screen.
+public struct HomeEntry {
+    path: String
+    size: Int = 0
+    title: String = ""
+    // The second line: the show and episode, the artist…
+    subtitle: String = ""
+    // "video" "audio".
+    kind: String = "video"
+    position: Float = 0.0
+    duration: Float = -1.0
+    finished: Bool = false
+}
+
+public struct HomeData {
+    continueWatching: [HomeEntry] = []
+    nextEpisodes: [HomeEntry] = []
+    recentlyAdded: [HomeEntry] = []
+
+    isEmpty: Bool {
+        continueWatching.isEmpty && nextEpisodes.isEmpty && recentlyAdded.isEmpty
+    }
+}
+
+// A card for a library item.
+public fn libHomeEntry(_ i: library.MediaItem) -> HomeEntry {
+    var sub = ""
+    if i.group == "tv" {
+        let code = libEpisodeCode(season: i.season, episode: i.episode, date: i.episodeDate)
+        sub = if code.isEmpty { i.series } else { "{i.series} · {code}" }
+    } else if !i.artist.isEmpty {
+        sub = i.artist
+    } else if i.year > 0 {
+        sub = "{i.year}"
+    }
+    HomeEntry(path: i.path, size: i.size, title: i.displayTitle, subtitle: sub, kind: if i.kind.isEmpty { "video" } else { i.kind }, position: i.position, duration: i.duration, finished: i.finished)
+}
+
+// Reads the Home screen's rows from the library: files left part way
+// (at least `minSeconds` in, newest first; with `existing`, only files
+// that are still there), the next unwatched episode of each show that
+// has been watched before (not already in Continue watching), and the
+// files added last.
+public fn loadHomeData(_ lib: library.Library, limit: Int = 12, minSeconds: Float = 10.0, existing: Bool = true) -> HomeData {
+    var d = HomeData()
+    var seen: Set<String> = []
+    var seenShows: Set<String> = []
+    for h in lib.history(limit: limit * 4) {
+        if d.continueWatching.count >= limit {
+            break
+        }
+        if h.finished || h.position < minSeconds {
+            continue
+        }
+        if existing && !library.isURL(h.path) && !fileExists(h.path) {
+            continue
+        }
+        var e = if let it = lib.item(h.path) { libHomeEntry(it) } else { HomeEntry(path: h.path, size: h.size, title: libStem(h.name), kind: library.mediaKindOf(h.path)) }
+        e.position = h.position
+        e.duration = h.duration
+        if e.kind.isEmpty {
+            e.kind = "video"
+        }
+        d.continueWatching.append(e)
+        seen.insert(h.path)
+        let ep = library.parseEpisode(h.path)
+        if ep.isEpisode {
+            seenShows.insert(ep.key)
+        }
+    }
+    // Shows watched before (an episode finished or started), newest first.
+    var keys: [String] = []
+    for h in lib.history(limit: 200) {
+        let ep = library.parseEpisode(h.path)
+        if ep.isEpisode && !ep.key.isEmpty && !keys.contains(ep.key) {
+            keys.append(ep.key)
+        }
+    }
+    for k in keys {
+        if d.nextEpisodes.count >= limit {
+            break
+        }
+        if seenShows.contains(k) {
+            continue
+        }
+        if let n = lib.nextUnwatched(key: k) {
+            if !seen.contains(n.path) && (!existing || fileExists(n.path)) {
+                d.nextEpisodes.append(libHomeEntry(n))
+                seen.insert(n.path)
+            }
+        }
+    }
+    for i in lib.items(sort: "added", descending: true, limit: limit * 2) {
+        if d.recentlyAdded.count >= limit {
+            break
+        }
+        if !seen.contains(i.path) {
+            d.recentlyAdded.append(libHomeEntry(i))
+        }
+    }
+    d
+}

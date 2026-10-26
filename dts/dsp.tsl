@@ -1,0 +1,644 @@
+// The DTS core's synthesis: the 32-band (and, for X96, 64-band) QMF filter
+// bank that turns subband samples back into PCM (ETSI TS 102 114 5.6 and
+// Annex D.8), and the LFE channel's interpolation FIR (5.7, D.9).
+//
+// There are two forms, as in FFmpeg's decoder:
+//
+// - Floating point, for lossy core streams. Each block of 32 subband
+//   samples goes through a half-length inverse MDCT (the cosine
+//   modulation of the filter bank), then a 512-tap polyphase window
+//   with the previous 15 blocks' MDCT outputs. FFmpeg's half inverse MDCT
+//   of 32 coefficients is out[i] = Σ_k X[k]·(−1)^k·sin(π/32·(i+½)(k+½));
+//   we do it as a 32×32 matrix product.
+//
+// - Fixed point, used whenever the frame also carries DTS-HD lossless
+//   (XLL) data: the lossless residual is added to this exact integer
+//   output, so it must be reproduced bit for bit. This is the DTS
+//   reference decoder's integer DCT (FFmpeg's dcadct.c: sums, 8-point DCTs
+//   and modulations, all rounded and clipped to 24 bits) and integer
+//   window.
+//
+// State per channel: the window history (hist1, 512 or 1024 values, used
+// as a ring with `offset`) and the overlap of the previous block (hist2).
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../core"
+
+// Unpacked tables (bigtables.tsl).
+fn dtsFloats32(_ text: String) -> [Float] {
+    let d = decodeBase64(text) ?? Data()
+    var out: [Float] = []
+    var i = 0
+    while i + 4 <= d.count {
+        out.append(d.float32(at: i))
+        i += 4
+    }
+    out
+}
+
+fn dtsInts32(_ text: String) -> [Int] {
+    let d = decodeBase64(text) ?? Data()
+    var out: [Int] = []
+    var i = 0
+    while i + 4 <= d.count {
+        out.append(d.int32(at: i))
+        i += 4
+    }
+    out
+}
+
+// The half inverse MDCT as a matrix: m[i·n + k] = (−1)^k sin(π/n (i+½)(k+½)).
+fn dtsImdctMatrix(_ n: Int) -> [Float] {
+    var out: [Float] = []
+    for i in 0..n {
+        for k in 0..n {
+            let s = sin(pi / Float(n) * (Float(i) + 0.5) * (Float(k) + 0.5))
+            out.append(if k % 2 == 0 { s } else { -s })
+        }
+    }
+    out
+}
+
+let dtsFir32Perfect: [Float] = dtsFloats32(dtsFir32PerfectText)
+let dtsFir32NonPerfect: [Float] = dtsFloats32(dtsFir32NonPerfectText)
+let dtsFir64: [Float] = dtsFloats32(dtsFir64Text)
+let dtsLfeFir64: [Float] = dtsFloats32(dtsLfeFir64Text)
+let dtsLfeFir128: [Float] = dtsFloats32(dtsLfeFir128Text)
+let dtsFir32PerfectFixed: [Int] = dtsInts32(dtsFir32PerfectFixedText)
+let dtsFir32NonPerfectFixed: [Int] = dtsInts32(dtsFir32NonPerfectFixedText)
+let dtsFir64Fixed: [Int] = dtsInts32(dtsFir64FixedText)
+let dtsLfeFir64Fixed: [Int] = dtsInts32(dtsLfeFir64FixedText)
+let dtsImdct32: [Float] = dtsImdctMatrix(32)
+let dtsImdct64: [Float] = dtsImdctMatrix(64)
+
+// Fixed point helpers (FFmpeg's dcamath.h): rounding shifts and clipping
+// to the 24-bit range.
+fn dtsNorm(_ a: Int, _ bits: Int) -> Int {
+    if bits > 0 { (a + (1 << (bits - 1))) >> bits } else { a }
+}
+
+fn dtsMul(_ a: Int, _ b: Int, _ bits: Int) -> Int {
+    (a * b + (1 << (bits - 1))) >> bits
+}
+
+fn dtsClip23(_ a: Int) -> Int {
+    if a < -8388608 { -8388608 } else if a > 8388607 { 8388607 } else { a }
+}
+
+// Wraps to a signed 32-bit value, as C's int32 arithmetic does.
+fn dtsWrap32(_ a: Int) -> Int {
+    let v = a & 0xffffffff
+    if v >= 0x80000000 { v - 0x100000000 } else { v }
+}
+
+// Most samples a channel can have in one frame (128 blocks × 32, ×2 for
+// X96 or XLL at 96 kHz).
+let dtsMaxFrameSamples = 8192
+
+public struct DtsSynth {
+    // Window tables (copies of the module tables: module lists are slow
+    // to read in loops).
+    w32p: [Float] = dtsFir32Perfect
+    w32n: [Float] = dtsFir32NonPerfect
+    w64: [Float] = dtsFir64
+    lfe64: [Float] = dtsLfeFir64
+    lfe128: [Float] = dtsLfeFir128
+    w32pFixed: [Int] = dtsFir32PerfectFixed
+    w32nFixed: [Int] = dtsFir32NonPerfectFixed
+    w64Fixed: [Int] = dtsFir64Fixed
+    lfe64Fixed: [Int] = dtsLfeFir64Fixed
+    m32: [Float] = dtsImdct32
+    m64: [Float] = dtsImdct64
+
+    // Per channel (7) history: hist1 1024, hist2 64, ring offsets.
+    hist1F: [Float] = []
+    hist2F: [Float] = []
+    hist1X: [Int] = []
+    hist2X: [Int] = []
+    offset: [Int] = []
+    lfeHistF: Float = 0.0
+    lfeHistX: Int = 0
+
+    // Scratch.
+    inF: [Float] = []
+    inX: [Int] = []
+    bufA: [Int] = []
+    bufB: [Int] = []
+    tmpX: [Int] = []
+    tmpF: [Float] = []
+
+    // Output, by speaker (DCA speaker number × dtsMaxFrameSamples).
+    pcmF: [Float] = []
+    pcmX: [Int] = []
+
+    fn setUp() {
+        if !offset.isEmpty {
+            return
+        }
+        var f: [Float] = []
+        for _ in 0..(7 * 1024) {
+            f.append(0.0)
+        }
+        hist1F = f
+        hist1X = core.zeros(7 * 1024)
+        hist2F = f.prefix(7 * 64)
+        hist2X = core.zeros(7 * 64)
+        offset = core.zeros(7)
+        inF = f.prefix(64)
+        tmpF = f.prefix(dtsMaxFrameSamples)
+        inX = core.zeros(64)
+        bufA = core.zeros(64)
+        bufB = core.zeros(64)
+        tmpX = core.zeros(dtsMaxFrameSamples)
+        var p: [Float] = []
+        for _ in 0..(28 * dtsMaxFrameSamples) {
+            p.append(0.0)
+        }
+        pcmF = p
+        pcmX = core.zeros(28 * dtsMaxFrameSamples)
+    }
+
+    // Forgets the filter history (after a seek, or when the filter mode
+    // changes).
+    fn clear() {
+        if offset.isEmpty {
+            return
+        }
+        for i in 0..hist1F.count {
+            hist1F[i] = 0.0
+            hist1X[i] = 0
+        }
+        for i in 0..hist2F.count {
+            hist2F[i] = 0.0
+            hist2X[i] = 0
+        }
+        for i in 0..7 {
+            offset[i] = 0
+        }
+        lfeHistF = 0.0
+        lfeHistX = 0
+    }
+
+    // --- Floating point QMF (FFmpeg's sub_qmf32_float / synth_filter_float) ---
+
+    // Filters `blocks` subband sample blocks of channel `ch` into
+    // pcmF[spkr …]. sub[base + band·stride + n] are the 32 bands' samples;
+    // with x96, hi (64 bands, same layout from hiBase) adds the X96 bands
+    // and the output is 64 samples a block.
+    fn qmfFloat(ch: Int, spkr: Int, sub: [Int], base: Int, stride: Int, x96: Bool, hi: [Int], hiBase: Int, hasHi: Bool, blocks: Int, perfect: Bool) {
+        let bands = if x96 { 64 } else { 32 }
+        let scale = if x96 { 1.0 / 65536.0 } else { 1.0 / 131072.0 }
+        let win = if x96 { w64 } else if perfect { w32p } else { w32n }
+        let m = if x96 { m64 } else { m32 }
+        let h1 = ch * 1024
+        let h2 = ch * 64
+        let ring = bands * 16
+        let half = bands / 2
+        var out = spkr * dtsMaxFrameSamples
+        for j in 0..blocks {
+            for i in 0..bands {
+                var v = 0
+                if i < 32 {
+                    v = sub[base + i * stride + j]
+                }
+                if hasHi {
+                    v += hi[hiBase + i * stride + j]
+                }
+                inF[i] = if ((i - 1) & 2) != 0 { -Float(v) } else { Float(v) }
+            }
+            // Half inverse MDCT into the ring at the current offset.
+            let off = offset[ch]
+            for i in 0..bands {
+                var s = 0.0
+                let row = i * bands
+                for k in 0..bands {
+                    s += m[row + k] * inF[k]
+                }
+                hist1F[h1 + off + i] = s
+            }
+            // Polyphase window.
+            for i in 0..half {
+                var a = hist2F[h2 + i]
+                var b = hist2F[h2 + i + half]
+                var c = 0.0
+                var d = 0.0
+                var jj = 0
+                while jj < ring {
+                    var p = off + jj
+                    if p >= ring {
+                        p -= ring
+                    }
+                    let q = h1 + p
+                    a -= win[i + jj] * hist1F[q + half - 1 - i]
+                    b += win[i + jj + half] * hist1F[q + i]
+                    c += win[i + jj + bands] * hist1F[q + half + i]
+                    d += win[i + jj + bands + half] * hist1F[q + bands - 1 - i]
+                    jj += 2 * bands
+                }
+                pcmF[out + i] = a * scale
+                pcmF[out + i + half] = b * scale
+                hist2F[h2 + i] = c
+                hist2F[h2 + i + half] = d
+            }
+            offset[ch] = (off - bands) & (ring - 1)
+            out += bands
+        }
+    }
+
+    // LFE interpolation, floating point (FFmpeg's lfe_fir_float): each
+    // decimated sample gives 64 (or 128) output samples. lfe[base − k] are
+    // the history samples before lfe[base].
+    fn lfeFloat(spkr: Int, outOffset: Int, lfe: [Int], base: Int, blocks: Int, dec128: Bool) {
+        let factor = if dec128 { 128 } else { 64 }
+        let ncoeffs = if dec128 { 4 } else { 8 }
+        let n = blocks / (if dec128 { 4 } else { 2 })
+        let coeff = if dec128 { lfe128 } else { lfe64 }
+        var out = spkr * dtsMaxFrameSamples + outOffset
+        for i in 0..n {
+            for j in 0..(factor / 2) {
+                var a = 0.0
+                var b = 0.0
+                for k in 0..ncoeffs {
+                    let s = Float(lfe[base + i - k])
+                    a += coeff[j * ncoeffs + k] * s
+                    b += coeff[255 - j * ncoeffs - k] * s
+                }
+                pcmF[out + j] = a
+                pcmF[out + factor / 2 + j] = b
+            }
+            out += factor
+        }
+    }
+
+    // X96 LFE: the interpolated LFE at 48 kHz (pcmF[spkr + from …], len
+    // samples) doubled to 96 kHz into pcmF[spkr …] by linear interpolation.
+    fn lfeX96Float(spkr: Int, from: Int, len: Int) {
+        let base = spkr * dtsMaxFrameSamples
+        for i in 0..len {
+            tmpF[i] = pcmF[base + from + i]
+        }
+        var prev = lfeHistF
+        for i in 0..len {
+            let s = tmpF[i]
+            pcmF[base + 2 * i] = 0.25 * s + 0.75 * prev
+            pcmF[base + 2 * i + 1] = 0.75 * s + 0.25 * prev
+            prev = s
+        }
+        lfeHistF = prev
+    }
+
+    // --- Fixed point QMF (FFmpeg's sub_qmf32_fixed / synth_filter_fixed) ---
+
+    fn qmfFixed(ch: Int, spkr: Int, sub: [Int], base: Int, stride: Int, x96: Bool, hi: [Int], hiBase: Int, hasHi: Bool, blocks: Int, perfect: Bool) {
+        let bands = if x96 { 64 } else { 32 }
+        let win = if x96 { w64Fixed } else if perfect { w32pFixed } else { w32nFixed }
+        let h1 = ch * 1024
+        let h2 = ch * 64
+        let ring = bands * 16
+        let half = bands / 2
+        let shift = if x96 { 20 } else { 21 }
+        let round = 1 << (shift - 1)
+        var out = spkr * dtsMaxFrameSamples
+        for j in 0..blocks {
+            for i in 0..bands {
+                var v = 0
+                if i < 32 {
+                    v = sub[base + i * stride + j]
+                }
+                if hasHi {
+                    v += hi[hiBase + i * stride + j]
+                }
+                inX[i] = v
+            }
+            let off = offset[ch]
+            if x96 {
+                imdctHalf64(h1 + off)
+            } else {
+                imdctHalf32(h1 + off)
+            }
+            for i in 0..half {
+                var a = hist2X[h2 + i] << shift
+                var b = hist2X[h2 + i + half] << shift
+                var c = 0
+                var d = 0
+                var jj = 0
+                while jj < ring {
+                    var p = off + jj
+                    if p >= ring {
+                        p -= ring
+                    }
+                    let q = h1 + p
+                    a += win[i + jj] * hist1X[q + i]
+                    b += win[i + jj + half] * hist1X[q + half - 1 - i]
+                    c += win[i + jj + bands] * hist1X[q + half + i]
+                    d += win[i + jj + bands + half] * hist1X[q + bands - 1 - i]
+                    jj += 2 * bands
+                }
+                pcmX[out + i] = dtsClip23((a + round) >> shift)
+                pcmX[out + i + half] = dtsClip23((b + round) >> shift)
+                hist2X[h2 + i] = (c + round) >> shift
+                hist2X[h2 + i + half] = (d + round) >> shift
+            }
+            offset[ch] = (off - bands) & (ring - 1)
+            out += bands
+        }
+    }
+
+    // LFE interpolation, fixed point (64× only, as in FFmpeg).
+    fn lfeFixed(spkr: Int, outOffset: Int, lfe: [Int], base: Int, blocks: Int) {
+        let n = blocks / 2
+        let coeff = lfe64Fixed
+        var out = spkr * dtsMaxFrameSamples + outOffset
+        for i in 0..n {
+            for j in 0..32 {
+                var a = 0
+                var b = 0
+                for k in 0..8 {
+                    let s = lfe[base + i - k]
+                    a += coeff[j * 8 + k] * s
+                    b += coeff[255 - j * 8 - k] * s
+                }
+                pcmX[out + j] = dtsClip23((a + 4194304) >> 23)
+                pcmX[out + 32 + j] = dtsClip23((b + 4194304) >> 23)
+            }
+            out += 64
+        }
+    }
+
+    fn lfeX96Fixed(spkr: Int, from: Int, len: Int) {
+        let base = spkr * dtsMaxFrameSamples
+        for i in 0..len {
+            tmpX[i] = pcmX[base + from + i]
+        }
+        var prev = lfeHistX
+        for i in 0..len {
+            let s = tmpX[i]
+            pcmX[base + 2 * i] = dtsClip23((2097471 * s + 6291137 * prev + 4194304) >> 23)
+            pcmX[base + 2 * i + 1] = dtsClip23((6291137 * s + 2097471 * prev + 4194304) >> 23)
+            prev = s
+        }
+        lfeHistX = prev
+    }
+
+    // --- The integer DCT (FFmpeg's dcadct.c), on inX → hist1X[at …] ---
+
+    fn sumA(_ src: Int, _ fromA: Bool, _ dst: Int, _ len: Int) {
+        for i in 0..len {
+            let v = if fromA { bufA[src + 2 * i] + bufA[src + 2 * i + 1] } else { bufB[src + 2 * i] + bufB[src + 2 * i + 1] }
+            if fromA { bufB[dst + i] = v } else { bufA[dst + i] = v }
+        }
+    }
+
+    fn sumB(_ src: Int, _ fromA: Bool, _ dst: Int, _ len: Int) {
+        for i in 0..len {
+            var v = 0
+            if fromA {
+                v = if i == 0 { bufA[src] } else { bufA[src + 2 * i] + bufA[src + 2 * i - 1] }
+                bufB[dst + i] = v
+            } else {
+                v = if i == 0 { bufB[src] } else { bufB[src + 2 * i] + bufB[src + 2 * i - 1] }
+                bufA[dst + i] = v
+            }
+        }
+    }
+
+    fn sumC(_ src: Int, _ fromA: Bool, _ dst: Int, _ len: Int) {
+        for i in 0..len {
+            if fromA { bufB[dst + i] = bufA[src + 2 * i] } else { bufA[dst + i] = bufB[src + 2 * i] }
+        }
+    }
+
+    fn sumD(_ src: Int, _ fromA: Bool, _ dst: Int, _ len: Int) {
+        for i in 0..len {
+            if fromA {
+                bufB[dst + i] = if i == 0 { bufA[src + 1] } else { bufA[src + 2 * i - 1] + bufA[src + 2 * i + 1] }
+            } else {
+                bufA[dst + i] = if i == 0 { bufB[src + 1] } else { bufB[src + 2 * i - 1] + bufB[src + 2 * i + 1] }
+            }
+        }
+    }
+
+    fn clipA(_ len: Int) {
+        for i in 0..len {
+            bufA[i] = dtsClip23(bufA[i])
+        }
+    }
+
+    fn clipB(_ len: Int) {
+        for i in 0..len {
+            bufB[i] = dtsClip23(bufB[i])
+        }
+    }
+
+    // 8-point DCTs (dct_a, dct_b): src in one buffer, dst in the other.
+    fn dctA(_ src: Int, _ fromA: Bool, _ dst: Int) {
+        let t = dtsDctA
+        for i in 0..8 {
+            var res = 0
+            for j in 0..8 {
+                res += t[i * 8 + j] * (if fromA { bufA[src + j] } else { bufB[src + j] })
+            }
+            let v = (res + 4194304) >> 23
+            if fromA { bufB[dst + i] = v } else { bufA[dst + i] = v }
+        }
+    }
+
+    fn dctB(_ src: Int, _ fromA: Bool, _ dst: Int) {
+        let t = dtsDctB
+        for i in 0..8 {
+            var res = (if fromA { bufA[src] } else { bufB[src] }) << 23
+            for j in 0..7 {
+                res += t[i * 7 + j] * (if fromA { bufA[src + 1 + j] } else { bufB[src + 1 + j] })
+            }
+            let v = (res + 4194304) >> 23
+            if fromA { bufB[dst + i] = v } else { bufA[dst + i] = v }
+        }
+    }
+
+    // mod_a / mod64_a / mod_c / mod64_c: out[i] = mul23(cos[i], in[i] +
+    // in[n+i]); out[n+i'] = mul23(cos[n+i'], in[k] − in[n+k]), k = n−1−i'.
+    fn modA(_ cos: [Int], _ n: Int, _ src: Int, _ fromA: Bool, _ dst: Int) {
+        for i in 0..n {
+            let x = if fromA { bufA[src + i] + bufA[src + n + i] } else { bufB[src + i] + bufB[src + n + i] }
+            let v = (cos[i] * x + 4194304) >> 23
+            if fromA { bufB[dst + i] = v } else { bufA[dst + i] = v }
+        }
+        for i in 0..n {
+            let k = n - 1 - i
+            let x = if fromA { bufA[src + k] - bufA[src + n + k] } else { bufB[src + k] - bufB[src + n + k] }
+            let v = (cos[n + i] * x + 4194304) >> 23
+            if fromA { bufB[dst + n + i] = v } else { bufA[dst + n + i] = v }
+        }
+    }
+
+    // mod_b / mod64_b: in[n+i] = mul23(cos[i], in[n+i]); out[i] = in[i] +
+    // in[n+i]; out[n+i'] = in[k] − in[n+k].
+    fn modB(_ cos: [Int], _ n: Int, _ src: Int, _ fromA: Bool, _ dst: Int) {
+        for i in 0..n {
+            if fromA {
+                bufA[src + n + i] = (cos[i] * bufA[src + n + i] + 4194304) >> 23
+            } else {
+                bufB[src + n + i] = (cos[i] * bufB[src + n + i] + 4194304) >> 23
+            }
+        }
+        for i in 0..n {
+            if fromA { bufB[dst + i] = bufA[src + i] + bufA[src + n + i] } else { bufA[dst + i] = bufB[src + i] + bufB[src + n + i] }
+        }
+        for i in 0..n {
+            let k = n - 1 - i
+            if fromA { bufB[dst + n + i] = bufA[src + k] - bufA[src + n + k] } else { bufA[dst + n + i] = bufB[src + k] - bufB[src + n + k] }
+        }
+    }
+
+    fn imdctHalf32(_ at: Int) {
+        var mag = 0
+        for i in 0..32 {
+            mag += abs(inX[i])
+        }
+        let shift = if mag > 0x400000 { 2 } else { 0 }
+        let round = if shift > 0 { 1 << (shift - 1) } else { 0 }
+        for i in 0..32 {
+            bufA[i] = (inX[i] + round) >> shift
+        }
+        sumA(0, true, 0, 16)
+        sumB(0, true, 16, 16)
+        clipB(32)
+        sumA(0, false, 0, 8)
+        sumB(0, false, 8, 8)
+        sumC(16, false, 16, 8)
+        sumD(16, false, 24, 8)
+        clipA(32)
+        dctA(0, true, 0)
+        dctB(8, true, 8)
+        dctB(16, true, 16)
+        dctB(24, true, 24)
+        clipB(32)
+        modA(dtsModA, 8, 0, false, 0)
+        modB(dtsModB, 8, 16, false, 16)
+        clipA(32)
+        modA(dtsModC, 16, 0, true, 0)
+        for i in 0..32 {
+            bufB[i] = dtsClip23(bufB[i] << shift)
+        }
+        for i in 0..16 {
+            let k = 31 - i
+            hist1X[at + i] = dtsClip23(bufB[i] - bufB[k])
+            hist1X[at + 16 + i] = dtsClip23(bufB[i] + bufB[k])
+        }
+    }
+
+    fn imdctHalf64(_ at: Int) {
+        var mag = 0
+        for i in 0..64 {
+            mag += abs(inX[i])
+        }
+        let shift = if mag > 0x400000 { 2 } else { 0 }
+        let round = if shift > 0 { 1 << (shift - 1) } else { 0 }
+        for i in 0..64 {
+            bufA[i] = (inX[i] + round) >> shift
+        }
+        sumA(0, true, 0, 32)
+        sumB(0, true, 32, 32)
+        clipB(64)
+        sumA(0, false, 0, 16)
+        sumB(0, false, 16, 16)
+        sumC(32, false, 32, 16)
+        sumD(32, false, 48, 16)
+        clipA(64)
+        sumA(0, true, 0, 8)
+        sumB(0, true, 8, 8)
+        sumC(16, true, 16, 8)
+        sumD(16, true, 24, 8)
+        sumC(32, true, 32, 8)
+        sumD(32, true, 40, 8)
+        sumC(48, true, 48, 8)
+        sumD(48, true, 56, 8)
+        clipB(64)
+        dctA(0, false, 0)
+        for blk in 1..8 {
+            dctB(blk * 8, false, blk * 8)
+        }
+        clipA(64)
+        modA(dtsModA, 8, 0, true, 0)
+        modB(dtsModB, 8, 16, true, 16)
+        modB(dtsModB, 8, 32, true, 32)
+        modB(dtsModB, 8, 48, true, 48)
+        clipB(64)
+        modA(dtsMod64A, 16, 0, false, 0)
+        modB(dtsMod64B, 16, 32, false, 32)
+        clipA(64)
+        modA(dtsMod64C, 32, 0, true, 0)
+        for i in 0..64 {
+            bufB[i] = dtsClip23(bufB[i] << shift)
+        }
+        for i in 0..32 {
+            let k = 63 - i
+            hist1X[at + i] = dtsClip23(bufB[i] - bufB[k])
+            hist1X[at + 32 + i] = dtsClip23(bufB[i] + bufB[k])
+        }
+    }
+}
+
+// Coefficients of the integer DCT (FFmpeg's dcadct.c), Q23.
+let dtsDctA: [Int] = [
+    8348215, 8027397, 7398092, 6484482, 5321677, 3954362, 2435084, 822227,
+    8027397, 5321677, 822227, -3954362, -7398092, -8348215, -6484482, -2435084,
+    7398092, 822227, -6484482, -8027397, -2435084, 5321677, 8348215, 3954362,
+    6484482, -3954362, -8027397, 822227, 8348215, 2435084, -7398092, -5321677,
+    5321677, -7398092, -2435084, 8348215, -822227, -8027397, 3954362, 6484482,
+    3954362, -8348215, 5321677, 2435084, -8027397, 6484482, 822227, -7398092,
+    2435084, -6484482, 8348215, -7398092, 3954362, 822227, -5321677, 8027397,
+    822227, -2435084, 3954362, -5321677, 6484482, -7398092, 8027397, -8348215,
+]
+
+let dtsDctB: [Int] = [
+    8227423, 7750063, 6974873, 5931642, 4660461, 3210181, 1636536,
+    6974873, 3210181, -1636536, -5931642, -8227423, -7750063, -4660461,
+    4660461, -3210181, -8227423, -5931642, 1636536, 7750063, 6974873,
+    1636536, -7750063, -4660461, 5931642, 6974873, -3210181, -8227423,
+    -1636536, -7750063, 4660461, 5931642, -6974873, -3210181, 8227423,
+    -4660461, -3210181, 8227423, -5931642, -1636536, 7750063, -6974873,
+    -6974873, 3210181, 1636536, -5931642, 8227423, -7750063, 4660461,
+    -8227423, 7750063, -6974873, 5931642, -4660461, 3210181, -1636536,
+]
+
+let dtsModA: [Int] = [
+    4199362, 4240198, 4323885, 4454708, 4639772, 4890013, 5221943, 5660703,
+    -6245623, -7040975, -8158494, -9809974, -12450076, -17261920, -28585092, -85479984,
+]
+
+let dtsModB: [Int] = [
+    4214598, 4383036, 4755871, 5425934, 6611520, 8897610, 14448934, 42791536,
+]
+
+let dtsModC: [Int] = [
+    1048892, 1051425, 1056522, 1064244, 1074689, 1087987, 1104313, 1123884,
+    1146975, 1173922, 1205139, 1241133, 1282529, 1330095, 1384791, 1447815,
+    -1520688, -1605358, -1704360, -1821051, -1959964, -2127368, -2332183, -2587535,
+    -2913561, -3342802, -3931480, -4785806, -6133390, -8566050, -14253820, -42727120,
+]
+
+let dtsMod64A: [Int] = [
+    4195568, 4205700, 4226086, 4256977, 4298755, 4351949, 4417251, 4495537,
+    4587901, 4695690, 4820557, 4964534, 5130115, 5320382, 5539164, 5791261,
+    -6082752, -6421430, -6817439, -7284203, -7839855, -8509474, -9328732, -10350140,
+    -11654242, -13371208, -15725922, -19143224, -24533560, -34264200, -57015280, -170908480,
+]
+
+let dtsMod64B: [Int] = [
+    4199362, 4240198, 4323885, 4454708, 4639772, 4890013, 5221943, 5660703,
+    6245623, 7040975, 8158494, 9809974, 12450076, 17261920, 28585092, 85479984,
+]
+
+let dtsMod64C: [Int] = [
+    741511, 741958, 742853, 744199, 746001, 748262, 750992, 754197,
+    757888, 762077, 766777, 772003, 777772, 784105, 791021, 798546,
+    806707, 815532, 825054, 835311, 846342, 858193, 870912, 884554,
+    899181, 914860, 931667, 949686, 969011, 989747, 1012012, 1035941,
+    -1061684, -1089412, -1119320, -1151629, -1186595, -1224511, -1265719, -1310613,
+    -1359657, -1413400, -1472490, -1537703, -1609974, -1690442, -1780506, -1881904,
+    -1996824, -2128058, -2279225, -2455101, -2662128, -2909200, -3208956, -3579983,
+    -4050785, -4667404, -5509372, -6726913, -8641940, -12091426, -20144284, -60420720,
+]

@@ -1,0 +1,409 @@
+// Avid DNxHD and DNxHR decoding (SMPTE ST 2019-1, "VC-3"): every
+// compression ID ffmpeg knows — DNxHD 1080p/1080i/720p/1440 profiles at 8
+// and 10 bits (CIDs 1235–1260), DNxHR LB/SQ/HQ (8-bit), HQX (10/12-bit
+// 4:2:2) and 444 (10/12-bit 4:4:4, with or without the adaptive colour
+// transform) — progressive and interlaced (two coding units per frame,
+// one per field), adaptive macroblock interlacing (CID 1260). Each frame
+// is a keyframe.
+//
+// A frame (§7.2) starts with a 640-byte header (prefix, field flags,
+// size, bit depth, CID, colour, the table of macroblock row offsets),
+// then rows of macroblocks (dnxhd/engine.tsl). As in ffmpeg, a 4:4:4
+// frame without the colour transform is RGB, stored G, B, R in y, u, v
+// (core.Picture has no RGB form: see build/NEEDED.md).
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../core"
+
+public struct Decoder {
+    skipNonReference: Bool = false
+    warnings: [String] = []
+    // The last frame's facts.
+    width: Int = 0
+    height: Int = 0
+    cid: Int = 0
+    depth: Int = 8
+    chroma: core.Chroma = .yuv422
+    interlaced: Bool = false
+    // 4:4:4 stored as G, B, R (no colour transform).
+    rgb: Bool = false
+
+    timescale: Int = 1000
+    frameDur: Int = 0
+    trackSarNum: Int = 1
+    trackSarDen: Int = 1
+    trackMatrix: core.ColorMatrix = .unknown
+    eng: DxEngine = DxEngine()
+    planeW: Int = 0
+    planeH: Int = 0
+    planeFull: Bool = false
+    planeDepth: Int = 0
+    haveFrame: Bool = false
+    sy: [Int] = []
+    su: [Int] = []
+    sv: [Int] = []
+    matrix: core.ColorMatrix = .unknown
+    sarNum: Int = 1
+    sarDen: Int = 1
+
+    fn decode(_ packet: Data, pts: Int, dts: Int, key: Bool) -> [core.Picture] {
+        var at = 0
+        var first = true
+        var curField = 0
+        var damaged = false
+        var rotated = false
+        while true {
+            let r = codingUnit(packet, at, first, curField, rotated)
+            if r.error != "" {
+                if first {
+                    return conceal(pts, r.error)
+                }
+                addWarning(r.error)
+                damaged = true
+                break
+            }
+            rotated = true
+            if r.damaged {
+                damaged = true
+            }
+            if first && r.interlaced {
+                at += r.unitSize
+                first = false
+                curField = r.field
+                continue
+            }
+            break
+        }
+        if damaged {
+            addWarning("dnxhd: damaged rows (pts {pts})")
+        }
+        haveFrame = true
+        picture(pts)
+    }
+
+    // Decodes the coding unit (a frame, or a field) at packet[at…].
+    fn codingUnit(_ d: Data, _ at: Int, _ first: Bool, _ prevField: Int, _ rotated: Bool) -> DxUnit {
+        var u = DxUnit()
+        let n = d.count - at
+        if n < 0x280 {
+            u.error = "dnxhd: frame too short ({n} bytes)"
+            return u
+        }
+        let b = at
+        let p0 = d.uint32(at: b, bigEndian: true)
+        let p4 = d[b + 4]
+        let prefixHr = p0 >> 16 == 0 && p4 == 3 && (p0 & 0xffff) >= 0x280 && (p0 & 0xffff) <= 0x2170 && (p0 & 3) == 0
+        if !(p0 == 0x280 && (p4 == 1 || p4 == 2)) && !prefixHr {
+            u.error = "dnxhd: unknown header {p0} {p4}"
+            return u
+        }
+        let b5 = d[b + 5]
+        u.interlaced = (b5 & 2) != 0
+        if u.interlaced {
+            u.field = if first { b5 & 1 } else { 1 - prevField }
+        }
+        let mbaff = ((d[b + 6] >> 5) & 1) == 1
+        var h = d.uint16(at: b + 0x18, bigEndian: true)
+        var w = d.uint16(at: b + 0x1a, bigEndian: true)
+        let depthCode = d[b + 0x21] >> 5
+        var bitDepth = 0
+        if depthCode == 1 {
+            bitDepth = 8
+        } else if depthCode == 2 {
+            bitDepth = 10
+        } else if depthCode == 3 {
+            bitDepth = 12
+        } else {
+            u.error = "dnxhd: unknown bit depth code {depthCode}"
+            return u
+        }
+        let id = d.uint32(at: b + 0x28, bigEndian: true)
+        var entry = DxCid()
+        var found = false
+        for c in dxCids {
+            if c.cid == id {
+                entry = c
+                found = true
+            }
+        }
+        if !found {
+            u.error = "dnxhd: unsupported CID {id}"
+            return u
+        }
+        if entry.bitDepth != bitDepth && entry.bitDepth != 0 {
+            u.error = "dnxhd: bit depth {bitDepth} doesn't match CID {id}"
+            return u
+        }
+        let colour = (d[b + 0x2C] >> 1) & 3
+        let act = (d[b + 0x2C] & 1) == 1
+        let full = ((d[b + 0x2C] >> 6) & 1) == 1
+        if full && bitDepth == 8 {
+            u.error = "dnxhd: 4:4:4 at 8 bits isn't supported"
+            return u
+        }
+        // Which dequantisation ffmpeg uses for this kind of stream.
+        var ib = 6
+        var bias = 8
+        var shift = 4
+        var dcs = 0
+        if full {
+            bias = 32
+            if bitDepth == 10 {
+                shift = 6
+            } else {
+                dcs = 2
+            }
+        } else if bitDepth == 12 {
+            dcs = 2
+        } else if bitDepth == 10 {
+            if id == 1271 {
+                bias = 32
+                shift = 6
+            }
+        } else {
+            ib = 4
+            bias = 32
+            shift = 6
+        }
+        var sarN = trackSarNum
+        var sarD = trackSarDen
+        if entry.width != 0 && w != entry.width {
+            // DNxHD 100 codes 1920 or 1280 wide pictures 1440 / 960 wide.
+            let g = dxGcd(w, entry.width)
+            sarN = w / g
+            sarD = entry.width / g
+            w = entry.width
+        }
+        if entry.codingUnit != 0 && n < entry.codingUnit {
+            u.error = "dnxhd: frame too short for CID {id} ({n} < {entry.codingUnit})"
+            return u
+        }
+        let mbW = (w + 15) >> 4
+        let mbH = d.uint16(at: b + 0x16c, bigEndian: true)
+        if u.interlaced && ((h + 15) >> 4) == mbH {
+            h = h << 1
+        }
+        var dataOffset = 0x280
+        if mbH > 68 && prefixHr {
+            dataOffset = 0x170 + (mbH << 2)
+        } else if mbH > 68 {
+            u.error = "dnxhd: {mbH} macroblock rows"
+            return u
+        }
+        let rowsNeeded = if u.interlaced { mbH * 2 } else { mbH }
+        if w == 0 || h == 0 || mbH == 0 || rowsNeeded > (h + 15) >> 4 || mbH > 512 || n < dataOffset {
+            u.error = "dnxhd: bad size {w}×{h}, {mbH} rows"
+            return u
+        }
+        u.unitSize = entry.codingUnit
+        // The frame's facts (the first coding unit sets them).
+        width = w
+        height = h
+        cid = id
+        depth = bitDepth
+        chroma = if full { .yuv444 } else { .yuv422 }
+        interlaced = u.interlaced
+        rgb = full && !act
+        sarNum = sarN
+        sarDen = sarD
+        matrix = if colour == 0 {
+            core.ColorMatrix.bt709
+        } else if colour == 1 || colour == 2 {
+            core.ColorMatrix.bt2020
+        } else if trackMatrix != .unknown {
+            trackMatrix
+        } else {
+            core.guessMatrix(width: w, height: h)
+        }
+        eng.useCid(entry)
+        eng.indexBits = ib
+        if eng.levelBias != bias || eng.levelShift != shift {
+            eng.lastQ = -1
+        }
+        eng.levelBias = bias
+        eng.levelShift = shift
+        eng.dcShift = dcs
+        eng.depth = bitDepth
+        eng.full = full
+        eng.mbaff = mbaff
+        eng.mbW = mbW
+        let planeRows = if u.interlaced { mbH * 32 } else { mbH * 16 }
+        makePlanes(mbW * 16, max(planeRows, (h + 15) >> 4 << 4), full, bitDepth)
+        if !rotated {
+            rotate()
+        }
+        // Rows of macroblocks, each from its offset in the row table.
+        let dataStart = b + dataOffset
+        let dataEnd = d.count
+        let field = if u.interlaced { u.field } else { -1 }
+        for r in 0..mbH {
+            let off = d.uint32(at: b + 0x170 + r * 4, bigEndian: true)
+            if off > dataEnd - dataStart {
+                u.damaged = true
+                concealRow(r, field)
+                continue
+            }
+            if !eng.row(d, dataStart + off, dataEnd, r, field) {
+                u.damaged = true
+                concealRow(r, field)
+            }
+        }
+        u
+    }
+
+    // Two sets of planes used in turn (see prores/decoder.tsl).
+    fn makePlanes(_ pw: Int, _ ph: Int, _ full: Bool, _ bitDepth: Int) {
+        if pw == planeW && ph == planeH && full == planeFull && bitDepth == planeDepth && !eng.y.isEmpty {
+            return
+        }
+        planeW = pw
+        planeH = ph
+        planeFull = full
+        planeDepth = bitDepth
+        let cw = if full { pw } else { pw / 2 }
+        eng.yStride = pw
+        eng.cStride = cw
+        eng.y = dxFilled(pw * ph, 16 << (bitDepth - 8))
+        eng.u = dxFilled(cw * ph, 128 << (bitDepth - 8))
+        eng.v = eng.u
+        sy = eng.y
+        su = eng.u
+        sv = eng.v
+        haveFrame = false
+    }
+
+    fn rotate() {
+        var t = eng.y
+        eng.y = sy
+        sy = t
+        t = eng.u
+        eng.u = su
+        su = t
+        t = eng.v
+        eng.v = sv
+        sv = t
+    }
+
+    // A damaged row: the previous frame's macroblocks there.
+    fn concealRow(_ r: Int, _ field: Int) {
+        let step = if field >= 0 { 2 } else { 1 }
+        let first = if field >= 0 { field } else { 0 }
+        for k in 0..16 {
+            let line = (r * 16 + k) * step + first
+            let ya = line * eng.yStride
+            if ya + eng.yStride <= eng.y.count && ya + eng.yStride <= sy.count {
+                for x in 0..eng.yStride {
+                    eng.y[ya + x] = sy[ya + x]
+                }
+            }
+            let ca = line * eng.cStride
+            if ca + eng.cStride <= eng.u.count && ca + eng.cStride <= su.count {
+                for x in 0..eng.cStride {
+                    eng.u[ca + x] = su[ca + x]
+                    eng.v[ca + x] = sv[ca + x]
+                }
+            }
+        }
+    }
+
+    fn picture(_ pts: Int) -> [core.Picture] {
+        var pic = core.Picture(width: width, height: height, chroma: chroma, depth: depth)
+        pic.y = eng.y
+        pic.u = eng.u
+        pic.v = eng.v
+        pic.yStride = eng.yStride
+        pic.cStride = eng.cStride
+        pic.matrix = if rgb { core.ColorMatrix.rgb } else { matrix }
+        pic.pts = pts
+        pic.duration = frameDur
+        pic.key = true
+        pic.sarNum = sarNum
+        pic.sarDen = sarDen
+        [pic]
+    }
+
+    fn conceal(_ pts: Int, _ why: String) -> [core.Picture] {
+        addWarning(why)
+        if !haveFrame || width == 0 {
+            return []
+        }
+        picture(pts)
+    }
+
+    fn addWarning(_ w: String) {
+        if warnings.count < 200 {
+            warnings.append(w)
+        }
+    }
+
+    fn flush() -> [core.Picture] {
+        []
+    }
+
+    fn reset() {
+    }
+}
+
+struct DxUnit {
+    error: String = ""
+    interlaced: Bool = false
+    field: Int = 0
+    unitSize: Int = 0
+    damaged: Bool = false
+}
+
+// A decoder for a "dnxhd" track.
+public fn newDecoder(_ track: core.Track) -> Result<Decoder> {
+    if track.codec != "dnxhd" {
+        return .failure(error: Error("dnxhd: not a DNxHD track ({track.codec})"))
+    }
+    var d = Decoder()
+    d.timescale = track.timescale
+    if track.fpsNum > 0 && track.fpsDen > 0 {
+        d.frameDur = (track.timescale * track.fpsDen) / track.fpsNum
+    }
+    d.trackSarNum = max(1, track.sarNum)
+    d.trackSarDen = max(1, track.sarDen)
+    d.sarNum = d.trackSarNum
+    d.sarDen = d.trackSarDen
+    d.trackMatrix = track.matrix
+    d.width = track.width
+    d.height = track.height
+    d.eng.setup()
+    Result.ok(value: d)
+}
+
+// "DNxHD, 1920×1080" from what the container says (the profile is in the
+// frames: Decoder.cid and dnxhd.profileName after decoding one).
+public fn streamInfo(_ track: core.Track) -> String {
+    let name = if track.tag == "AVdh" { "DNxHR" } else { "DNxHD" }
+    if track.width > 0 && track.height > 0 {
+        return "{name}, {track.width}×{track.height}"
+    }
+    name
+}
+
+// "DNxHR HQX", "DNxHD 1080p 175/185/220x (CID 1235)" for a CID.
+public fn profileName(_ cid: Int) -> String {
+    match cid {
+        1270 -> "DNxHR 444"
+        1271 -> "DNxHR HQX"
+        1272 -> "DNxHR HQ"
+        1273 -> "DNxHR SQ"
+        1274 -> "DNxHR LB"
+        _ -> "DNxHD (CID {cid})"
+    }
+}
+
+fn dxGcd(_ a: Int, _ b: Int) -> Int {
+    var x = a
+    var y = b
+    while y != 0 {
+        let t = x % y
+        x = y
+        y = t
+    }
+    max(1, x)
+}

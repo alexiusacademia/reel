@@ -1,0 +1,478 @@
+// One video decoder and one audio decoder type for the player, whatever
+// the codec. Each holds the codec module's own Decoder in a one-item
+// list (empty for the other codecs), so calls through `self` change it
+// in place, and the whole thing stays plain data that `background` work
+// can take and give back.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../core"
+import "../h264"
+import "../hevc"
+import "../vp9"
+import "../mpeg12"
+import "../mpeg4"
+import "../jpeg"
+import "../vp8"
+import "../theora"
+import "../prores"
+import "../dnxhd"
+import "../wmv"
+import "../aac"
+import "../mpa"
+import "../lossless"
+import "../vorbis"
+import "../opus"
+import "../ac3"
+import "../dts"
+import "../truehd"
+import "../wma"
+import "../av1"
+
+// The video codecs Reel can decode.
+public fn canDecodeVideo(_ codec: String) -> Bool {
+    codec == "h264" || codec == "hevc" || codec == "vp9" || codec == "mpeg1" || codec == "mpeg2" || codec == "mpeg4" || codec == "mjpeg" || codec == "jpeg" || codec == "vp8" || codec == "theora" || codec == "prores" || codec == "dnxhd" || codec == "av1" || codec == "msmpeg4v1" || codec == "msmpeg4v2" || codec == "msmpeg4v3" || codec == "wmv1" || codec == "wmv2" || codec == "wmv3" || codec == "vc1"
+}
+
+// The audio codecs Reel can decode.
+public fn canDecodeAudio(_ codec: String) -> Bool {
+    match codec {
+        "aac" -> true
+        "mp3" -> true
+        "mp2" -> true
+        "mp1" -> true
+        "flac" -> true
+        "alac" -> true
+        "pcm" -> true
+        "alaw" -> true
+        "ulaw" -> true
+        "vorbis" -> true
+        "opus" -> true
+        "ac3" -> true
+        "eac3" -> true
+        "dts" -> true
+        "truehd" -> true
+        "mlp" -> true
+        "wmav1" -> true
+        "wmav2" -> true
+        "wmapro" -> true
+        "wmalossless" -> true
+        _ -> false
+    }
+}
+
+public struct VideoDecoder {
+    codec: String = ""
+    h264: [h264.Decoder] = []
+    mpeg12: [mpeg12.Decoder] = []
+    mpeg4: [mpeg4.Decoder] = []
+    jpeg: [jpeg.Decoder] = []
+    vp8: [vp8.Decoder] = []
+    theora: [theora.Decoder] = []
+    prores: [prores.Decoder] = []
+    dnxhd: [dnxhd.Decoder] = []
+    wmv: [wmv.Decoder] = []
+
+    fn decode(_ packet: Data, pts: Int, dts: Int, key: Bool) -> [core.Picture] {
+        if !h264.isEmpty {
+            return h264[0].decode(packet, pts: pts, dts: dts, key: key)
+        }
+        if !mpeg12.isEmpty {
+            return mpeg12[0].decode(packet, pts: pts, dts: dts, key: key)
+        }
+        if !mpeg4.isEmpty {
+            return mpeg4[0].decode(packet, pts: pts, dts: dts, key: key)
+        }
+        if !jpeg.isEmpty {
+            return jpeg[0].decode(packet, pts: pts, dts: dts, key: key)
+        }
+        if !vp8.isEmpty {
+            return vp8[0].decode(packet, pts: pts, dts: dts, key: key)
+        }
+        if !theora.isEmpty {
+            return theora[0].decode(packet, pts: pts, dts: dts, key: key)
+        }
+        if !prores.isEmpty {
+            return prores[0].decode(packet, pts: pts, dts: dts, key: key)
+        }
+        if !dnxhd.isEmpty {
+            return dnxhd[0].decode(packet, pts: pts, dts: dts, key: key)
+        }
+        if !wmv.isEmpty {
+            return wmv[0].decode(packet, pts: pts, dts: dts, key: key)
+        }
+        []
+    }
+
+    fn flush() -> [core.Picture] {
+        if !h264.isEmpty {
+            return h264[0].flush()
+        }
+        if !mpeg12.isEmpty {
+            return mpeg12[0].flush()
+        }
+        if !mpeg4.isEmpty {
+            return mpeg4[0].flush()
+        }
+        if !jpeg.isEmpty {
+            return jpeg[0].flush()
+        }
+        if !vp8.isEmpty {
+            return vp8[0].flush()
+        }
+        if !theora.isEmpty {
+            return theora[0].flush()
+        }
+        if !prores.isEmpty {
+            return prores[0].flush()
+        }
+        if !dnxhd.isEmpty {
+            return dnxhd[0].flush()
+        }
+        if !wmv.isEmpty {
+            return wmv[0].flush()
+        }
+        []
+    }
+
+    fn reset() {
+        if !h264.isEmpty {
+            h264[0].reset()
+        }
+        if !mpeg12.isEmpty {
+            mpeg12[0].reset()
+        }
+        if !mpeg4.isEmpty {
+            mpeg4[0].reset()
+        }
+        if !jpeg.isEmpty {
+            jpeg[0].reset()
+        }
+        if !vp8.isEmpty {
+            vp8[0].reset()
+        }
+        if !theora.isEmpty {
+            theora[0].reset()
+        }
+        if !prores.isEmpty {
+            prores[0].reset()
+        }
+        if !dnxhd.isEmpty {
+            dnxhd[0].reset()
+        }
+        if !wmv.isEmpty {
+            wmv[0].reset()
+        }
+    }
+
+    // Skip pictures nothing refers to (B-frames) when decoding falls behind.
+    fn setSkipNonReference(_ on: Bool) {
+        if !h264.isEmpty {
+            h264[0].skipNonReference = on
+        }
+        if !mpeg12.isEmpty {
+            mpeg12[0].skipNonReference = on
+        }
+        if !mpeg4.isEmpty {
+            mpeg4[0].skipNonReference = on
+        }
+        if !jpeg.isEmpty {
+            jpeg[0].skipNonReference = on
+        }
+        if !vp8.isEmpty {
+            vp8[0].skipNonReference = on
+        }
+        if !theora.isEmpty {
+            theora[0].skipNonReference = on
+        }
+        if !prores.isEmpty {
+            prores[0].skipNonReference = on
+        }
+        if !dnxhd.isEmpty {
+            dnxhd[0].skipNonReference = on
+        }
+        if !wmv.isEmpty {
+            wmv[0].skipNonReference = on
+        }
+    }
+
+    // Warnings gathered so far, and clears them.
+    fn takeWarnings() -> [String] {
+        var out: [String] = []
+        if !h264.isEmpty {
+            out = h264[0].warnings
+            h264[0].warnings = []
+        }
+        if !mpeg12.isEmpty {
+            out = mpeg12[0].warnings
+            mpeg12[0].warnings = []
+        }
+        if !mpeg4.isEmpty {
+            out = mpeg4[0].warnings
+            mpeg4[0].warnings = []
+        }
+        if !jpeg.isEmpty {
+            out = jpeg[0].warnings
+            jpeg[0].warnings = []
+        }
+        if !vp8.isEmpty {
+            out = vp8[0].warnings
+            vp8[0].warnings = []
+        }
+        if !theora.isEmpty {
+            out = theora[0].warnings
+            theora[0].warnings = []
+        }
+        if !prores.isEmpty {
+            out = prores[0].warnings
+            prores[0].warnings = []
+        }
+        if !dnxhd.isEmpty {
+            out = dnxhd[0].warnings
+            dnxhd[0].warnings = []
+        }
+        if !wmv.isEmpty {
+            out = wmv[0].warnings
+            wmv[0].warnings = []
+        }
+        out
+    }
+}
+
+public fn newVideoDecoder(_ track: core.Track) -> Result<VideoDecoder> {
+    var d = VideoDecoder(codec: track.codec)
+    match track.codec {
+        "h264" -> { d.h264 = [try h264.newDecoder(track)] }
+        "mpeg1" -> { d.mpeg12 = [try mpeg12.newDecoder(track)] }
+        "mpeg2" -> { d.mpeg12 = [try mpeg12.newDecoder(track)] }
+        "mpeg4" -> { d.mpeg4 = [try mpeg4.newDecoder(track)] }
+        "mjpeg" -> { d.jpeg = [try jpeg.newDecoder(track)] }
+        "jpeg" -> { d.jpeg = [try jpeg.newDecoder(track)] }
+        "vp8" -> { d.vp8 = [try vp8.newDecoder(track)] }
+        "theora" -> { d.theora = [try theora.newDecoder(track)] }
+        "prores" -> { d.prores = [try prores.newDecoder(track)] }
+        "dnxhd" -> { d.dnxhd = [try dnxhd.newDecoder(track)] }
+        "msmpeg4v1", "msmpeg4v2", "msmpeg4v3", "wmv1", "wmv2", "wmv3", "vc1" -> { d.wmv = [try wmv.newDecoder(track)] }
+        _ -> { return Result.failure(error: Error("Reel can't decode {track.codec} video yet")) }
+    }
+    Result.ok(value: d)
+}
+
+public struct AudioDecoder {
+    codec: String = ""
+    aac: [aac.Decoder] = []
+    mpa: [mpa.Decoder] = []
+    lossless: [lossless.Decoder] = []
+    vorbis: [vorbis.Decoder] = []
+    opus: [opus.Decoder] = []
+    ac3: [ac3.Decoder] = []
+    dts: [dts.Decoder] = []
+    truehd: [truehd.Decoder] = []
+    wma: [wma.Decoder] = []
+
+    fn decode(_ packet: Data, pts: Int) -> core.Samples {
+        if !dts.isEmpty {
+            return dts[0].decode(packet, pts: pts)
+        }
+        if !truehd.isEmpty {
+            return truehd[0].decode(packet, pts: pts)
+        }
+        if !wma.isEmpty {
+            return wma[0].decode(packet, pts: pts)
+        }
+        if !aac.isEmpty {
+            return aac[0].decode(packet, pts: pts)
+        }
+        if !mpa.isEmpty {
+            return mpa[0].decode(packet, pts: pts)
+        }
+        if !lossless.isEmpty {
+            return lossless[0].decode(packet, pts: pts)
+        }
+        if !vorbis.isEmpty {
+            return vorbis[0].decode(packet, pts: pts)
+        }
+        if !opus.isEmpty {
+            return opus[0].decode(packet, pts: pts)
+        }
+        if !ac3.isEmpty {
+            return ac3[0].decode(packet, pts: pts)
+        }
+        core.Samples(rate: 0, channels: 0)
+    }
+
+    fn flush() -> core.Samples {
+        if !dts.isEmpty {
+            return dts[0].flush()
+        }
+        if !truehd.isEmpty {
+            return truehd[0].flush()
+        }
+        if !wma.isEmpty {
+            return wma[0].flush()
+        }
+        if !aac.isEmpty {
+            return aac[0].flush()
+        }
+        if !mpa.isEmpty {
+            return mpa[0].flush()
+        }
+        if !lossless.isEmpty {
+            return lossless[0].flush()
+        }
+        if !vorbis.isEmpty {
+            return vorbis[0].flush()
+        }
+        if !opus.isEmpty {
+            return opus[0].flush()
+        }
+        if !ac3.isEmpty {
+            return ac3[0].flush()
+        }
+        core.Samples(rate: 0, channels: 0)
+    }
+
+    fn reset() {
+        if !dts.isEmpty {
+            dts[0].reset()
+        }
+        if !truehd.isEmpty {
+            truehd[0].reset()
+        }
+        if !wma.isEmpty {
+            wma[0].reset()
+        }
+        if !aac.isEmpty {
+            aac[0].reset()
+        }
+        if !mpa.isEmpty {
+            mpa[0].reset()
+        }
+        if !lossless.isEmpty {
+            lossless[0].reset()
+        }
+        if !vorbis.isEmpty {
+            vorbis[0].reset()
+        }
+        if !opus.isEmpty {
+            opus[0].reset()
+        }
+        if !ac3.isEmpty {
+            ac3[0].reset()
+        }
+    }
+
+    // Priming frames to drop at the start of the stream, when the
+    // container doesn't already place them before time 0.
+    fn delay() -> Int {
+        if !aac.isEmpty {
+            return aac[0].delay
+        }
+        if !mpa.isEmpty {
+            return mpa[0].delay
+        }
+        if !lossless.isEmpty {
+            return lossless[0].delay
+        }
+        if !vorbis.isEmpty {
+            return vorbis[0].delay
+        }
+        if !opus.isEmpty {
+            return opus[0].delay
+        }
+        if !ac3.isEmpty {
+            return ac3[0].delay
+        }
+        if !wma.isEmpty {
+            return wma[0].delay
+        }
+        0
+    }
+
+    fn takeWarnings() -> [String] {
+        var out: [String] = []
+        if !aac.isEmpty {
+            out = aac[0].warnings
+            aac[0].warnings = []
+        }
+        if !mpa.isEmpty {
+            out = mpa[0].warnings
+            mpa[0].warnings = []
+        }
+        if !lossless.isEmpty {
+            out = lossless[0].warnings
+            lossless[0].warnings = []
+        }
+        if !vorbis.isEmpty {
+            out = vorbis[0].warnings
+            vorbis[0].warnings = []
+        }
+        if !opus.isEmpty {
+            out = opus[0].warnings
+            opus[0].warnings = []
+        }
+        if !ac3.isEmpty {
+            out = ac3[0].warnings
+            ac3[0].warnings = []
+        }
+        if !dts.isEmpty {
+            out = dts[0].warnings
+            dts[0].warnings = []
+        }
+        if !truehd.isEmpty {
+            out = truehd[0].warnings
+            truehd[0].warnings = []
+        }
+        if !wma.isEmpty {
+            out = wma[0].warnings
+            wma[0].warnings = []
+        }
+        out
+    }
+}
+
+public fn newAudioDecoder(_ track: core.Track) -> Result<AudioDecoder> {
+    var d = AudioDecoder(codec: track.codec)
+    match track.codec {
+        "aac" -> { d.aac = [try aac.newDecoder(track)] }
+        "mp3" -> { d.mpa = [try mpa.newDecoder(track)] }
+        "mp2" -> { d.mpa = [try mpa.newDecoder(track)] }
+        "mp1" -> { d.mpa = [try mpa.newDecoder(track)] }
+        "flac" -> { d.lossless = [try lossless.newDecoder(track)] }
+        "alac" -> { d.lossless = [try lossless.newDecoder(track)] }
+        "pcm" -> { d.lossless = [try lossless.newDecoder(track)] }
+        "alaw" -> { d.lossless = [try lossless.newDecoder(track)] }
+        "ulaw" -> { d.lossless = [try lossless.newDecoder(track)] }
+        "vorbis" -> { d.vorbis = [try vorbis.newDecoder(track)] }
+        "opus" -> { d.opus = [try opus.newDecoder(track)] }
+        "ac3" -> { d.ac3 = [try ac3.newDecoder(track)] }
+        "eac3" -> { d.ac3 = [try ac3.newDecoder(track)] }
+        "dts" -> { d.dts = [try dts.newDecoder(track)] }
+        "truehd" -> { d.truehd = [try truehd.newDecoder(track)] }
+        "mlp" -> { d.truehd = [try truehd.newDecoder(track)] }
+        "wmav1", "wmav2", "wmapro", "wmalossless" -> { d.wma = [try wma.newDecoder(track)] }
+        _ -> { return Result.failure(error: Error("Reel can't decode {track.codec} audio yet")) }
+    }
+    Result.ok(value: d)
+}
+
+// A track's codec details as its decoder module tells them ("" when the
+// module has nothing to add), for Media Information.
+public fn streamInfoOf(_ t: core.Track) -> String {
+    match t.codec {
+        "av1" -> av1.streamInfo(t)
+        "vp9" -> vp9.streamInfo(t)
+        "vp8" -> vp8.streamInfo(t)
+        "theora" -> theora.streamInfo(t)
+        "prores" -> prores.streamInfo(t)
+        "dnxhd" -> dnxhd.streamInfo(t)
+        "vc1", "wmv3", "wmv2", "wmv1", "msmpeg4v3", "msmpeg4v2", "msmpeg4v1" -> wmv.streamInfo(t)
+        "ac3", "eac3" -> ac3.streamInfo(t)
+        "dts" -> dts.streamInfo(t)
+        "truehd", "mlp" -> truehd.streamInfo(t)
+        "vorbis" -> vorbis.streamInfo(t)
+        "wmav1", "wmav2", "wmapro", "wmalossless" -> wma.streamInfo(t)
+        _ -> ""
+    }
+}

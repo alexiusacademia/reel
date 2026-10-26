@@ -1,0 +1,131 @@
+// The VC-1 decoder's two stages for running side by side in two
+// background jobs ("wmv3" and "vc1" tracks): a Parser (entropy decoding of
+// SMPTE 421M pictures into per-macroblock data, vcparse.tsl) and a
+// Reconstructor (prediction, transforms, overlap and loop filters, output
+// in display order, vcrecon.tsl) exchanging ParsedFrames, as vp9/api.tsl
+// does. VcDecoder (vc.tsl) is the same two stages one after the other.
+//
+// A packet gives one ParsedFrame per picture: two for a field pair
+// (interlaced field pictures, 9.1), reconstructed in order; flush gives an
+// end-of-stream one that makes the Reconstructor hand on the picture it
+// still holds.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../core"
+
+// One parsed picture (or field).
+public struct ParsedFrame {
+    p: VcParsed = VcParsed()
+    // Simple/Main streams without RES_FASTTX use the simple IDCT.
+    fastTx: Bool = true
+    // The end of the stream (from Parser.flush).
+    end: Bool = false
+}
+
+public struct Parser {
+    // When true, B pictures (which nothing refers to) aren't parsed.
+    skipNonReference: Bool = false
+    warnings: [String] = []
+    vc: VcParser = VcParser()
+
+    fn parse(_ packet: Data, pts: Int, dts: Int, key: Bool) -> [ParsedFrame] {
+        vc.skipNonReference = skipNonReference
+        var out: [ParsedFrame] = []
+        let p = vc.parse(packet, pts: pts, key: key)
+        let fast = vc.resFasttx || vc.profile == 3
+        out.append(ParsedFrame(p: p, fastTx: fast))
+        if vc.pendingField {
+            let p2 = vc.parseSecondField()
+            out.append(ParsedFrame(p: p2, fastTx: fast))
+        }
+        takeWarnings()
+        out
+    }
+
+    // End of stream: tells the Reconstructor to hand on what it holds.
+    fn flush() -> [ParsedFrame] {
+        [ParsedFrame(end: true)]
+    }
+
+    // After a seek: wait for a keyframe.
+    fn reset() {
+        vc.reset()
+    }
+
+    fn takeWarnings() {
+        for w in vc.warnings {
+            if warnings.count < 200 {
+                warnings.append(w)
+            }
+        }
+        vc.warnings = []
+    }
+}
+
+public struct Reconstructor {
+    warnings: [String] = []
+    vc: VcRecon = VcRecon()
+
+    fn reconstruct(_ f: ParsedFrame) -> [core.Picture] {
+        if f.end {
+            return vc.flush()
+        }
+        vc.resFasttxHint = f.fastTx
+        let out = vc.reconstruct(f.p)
+        for w in vc.warnings {
+            if warnings.count < 200 {
+                warnings.append(w)
+            }
+        }
+        vc.warnings = []
+        out
+    }
+
+    // After a seek: drop the references.
+    fn reset() {
+        vc.reset()
+    }
+}
+
+// Both stages for one "wmv3" or "vc1" track.
+public struct Pipeline {
+    parser: Parser = Parser()
+    reconstructor: Reconstructor = Reconstructor()
+}
+
+public fn newPipeline(_ track: core.Track) -> Result<Pipeline> {
+    if track.codec != "wmv3" && track.codec != "vc1" {
+        return .failure(error: Error("wmv: the staged decoder is for VC-1 tracks (wmv3, vc1), not {track.codec}"))
+    }
+    let d = try vcNewDecoder(track)
+    Result.ok(value: Pipeline(parser: Parser(vc: d.parser), reconstructor: Reconstructor(vc: d.recon)))
+}
+
+// For background jobs, which call top-level functions: one parse step and
+// one reconstruct step, each returning the stage's new state.
+public struct ParseStep {
+    parser: Parser = Parser()
+    frames: [ParsedFrame] = []
+}
+
+public fn parseStep(_ parser: Parser, _ packet: Data, pts: Int, dts: Int, key: Bool) -> ParseStep {
+    var p = parser
+    let f = p.parse(packet, pts: pts, dts: dts, key: key)
+    ParseStep(parser: p, frames: f)
+}
+
+public struct ReconstructStep {
+    reconstructor: Reconstructor = Reconstructor()
+    pictures: [core.Picture] = []
+}
+
+public fn reconstructStep(_ reconstructor: Reconstructor, _ frames: [ParsedFrame]) -> ReconstructStep {
+    var r = reconstructor
+    var out: [core.Picture] = []
+    for f in frames {
+        out += r.reconstruct(f)
+    }
+    ReconstructStep(reconstructor: r, pictures: out)
+}

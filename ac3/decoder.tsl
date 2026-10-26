@@ -1,0 +1,2088 @@
+// The AC-3 / E-AC-3 decoder: the public Decoder, frame headers (A/52
+// 5.3 and E.1.2), and the steps every frame goes through.
+//
+// An AC-3 syncframe holds 6 audio blocks of 256 samples per channel
+// (E-AC-3 frames 1, 2, 3 or 6). Each block (A/52 5.4.3, decoded in
+// block.tsl) carries, for every channel, exponents (a coarse floating
+// point "envelope" of the spectrum), the parameters of a psychoacoustic
+// model that both encoder and decoder run on those exponents to work out
+// how many bits each mantissa got (bitalloc.tsl), the mantissas, and
+// switches for coupling (high frequencies of several channels sent once,
+// with per-channel scale factors), rematrixing (stereo sum/difference)
+// and the transform length. The decoder rebuilds the 256 spectral
+// coefficients and turns them into samples with an inverse MDCT and
+// overlap-add (dsp.tsl).
+//
+// Channels are numbered as in FFmpeg and the spec's pseudo code: 0 is the
+// coupling channel, 1…nfch the full-bandwidth channels in the stream's
+// order (L C R Ls Rs, Table 5.8), then the LFE channel. Output goes out in
+// WAV order (FL FR FC LFE …).
+//
+// E-AC-3 with more than 5.1 channels (7.1 on Blu-ray and streaming) sends
+// the extra channels in a dependent substream (strmtyp 1, Annex E.2.3)
+// right after the independent frame (E-AC-3 or plain AC-3), in the same
+// packet. Its channel map (chanmap, Table E.1.4) says which speakers its
+// channels are; they are added to (or replace channels of) the
+// independent frame's set, as FFmpeg's ac3_decode_frame does, so 7.1 comes
+// out as FL FR FC LFE BL BR SL SR. The dependent frame is decoded with the
+// same block state but its own transform overlap. Independent substreams
+// other than 0 (more programs) and their dependents are skipped.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../core"
+
+public struct Decoder {
+    // Output format: set by newDecoder when the track says, and by every
+    // frame decoded.
+    rate: Int = 0
+    channels: Int = 0
+    layout: [String] = []
+    // AC-3 has no priming the player needs to drop: the encoder's delay
+    // (256 samples for FFmpeg's) is inside the stream's own timing.
+    delay: Int = 0
+    warnings: [String] = []
+    // Dynamic range compression (A/52 7.7.1): 0 is off (the default, full
+    // dynamic range), 1 applies the stream's dynrng words fully, as most
+    // players (and FFmpeg) do; values between scale it.
+    drcScale: Float = 0.0
+
+    codec: String = "ac3"
+    // Frames decoded and frames that were damaged.
+    frames: Int = 0
+    damaged: Int = 0
+
+    // --- The frame being decoded. ---
+    br: core.BitReader = core.bitReader(Data())
+    dither: Ac3Dither = Ac3Dither()
+    bsid: Int = 0
+    eac3: Bool = false
+    frameType: Int = 2
+    srCode: Int = 0
+    srShift: Int = 0
+    acmod: Int = 0
+    lfeOn: Bool = false
+    // Full-bandwidth channels, all channels (with LFE), the LFE's number.
+    nfch: Int = 0
+    nch: Int = 0
+    lfeCh: Int = -1
+    numBlocks: Int = 6
+    frameSize: Int = 0
+
+    // Which optional parts the blocks have (always all for AC-3; E-AC-3's
+    // audio frame element says, E.1.2.3).
+    snrOffsetStrategy: Int = 2
+    blockSwitchSyntax: Bool = true
+    ditherFlagSyntax: Bool = true
+    bitAllocSyntax: Bool = true
+    fastGainSyntax: Bool = false
+    dbaSyntax: Bool = true
+    skipSyntax: Bool = true
+    firstCplLeak: Bool = false
+
+    // Per block (6) and per block × channel (6 × 7) strategies.
+    cplStrategyExists: [Int] = core.zeros(6)
+    cplInUse: [Int] = core.zeros(6)
+    expStr: [Int] = core.zeros(42)
+    channelUsesAht: [Int] = core.zeros(7)
+    spxAttenCode: [Int] = core.filled(7, -1)
+
+    // Per channel (7) switches.
+    blockSwitch: [Int] = core.zeros(7)
+    ditherFlag: [Int] = core.zeros(7)
+    startFreq: [Int] = core.zeros(7)
+    endFreq: [Int] = core.zeros(7)
+    numExpGroups: [Int] = core.zeros(7)
+    channelInCpl: [Int] = core.zeros(7)
+    firstCplCoords: [Int] = core.filled(7, 1)
+    dynRange: [Float] = [1.0, 1.0]
+
+    // Spectral extension (E-AC-3, E.3.6).
+    spxInUse: Bool = false
+    channelUsesSpx: [Int] = core.zeros(7)
+    firstSpxCoords: [Int] = core.filled(7, 1)
+    spxDstStart: Int = 0
+    spxSrcStart: Int = 0
+    spxDstEnd: Int = 0
+    numSpxBands: Int = 0
+    spxBandSizes: [Int] = core.zeros(17)
+    spxBandStruct: [Int] = core.zeros(17)
+    spxNoiseBlend: [Float] = []
+    spxSignalBlend: [Float] = []
+
+    // Coupling (A/52 7.4).
+    phaseFlagsInUse: Bool = false
+    phaseFlags: [Int] = core.zeros(18)
+    cplCoords: [Int] = core.zeros(7 * 18)
+    numCplBands: Int = 0
+    cplBandSizes: [Int] = core.zeros(18)
+    cplBandStruct: [Int] = core.zeros(18)
+
+    // Rematrixing (A/52 7.5).
+    numRematBands: Int = 0
+    rematFlags: [Int] = core.zeros(4)
+
+    // Bit allocation parameters (A/52 7.2.2).
+    slowDecay: Int = 0
+    fastDecay: Int = 0
+    slowGain: Int = 0
+    dbPerBit: Int = 0
+    floorLevel: Int = 0
+    cplFastLeak: Int = 0
+    cplSlowLeak: Int = 0
+    snrOffset: [Int] = core.zeros(7)
+    fastGain: [Int] = core.zeros(7)
+    dbaMode: [Int] = core.zeros(7)
+    dbaNsegs: [Int] = core.zeros(7)
+    dbaOffsets: [Int] = core.zeros(56)
+    dbaLengths: [Int] = core.zeros(56)
+    dbaValues: [Int] = core.zeros(56)
+
+    // Per channel × 256 bins: exponents, PSD, bap, fixed point coefficients;
+    // per channel × 50 bands: banded PSD and masking curve.
+    dexps: [Int] = core.zeros(7 * 256)
+    psd: [Int] = core.zeros(7 * 256)
+    bandPsd: [Int] = core.zeros(7 * 50)
+    mask: [Int] = core.zeros(7 * 50)
+    bap: [Int] = core.zeros(7 * 256)
+    fixed: [Int] = core.zeros(7 * 256)
+    // E-AC-3 AHT mantissas for the 6 blocks of each bin: (ch × 256 + bin) × 6.
+    preMant: [Int] = core.zeros(7 * 256 * 6)
+    // Grouped mantissas waiting to be used (A/52 7.3.5).
+    mb1: Int = 0
+    mb2: Int = 0
+    mb4: Int = 0
+    mb1v: [Int] = [0, 0]
+    mb2v: [Int] = [0, 0]
+    mb4v: Int = 0
+    gaqGain: [Int] = core.zeros(256)
+
+    // Floating point coefficients (ch × 256), the overlap half of each
+    // channel's last transform ((ch − 1) × 128) and the block's output
+    // ((ch − 1) × 256).
+    coeffs: [Float] = []
+    overlap: [Float] = []
+    blockOut: [Float] = []
+    // Transform scratch.
+    xr: [Float] = []
+    xi: [Float] = []
+    xin: [Float] = []
+    half: [Float] = []
+
+    // For each output position (WAV order), the stream channel (1…nch).
+    outMap: [Int] = []
+    // A frame has set the channel layout up; the independent frames'
+    // channel names (WAV order) and rate.
+    configured: Bool = false
+    streamNames: [String] = []
+    streamRate: Int = 0
+
+    // --- Dependent substreams (E-AC-3 7.1). ---
+    // Decoding a dependent frame now.
+    inDep: Bool = false
+    // The dependent frames' transform overlap (the independent's is
+    // `overlap`; they are swapped while a dependent frame decodes).
+    overlapDep: [Float] = []
+    // The dependent frame's channel map (Table E.1.4), and for each of its
+    // channels in WAV order, its stream channel (1…nch).
+    chanmap: Int = 0
+    depMap: [Int] = []
+    // The frame just decoded: (ch − 1) × 1536 + block × 256 + i.
+    frameBuf: [Float] = []
+    // The independent frame waiting for a possible dependent one.
+    heldBuf: [Float] = []
+    heldMap: [Int] = []
+    heldNames: [String] = []
+    heldBlocks: Int = 0
+    heldRate: Int = 0
+    held: Bool = false
+    // What the last frame of the packet was: 0 an independent frame of
+    // program 0, 1 its dependent, 2 another program's frame.
+    lastKind: Int = -1
+    // Samples decoded from the current packet, interleaved.
+    outBuf: [Float] = []
+    // Problems warned about once already.
+    warned: [String] = []
+
+    // Decodes one packet: one syncframe normally, or several (E-AC-3
+    // frames of fewer than 6 blocks, independent + dependent frames).
+    // A damaged frame gives silence and a warning.
+    fn decode(_ packet: Data, pts: Int) -> core.Samples {
+        outBuf = []
+        var data = packet
+        if data.count >= 2 && data[0] == 0x77 && data[1] == 0x0b {
+            data = ac3ByteSwapped(data)
+            warnOnce("byte-swapped AC-3")
+        }
+        var at = 0
+        while at + 7 <= data.count {
+            if data[at] != 0x0b || data[at + 1] != 0x77 {
+                let next = findSync(data, from: at + 1)
+                if next < 0 {
+                    break
+                }
+                warn("skipped {next - at} bytes before a sync word")
+                at = next
+                continue
+            }
+            let info = frameInfo(data, at: at)
+            if !info.ok {
+                at += 2
+                continue
+            }
+            if at + info.size > data.count {
+                warn("syncframe of {info.size} bytes cut off at {data.count - at}")
+                damaged += 1
+                break
+            }
+            if info.eac3 && info.frameType == 1 {
+                if lastKind == 0 && held {
+                    if info.blocks != heldBlocks || info.rate != heldRate {
+                        warnOnce("ignored a dependent substream that doesn't match its independent frame")
+                    } else {
+                        decodeDependent(data, at, info)
+                    }
+                    lastKind = 1
+                } else if lastKind == 2 {
+                    // Belongs to a program we don't decode.
+                } else if lastKind == 1 {
+                    warnOnce("E-AC-3 dependent substream {info.substream} ignored (one is decoded)")
+                } else {
+                    warnOnce("ignored a dependent frame without an independent frame before it")
+                }
+            } else if info.eac3 && info.substream != 0 {
+                warnOnce("E-AC-3 independent substream {info.substream} ignored")
+                lastKind = 2
+            } else {
+                if held {
+                    emitHeld()
+                }
+                decodeFrame(data, at, info)
+                // Keep it until we know whether a dependent frame follows.
+                let t = heldBuf
+                heldBuf = frameBuf
+                frameBuf = t
+                heldMap = outMap
+                heldNames = streamNames
+                heldBlocks = numBlocks
+                heldRate = streamRate
+                held = true
+                lastKind = 0
+            }
+            at += info.size
+        }
+        if held {
+            emitHeld()
+        }
+        lastKind = -1
+        var s = core.Samples(rate: rate, channels: channels, layout: layout, pts: pts)
+        s.data = outBuf
+        outBuf = []
+        s
+    }
+
+    // AC-3 keeps nothing back: the overlap half is part of the next block.
+    fn flush() -> core.Samples {
+        core.Samples(rate: rate, channels: channels, layout: layout)
+    }
+
+    // After a seek: forget the overlap and the block-to-block state.
+    fn reset() {
+        for i in 0..overlap.count {
+            overlap[i] = 0.0
+        }
+        for i in 0..overlapDep.count {
+            overlapDep[i] = 0.0
+        }
+        held = false
+        lastKind = -1
+        dither.seed(0)
+        for ch in 0..7 {
+            firstCplCoords[ch] = 1
+            firstSpxCoords[ch] = 1
+        }
+    }
+
+    fn warn(_ text: String) {
+        if warnings.count < 100 {
+            warnings.append(text)
+        }
+    }
+
+    fn warnOnce(_ text: String) {
+        if !warned.contains(text) {
+            warned.append(text)
+            warn(text)
+        }
+    }
+
+    // One syncframe at data[at…]: header, blocks, output.
+    fn decodeFrame(_ data: Data, _ at: Int, _ info: FrameInfo) {
+        frames += 1
+        if frameBuf.count < 7 * 1536 {
+            frameBuf = ac3Floats(7 * 1536)
+        }
+        if blockOut.count < 7 * 256 {
+            blockOut = ac3Floats(7 * 256)
+        }
+        var ok = true
+        if crc16(data, from: at + 2, to: at + info.size) != 0 {
+            warn("frame {frames}: CRC mismatch, frame muted")
+            ok = false
+        }
+        br = core.bitReaderRange(data, from: at, to: at + info.size)
+        if ok {
+            ok = parseHeader(info)
+        } else {
+            setChannels(info.acmod, info.lfe, info.rate, info.blocks)
+        }
+        var blk = 0
+        while blk < numBlocks {
+            if ok {
+                ok = decodeBlock(blk)
+                if ok && br.overrun {
+                    warn("frame {frames}: block {blk} reads past the frame's end")
+                    ok = false
+                }
+                if !ok {
+                    damaged += 1
+                    warn("frame {frames}: damaged at block {blk}, rest of the frame muted")
+                }
+            }
+            if !ok {
+                for i in 0..blockOut.count {
+                    blockOut[i] = 0.0
+                }
+            }
+            emitBlock(blk)
+            blk += 1
+        }
+        if !ok {
+            for i in 0..overlap.count {
+                overlap[i] = 0.0
+            }
+        }
+    }
+
+    // Sets up the channel set (and the output layout) for a frame.
+    fn setChannels(_ mode: Int, _ lfe: Bool, _ sampleRate: Int, _ blocks: Int) {
+        acmod = mode
+        lfeOn = lfe
+        nfch = ac3ChannelsTab[mode]
+        nch = nfch + (if lfe { 1 } else { 0 })
+        lfeCh = if lfe { nfch + 1 } else { -1 }
+        numBlocks = blocks
+        if blockOut.count < nch * 256 {
+            blockOut = ac3Floats(7 * 256)
+        }
+        if frameBuf.count < nch * 1536 {
+            frameBuf = ac3Floats(7 * 1536)
+        }
+        let names = layoutFor(acmod: mode, lfe: lfe)
+        // Which stream channel feeds each WAV position.
+        var stream = ac3StreamNames(mode)
+        if lfe {
+            stream.append("LFE")
+        }
+        if inDep {
+            depMap = []
+            for name in names {
+                depMap.append((stream.index(of: name) ?? 0) + 1)
+            }
+            if overlap.count != nch * 128 {
+                overlap = ac3Floats(nch * 128)
+            }
+            return
+        }
+        if !configured || names != streamNames || sampleRate != streamRate {
+            if configured {
+                warn("frame {frames}: format changes to {sampleRate} Hz, {names.count} channels")
+            }
+            configured = true
+            streamNames = names
+            streamRate = sampleRate
+            outMap = []
+            for name in names {
+                outMap.append((stream.index(of: name) ?? 0) + 1)
+            }
+            overlap = ac3Floats(nch * 128)
+        }
+    }
+
+    // Keeps the block's output in frameBuf.
+    fn emitBlock(_ blk: Int) {
+        for ch in 0..nch {
+            let from = ch * 256
+            let to = ch * 1536 + blk * 256
+            for i in 0..256 {
+                frameBuf[to + i] = blockOut[from + i]
+            }
+        }
+    }
+
+    // The output format of what goes out now.
+    fn publish(_ names: [String], _ r: Int) {
+        if names != layout || r != rate || channels != names.count {
+            rate = r
+            layout = names
+            channels = names.count
+        }
+    }
+
+    // Appends the held independent frame to outBuf, interleaved in WAV
+    // order.
+    fn emitHeld() {
+        held = false
+        publish(heldNames, heldRate)
+        let n = heldMap.count
+        for blk in 0..heldBlocks {
+            for i in 0..256 {
+                let at = blk * 256 + i
+                for k in 0..n {
+                    outBuf.append(heldBuf[(heldMap[k] - 1) * 1536 + at])
+                }
+            }
+        }
+    }
+
+    // Decodes a dependent frame and puts its channels together with the
+    // held independent frame's (ac3_decode_frame's extended channel map).
+    fn decodeDependent(_ data: Data, _ at: Int, _ info: FrameInfo) {
+        inDep = true
+        var t = overlap
+        overlap = overlapDep
+        overlapDep = t
+        decodeFrame(data, at, info)
+        t = overlap
+        overlap = overlapDep
+        overlapDep = t
+        inDep = false
+        // The combined layout: the independent's channels and the map's.
+        var indepMask = 0
+        for name in heldNames {
+            indepMask = indepMask | (1 << ac3ChannelBit(name))
+        }
+        var mask = indepMask
+        let locs = ac3CustomLocations
+        for loc in 0..16 {
+            if (chanmap & (1 << (15 - loc))) != 0 {
+                mask = mask | locs[loc * 2 + 1]
+            }
+        }
+        if ac3PopCount(mask) > 16 {
+            warn("frame {frames}: too many channels in the dependent substream's map")
+            held = false
+            return
+        }
+        var names: [String] = []
+        for b in 0..36 {
+            if ((mask >> b) & 1) == 1 {
+                names.append(ac3BitNames[b])
+            }
+        }
+        let nOut = names.count
+        // For each output position: −1 silence, 0…6 the independent frame's
+        // WAV position, 7… the dependent's (FFmpeg's output buffers, whose
+        // default is the same position).
+        var src: [Int] = []
+        for k in 0..nOut {
+            src.append(if k < 7 { (if k < heldMap.count { k } else { -1 }) } else { (if k - 7 < depMap.count { k } else { -1 }) })
+        }
+        let depSize = depMap.count
+        var extend = 0
+        var stop = false
+        for loc in 0..16 {
+            if stop {
+                break
+            }
+            if (chanmap & (1 << (15 - loc))) == 0 {
+                continue
+            }
+            let bits = locs[loc * 2 + 1]
+            for b in 0..36 {
+                if ((bits >> b) & 1) == 0 {
+                    continue
+                }
+                if extend >= depSize {
+                    // FFmpeg stops the whole map at a single speaker, only
+                    // the pair at a pair.
+                    if locs[loc * 2] == 1 {
+                        stop = true
+                    }
+                    break
+                }
+                let index = ac3PopCount(mask & ((1 << b) - 1))
+                // FFmpeg takes its output buffer channel_map[extend]: the
+                // buffers are in WAV order and channel_map gives a stream
+                // channel for each, so the stream channel number is used
+                // as a WAV position here (the same thing for the usual
+                // dependent sets, which have no centre or LFE out of order).
+                src[index] = 7 + depMap[extend] - 1
+                extend += 1
+            }
+        }
+        publish(names, heldRate)
+        held = false
+        for blk in 0..heldBlocks {
+            for i in 0..256 {
+                let at = blk * 256 + i
+                for k in 0..nOut {
+                    let s = src[k]
+                    if s < 0 {
+                        outBuf.append(0.0)
+                    } else if s < 7 {
+                        outBuf.append(heldBuf[(heldMap[s] - 1) * 1536 + at])
+                    } else {
+                        outBuf.append(frameBuf[(depMap[s - 7] - 1) * 1536 + at])
+                    }
+                }
+            }
+        }
+    }
+
+    // Reads syncinfo + bsi (AC-3, A/52 5.3) or the E-AC-3 bsi and audio
+    // frame elements (E.1.2.2, E.1.2.3).
+    fn parseHeader(_ info: FrameInfo) -> Bool {
+        br.bits(16)
+        bsid = info.bsid
+        eac3 = info.eac3
+        frameType = info.frameType
+        frameSize = info.size
+        srShift = 0
+        if !eac3 {
+            br.bits(16)
+            srCode = br.bits(2)
+            br.bits(6)
+            br.bits(5)
+            br.bits(3)
+            let mode = br.bits(3)
+            if mode == 2 {
+                br.bits(2)
+            } else {
+                if (mode & 1) != 0 && mode != 1 {
+                    br.bits(2)
+                }
+                if (mode & 4) != 0 {
+                    br.bits(2)
+                }
+            }
+            let lfe = br.flag()
+            srShift = max(bsid, 8) - 8
+            setChannels(mode, lfe, info.rate, 6)
+            // dialnorm, compr, langcod, audprodinfo (twice for 1+1).
+            let programs = if mode == 0 { 2 } else { 1 }
+            for _ in 0..programs {
+                br.bits(5)
+                if br.flag() {
+                    br.bits(8)
+                }
+                if br.flag() {
+                    br.bits(8)
+                }
+                if br.flag() {
+                    br.bits(7)
+                }
+            }
+            // copyrightb, origbs, then timecodes (or bsid 6's extended bsi:
+            // both are two optional 14-bit fields).
+            br.bits(2)
+            if br.flag() {
+                br.bits(14)
+            }
+            if br.flag() {
+                br.bits(14)
+            }
+            if br.flag() {
+                let n = br.bits(6)
+                br.skip((n + 1) * 8)
+            }
+            // AC-3 blocks have every optional part.
+            snrOffsetStrategy = 2
+            blockSwitchSyntax = true
+            ditherFlagSyntax = true
+            bitAllocSyntax = true
+            fastGainSyntax = false
+            firstCplLeak = false
+            dbaSyntax = true
+            skipSyntax = true
+            for ch in 0..7 {
+                channelUsesAht[ch] = 0
+            }
+        } else {
+            if !parseEac3Header(info) {
+                return false
+            }
+        }
+        if lfeOn {
+            startFreq[lfeCh] = 0
+            endFreq[lfeCh] = 7
+            numExpGroups[lfeCh] = 2
+            channelInCpl[lfeCh] = 0
+        }
+        !br.overrun
+    }
+
+    // ---------------------------------------------------------------
+    // E-AC-3 headers: the rest of bsi (E.1.2.2) and audfrm (E.1.2.3).
+    // ---------------------------------------------------------------
+
+    fn parseEac3Header(_ info: FrameInfo) -> Bool {
+        frameType = br.bits(2)
+        br.bits(3)
+        br.bits(11)
+        srCode = br.bits(2)
+        var blocks = 6
+        if srCode == 3 {
+            br.bits(2)
+            warnOnce("E-AC-3 at a reduced sample rate (fscod2) is not supported")
+            return false
+        }
+        blocks = eac3Blocks[br.bits(2)]
+        let mode = br.bits(3)
+        let lfe = br.flag()
+        setChannels(mode, lfe, info.rate, blocks)
+        br.bits(5)
+        let programs = if mode == 0 { 2 } else { 1 }
+        // dialnorm, compr
+        for _ in 0..programs {
+            br.bits(5)
+            if br.flag() {
+                br.bits(8)
+            }
+        }
+        // chanmape / chanmap (dependent substreams only)
+        chanmap = 0
+        if frameType == 1 && br.flag() {
+            chanmap = br.bits(16)
+        }
+        // mixmdate: mixing metadata.
+        if br.flag() {
+            if acmod > 2 {
+                br.bits(2)
+                if (acmod & 1) != 0 {
+                    br.bits(6)
+                }
+                if (acmod & 4) != 0 {
+                    br.bits(6)
+                }
+            }
+            if lfeOn && br.flag() {
+                br.bits(5)
+            }
+            if frameType == 0 {
+                for _ in 0..programs {
+                    if br.flag() {
+                        br.bits(6)
+                    }
+                }
+                if br.flag() {
+                    br.bits(6)
+                }
+                let mixdef = br.bits(2)
+                if mixdef == 1 {
+                    br.bits(5)
+                } else if mixdef == 2 {
+                    br.bits(12)
+                } else if mixdef == 3 {
+                    let n = br.bits(5)
+                    br.skip((n + 2) * 8)
+                }
+                if acmod < 2 {
+                    for _ in 0..programs {
+                        if br.flag() {
+                            br.bits(14)
+                        }
+                    }
+                }
+                if br.flag() {
+                    for _ in 0..numBlocks {
+                        if numBlocks == 1 || br.flag() {
+                            br.bits(5)
+                        }
+                    }
+                }
+            }
+        }
+        // infomdate: informational metadata.
+        if br.flag() {
+            br.bits(5)
+            if acmod == 2 {
+                br.bits(4)
+            }
+            if acmod >= 6 {
+                br.bits(2)
+            }
+            for _ in 0..programs {
+                if br.flag() {
+                    br.bits(8)
+                }
+            }
+            if srCode != 3 {
+                br.bits(1)
+            }
+        }
+        if frameType == 0 && numBlocks != 6 {
+            br.bits(1)
+        }
+        if frameType == 2 && (numBlocks == 6 || br.flag()) {
+            br.bits(6)
+        }
+        if br.flag() {
+            let n = br.bits(6)
+            br.skip((n + 1) * 8)
+        }
+
+        // audfrm: which optional parts the blocks have, and the strategies
+        // that hold for the whole frame.
+        var ac3ExpStrategy = true
+        var parseAht = false
+        if numBlocks == 6 {
+            ac3ExpStrategy = br.flag()
+            parseAht = br.flag()
+        }
+        snrOffsetStrategy = br.bits(2)
+        let parseTransient = br.flag()
+        blockSwitchSyntax = br.flag()
+        if !blockSwitchSyntax {
+            for ch in 0..7 {
+                blockSwitch[ch] = 0
+            }
+        }
+        ditherFlagSyntax = br.flag()
+        if !ditherFlagSyntax {
+            for ch in 1..(nfch + 1) {
+                ditherFlag[ch] = 1
+            }
+        }
+        ditherFlag[0] = 0
+        if lfeOn {
+            ditherFlag[lfeCh] = 0
+        }
+        bitAllocSyntax = br.flag()
+        if !bitAllocSyntax {
+            slowDecay = ac3SlowDecayTab[2]
+            fastDecay = ac3FastDecayTab[1]
+            slowGain = ac3SlowGainTab[1]
+            dbPerBit = ac3DbPerBitTab[2]
+            floorLevel = ac3FloorTab[7]
+        }
+        fastGainSyntax = br.flag()
+        dbaSyntax = br.flag()
+        skipSyntax = br.flag()
+        let parseSpxAtten = br.flag()
+
+        // Coupling in use per block.
+        var cplBlocks = 0
+        if acmod > 1 {
+            for blk in 0..numBlocks {
+                cplStrategyExists[blk] = if blk == 0 || br.flag() { 1 } else { 0 }
+                if cplStrategyExists[blk] != 0 {
+                    cplInUse[blk] = br.bit()
+                } else {
+                    cplInUse[blk] = cplInUse[blk - 1]
+                }
+                cplBlocks += cplInUse[blk]
+            }
+        } else {
+            for blk in 0..6 {
+                cplInUse[blk] = 0
+            }
+        }
+
+        // Exponent strategies, AC-3 style or as one of 32 frame patterns
+        // (Table E2.14).
+        if ac3ExpStrategy {
+            for blk in 0..numBlocks {
+                var ch = if cplInUse[blk] != 0 { 0 } else { 1 }
+                while ch <= nfch {
+                    expStr[blk * 7 + ch] = br.bits(2)
+                    ch += 1
+                }
+            }
+        } else {
+            var ch = if acmod > 1 && cplBlocks > 0 { 0 } else { 1 }
+            while ch <= nfch {
+                let code = br.bits(5)
+                for blk in 0..6 {
+                    expStr[blk * 7 + ch] = eac3FrmExpStr[code * 6 + blk]
+                }
+                ch += 1
+            }
+        }
+        if lfeOn {
+            for blk in 0..numBlocks {
+                expStr[blk * 7 + lfeCh] = br.bit()
+            }
+        }
+        // Converter exponent strategies (for re-encoding to AC-3).
+        if frameType == 0 && (numBlocks == 6 || br.flag()) {
+            br.skip(5 * nfch)
+        }
+
+        // Which channels use the adaptive hybrid transform: only those whose
+        // exponents are sent in block 0 and reused in all the others.
+        if parseAht {
+            channelUsesAht[0] = 0
+            var ch = if cplBlocks != 6 { 1 } else { 0 }
+            while ch <= nch {
+                var useAht = true
+                for blk in 1..6 {
+                    if expStr[blk * 7 + ch] != 0 || (ch == 0 && cplStrategyExists[blk] != 0) {
+                        useAht = false
+                    }
+                }
+                channelUsesAht[ch] = if useAht && br.flag() { 1 } else { 0 }
+                ch += 1
+            }
+        } else {
+            for ch in 0..7 {
+                channelUsesAht[ch] = 0
+            }
+        }
+
+        // One SNR offset for the whole frame.
+        if snrOffsetStrategy == 0 {
+            let csnr = (br.bits(6) - 15) << 4
+            let snr = (csnr + br.bits(4)) << 2
+            for ch in 0..(nch + 1) {
+                snrOffset[ch] = snr
+            }
+        }
+        // Transient pre-noise processing (only for re-encoders: skipped).
+        if parseTransient {
+            for _ in 1..(nfch + 1) {
+                if br.flag() {
+                    br.bits(18)
+                }
+            }
+        }
+        // Spectral extension notch filter attenuation.
+        for ch in 1..(nfch + 1) {
+            if parseSpxAtten && br.flag() {
+                spxAttenCode[ch] = br.bits(5)
+            } else {
+                spxAttenCode[ch] = -1
+            }
+        }
+        // Block start positions (not needed to decode).
+        if numBlocks > 1 && br.flag() {
+            var words = 0
+            while (1 << (words + 1)) <= frameSize - 2 {
+                words += 1
+            }
+            br.skip((numBlocks - 1) * (4 + words))
+        }
+        for ch in 1..(nfch + 1) {
+            firstSpxCoords[ch] = 1
+            firstCplCoords[ch] = 1
+        }
+        firstCplLeak = true
+        true
+    }
+
+    // ---------------------------------------------------------------
+    // One audio block (A/52 5.4.3 audblk, E.1.2.4 for E-AC-3).
+    // ---------------------------------------------------------------
+
+    fn decodeBlock(_ blk: Int) -> Bool {
+        // blksw: short transforms; dithflag: noise in bap-0 mantissas.
+        if blockSwitchSyntax {
+            for ch in 1..(nfch + 1) {
+                blockSwitch[ch] = br.bit()
+            }
+        }
+        if ditherFlagSyntax {
+            for ch in 1..(nfch + 1) {
+                ditherFlag[ch] = br.bit()
+            }
+        }
+        // dynrng (and dynrng2 for 1+1): 7.7.1.
+        var prog = if acmod == 0 { 1 } else { 0 }
+        while prog >= 0 {
+            if br.flag() {
+                dynRange[prog] = drcGain(br.bits(8))
+            } else if blk == 0 {
+                dynRange[prog] = 1.0
+            }
+            prog -= 1
+        }
+
+        // Spectral extension strategy and coordinates (E-AC-3, E.1.3.3).
+        if eac3 && (blk == 0 || br.flag()) {
+            spxInUse = br.flag()
+            if spxInUse && !spxStrategy(blk) {
+                return false
+            }
+        }
+        if !eac3 || !spxInUse {
+            spxInUse = false
+            for ch in 1..(nfch + 1) {
+                channelUsesSpx[ch] = 0
+                firstSpxCoords[ch] = 1
+            }
+        }
+        if spxInUse {
+            spxCoordinates()
+        }
+
+        // Coupling strategy and coordinates (7.4).
+        let cplNew = if eac3 { cplStrategyExists[blk] != 0 } else { br.flag() }
+        if cplNew {
+            if !couplingStrategy(blk) {
+                return false
+            }
+        } else if !eac3 {
+            if blk == 0 {
+                warn("frame {frames}: no coupling strategy in block 0")
+                return false
+            }
+            cplInUse[blk] = cplInUse[blk - 1]
+        }
+        let cpl = cplInUse[blk] != 0
+        if cpl && !couplingCoordinates(blk) {
+            return false
+        }
+
+        // Rematrixing flags (7.5): 4 bands, fewer when coupling or spectral
+        // extension starts low.
+        if acmod == 2 {
+            if (eac3 && blk == 0) || br.flag() {
+                numRematBands = 4
+                if cpl && startFreq[0] <= 61 {
+                    numRematBands -= 1 + (if startFreq[0] == 37 { 1 } else { 0 })
+                } else if spxInUse && spxSrcStart <= 61 {
+                    numRematBands -= 1
+                }
+                for bnd in 0..numRematBands {
+                    rematFlags[bnd] = br.bit()
+                }
+            } else if blk == 0 {
+                warnOnce("no rematrixing strategy in block 0")
+                numRematBands = 0
+            }
+        }
+
+        // Exponent strategies (AC-3; E-AC-3 has them in audfrm).
+        let first = if cpl { 0 } else { 1 }
+        if !eac3 {
+            var ch = first
+            while ch <= nch {
+                expStr[blk * 7 + ch] = br.bits(if ch == lfeCh { 1 } else { 2 })
+                ch += 1
+            }
+        }
+
+        // Channel bandwidth: where each channel's own coefficients end.
+        for ch in 1..(nfch + 1) {
+            startFreq[ch] = 0
+            let es = expStr[blk * 7 + ch]
+            if es != 0 {
+                if channelInCpl[ch] != 0 {
+                    endFreq[ch] = startFreq[0]
+                } else if channelUsesSpx[ch] != 0 {
+                    endFreq[ch] = spxSrcStart
+                } else {
+                    let bw = br.bits(6)
+                    if bw > 60 {
+                        warn("frame {frames}: bandwidth code {bw} > 60")
+                        return false
+                    }
+                    endFreq[ch] = bw * 3 + 73
+                }
+                let size = 3 << (es - 1)
+                numExpGroups[ch] = (endFreq[ch] + size - 4) / size
+            }
+        }
+        if cpl && expStr[blk * 7] != 0 {
+            numExpGroups[0] = (endFreq[0] - startFreq[0]) / (3 << (expStr[blk * 7] - 1))
+        }
+
+        // Exponents (7.1).
+        var ch = first
+        while ch <= nch {
+            let es = expStr[blk * 7 + ch]
+            if es != 0 {
+                let absexp = br.bits(4) << (if ch == 0 { 1 } else { 0 })
+                dexps[ch * 256] = absexp
+                let at = ch * 256 + startFreq[ch] + (if ch == 0 { 0 } else { 1 })
+                if !decodeExponents(es, numExpGroups[ch], absexp, at) {
+                    return false
+                }
+                if ch != 0 && ch != lfeCh {
+                    br.bits(2)
+                }
+            }
+            ch += 1
+        }
+
+        // Bit allocation parameters (7.2.2).
+        if bitAllocSyntax {
+            if br.flag() {
+                slowDecay = ac3SlowDecayTab[br.bits(2)] >> srShift
+                fastDecay = ac3FastDecayTab[br.bits(2)] >> srShift
+                slowGain = ac3SlowGainTab[br.bits(2)]
+                dbPerBit = ac3DbPerBitTab[br.bits(2)]
+                floorLevel = ac3FloorTab[br.bits(3)]
+            } else if blk == 0 {
+                warn("frame {frames}: no bit allocation parameters in block 0")
+                return false
+            }
+        }
+        // SNR offsets and fast gains.
+        if !eac3 || blk == 0 {
+            if snrOffsetStrategy != 0 && br.flag() {
+                var snr = 0
+                let csnr = (br.bits(6) - 15) << 4
+                var c = first
+                while c <= nch {
+                    if c == first || snrOffsetStrategy == 2 {
+                        snr = (csnr + br.bits(4)) << 2
+                    }
+                    snrOffset[c] = snr
+                    if !eac3 {
+                        fastGain[c] = ac3FastGainTab[br.bits(3)]
+                    }
+                    c += 1
+                }
+            } else if !eac3 && blk == 0 {
+                warn("frame {frames}: no SNR offsets in block 0")
+                return false
+            }
+        }
+        if fastGainSyntax && br.flag() {
+            var c = first
+            while c <= nch {
+                fastGain[c] = ac3FastGainTab[br.bits(3)]
+                c += 1
+            }
+        } else if eac3 && blk == 0 {
+            var c = first
+            while c <= nch {
+                fastGain[c] = ac3FastGainTab[4]
+                c += 1
+            }
+        }
+        // E-AC-3 → AC-3 converter SNR offset (not needed).
+        if frameType == 0 && br.flag() {
+            br.bits(10)
+        }
+        // Coupling leak (7.2.2.4).
+        if cpl {
+            if firstCplLeak || br.flag() {
+                cplFastLeak = br.bits(3)
+                cplSlowLeak = br.bits(3)
+            } else if !eac3 && blk == 0 {
+                warn("frame {frames}: no coupling leak in block 0")
+                return false
+            }
+            firstCplLeak = false
+        }
+        // Delta bit allocation (7.2.2.6): encoder corrections to the mask.
+        if dbaSyntax && br.flag() {
+            var c = first
+            while c <= nfch {
+                dbaMode[c] = br.bits(2)
+                if dbaMode[c] == 3 {
+                    warn("frame {frames}: reserved delta bit allocation mode")
+                    return false
+                }
+                c += 1
+            }
+            c = first
+            while c <= nfch {
+                if dbaMode[c] == 1 {
+                    dbaNsegs[c] = br.bits(3) + 1
+                    for seg in 0..dbaNsegs[c] {
+                        dbaOffsets[c * 8 + seg] = br.bits(5)
+                        dbaLengths[c * 8 + seg] = br.bits(4)
+                        dbaValues[c * 8 + seg] = br.bits(3)
+                    }
+                }
+                c += 1
+            }
+        } else if blk == 0 {
+            for c in 0..7 {
+                dbaMode[c] = 2
+            }
+        }
+
+        // Run the bit allocation for every channel in the block.
+        ch = first
+        while ch <= nch {
+            calcPsd(ch)
+            if !calcMask(ch) {
+                warn("frame {frames}: bad delta bit allocation")
+                return false
+            }
+            calcBap(ch)
+            ch += 1
+        }
+
+        // skipl: padding.
+        if skipSyntax && br.flag() {
+            let n = br.bits(9)
+            br.skip(8 * n)
+        }
+
+        // Mantissas → coefficients; uncoupling; rematrixing.
+        decodeCoefficients(blk)
+        if acmod == 2 {
+            rematrix()
+        }
+        // To floating point with the dynamic range gain (7.7); 2^-22
+        // brings the 24-bit fixed point mantissas to the transform's scale.
+        for c in 1..(nch + 1) {
+            var prog = 0
+            if acmod == 0 && c <= 2 {
+                prog = 2 - c
+            }
+            let gain = dynRange[prog] / 4194304.0
+            let base = c * 256
+            for bin in 0..256 {
+                coeffs[base + bin] = Float(fixed[base + bin]) * gain
+            }
+        }
+        if spxInUse {
+            applySpx()
+        }
+        for c in 1..(nch + 1) {
+            imdctChannel(c)
+        }
+        true
+    }
+
+    // A dynrng word as a gain, scaled by drcScale (7.7.1.2).
+    fn drcGain(_ code: Int) -> Float {
+        if drcScale == 0.0 {
+            return 1.0
+        }
+        let range = ac3DynRangeTab[code]
+        if code <= 127 || drcScale <= 1.0 {
+            return pow(range, drcScale)
+        }
+        range
+    }
+
+    // Grouped exponents (7.1.3): each 7-bit group holds three differences
+    // (−2…+2) from the previous exponent; D25 and D45 repeat each exponent
+    // over 2 or 4 bins.
+    fn decodeExponents(_ strategy: Int, _ groups: Int, _ absexp: Int, _ at: Int) -> Bool {
+        let size = strategy + (if strategy == 3 { 1 } else { 0 })
+        var prev = absexp
+        var j = at
+        for _ in 0..groups {
+            let acc = br.bits(7)
+            if acc >= 125 {
+                warn("frame {frames}: exponent group {acc} out of range")
+                return false
+            }
+            for part in 0..3 {
+                let d = if part == 0 { acc / 25 } else if part == 1 { (acc % 25) / 5 } else { acc % 5 }
+                prev += d - 2
+                if prev < 0 || prev > 24 {
+                    warn("frame {frames}: exponent {prev} out of range")
+                    return false
+                }
+                for _ in 0..size {
+                    dexps[j] = prev
+                    j += 1
+                }
+            }
+        }
+        true
+    }
+
+    // ---------------------------------------------------------------
+    // Coupling and spectral extension side information.
+    // ---------------------------------------------------------------
+
+    fn couplingStrategy(_ blk: Int) -> Bool {
+        if !eac3 {
+            cplInUse[blk] = br.bit()
+        }
+        if cplInUse[blk] != 0 {
+            if acmod < 2 {
+                warn("frame {frames}: coupling in a mono or 1+1 stream")
+                return false
+            }
+            if eac3 && br.flag() {
+                warnOnce("E-AC-3 enhanced coupling is not supported: those frames are muted")
+                return false
+            }
+            if eac3 && acmod == 2 {
+                channelInCpl[1] = 1
+                channelInCpl[2] = 1
+            } else {
+                for ch in 1..(nfch + 1) {
+                    channelInCpl[ch] = br.bit()
+                }
+            }
+            if acmod == 2 {
+                phaseFlagsInUse = br.flag()
+            }
+            let startSub = br.bits(4)
+            let endSub = if spxInUse { (spxSrcStart - 37) / 12 } else { br.bits(4) + 3 }
+            if startSub >= endSub {
+                warn("frame {frames}: coupling range {startSub} to {endSub}")
+                return false
+            }
+            startFreq[0] = startSub * 12 + 37
+            endFreq[0] = endSub * 12 + 37
+            bandStructure(blk, true, startSub, endSub)
+        } else {
+            for ch in 1..(nfch + 1) {
+                channelInCpl[ch] = 0
+                firstCplCoords[ch] = 1
+            }
+            firstCplLeak = eac3
+            phaseFlagsInUse = false
+        }
+        true
+    }
+
+    // Coupling or spectral extension band structure: for each 12-bin
+    // sub-band after the first, 1 joins it to the band before.
+    fn bandStructure(_ blk: Int, _ isCpl: Bool, _ startSub: Int, _ endSub: Int) {
+        let n = endSub - startSub
+        if blk == 0 {
+            if isCpl {
+                cplBandStruct = ac3DefaultCplBandStruct
+            } else {
+                spxBandStruct = eac3DefaultSpxBandStruct
+            }
+        }
+        if !eac3 || br.flag() {
+            for sb in 0..(n - 1) {
+                if isCpl {
+                    cplBandStruct[startSub + 1 + sb] = br.bit()
+                } else {
+                    spxBandStruct[startSub + 1 + sb] = br.bit()
+                }
+            }
+        }
+        var bands = n
+        var bnd = 0
+        var sizes = core.zeros(18)
+        sizes[0] = 12
+        for sb in 1..n {
+            let joined = if isCpl { cplBandStruct[startSub + sb] } else { spxBandStruct[startSub + sb] }
+            if joined != 0 {
+                bands -= 1
+                sizes[bnd] += 12
+            } else {
+                bnd += 1
+                sizes[bnd] = 12
+            }
+        }
+        if isCpl {
+            numCplBands = bands
+            cplBandSizes = sizes
+        } else {
+            numSpxBands = bands
+            for i in 0..17 {
+                spxBandSizes[i] = sizes[i]
+            }
+        }
+    }
+
+    // Coupling coordinates (7.4.3): per channel and band, a 4-bit exponent
+    // and mantissa (with a master exponent), kept as fixed point.
+    fn couplingCoordinates(_ blk: Int) -> Bool {
+        var exist = false
+        for ch in 1..(nfch + 1) {
+            if channelInCpl[ch] != 0 {
+                if (eac3 && firstCplCoords[ch] != 0) || br.flag() {
+                    firstCplCoords[ch] = 0
+                    exist = true
+                    let master = 3 * br.bits(2)
+                    for bnd in 0..numCplBands {
+                        let e = br.bits(4)
+                        let m = br.bits(4)
+                        let c = if e == 15 { m << 22 } else { (m + 16) << 21 }
+                        cplCoords[ch * 18 + bnd] = c >> (e + master)
+                    }
+                } else if blk == 0 {
+                    warn("frame {frames}: no coupling coordinates in block 0")
+                    return false
+                }
+            } else {
+                firstCplCoords[ch] = 1
+            }
+        }
+        if acmod == 2 && exist {
+            for bnd in 0..numCplBands {
+                phaseFlags[bnd] = if phaseFlagsInUse { br.bit() } else { 0 }
+            }
+        }
+        true
+    }
+
+    // Spectral extension strategy (E.1.3.3.1): which channels, and the
+    // bins copied from (dst…src) and to (src…end).
+    fn spxStrategy(_ blk: Int) -> Bool {
+        if acmod == 1 {
+            channelUsesSpx[1] = 1
+        } else {
+            var bits = br.bits(nfch)
+            var ch = nfch
+            while ch >= 1 {
+                channelUsesSpx[ch] = bits & 1
+                bits = bits >> 1
+                ch -= 1
+            }
+        }
+        var dst = br.bits(2)
+        var startSub = br.bits(3) + 2
+        if startSub > 7 {
+            startSub += startSub - 7
+        }
+        var endSub = br.bits(3) + 5
+        if endSub > 7 {
+            endSub += endSub - 7
+        }
+        dst = dst * 12 + 25
+        let src = startSub * 12 + 25
+        let end = endSub * 12 + 25
+        if startSub >= endSub || dst >= src {
+            warn("frame {frames}: bad spectral extension range")
+            return false
+        }
+        spxDstStart = dst
+        spxSrcStart = src
+        spxDstEnd = end
+        bandStructure(blk, false, startSub, endSub)
+        true
+    }
+
+    // Spectral extension coordinates and blending factors (E.3.6.3).
+    fn spxCoordinates() {
+        for ch in 1..(nfch + 1) {
+            if channelUsesSpx[ch] != 0 {
+                if firstSpxCoords[ch] != 0 || br.flag() {
+                    firstSpxCoords[ch] = 0
+                    let blend = Float(br.bits(5)) / 32.0
+                    let master = br.bits(2) * 3
+                    var bin = spxSrcStart
+                    for bnd in 0..numSpxBands {
+                        let size = spxBandSizes[bnd]
+                        var ratio = Float(bin + (size >> 1)) / Float(spxDstEnd) - blend
+                        ratio = min(max(ratio, 0.0), 1.0)
+                        let nblend = sqrt(3.0 * ratio)
+                        let sblend = sqrt(1.0 - ratio)
+                        bin += size
+                        let e = br.bits(4)
+                        var m = br.bits(2)
+                        if e == 15 {
+                            m = m << 1
+                        } else {
+                            m += 4
+                        }
+                        m = m << (25 - e - master)
+                        let coord = Float(m) / 8388608.0
+                        spxNoiseBlend[ch * 17 + bnd] = nblend * coord
+                        spxSignalBlend[ch * 17 + bnd] = sblend * coord
+                    }
+                }
+            } else {
+                firstSpxCoords[ch] = 1
+            }
+        }
+    }
+
+    // Spectral extension (E.3.6): copy low bins up, notch the seams,
+    // scale, and blend in noise.
+    fn applySpx() {
+        var wrap = core.zeros(17)
+        wrap[0] = 1
+        var copies: [Int] = []
+        var bin = spxDstStart
+        for bnd in 0..numSpxBands {
+            let size = spxBandSizes[bnd]
+            if bin + size > spxSrcStart {
+                copies.append(bin - spxDstStart)
+                bin = spxDstStart
+                wrap[bnd] = 1
+            }
+            var i = 0
+            while i < size {
+                if bin == spxSrcStart {
+                    copies.append(bin - spxDstStart)
+                    bin = spxDstStart
+                }
+                let n = min(size - i, spxSrcStart - bin)
+                bin += n
+                i += n
+            }
+        }
+        copies.append(bin - spxDstStart)
+        var rms = ac3Floats(17)
+        for ch in 1..(nfch + 1) {
+            if channelUsesSpx[ch] == 0 {
+                continue
+            }
+            let base = ch * 256
+            bin = spxSrcStart
+            for n in copies {
+                for i in 0..n {
+                    coeffs[base + bin + i] = coeffs[base + spxDstStart + i]
+                }
+                bin += n
+            }
+            bin = spxSrcStart
+            for bnd in 0..numSpxBands {
+                let size = spxBandSizes[bnd]
+                var acc = 0.0
+                for _ in 0..size {
+                    let c = coeffs[base + bin]
+                    acc += c * c
+                    bin += 1
+                }
+                rms[bnd] = sqrt(acc / Float(size))
+            }
+            if spxAttenCode[ch] >= 0 {
+                let a = spxAttenCode[ch] * 3
+                bin = spxSrcStart - 2
+                for bnd in 0..numSpxBands {
+                    if wrap[bnd] != 0 {
+                        coeffs[base + bin] *= eac3SpxAtten[a]
+                        coeffs[base + bin + 1] *= eac3SpxAtten[a + 1]
+                        coeffs[base + bin + 2] *= eac3SpxAtten[a + 2]
+                        coeffs[base + bin + 3] *= eac3SpxAtten[a + 1]
+                        coeffs[base + bin + 4] *= eac3SpxAtten[a]
+                    }
+                    bin += spxBandSizes[bnd]
+                }
+            }
+            bin = spxSrcStart
+            for bnd in 0..numSpxBands {
+                let nscale = spxNoiseBlend[ch * 17 + bnd] * rms[bnd] / -2147483648.0
+                let sscale = spxSignalBlend[ch * 17 + bnd]
+                for _ in 0..spxBandSizes[bnd] {
+                    var r = dither.next()
+                    if r >= 2147483648 {
+                        r -= 4294967296
+                    }
+                    coeffs[base + bin] = coeffs[base + bin] * sscale + nscale * Float(r)
+                    bin += 1
+                }
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Bit allocation (A/52 7.2.2): exponents → PSD → masking curve → bap.
+    // ---------------------------------------------------------------
+
+    // Exponents as power spectral density, and summed into bands with
+    // log-addition (7.2.2.2, 7.2.2.3).
+    fn calcPsd(_ ch: Int) {
+        let base = ch * 256
+        let bb = ch * 50
+        let start = startFreq[ch]
+        let end = endFreq[ch]
+        for bin in start..end {
+            psd[base + bin] = 3072 - (dexps[base + bin] << 7)
+        }
+        var bin = start
+        var band = ac3BinToBand[start]
+        while true {
+            var v = psd[base + bin]
+            bin += 1
+            let bandEnd = min(ac3BandStart[band + 1], end)
+            while bin < bandEnd {
+                let p = psd[base + bin]
+                let hi = max(v, p)
+                let adr = min(hi - ((v + p + 1) >> 1), 255)
+                v = hi + ac3LogAdd[adr]
+                bin += 1
+            }
+            bandPsd[bb + band] = v
+            band += 1
+            if end <= ac3BandStart[band] {
+                break
+            }
+        }
+    }
+
+    // The excitation function and masking curve (7.2.2.4, 7.2.2.5), then
+    // delta bit allocation (7.2.2.6).
+    fn calcMask(_ ch: Int) -> Bool {
+        let bb = ch * 50
+        let start = startFreq[ch]
+        let end = endFreq[ch]
+        if end <= 0 {
+            return false
+        }
+        let isLfe = ch == lfeCh
+        let gain = fastGain[ch]
+        let bandStart = ac3BinToBand[start]
+        let bandEnd = ac3BinToBand[end - 1] + 1
+        var begin = 0
+        var fastleak = 0
+        var slowleak = 0
+        if bandStart == 0 {
+            var lowcomp = 0
+            lowcomp = ac3LowComp1(lowcomp, bandPsd[bb], bandPsd[bb + 1], 384)
+            mask[bb] = bandPsd[bb] - gain - lowcomp
+            lowcomp = ac3LowComp1(lowcomp, bandPsd[bb + 1], bandPsd[bb + 2], 384)
+            mask[bb + 1] = bandPsd[bb + 1] - gain - lowcomp
+            begin = 7
+            var band = 2
+            while band < 7 {
+                if !(isLfe && band == 6) {
+                    lowcomp = ac3LowComp1(lowcomp, bandPsd[bb + band], bandPsd[bb + band + 1], 384)
+                }
+                fastleak = bandPsd[bb + band] - gain
+                slowleak = bandPsd[bb + band] - slowGain
+                mask[bb + band] = fastleak - lowcomp
+                if !(isLfe && band == 6) {
+                    if bandPsd[bb + band] <= bandPsd[bb + band + 1] {
+                        begin = band + 1
+                        break
+                    }
+                }
+                band += 1
+            }
+            let end1 = min(bandEnd, 22)
+            band = begin
+            while band < end1 {
+                if !(isLfe && band == 6) {
+                    lowcomp = ac3LowComp(lowcomp, bandPsd[bb + band], bandPsd[bb + band + 1], band)
+                }
+                fastleak = max(fastleak - fastDecay, bandPsd[bb + band] - gain)
+                slowleak = max(slowleak - slowDecay, bandPsd[bb + band] - slowGain)
+                mask[bb + band] = max(fastleak - lowcomp, slowleak)
+                band += 1
+            }
+            begin = 22
+        } else {
+            // The coupling channel starts with the stream's leak values.
+            begin = bandStart
+            fastleak = (cplFastLeak << 8) + 768
+            slowleak = (cplSlowLeak << 8) + 768
+        }
+        var band = begin
+        while band < bandEnd {
+            fastleak = max(fastleak - fastDecay, bandPsd[bb + band] - gain)
+            slowleak = max(slowleak - slowDecay, bandPsd[bb + band] - slowGain)
+            mask[bb + band] = max(fastleak, slowleak)
+            band += 1
+        }
+        // Here mask holds the excitation; now the masking curve.
+        band = bandStart
+        while band < bandEnd {
+            let tmp = dbPerBit - bandPsd[bb + band]
+            if tmp > 0 {
+                mask[bb + band] += tmp >> 2
+            }
+            mask[bb + band] = max(ac3HearingThreshold[(band >> srShift) * 3 + srCode], mask[bb + band])
+            band += 1
+        }
+        let mode = dbaMode[ch]
+        if mode == 0 || mode == 1 {
+            let nsegs = dbaNsegs[ch]
+            if nsegs > 8 {
+                return false
+            }
+            band = bandStart
+            for seg in 0..nsegs {
+                band += dbaOffsets[ch * 8 + seg]
+                let len = dbaLengths[ch * 8 + seg]
+                if band >= 50 || len > 50 - band {
+                    return false
+                }
+                let value = dbaValues[ch * 8 + seg]
+                let delta = if value >= 4 { (value - 3) * 128 } else { (value - 4) * 128 }
+                for _ in 0..len {
+                    mask[bb + band] += delta
+                    band += 1
+                }
+            }
+        }
+        true
+    }
+
+    // Bit allocation pointers from PSD and mask (7.2.2.7).
+    fn calcBap(_ ch: Int) {
+        let base = ch * 256
+        let bb = ch * 50
+        let start = startFreq[ch]
+        let end = endFreq[ch]
+        let snr = snrOffset[ch]
+        let aht = channelUsesAht[ch] != 0
+        if snr == -960 {
+            for i in 0..256 {
+                bap[base + i] = 0
+            }
+            return
+        }
+        var bin = start
+        var band = ac3BinToBand[start]
+        while true {
+            let m = (max(mask[bb + band] - snr - floorLevel, 0) & 0x1fe0) + floorLevel
+            band += 1
+            let bandEnd = min(ac3BandStart[band], end)
+            while bin < bandEnd {
+                let adr = min(max((psd[base + bin] - m) >> 5, 0), 63)
+                bap[base + bin] = if aht { eac3HebapTab[adr] } else { ac3BapTab[adr] }
+                bin += 1
+            }
+            if end <= bandEnd {
+                break
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Mantissas (7.3) and the coefficients they make.
+    // ---------------------------------------------------------------
+
+    fn decodeCoefficients(_ blk: Int) {
+        mb1 = 0
+        mb2 = 0
+        mb4 = 0
+        var gotCpl = false
+        for ch in 1..(nch + 1) {
+            channelCoefficients(blk, ch)
+            var end = 0
+            if channelInCpl[ch] != 0 {
+                // The coupling channel's mantissas follow the first coupled
+                // channel's.
+                if !gotCpl {
+                    channelCoefficients(blk, 0)
+                    uncouple()
+                    gotCpl = true
+                }
+                end = endFreq[0]
+            } else {
+                end = endFreq[ch]
+            }
+            let base = ch * 256
+            while end < 256 {
+                fixed[base + end] = 0
+                end += 1
+            }
+        }
+        // Coupled channels that don't want dither get zeros where the
+        // coupling channel had none (7.3.4).
+        for ch in 1..(nfch + 1) {
+            if ditherFlag[ch] == 0 && channelInCpl[ch] != 0 {
+                for i in startFreq[0]..endFreq[0] {
+                    if bap[i] == 0 {
+                        fixed[ch * 256 + i] = 0
+                    }
+                }
+            }
+        }
+    }
+
+    fn channelCoefficients(_ blk: Int, _ ch: Int) {
+        let base = ch * 256
+        let start = startFreq[ch]
+        let end = endFreq[ch]
+        if channelUsesAht[ch] != 0 {
+            // AHT: all six blocks' mantissas come in block 0.
+            if blk == 0 {
+                ahtMantissas(ch)
+            }
+            for bin in start..end {
+                fixed[base + bin] = preMant[(base + bin) * 6 + blk] >> dexps[base + bin]
+            }
+            return
+        }
+        let dith = ch == 0 || ditherFlag[ch] != 0
+        for freq in start..end {
+            let b = bap[base + freq]
+            var mant = 0
+            if b == 0 {
+                // Noise of about ±0.707 (7.3.4).
+                if dith {
+                    mant = (((dither.next() >> 8) * 181) >> 8) - 5931008
+                }
+            } else if b == 1 {
+                if mb1 > 0 {
+                    mb1 -= 1
+                    mant = mb1v[mb1]
+                } else {
+                    let c = br.bits(5) * 3
+                    mant = ac3Bap1Mant[c]
+                    mb1v[1] = ac3Bap1Mant[c + 1]
+                    mb1v[0] = ac3Bap1Mant[c + 2]
+                    mb1 = 2
+                }
+            } else if b == 2 {
+                if mb2 > 0 {
+                    mb2 -= 1
+                    mant = mb2v[mb2]
+                } else {
+                    let c = br.bits(7) * 3
+                    mant = ac3Bap2Mant[c]
+                    mb2v[1] = ac3Bap2Mant[c + 1]
+                    mb2v[0] = ac3Bap2Mant[c + 2]
+                    mb2 = 2
+                }
+            } else if b == 3 {
+                mant = ac3Bap3Mant[br.bits(3)]
+            } else if b == 4 {
+                if mb4 > 0 {
+                    mb4 = 0
+                    mant = mb4v
+                } else {
+                    let c = br.bits(7) * 2
+                    mant = ac3Bap4Mant[c]
+                    mb4v = ac3Bap4Mant[c + 1]
+                    mb4 = 1
+                }
+            } else if b == 5 {
+                mant = ac3Bap5Mant[br.bits(4)]
+            } else {
+                let q = ac3QuantBits[min(b, 15)]
+                mant = br.signed(q) << (24 - q)
+            }
+            fixed[base + freq] = mant >> dexps[base + freq]
+        }
+    }
+
+    // Coupled channels' high bins: the coupling channel times each channel's
+    // coordinate (7.4.3), negated in phase-flagged bands of channel 2.
+    fn uncouple() {
+        var bin = startFreq[0]
+        for band in 0..numCplBands {
+            let bandStart = bin
+            let bandEnd = bin + cplBandSizes[band]
+            for ch in 1..(nfch + 1) {
+                if channelInCpl[ch] != 0 {
+                    let coord = cplCoords[ch * 18 + band] << 5
+                    let base = ch * 256
+                    for b in bandStart..bandEnd {
+                        fixed[base + b] = (fixed[b] * 16 * coord) >> 32
+                    }
+                    if ch == 2 && phaseFlags[band] != 0 {
+                        for b in bandStart..bandEnd {
+                            fixed[base + b] = -fixed[base + b]
+                        }
+                    }
+                }
+            }
+            bin = bandEnd
+        }
+    }
+
+    // Stereo rematrixing (7.5.4): L = M + S, R = M − S in flagged bands.
+    fn rematrix() {
+        let end = min(endFreq[1], endFreq[2])
+        for bnd in 0..numRematBands {
+            if rematFlags[bnd] != 0 {
+                let bandEnd = min(end, ac3RematBands[bnd + 1])
+                var i = ac3RematBands[bnd]
+                while i < bandEnd {
+                    let a = fixed[256 + i]
+                    let b = fixed[512 + i]
+                    fixed[256 + i] = a + b
+                    fixed[512 + i] = a - b
+                    i += 1
+                }
+            }
+        }
+    }
+
+    // E-AC-3 adaptive hybrid transform mantissas (E.3.4): per bin, six
+    // values (one per block) as a vector-quantised code or gain-adaptive
+    // scalars, then a 6-point DCT across the blocks.
+    fn ahtMantissas(_ ch: Int) {
+        let base = ch * 256
+        let start = startFreq[ch]
+        let end = endFreq[ch]
+        let gaqMode = br.bits(2)
+        let endBap = if gaqMode < 2 { 12 } else { 17 }
+        var gs = 0
+        if gaqMode == 1 || gaqMode == 2 {
+            for bin in start..end {
+                let b = bap[base + bin]
+                if b > 7 && b < endBap {
+                    gaqGain[gs] = br.bit() << (gaqMode - 1)
+                    gs += 1
+                }
+            }
+        } else if gaqMode == 3 {
+            var gc = 2
+            for bin in start..end {
+                let b = bap[base + bin]
+                if b > 7 && b < 17 {
+                    if gc == 2 {
+                        var code = br.bits(5)
+                        if code > 26 {
+                            warnOnce("GAQ gain group code out of range")
+                            code = 26
+                        }
+                        gaqGain[gs] = code / 9
+                        gaqGain[gs + 1] = (code % 9) / 3
+                        gaqGain[gs + 2] = code % 3
+                        gs += 3
+                        gc = 0
+                    } else {
+                        gc += 1
+                    }
+                }
+            }
+        }
+        gs = 0
+        for bin in start..end {
+            let hebap = bap[base + bin]
+            let bits = eac3BitsVsHebap[hebap]
+            let p = (base + bin) * 6
+            if hebap == 0 {
+                for blk in 0..6 {
+                    preMant[p + blk] = (dither.next() & 0x7fffff) - 0x400000
+                }
+            } else if hebap < 8 {
+                let v = br.bits(bits)
+                let at = eac3VqStart[hebap] + v * 6
+                for blk in 0..6 {
+                    preMant[p + blk] = eac3Vq[at + blk] * 256
+                }
+            } else {
+                var logGain = 0
+                if gaqMode != 0 && hebap < endBap {
+                    logGain = gaqGain[gs]
+                    gs += 1
+                }
+                let gbits = bits - logGain
+                for blk in 0..6 {
+                    var mant = br.signed(gbits)
+                    if logGain != 0 && mant == -(1 << (gbits - 1)) {
+                        // Large mantissa: read again with more bits.
+                        let mbits = bits - (2 - logGain)
+                        mant = br.signed(mbits)
+                        mant = mant << (23 - (mbits - 1))
+                        let r = (hebap - 8) * 2 + logGain - 1
+                        let b = if mant >= 0 { 1 << (23 - logGain) } else { eac3GaqRemapB[r] * 256 }
+                        mant += ((eac3GaqRemapA[r] * mant) >> 15) + b
+                    } else {
+                        mant = mant * (1 << (24 - bits))
+                        if logGain == 0 {
+                            mant += (eac3GaqRemap1[hebap - 8] * mant) >> 15
+                        }
+                    }
+                    preMant[p + blk] = mant
+                }
+            }
+            ac3Idct6(p)
+        }
+    }
+
+    // The 6-point inverse DCT of AHT (E.3.4.3), in 24-bit fixed point.
+    fn ac3Idct6(_ p: Int) {
+        let m0 = preMant[p]
+        let m1 = preMant[p + 1]
+        let m2 = preMant[p + 2]
+        let m3 = preMant[p + 3]
+        let m4 = preMant[p + 4]
+        let m5 = preMant[p + 5]
+        let odd1 = m1 - m3 - m5
+        var even2 = (m2 * 10273905) >> 23
+        let tmp = (m4 * 11863283) >> 23
+        var odd0 = ((m1 + m5) * 3070444) >> 23
+        var even0 = m0 + (tmp >> 1)
+        let even1 = m0 - tmp
+        let t = even0
+        even0 = t + even2
+        even2 = t - even2
+        let t2 = odd0
+        odd0 = t2 + m1 + m3
+        let odd2 = t2 + m5 - m3
+        preMant[p] = even0 + odd0
+        preMant[p + 1] = even1 + odd1
+        preMant[p + 2] = even2 + odd2
+        preMant[p + 3] = even2 - odd2
+        preMant[p + 4] = even1 - odd1
+        preMant[p + 5] = even0 - odd0
+    }
+
+    // ---------------------------------------------------------------
+    // The inverse transform (7.9).
+    // ---------------------------------------------------------------
+
+    // One channel's 256 new samples into blockOut, keeping the second
+    // half for the next block.
+    fn imdctChannel(_ ch: Int) {
+        let cb = ch * 256
+        let ob = (ch - 1) * 128
+        if blockSwitch[ch] != 0 {
+            // Two 256-point transforms of the even and odd coefficients.
+            for i in 0..128 {
+                xin[i] = coeffs[cb + 2 * i]
+            }
+            halfImdct(128)
+            windowBlock(ch)
+            for i in 0..128 {
+                xin[i] = coeffs[cb + 2 * i + 1]
+            }
+            halfImdct(128)
+            for i in 0..128 {
+                overlap[ob + i] = half[i]
+            }
+        } else {
+            for i in 0..256 {
+                xin[i] = coeffs[cb + i]
+            }
+            halfImdct(256)
+            windowBlock(ch)
+            for i in 0..128 {
+                overlap[ob + i] = half[128 + i]
+            }
+        }
+    }
+
+    // Window the overlap and the new transform's first half together.
+    fn windowBlock(_ ch: Int) {
+        let ob = (ch - 1) * 128
+        let out = (ch - 1) * 256
+        for m in 0..128 {
+            let s0 = overlap[ob + m]
+            let s1 = half[127 - m]
+            let wi = ac3Window[m]
+            let wj = ac3Window[255 - m]
+            blockOut[out + m] = s0 * wj - s1 * wi
+            blockOut[out + 255 - m] = s0 * wi + s1 * wj
+        }
+    }
+
+    // half[0…len) = the non-redundant half of the inverse MDCT of xin.
+    fn halfImdct(_ len: Int) {
+        let tx = if len == 256 { ac3Tx256 } else { ac3Tx128 }
+        let m = len / 2
+        for n in 0..m {
+            let a = xin[2 * n]
+            let b = xin[len - 1 - 2 * n]
+            let c = tx.preCos[n]
+            let s = tx.preSin[n]
+            let r = tx.reverse[n]
+            xr[r] = a * c + b * s
+            xi[r] = b * c - a * s
+        }
+        // Radix-2 FFT, input in bit-reversed order.
+        var size = 2
+        while size <= m {
+            let halfSize = size / 2
+            let step = m / size
+            var startAt = 0
+            while startAt < m {
+                for j in 0..halfSize {
+                    let wr = tx.rootCos[j * step]
+                    let wi = -tx.rootSin[j * step]
+                    let p = startAt + j
+                    let q = p + halfSize
+                    let tr = xr[q] * wr - xi[q] * wi
+                    let ti = xr[q] * wi + xi[q] * wr
+                    xr[q] = xr[p] - tr
+                    xi[q] = xi[p] - ti
+                    xr[p] = xr[p] + tr
+                    xi[p] = xi[p] + ti
+                }
+                startAt += size
+            }
+            size *= 2
+        }
+        for k in 0..m {
+            let c = tx.postCos[k]
+            let s = tx.postSin[k]
+            let ure = xr[k] * c + xi[k] * s
+            let uim = xi[k] * c - xr[k] * s
+            half[len - 1 - 2 * k] = ure
+            half[2 * k] = -uim
+        }
+    }
+}
+
+// A decoder for an "ac3" or "eac3" track. The header of the first frame
+// sets the format; when the track gives a rate and channel count they are
+// used until then.
+public fn newDecoder(_ track: core.Track) -> Result<Decoder> {
+    if track.codec != "ac3" && track.codec != "eac3" {
+        return .failure(error: Error("the ac3 decoder can't decode \"{track.codec}\""))
+    }
+    var d = Decoder()
+    d.codec = track.codec
+    d.rate = track.sampleRate
+    d.channels = track.channels
+    if track.channels > 0 {
+        d.layout = core.defaultLayout(track.channels)
+    }
+    d.dither = newDither()
+    d.spxNoiseBlend = ac3Floats(7 * 17)
+    d.spxSignalBlend = ac3Floats(7 * 17)
+    d.coeffs = ac3Floats(7 * 256)
+    d.xr = ac3Floats(128)
+    d.xi = ac3Floats(128)
+    d.xin = ac3Floats(256)
+    d.half = ac3Floats(256)
+    Result.ok(value: d)
+}
+
+// Speakers of the dependent substream channel map (Table E.1.4, FFmpeg's
+// ff_eac3_custom_channel_map_locations): whether it's one speaker, and its
+// channel bits (FFmpeg's AV_CH_* numbers, WAV order).
+let ac3CustomLocations: [Int] = [
+    1, 1 << 0, 1, 1 << 2, 1, 1 << 1, 1, 1 << 9, 1, 1 << 10,
+    0, (1 << 6) | (1 << 7), 0, (1 << 4) | (1 << 5), 0, 1 << 8, 0, 1 << 11,
+    0, (1 << 33) | (1 << 34), 0, (1 << 31) | (1 << 32), 0, (1 << 12) | (1 << 14),
+    0, 1 << 13, 0, (1 << 15) | (1 << 17), 0, 1 << 35, 1, 1 << 3
+]
+let ac3BitNames: [String] = ["FL", "FR", "FC", "LFE", "BL", "BR", "FLC", "FRC", "BC", "SL", "SR", "TC", "TFL", "TFC", "TFR", "TBL", "TBC", "TBR", "", "", "", "", "", "", "", "", "", "", "", "DL", "DR", "WL", "WR", "SDL", "SDR", "LFE2"]
+
+fn ac3ChannelBit(_ name: String) -> Int {
+    ac3BitNames.index(of: name) ?? 0
+}
+
+fn ac3PopCount(_ mask: Int) -> Int {
+    var n = 0
+    var m = mask
+    while m != 0 {
+        n += m & 1
+        m = m >> 1
+    }
+    n
+}
+
+fn ac3Floats(_ n: Int) -> [Float] {
+    var out: [Float] = []
+    for _ in 0..n {
+        out.append(0.0)
+    }
+    out
+}
+
+// AC-3 stored as 16-bit little-endian words (some WAV/S/PDIF captures).
+fn ac3ByteSwapped(_ data: Data) -> Data {
+    var out = Data()
+    var i = 0
+    while i + 1 < data.count {
+        out.append(byte: data[i + 1])
+        out.append(byte: data[i])
+        i += 2
+    }
+    out
+}
+
+// Low-frequency compensation steps of the excitation function (7.2.2.4).
+fn ac3LowComp1(_ a: Int, _ b0: Int, _ b1: Int, _ c: Int) -> Int {
+    if b0 + 256 == b1 {
+        return c
+    }
+    if b0 > b1 {
+        return max(a - 64, 0)
+    }
+    a
+}
+
+fn ac3LowComp(_ a: Int, _ b0: Int, _ b1: Int, _ band: Int) -> Int {
+    if band < 7 {
+        return ac3LowComp1(a, b0, b1, 384)
+    }
+    if band < 20 {
+        return ac3LowComp1(a, b0, b1, 320)
+    }
+    max(a - 128, 0)
+}

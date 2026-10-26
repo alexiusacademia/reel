@@ -1,0 +1,203 @@
+// The MS-MPEG4 v1/v2/v3, WMV1 and WMV2 cases of the wmv test, and the
+// MsDecoder's extra checks (seeking to a keyframe, damaged, cut and empty
+// packets, skipNonReference, IntraX8 pictures really being decoded).
+//
+// MS-MPEG4 v3 clips are AVI: Reel's Matroska demuxer doesn't name
+// ffmpeg's V_MPEG4/MS/V3 codec id yet (build/NEEDED.md). The whole WMV2
+// samples with IntraX8 pictures and the AVI cuts of the v3 samples are in
+// build/scratch/wmv/ms/clips (build/scratch/wmv/ms/remux.sh); cases whose
+// file is missing are skipped.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../../wmv"
+import "../../core"
+import "../../testkit"
+
+let msFx = "tests/wmv/fixtures"
+let msConf = "build/conformance/wmv"
+let msClips = "build/scratch/wmv/ms/clips"
+
+fn msCases() -> [WmvCase] {
+    [
+        WmvCase(name: "msmpeg4v3.avi", path: joinPath(msFx, "msmpeg4v3.avi")),
+        WmvCase(name: "msmpeg4v3_odd.avi", path: joinPath(msFx, "msmpeg4v3_odd.avi")),
+        WmvCase(name: "msmpeg4v3_hq.avi", path: joinPath(msFx, "msmpeg4v3_hq.avi")),
+        WmvCase(name: "msmpeg4v2.avi", path: joinPath(msFx, "msmpeg4v2.avi")),
+        WmvCase(name: "msmpeg4v2_odd.mkv", path: joinPath(msFx, "msmpeg4v2_odd.mkv")),
+        WmvCase(name: "wmv1.avi", path: joinPath(msFx, "wmv1.avi")),
+        WmvCase(name: "wmv1_odd.mkv", path: joinPath(msFx, "wmv1_odd.mkv")),
+        WmvCase(name: "wmv1_lowrate.avi", path: joinPath(msFx, "wmv1_lowrate.avi")),
+        WmvCase(name: "wmv2.avi", path: joinPath(msFx, "wmv2.avi")),
+        WmvCase(name: "wmv2_odd.mkv", path: joinPath(msFx, "wmv2_odd.mkv")),
+        WmvCase(name: "wmv2_hq.mkv", path: joinPath(msFx, "wmv2_hq.mkv")),
+        WmvCase(name: "conf msmpeg4v1_mpg4", path: joinPath(msConf, "msmpeg4v1_mpg4.avi")),
+        WmvCase(name: "conf msmpeg4v3_bug821", path: joinPath(msClips, "msmpeg4v3_bug821.avi")),
+        WmvCase(name: "conf msmpeg4v3_park", path: joinPath(msClips, "msmpeg4v3_park.avi"), timing: true),
+        WmvCase(name: "conf wmv1_damien", path: joinPath(msConf, "wmv1_damien.mkv")),
+        WmvCase(name: "conf wmv1_sample", path: joinPath(msConf, "wmv1_sample.mkv"), timing: true),
+        WmvCase(name: "conf wmv2_sample", path: joinPath(msConf, "wmv2_sample.mkv"), timing: true),
+        WmvCase(name: "conf wmv2_x8intra", path: joinPath(msConf, "wmv2_x8intra.mkv")),
+        WmvCase(name: "conf wmv2_brancadier", path: joinPath(msConf, "wmv2_brancadier.mkv")),
+        WmvCase(name: "conf wmv2_logos", path: joinPath(msConf, "wmv2_logos.mkv"), timing: true),
+        WmvCase(name: "conf wmv2_x8intra whole", path: joinPath(msClips, "wmv8_x8intra.mkv")),
+        WmvCase(name: "conf wmv2_brancadier whole", path: joinPath(msClips, "brancadier.mkv")),
+        WmvCase(name: "msmpeg4v3 720p", path: joinPath(msClips, "msmpeg4_720p.avi"), timing: true),
+        WmvCase(name: "wmv2 720p", path: joinPath(msClips, "wmv2_720p.avi"), timing: true),
+        // Straight from ASF (.wmv/.asf) through demux.open: the first 60.
+        WmvCase(name: "asf sample-wmv7", path: joinPath(msConf, "asf/sample-wmv7.wmv"), limit: 60),
+        WmvCase(name: "asf sample-wmv8.1", path: joinPath(msConf, "asf/sample-wmv8.1.wmv"), limit: 60),
+        WmvCase(name: "asf park MP43", path: joinPath(msConf, "asf/Park_auto_no_driver.wmv"), limit: 60),
+        WmvCase(name: "asf wmv8_x8intra", path: joinPath(msConf, "asf/wmv8_x8intra.wmv"), limit: 60),
+        WmvCase(name: "asf bug821 MP43", path: joinPath(msConf, "asf/bug821-2.asf"))
+    ]
+}
+
+// A fresh decoder for a clip (or nil when the clip can't be opened).
+fn msDecoderFor(_ clip: WmvClip) -> wmv.Decoder? {
+    if !clip.ok {
+        return nil
+    }
+    wmv.newDecoder(clip.track).value()
+}
+
+fn msExtraChecks(_ t: bind Tally, _ only: String) {
+    if !only.isEmpty && !"ms extra".contains(only) && !only.hasPrefix("ms") && !only.hasPrefix("wmv1") && !only.hasPrefix("wmv2") {
+        return
+    }
+    for name in ["wmv2.avi", "msmpeg4v3.avi", "wmv1.avi", "msmpeg4v2.avi"] {
+        msSeekCheck(t, joinPath(msFx, name))
+    }
+    msDamageCheck(t, joinPath(msFx, "wmv2.avi"))
+    msDamageCheck(t, joinPath(msFx, "msmpeg4v3.avi"))
+    msDamageCheck(t, joinPath(msFx, "msmpeg4v2.avi"))
+    msDamageCheck(t, joinPath(msConf, "msmpeg4v1_mpg4.avi"))
+
+    // skipNonReference changes nothing (these codecs have no B pictures).
+    let clip = wmvOpenClip(joinPath(msFx, "wmv1.avi"))
+    if clip.ok {
+        let a = wmvDecodeClip(clip, limit: 0)
+        let b = wmvDecodeClip(clip, limit: 0, skipNonReference: true)
+        t.check(a.md5s == b.md5s && a.md5s.count == 30, "skipNonReference keeps every picture ({b.md5s.count})")
+        t.check(a.keys == 3, "wmv1.avi has 3 key pictures ({a.keys})")
+        var ptsBad = -1
+        for k in 0..min(a.pts.count, clip.pts.count) {
+            if a.pts[k] != clip.pts[k] && ptsBad < 0 {
+                ptsBad = k
+            }
+        }
+        t.check(ptsBad < 0 && a.pts.count == clip.pts.count, "pictures keep their packets' pts (first difference at {ptsBad})")
+    }
+
+    // The IntraX8 sample really has IntraX8 pictures.
+    let x8 = wmvOpenClip(joinPath(msClips, "wmv8_x8intra.mkv"))
+    if let d0 = msDecoderFor(x8) {
+        var d = d0
+        for i in 0..x8.packets.count {
+            d.decode(x8.packets[i], pts: x8.pts[i], dts: x8.dts[i], key: x8.keys[i])
+        }
+        print("wmv8_x8intra: {d.ms.x8Pictures} IntraX8 pictures of {d.ms.pictures}")
+        t.check(d.ms.x8Pictures > 0, "IntraX8 pictures decoded ({d.ms.x8Pictures})")
+    }
+
+    // The low-rate WMV1 clip uses inter-intra prediction.
+    let ii = wmvOpenClip(joinPath(msFx, "wmv1_lowrate.avi"))
+    if let d0 = msDecoderFor(ii) {
+        var d = d0
+        for i in 0..ii.packets.count {
+            d.decode(ii.packets[i], pts: ii.pts[i], dts: ii.dts[i], key: ii.keys[i])
+        }
+        t.check(d.ms.interIntraCount > 0, "wmv1_lowrate uses inter-intra prediction ({d.ms.interIntraCount} macroblocks)")
+    }
+
+    // streamInfo names the codecs.
+    var tr = core.Track(index: 0, kind: .video, codec: "msmpeg4v3")
+    tr.width = 720
+    tr.height = 576
+    t.check(wmv.streamInfo(tr) == "MS-MPEG4 v3 (DivX ;-) 3), 720×576", "streamInfo msmpeg4v3: {wmv.streamInfo(tr)}")
+    tr.codec = "wmv2"
+    t.check(wmv.streamInfo(tr) == "WMV8, 720×576", "streamInfo wmv2: {wmv.streamInfo(tr)}")
+
+    // A track without a picture size is refused, not crashed on.
+    let bad = wmv.newDecoder(core.Track(index: 0, kind: .video, codec: "wmv1"))
+    t.check(bad.error() != nil, "newDecoder refuses a wmv1 track without a size")
+}
+
+// Decoding from the second keyframe after reset() gives ffmpeg's pictures
+// from there on (an I picture restarts every prediction).
+fn msSeekCheck(_ t: bind Tally, _ path: String) {
+    let clip = wmvOpenClip(path)
+    let want = wmvRefMd5s(path + ".framemd5")
+    if !clip.ok || want.count != clip.packets.count {
+        print("skip seek check: {path}")
+        return
+    }
+    var keyAt: [Int] = []
+    for i in 0..clip.keys.count {
+        if clip.keys[i] {
+            keyAt.append(i)
+        }
+    }
+    if keyAt.count < 2 {
+        t.check(false, "{path}: no second keyframe to seek to")
+        return
+    }
+    var d = msDecoderFor(clip) ?? wmv.Decoder()
+    // Decode a few pictures, then seek.
+    for i in 0..min(5, clip.packets.count) {
+        d.decode(clip.packets[i], pts: clip.pts[i], dts: clip.dts[i], key: clip.keys[i])
+    }
+    d.reset()
+    // A P picture right after the reset is dropped.
+    let early = d.decode(clip.packets[keyAt[1] + 1], pts: 0, dts: 0, key: false)
+    var same = early.isEmpty
+    let from = keyAt[1]
+    for i in from..clip.packets.count {
+        for p in d.decode(clip.packets[i], pts: clip.pts[i], dts: clip.dts[i], key: clip.keys[i]) {
+            let k = i
+            if testkit.pictureMd5(p) != want[k] {
+                same = false
+            }
+        }
+    }
+    t.check(same, "{path}: seek to picture {from} matches ffmpeg")
+}
+
+// Cut, damaged, garbage and empty packets: no crash, a warning, and
+// pictures keep coming.
+fn msDamageCheck(_ t: bind Tally, _ path: String) {
+    let clip = wmvOpenClip(path)
+    if !clip.ok || clip.packets.count < 6 {
+        print("skip damage check: {path}")
+        return
+    }
+    var d = msDecoderFor(clip) ?? wmv.Decoder()
+    var shown = 0
+    for i in 0..clip.packets.count {
+        var pkt = clip.packets[i]
+        if i == 3 {
+            pkt = pkt.slice(from: 0, to: pkt.count / 2)
+        } else if i == 4 {
+            var bytes = pkt.bytes
+            var k = 6
+            while k < bytes.count {
+                bytes[k] = (bytes[k] * 37 + 11) & 255
+                k += 7
+            }
+            pkt = Data(bytes: bytes)
+        } else if i == 5 {
+            pkt = Data()
+        }
+        shown += d.decode(pkt, pts: clip.pts[i], dts: clip.dts[i], key: clip.keys[i]).count
+    }
+    var g = msDecoderFor(clip) ?? wmv.Decoder()
+    var junk: [Int] = []
+    for k in 0..400 {
+        junk.append((k * 73 + 19) & 255)
+    }
+    g.decode(Data(bytes: junk), pts: 0, dts: 0, key: true)
+    g.decode(Data(bytes: [0]), pts: 0, dts: 0, key: true)
+    t.check(shown >= clip.packets.count - 3, "{path}: pictures go on after damage ({shown} of {clip.packets.count})")
+    t.check(!d.warnings.isEmpty, "{path}: damage gives a warning")
+}

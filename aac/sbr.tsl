@@ -1,0 +1,1885 @@
+// Spectral Band Replication (HE-AAC v1, ISO/IEC 14496-3 4.6.18): the SBR
+// header and data (4.4.2.8, Tables 4.62-4.74), the frequency band tables
+// (4.6.18.3), the 32-band analysis and 64-band synthesis QMF banks
+// (4.6.18.4), HF generation with inverse filtering (4.6.18.6) and HF
+// adjustment: envelope and noise dequantisation, mapping, gain
+// calculation with the limiter, smoothing, noise and sinusoids
+// (4.6.18.7).
+//
+// It follows FFmpeg's decoder closely where the standard leaves room
+// (numerical guards, float rounding of the band tables), so the output
+// matches FFmpeg's to rounding. Samples go in and come out in 16-bit
+// units; the output has twice the input's rate.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../core"
+
+// The value rounded to a 32-bit float (FFmpeg computes these in float).
+fn sbrF32(_ x: Float) -> Float {
+    Data(bytes: x.bytes(count: 4)).float32(at: 0)
+}
+
+// lrintf: round half to even.
+fn sbrRint(_ x: Float) -> Int {
+    let f = floor(x)
+    let d = x - f
+    if d > 0.5 {
+        return Int(f) + 1
+    }
+    if d < 0.5 {
+        return Int(f)
+    }
+    let i = Int(f)
+    if i % 2 == 0 { i } else { i + 1 }
+}
+
+// The QMF banks are computed with FFTs (4.6.18.4):
+//   analysis   W[k] = 2 e^(-i pi (k/2 + 1/4)/64) sum_n (u[n] e^(i pi n/64)) e^(2 pi i kn/64)
+//   synthesis  v[n] = Re(e^(i pi n/128) sum_k (X[k] e^(-i pi (255k + 127.5)/128)/64) e^(2 pi i kn/128))
+// which is the standard's matrices M and N written out.
+struct SbrFft {
+    n: Int = 0
+    rev: [Int] = []
+    twCos: [Float] = []
+    twSin: [Float] = []
+    re: [Float] = []
+    im: [Float] = []
+
+    // In place: re/im (in natural order) to sum_j x[j] e^(+2 pi i jk/n).
+    fn inverse() {
+        for i in 0..n {
+            let j = rev[i]
+            if j > i {
+                let tr = re[i]
+                re[i] = re[j]
+                re[j] = tr
+                let ti = im[i]
+                im[i] = im[j]
+                im[j] = ti
+            }
+        }
+        var size = 2
+        while size <= n {
+            let half = size / 2
+            let step = n / size
+            var start = 0
+            while start < n {
+                var k = 0
+                for j in start..(start + half) {
+                    let wc = twCos[k]
+                    let ws = twSin[k]
+                    let l = j + half
+                    let tr = re[l] * wc - im[l] * ws
+                    let ti = re[l] * ws + im[l] * wc
+                    re[l] = re[j] - tr
+                    im[l] = im[j] - ti
+                    re[j] = re[j] + tr
+                    im[j] = im[j] + ti
+                    k += step
+                }
+                start += size
+            }
+            size *= 2
+        }
+    }
+}
+
+fn sbrNewFft(_ n: Int) -> SbrFft {
+    var f = SbrFft(n: n)
+    var bits = 0
+    while (1 << bits) < n {
+        bits += 1
+    }
+    for i in 0..n {
+        var r = 0
+        for b in 0..bits {
+            if (i >> b) & 1 == 1 {
+                r = r | (1 << (bits - 1 - b))
+            }
+        }
+        f.rev.append(r)
+        let t = 2.0 * pi * Float(i) / Float(n)
+        f.twCos.append(cos(t))
+        f.twSin.append(sin(t))
+        f.re.append(0.0)
+        f.im.append(0.0)
+    }
+    f
+}
+
+// Twiddles of the two banks.
+let sbrAnaPre = sbrMakeTw(64, 1.0, 0.0, 64.0)
+let sbrAnaPost = sbrMakeTw(32, -0.5, -0.25, 64.0)
+let sbrSynPre = sbrMakeTw(64, -255.0, -127.5, 128.0)
+let sbrSynPost = sbrMakeTw(128, 1.0, 0.0, 128.0)
+let sbrDownPre = sbrMakeTw(32, -127.5, -63.75, 64.0)
+
+// cos and sin of pi (a k + b)/d for k < n, as [cos..., sin...].
+fn sbrMakeTw(_ n: Int, _ a: Float, _ b: Float, _ d: Float) -> [Float] {
+    var t: [Float] = []
+    for k in 0..n {
+        t.append(cos(pi * (a * Float(k) + b) / d))
+    }
+    for k in 0..n {
+        t.append(sin(pi * (a * Float(k) + b) / d))
+    }
+    t
+}
+
+let sbrHSmooth = [0.33333333333333, 0.30150283239582, 0.21816949906249, 0.11516383427084, 0.03183050093751]
+let sbrLimGain = [0.70795, 1.0, 1.41254, 10000000000.0]
+let sbrFltEpsilon = 1.1920928955078125e-07
+let sbrFltMin = 1.1754943508222875e-38
+
+// Huffman table numbers in sbrHuff (Tables 4.A.78-4.A.87).
+let sbrTEnv15 = 0
+let sbrFEnv15 = 1
+let sbrTEnvBal15 = 2
+let sbrFEnvBal15 = 3
+let sbrTEnv30 = 4
+let sbrFEnv30 = 5
+let sbrTEnvBal30 = 6
+let sbrFEnvBal30 = 7
+let sbrTNoise30 = 8
+let sbrTNoiseBal30 = 9
+
+// Frame classes (Table 4.70).
+let sbrFixFix = 0
+let sbrFixVar = 1
+let sbrVarFix = 2
+let sbrVarVar = 3
+
+// Per channel SBR data and state (FFmpeg's SBRData).
+struct AacSbrCh {
+    frameClass: Int = 0
+    addHarmonicFlag: Bool = false
+    numEnv: Int = 0
+    freqRes: [Int] = [0, 0, 0, 0, 0, 0, 0, 0, 0]
+    numNoise: Int = 0
+    dfEnv: [Int] = [0, 0, 0, 0, 0, 0, 0, 0, 0]
+    dfNoise: [Int] = [0, 0]
+    // invf modes: [0..4] this frame, [5..9] the previous frame.
+    invf: [Int] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    addHarmonic: [Int] = []
+    ampRes: Int = 0
+    analysis: [Float] = []
+    // The synthesis bank's v, inside a 2304-value buffer from vOff.
+    synth: [Float] = []
+    vOff: Int = 1152
+    eA: [Int] = [-1, -1]
+    bw: [Float] = [0.0, 0.0, 0.0, 0.0, 0.0]
+    // W[buf][slot][k] at (buf * 32 + slot) * 32 + k.
+    wRe: [Float] = []
+    wIm: [Float] = []
+    ypos: Int = 0
+    // Y[buf][i][k] at (buf * 38 + i) * 64 + k.
+    yRe: [Float] = []
+    yIm: [Float] = []
+    gTemp: [Float] = []
+    qTemp: [Float] = []
+    // [row * 48 + k], rows 0..8.
+    sIndexMapped: [Int] = []
+    envQ: [Int] = []
+    envFacs: [Float] = []
+    // [row * 5 + k], rows 0..2.
+    noiseQ: [Int] = []
+    noiseFacs: [Float] = []
+    tEnv: [Int] = [0, 0, 0, 0, 0, 0, 0, 0, 0]
+    tEnvNumEnvOld: Int = 0
+    tQ: [Int] = [0, 0, 0]
+    indexNoise: Int = 0
+    indexSine: Int = 0
+}
+
+fn sbrNewCh() -> AacSbrCh {
+    var c = AacSbrCh()
+    for _ in 0..48 {
+        c.addHarmonic.append(0)
+    }
+    for _ in 0..1312 {
+        c.analysis.append(0.0)
+    }
+    for _ in 0..2304 {
+        c.synth.append(0.0)
+    }
+    for _ in 0..(2 * 32 * 32) {
+        c.wRe.append(0.0)
+        c.wIm.append(0.0)
+    }
+    for _ in 0..(2 * 38 * 64) {
+        c.yRe.append(0.0)
+        c.yIm.append(0.0)
+    }
+    for _ in 0..(42 * 48) {
+        c.gTemp.append(0.0)
+        c.qTemp.append(0.0)
+    }
+    for _ in 0..(9 * 48) {
+        c.sIndexMapped.append(0)
+        c.envQ.append(0)
+        c.envFacs.append(0.0)
+    }
+    for _ in 0..15 {
+        c.noiseQ.append(0)
+        c.noiseFacs.append(0.0)
+    }
+    c
+}
+
+struct AacSbr {
+    br: core.BitReader
+    // The SBR (output) sampling rate.
+    sampleRate: Int = 0
+    start: Bool = false
+    reset: Bool = false
+    readyForDequant: Bool = false
+    idAac: Int = 0
+    // Header (Table 4.63); -1 until the first header.
+    ampResHeader: Int = 0
+    startFreq: Int = -1
+    stopFreq: Int = -1
+    xoverBand: Int = -1
+    freqScale: Int = -1
+    alterScale: Int = -1
+    noiseBands: Int = -1
+    limiterBands: Int = 0
+    limiterGains: Int = 0
+    interpolFreq: Int = 0
+    smoothingMode: Int = 0
+    coupling: Bool = false
+    // Frequency tables (4.6.18.3).
+    k0: Int = 0
+    k1: Int = 0
+    k2: Int = 0
+    kx0: Int = 32
+    kx1: Int = 32
+    m0: Int = 0
+    m1: Int = 0
+    kxAndMPushed: Bool = false
+    nMaster: Int = 0
+    fMaster: [Int] = []
+    nLow: Int = 0
+    nHigh: Int = 0
+    fHigh: [Int] = []
+    fLow: [Int] = []
+    nQ: Int = 1
+    fNoise: [Int] = []
+    nLim: Int = 0
+    fLim: [Int] = []
+    numPatches: Int = 0
+    patchNum: [Int] = [0, 0, 0, 0, 0, 0]
+    patchStart: [Int] = [0, 0, 0, 0, 0, 0]
+    ch: [AacSbrCh] = []
+    // Scratch.
+    xLowRe: [Float] = []
+    xLowIm: [Float] = []
+    xHighRe: [Float] = []
+    xHighIm: [Float] = []
+    alpha0Re: [Float] = []
+    alpha0Im: [Float] = []
+    alpha1Re: [Float] = []
+    alpha1Im: [Float] = []
+    // X[ch][i][k] for synthesis at (ch * 38 + i) * 64 + k.
+    xRe: [Float] = []
+    xIm: [Float] = []
+    // [e * 48 + m], e < 7.
+    eOrig: [Float] = []
+    qMapped: [Float] = []
+    sMapped: [Int] = []
+    eCurr: [Float] = []
+    qM: [Float] = []
+    sM: [Float] = []
+    gain: [Float] = []
+    gFilt: [Float] = []
+    qFilt: [Float] = []
+    // The two output channels (2048 samples each).
+    out: [Float] = []
+    ps: AacPs
+    fftA: SbrFft
+    fftS: SbrFft
+    // Downsampled synthesis (32 bands, output at the core rate).
+    downsampled: Bool = false
+    // Whether parametric stereo is on (mono core, stereo out).
+    psOn: Bool = false
+    error: String = ""
+
+    // --- Bitstream ---
+
+    fn huff(_ table: Int) -> Int {
+        var base = sbrHuffStart[table]
+        var bits = 9
+        while true {
+            let e = sbrHuff[base + br.peek(bits)]
+            if e >= 0 {
+                br.bits(e & 31)
+                return (e >> 5) + sbrHuffOffset[table]
+            }
+            if e == -1 {
+                return 0
+            }
+            br.bits(bits)
+            let v = -e
+            base = v >> 5
+            bits = v & 31
+        }
+        0
+    }
+
+    // sbr_extension_data (Table 4.62) of `bytes` bytes; br is at the
+    // bit after the extension type. `type` is the element it follows.
+    fn readExtension(crc: Bool, bytes: Int, type: Int) {
+        let startBit = br.position - 4
+        reset = false
+        if crc {
+            br.bits(10)
+        }
+        kx0 = kx1
+        m0 = m1
+        kxAndMPushed = true
+        if br.bit() == 1 {
+            readHeader()
+        }
+        if reset {
+            resetTables()
+        }
+        if start {
+            readData(type)
+        }
+        if br.position - startBit > bytes * 8 {
+            error = "SBR data longer than its fill element"
+            turnOff()
+        }
+    }
+
+    fn turnOff() {
+        start = false
+        readyForDequant = false
+        kx1 = 32
+        m1 = 0
+        ch[0].eA[1] = -1
+        ch[1].eA[1] = -1
+        startFreq = -1
+        stopFreq = -1
+        xoverBand = -1
+        freqScale = -1
+        alterScale = -1
+        noiseBands = -1
+    }
+
+    // sbr_header (Table 4.63).
+    fn readHeader() {
+        start = true
+        readyForDequant = false
+        let old = [startFreq, stopFreq, xoverBand, freqScale, alterScale, noiseBands]
+        let oldLimiter = limiterBands
+        ampResHeader = br.bit()
+        startFreq = br.bits(4)
+        stopFreq = br.bits(4)
+        xoverBand = br.bits(3)
+        br.bits(2)
+        let extra1 = br.bit()
+        let extra2 = br.bit()
+        if extra1 == 1 {
+            freqScale = br.bits(2)
+            alterScale = br.bit()
+            noiseBands = br.bits(2)
+        } else {
+            freqScale = 2
+            alterScale = 1
+            noiseBands = 2
+        }
+        if old != [startFreq, stopFreq, xoverBand, freqScale, alterScale, noiseBands] {
+            reset = true
+        }
+        if extra2 == 1 {
+            limiterBands = br.bits(2)
+            limiterGains = br.bits(2)
+            interpolFreq = br.bit()
+            smoothingMode = br.bit()
+        } else {
+            limiterBands = 2
+            limiterGains = 2
+            interpolFreq = 1
+            smoothingMode = 1
+        }
+        if limiterBands != oldLimiter && !reset {
+            makeLimiterTable()
+        }
+    }
+
+    // sbr_data (Table 4.64).
+    fn readData(_ type: Int) {
+        idAac = type
+        readyForDequant = true
+        var ok = true
+        if type == 0 || type == 2 {
+            ok = readSce()
+        } else if type == 1 {
+            ok = readCpe()
+        } else {
+            ok = false
+        }
+        if !ok {
+            turnOff()
+            return
+        }
+        if br.bit() == 1 {
+            var left = br.bits(4)
+            if left == 15 {
+                left += br.bits(8)
+            }
+            left = left * 8
+            while left > 7 {
+                left -= 2
+                let id = br.bits(2)
+                if id == 2 && psOn {
+                    // ps_data (8.3.1).
+                    let used = ps.read(br, left)
+                    br.skip(used)
+                    left -= used
+                } else {
+                    br.skip(left)
+                    left = 0
+                }
+            }
+            if left > 0 {
+                br.skip(left)
+            }
+        }
+    }
+
+    fn readSce() -> Bool {
+        if br.bit() == 1 {
+            br.bits(4)
+        }
+        if !readGrid(0) {
+            return false
+        }
+        readDtdf(0)
+        readInvf(0)
+        if !readEnvelope(0) {
+            return false
+        }
+        if !readNoise(0) {
+            return false
+        }
+        readHarmonics(0)
+        true
+    }
+
+    fn readCpe() -> Bool {
+        if br.bit() == 1 {
+            br.bits(8)
+        }
+        coupling = br.bit() == 1
+        if coupling {
+            if !readGrid(0) {
+                return false
+            }
+            copyGrid()
+            readDtdf(0)
+            readDtdf(1)
+            readInvf(0)
+            for i in 0..5 {
+                ch[1].invf[5 + i] = ch[1].invf[i]
+                ch[1].invf[i] = ch[0].invf[i]
+            }
+            if !readEnvelope(0) || !readNoise(0) || !readEnvelope(1) || !readNoise(1) {
+                return false
+            }
+        } else {
+            if !readGrid(0) || !readGrid(1) {
+                return false
+            }
+            readDtdf(0)
+            readDtdf(1)
+            readInvf(0)
+            readInvf(1)
+            if !readEnvelope(0) || !readEnvelope(1) || !readNoise(0) || !readNoise(1) {
+                return false
+            }
+        }
+        readHarmonics(0)
+        readHarmonics(1)
+        true
+    }
+
+    fn readHarmonics(_ c: Int) {
+        ch[c].addHarmonicFlag = br.bit() == 1
+        if ch[c].addHarmonicFlag {
+            for i in 0..nHigh {
+                ch[c].addHarmonic[i] = br.bit()
+            }
+        }
+    }
+
+    // sbr_grid (Table 4.67) and the time borders (4.6.18.3.3).
+    fn readGrid(_ c: Int) -> Bool {
+        var trail = 16
+        var pointer = 0
+        let oldNumEnv = ch[c].numEnv
+        ch[c].freqRes[0] = ch[c].freqRes[ch[c].numEnv]
+        ch[c].ampRes = ampResHeader
+        ch[c].tEnvNumEnvOld = ch[c].tEnv[oldNumEnv]
+        let frameClass = br.bits(2)
+        if frameClass == sbrFixFix {
+            let n = 1 << br.bits(2)
+            if n > 5 {
+                error = "too many SBR envelopes"
+                return false
+            }
+            ch[c].numEnv = n
+            let lead = n - 1
+            if n == 1 {
+                ch[c].ampRes = 0
+            }
+            ch[c].tEnv[0] = 0
+            ch[c].tEnv[n] = trail
+            let step = (trail + (n >> 1)) / n
+            for i in 0..lead {
+                ch[c].tEnv[i + 1] = ch[c].tEnv[i] + step
+            }
+            ch[c].freqRes[1] = br.bit()
+            for i in 1..n {
+                ch[c].freqRes[i + 1] = ch[c].freqRes[1]
+            }
+        } else if frameClass == sbrFixVar {
+            trail += br.bits(2)
+            let relTrail = br.bits(2)
+            let n = relTrail + 1
+            ch[c].numEnv = n
+            ch[c].tEnv[0] = 0
+            ch[c].tEnv[n] = trail
+            for i in 0..relTrail {
+                ch[c].tEnv[n - 1 - i] = ch[c].tEnv[n - i] - 2 * br.bits(2) - 2
+            }
+            pointer = br.bits(sbrCeilLog2(n))
+            for i in 0..n {
+                ch[c].freqRes[n - i] = br.bit()
+            }
+        } else if frameClass == sbrVarFix {
+            ch[c].tEnv[0] = br.bits(2)
+            let lead = br.bits(2)
+            let n = lead + 1
+            ch[c].numEnv = n
+            ch[c].tEnv[n] = trail
+            for i in 0..lead {
+                ch[c].tEnv[i + 1] = ch[c].tEnv[i] + 2 * br.bits(2) + 2
+            }
+            pointer = br.bits(sbrCeilLog2(n))
+            for i in 0..n {
+                ch[c].freqRes[i + 1] = br.bit()
+            }
+        } else {
+            ch[c].tEnv[0] = br.bits(2)
+            trail += br.bits(2)
+            let lead = br.bits(2)
+            let relTrail = br.bits(2)
+            let n = lead + relTrail + 1
+            if n > 5 {
+                error = "too many SBR envelopes"
+                return false
+            }
+            ch[c].numEnv = n
+            ch[c].tEnv[n] = trail
+            for i in 0..lead {
+                ch[c].tEnv[i + 1] = ch[c].tEnv[i] + 2 * br.bits(2) + 2
+            }
+            for i in 0..relTrail {
+                ch[c].tEnv[n - 1 - i] = ch[c].tEnv[n - i] - 2 * br.bits(2) - 2
+            }
+            pointer = br.bits(sbrCeilLog2(n))
+            for i in 0..n {
+                ch[c].freqRes[i + 1] = br.bit()
+            }
+        }
+        ch[c].frameClass = frameClass
+        let n = ch[c].numEnv
+        if pointer > n + 1 {
+            error = "SBR bs_pointer out of range"
+            return false
+        }
+        for i in 1..(n + 1) {
+            if ch[c].tEnv[i - 1] >= ch[c].tEnv[i] {
+                error = "SBR time borders not increasing"
+                return false
+            }
+        }
+        ch[c].numNoise = if n > 1 { 2 } else { 1 }
+        ch[c].tQ[0] = ch[c].tEnv[0]
+        ch[c].tQ[ch[c].numNoise] = ch[c].tEnv[n]
+        if ch[c].numNoise > 1 {
+            var idx = 0
+            if frameClass == sbrFixFix {
+                idx = n >> 1
+            } else if frameClass & 1 == 1 {
+                idx = n - max(pointer - 1, 1)
+            } else {
+                if pointer == 0 {
+                    idx = 1
+                } else if pointer == 1 {
+                    idx = n - 1
+                } else {
+                    idx = pointer - 1
+                }
+            }
+            ch[c].tQ[1] = ch[c].tEnv[idx]
+        }
+        ch[c].eA[0] = if ch[c].eA[1] != oldNumEnv { -1 } else { 0 }
+        ch[c].eA[1] = -1
+        if frameClass & 1 == 1 && pointer > 0 {
+            ch[c].eA[1] = n + 1 - pointer
+        } else if frameClass == sbrVarFix && pointer > 1 {
+            ch[c].eA[1] = pointer - 1
+        }
+        true
+    }
+
+    // With coupling the second channel shares the first one's grid.
+    fn copyGrid() {
+        ch[1].freqRes[0] = ch[1].freqRes[ch[1].numEnv]
+        ch[1].tEnvNumEnvOld = ch[1].tEnv[ch[1].numEnv]
+        ch[1].eA[0] = if ch[1].eA[1] != ch[1].numEnv { -1 } else { 0 }
+        for i in 1..9 {
+            ch[1].freqRes[i] = ch[0].freqRes[i]
+        }
+        for i in 0..9 {
+            ch[1].tEnv[i] = ch[0].tEnv[i]
+        }
+        for i in 0..3 {
+            ch[1].tQ[i] = ch[0].tQ[i]
+        }
+        ch[1].numEnv = ch[0].numEnv
+        ch[1].ampRes = ch[0].ampRes
+        ch[1].numNoise = ch[0].numNoise
+        ch[1].frameClass = ch[0].frameClass
+        ch[1].eA[1] = ch[0].eA[1]
+    }
+
+    // sbr_dtdf (Table 4.68).
+    fn readDtdf(_ c: Int) {
+        for i in 0..ch[c].numEnv {
+            ch[c].dfEnv[i] = br.bit()
+        }
+        for i in 0..ch[c].numNoise {
+            ch[c].dfNoise[i] = br.bit()
+        }
+    }
+
+    // sbr_invf (Table 4.69).
+    fn readInvf(_ c: Int) {
+        for i in 0..5 {
+            ch[c].invf[5 + i] = ch[c].invf[i]
+        }
+        for i in 0..nQ {
+            ch[c].invf[i] = br.bits(2)
+        }
+    }
+
+    // sbr_envelope (Table 4.70), delta decoded in time or frequency
+    // (4.6.18.3.4).
+    fn readEnvelope(_ c: Int) -> Bool {
+        let delta = if c == 1 && coupling { 2 } else { 1 }
+        let odd = nHigh & 1
+        var bits = 7
+        var tTab = sbrTEnv15
+        var fTab = sbrFEnv15
+        if coupling && c == 1 {
+            if ch[c].ampRes == 1 {
+                bits = 5
+                tTab = sbrTEnvBal30
+                fTab = sbrFEnvBal30
+            } else {
+                bits = 6
+                tTab = sbrTEnvBal15
+                fTab = sbrFEnvBal15
+            }
+        } else if ch[c].ampRes == 1 {
+            bits = 6
+            tTab = sbrTEnv30
+            fTab = sbrFEnv30
+        }
+        for i in 0..ch[c].numEnv {
+            let res = ch[c].freqRes[i + 1]
+            let count = if res == 1 { nHigh } else { nLow }
+            let row = (i + 1) * 48
+            let prev = i * 48
+            if ch[c].dfEnv[i] == 1 {
+                for j in 0..count {
+                    var k = j
+                    if res != ch[c].freqRes[i] {
+                        if res == 1 {
+                            k = (j + odd) >> 1
+                        } else {
+                            k = if j == 0 { 0 } else { 2 * j - odd }
+                        }
+                    }
+                    let v = ch[c].envQ[prev + k] + delta * huff(tTab)
+                    if v < 0 || v > 127 {
+                        error = "SBR envelope value {v} out of range"
+                        return false
+                    }
+                    ch[c].envQ[row + j] = v
+                }
+            } else {
+                ch[c].envQ[row] = delta * br.bits(bits)
+                for j in 1..max(count, 1) {
+                    let v = ch[c].envQ[row + j - 1] + delta * huff(fTab)
+                    if v < 0 || v > 127 {
+                        error = "SBR envelope value {v} out of range"
+                        return false
+                    }
+                    ch[c].envQ[row + j] = v
+                }
+            }
+        }
+        let last = ch[c].numEnv * 48
+        for j in 0..48 {
+            ch[c].envQ[j] = ch[c].envQ[last + j]
+        }
+        true
+    }
+
+    // sbr_noise (Table 4.71).
+    fn readNoise(_ c: Int) -> Bool {
+        let delta = if c == 1 && coupling { 2 } else { 1 }
+        var tTab = sbrTNoise30
+        var fTab = sbrFEnv30
+        if coupling && c == 1 {
+            tTab = sbrTNoiseBal30
+            fTab = sbrFEnvBal30
+        }
+        for i in 0..ch[c].numNoise {
+            let row = (i + 1) * 5
+            if ch[c].dfNoise[i] == 1 {
+                for j in 0..nQ {
+                    let v = ch[c].noiseQ[i * 5 + j] + delta * huff(tTab)
+                    if v < 0 || v > 30 {
+                        error = "SBR noise value {v} out of range"
+                        return false
+                    }
+                    ch[c].noiseQ[row + j] = v
+                }
+            } else {
+                ch[c].noiseQ[row] = delta * br.bits(5)
+                for j in 1..max(nQ, 1) {
+                    let v = ch[c].noiseQ[row + j - 1] + delta * huff(fTab)
+                    if v < 0 || v > 30 {
+                        error = "SBR noise value {v} out of range"
+                        return false
+                    }
+                    ch[c].noiseQ[row + j] = v
+                }
+            }
+        }
+        let last = ch[c].numNoise * 5
+        for j in 0..5 {
+            ch[c].noiseQ[j] = ch[c].noiseQ[last + j]
+        }
+        true
+    }
+
+    // --- Frequency band tables (4.6.18.3.2) ---
+
+    fn resetTables() {
+        if !makeMaster() || !makeDerived() {
+            if error.isEmpty {
+                error = "bad SBR frequency tables"
+            }
+            turnOff()
+        }
+    }
+
+    // Band widths from start to stop in num bands, as FFmpeg's make_bands
+    // (a float product rounded each step), sorted.
+    fn makeBands(_ startBand: Int, _ stop: Int, _ num: Int) -> [Int] {
+        var out: [Int] = []
+        let base = sbrF32(pow(sbrF32(Float(stop) / Float(startBand)), sbrF32(1.0 / Float(num))))
+        var prod = Float(startBand)
+        var previous = startBand
+        for _ in 0..(num - 1) {
+            prod = sbrF32(prod * base)
+            let present = sbrRint(prod)
+            out.append(present - previous)
+            previous = present
+        }
+        out.append(stop - previous)
+        out
+    }
+
+    // The master table (4.6.18.3.2.1).
+    fn makeMaster() -> Bool {
+        var offsetRow = 0
+        if sampleRate == 16000 {
+            offsetRow = 0
+        } else if sampleRate == 22050 {
+            offsetRow = 1
+        } else if sampleRate == 24000 {
+            offsetRow = 2
+        } else if sampleRate == 32000 {
+            offsetRow = 3
+        } else if sampleRate == 44100 || sampleRate == 48000 || sampleRate == 64000 {
+            offsetRow = 4
+        } else if sampleRate >= 88200 && sampleRate <= 192000 {
+            offsetRow = 5
+        } else {
+            error = "SBR rate {sampleRate} is not supported"
+            return false
+        }
+        let temp = if sampleRate < 32000 { 3000 } else if sampleRate < 64000 { 4000 } else { 5000 }
+        let startMin = ((temp << 7) + (sampleRate >> 1)) / sampleRate
+        let stopMin = ((temp << 8) + (sampleRate >> 1)) / sampleRate
+        k0 = startMin + sbrOffsetTab[offsetRow * 16 + startFreq]
+        if stopFreq < 14 {
+            k2 = stopMin
+            let dk = makeBands(stopMin, 64, 13).sorted()
+            for k in 0..stopFreq {
+                k2 += dk[k]
+            }
+        } else if stopFreq == 14 {
+            k2 = 2 * k0
+        } else {
+            k2 = 3 * k0
+        }
+        k2 = min(64, k2)
+        var maxBands = 32
+        if sampleRate <= 32000 {
+            maxBands = 48
+        } else if sampleRate == 44100 {
+            maxBands = 35
+        }
+        if k2 - k0 > maxBands {
+            error = "too many SBR subbands"
+            return false
+        }
+        fMaster = []
+        if freqScale == 0 {
+            let dk = alterScale + 1
+            nMaster = ((k2 - k0 + (dk & 2)) >> dk) << 1
+            if nMaster <= 0 || xoverBand >= nMaster {
+                return false
+            }
+            var steps: [Int] = [0]
+            for _ in 1..(nMaster + 1) {
+                steps.append(dk)
+            }
+            let k2diff = k2 - k0 - nMaster * dk
+            if k2diff < 0 {
+                steps[1] -= 1
+                if k2diff < -1 {
+                    steps[2] -= 1
+                }
+            } else if k2diff > 0 {
+                steps[nMaster] += 1
+            }
+            fMaster.append(k0)
+            for k in 1..(nMaster + 1) {
+                fMaster.append(fMaster[k - 1] + steps[k])
+            }
+        } else {
+            let halfBands = 7 - freqScale
+            var twoRegions = false
+            if 49 * k2 > 110 * k0 {
+                twoRegions = true
+                k1 = 2 * k0
+            } else {
+                k1 = k2
+            }
+            let num0 = sbrRint(sbrF32(Float(halfBands) * sbrF32(log(sbrF32(Float(k1) / Float(k0))) / log(2.0)))) * 2
+            if num0 <= 0 {
+                return false
+            }
+            let d0 = makeBands(k0, k1, num0).sorted()
+            let vdk0Max = d0[num0 - 1]
+            var vk0: [Int] = [k0]
+            for k in 0..num0 {
+                if d0[k] <= 0 {
+                    return false
+                }
+                vk0.append(vk0[k] + d0[k])
+            }
+            if twoRegions {
+                let invwarp = if alterScale == 1 { sbrF32(0.76923076923076923077) } else { 1.0 }
+                let num1 = sbrRint(sbrF32(sbrF32(Float(halfBands) * invwarp) * sbrF32(log(sbrF32(Float(k2) / Float(k1))) / log(2.0)))) * 2
+                var d1 = makeBands(k1, k2, num1)
+                let vdk1Min = d1.min() ?? 0
+                if vdk1Min < vdk0Max {
+                    d1 = d1.sorted()
+                    let change = min(vdk0Max - d1[0], (d1[num1 - 1] - d1[0]) >> 1)
+                    d1[0] += change
+                    d1[num1 - 1] -= change
+                }
+                d1 = d1.sorted()
+                var vk1: [Int] = [k1]
+                for k in 0..num1 {
+                    if d1[k] <= 0 {
+                        return false
+                    }
+                    vk1.append(vk1[k] + d1[k])
+                }
+                nMaster = num0 + num1
+                if xoverBand >= nMaster {
+                    return false
+                }
+                fMaster = vk0
+                for k in 1..(num1 + 1) {
+                    fMaster.append(vk1[k])
+                }
+            } else {
+                nMaster = num0
+                if xoverBand >= nMaster {
+                    return false
+                }
+                fMaster = vk0
+            }
+        }
+        true
+    }
+
+    // Derived tables (4.6.18.3.2.2): high and low resolution, noise
+    // floor bands, patches and the limiter table.
+    fn makeDerived() -> Bool {
+        nHigh = nMaster - xoverBand
+        nLow = (nHigh + 1) >> 1
+        fHigh = []
+        for i in 0..(nHigh + 1) {
+            fHigh.append(fMaster[xoverBand + i])
+        }
+        m1 = fHigh[nHigh] - fHigh[0]
+        kx1 = fHigh[0]
+        if kx1 + m1 > 64 || kx1 > 32 {
+            error = "SBR frequency borders out of range"
+            return false
+        }
+        fLow = [fHigh[0]]
+        let odd = nHigh & 1
+        for k in 1..(nLow + 1) {
+            fLow.append(fHigh[2 * k - odd])
+        }
+        nQ = max(1, sbrRint(sbrF32(Float(noiseBands) * sbrF32(log(sbrF32(Float(k2) / Float(kx1))) / log(2.0)))))
+        if nQ > 5 {
+            nQ = 1
+            error = "too many SBR noise bands"
+            return false
+        }
+        fNoise = [fLow[0]]
+        var temp = 0
+        for k in 1..(nQ + 1) {
+            temp += (nLow - temp) / (nQ + 1 - k)
+            fNoise.append(fLow[temp])
+        }
+        if !makePatches() {
+            return false
+        }
+        makeLimiterTable()
+        ch[0].indexNoise = 0
+        ch[1].indexNoise = 0
+        true
+    }
+
+    // Patch construction (4.6.18.6.3, Figure 4.48).
+    fn makePatches() -> Bool {
+        var lastK = -1
+        var lastMsb = -1
+        var sb = 0
+        var msb = k0
+        var usb = kx1
+        let goalSb = ((1000 << 11) + (sampleRate >> 1)) / sampleRate
+        numPatches = 0
+        var k = 0
+        if goalSb < kx1 + m1 {
+            k = 0
+            while fMaster[k] < goalSb {
+                k += 1
+            }
+        } else {
+            k = nMaster
+        }
+        while true {
+            var odd = 0
+            if k == lastK && msb == lastMsb {
+                error = "SBR patch construction failed"
+                return false
+            }
+            lastK = k
+            lastMsb = msb
+            var i = k
+            while true {
+                sb = fMaster[i]
+                odd = (sb + k0) & 1
+                i -= 1
+                if !(sb > (k0 - 1 + msb - odd)) || i < 0 {
+                    break
+                }
+            }
+            if numPatches > 5 {
+                error = "too many SBR patches"
+                return false
+            }
+            patchNum[numPatches] = max(sb - usb, 0)
+            patchStart[numPatches] = k0 - odd - patchNum[numPatches]
+            if patchNum[numPatches] > 0 {
+                usb = sb
+                msb = sb
+                numPatches += 1
+            } else {
+                msb = kx1
+            }
+            if fMaster[k] - sb < 3 {
+                k = nMaster
+            }
+            if sb == kx1 + m1 {
+                break
+            }
+        }
+        if numPatches > 1 && patchNum[numPatches - 1] < 3 {
+            numPatches -= 1
+        }
+        true
+    }
+
+    // The limiter band table (4.6.18.3.2.3).
+    fn makeLimiterTable() {
+        if fLow.isEmpty {
+            return
+        }
+        if limiterBands > 0 {
+            let warped = [1.32715174233856803909, 1.18509277094158210129, 1.11987160404675912501]
+            let lim = sbrF32(warped[limiterBands - 1])
+            var borders: [Int] = [kx1]
+            for k in 1..(numPatches + 1) {
+                borders.append(borders[k - 1] + patchNum[k - 1])
+            }
+            var t: [Int] = []
+            for i in 0..(nLow + 1) {
+                t.append(fLow[i])
+            }
+            if numPatches > 1 {
+                for i in 1..numPatches {
+                    t.append(borders[i])
+                }
+            }
+            t = t.slice(from: 0, to: numPatches + nLow).sorted() + t.slice(from: numPatches + nLow, to: t.count)
+            nLim = nLow + numPatches - 1
+            var outI = 0
+            var inI = 1
+            while outI < nLim {
+                if inI >= t.count {
+                    nLim = outI
+                    break
+                }
+                let vin = t[inI]
+                let vout = t[outI]
+                if Float(vin) >= sbrF32(Float(vout) * lim) {
+                    outI += 1
+                    t[outI] = vin
+                    inI += 1
+                } else if vin == vout || !sbrInTable(borders, numPatches, vin) {
+                    inI += 1
+                    nLim -= 1
+                } else if !sbrInTable(borders, numPatches, vout) {
+                    t[outI] = vin
+                    inI += 1
+                    nLim -= 1
+                } else {
+                    outI += 1
+                    t[outI] = vin
+                    inI += 1
+                }
+            }
+            fLim = t
+        } else {
+            fLim = [fLow[0], fLow[nLow]]
+            nLim = 1
+        }
+    }
+
+    // After a seek: forget the signal (filterbanks, HF history) but keep
+    // the header and tables.
+    fn resetSignal() {
+        for c in 0..2 {
+            ch[c] = sbrNewCh()
+        }
+        ps.resetSignal()
+        if start {
+            start = false
+            readyForDequant = false
+        }
+    }
+
+    // --- Processing (4.6.18.4 - 4.6.18.8) ---
+
+    // Dequantisation of envelopes and noise floors, with coupling
+    // (4.6.18.3.5).
+    fn dequant() {
+        if idAac == 1 && coupling {
+            let panOffset = if ch[0].ampRes == 1 { 12 } else { 24 }
+            for e in 1..(ch[0].numEnv + 1) {
+                let count = if ch[0].freqRes[e] == 1 { nHigh } else { nLow }
+                for k in 0..count {
+                    let a = ch[0].envQ[e * 48 + k]
+                    let b = ch[1].envQ[e * 48 + k]
+                    var t1 = 0.0
+                    var t2 = 0.0
+                    if ch[0].ampRes == 1 {
+                        t1 = sbrExp2(a + 7)
+                        t2 = sbrExp2(panOffset - b)
+                    } else {
+                        t1 = sbrExp2((a >> 1) + 7) * (if a & 1 == 1 { sqrt(2.0) } else { 1.0 })
+                        let p = panOffset - b
+                        t2 = sbrExp2(p >> 1) * (if p & 1 == 1 { sqrt(2.0) } else { 1.0 })
+                    }
+                    if t1 > 1e20 {
+                        t1 = 1.0
+                    }
+                    let fac = t1 / (1.0 + t2)
+                    ch[0].envFacs[e * 48 + k] = fac
+                    ch[1].envFacs[e * 48 + k] = fac * t2
+                }
+            }
+            for e in 1..(ch[0].numNoise + 1) {
+                for k in 0..nQ {
+                    let t1 = sbrExp2(6 - ch[0].noiseQ[e * 5 + k] + 1)
+                    let t2 = sbrExp2(12 - ch[1].noiseQ[e * 5 + k])
+                    let fac = t1 / (1.0 + t2)
+                    ch[0].noiseFacs[e * 5 + k] = fac
+                    ch[1].noiseFacs[e * 5 + k] = fac * t2
+                }
+            }
+            return
+        }
+        let n = if idAac == 1 { 2 } else { 1 }
+        for c in 0..n {
+            for e in 1..(ch[c].numEnv + 1) {
+                let count = if ch[c].freqRes[e] == 1 { nHigh } else { nLow }
+                for k in 0..count {
+                    let q = ch[c].envQ[e * 48 + k]
+                    var v = 0.0
+                    if ch[c].ampRes == 1 {
+                        v = sbrExp2(q + 6)
+                    } else {
+                        v = sbrExp2((q >> 1) + 6) * (if q & 1 == 1 { sqrt(2.0) } else { 1.0 })
+                    }
+                    if v > 1e20 {
+                        v = 1.0
+                    }
+                    ch[c].envFacs[e * 48 + k] = v
+                }
+            }
+            for e in 1..(ch[c].numNoise + 1) {
+                for k in 0..nQ {
+                    ch[c].noiseFacs[e * 5 + k] = sbrExp2(6 - ch[c].noiseQ[e * 5 + k])
+                }
+            }
+        }
+    }
+
+    // Analysis QMF bank (4.6.18.4.1): 1024 samples of `input` from
+    // `from` into 32 slots of 32 subbands, W[ypos].
+    fn analysis(_ c: Int, _ input: [Float], _ from: Int) {
+        for i in 0..288 {
+            ch[c].analysis[i] = ch[c].analysis[1024 + i]
+        }
+        for i in 0..1024 {
+            ch[c].analysis[288 + i] = input[from + i]
+        }
+        let buf = ch[c].ypos
+        for l in 0..32 {
+            let base = l * 32
+            // z[n] = x[n] c[2n] with x newest first; u[n] = sum of 5.
+            for n in 0..64 {
+                var s = 0.0
+                var m = n
+                for _ in 0..5 {
+                    s += ch[c].analysis[base + 319 - m] * sbrQmfWindow[2 * m]
+                    m += 64
+                }
+                fftA.re[n] = s * sbrAnaPre[n]
+                fftA.im[n] = s * sbrAnaPre[64 + n]
+            }
+            fftA.inverse()
+            let wbase = (buf * 32 + l) * 32
+            for k in 0..32 {
+                let pc = sbrAnaPost[k]
+                let ps = sbrAnaPost[32 + k]
+                ch[c].wRe[wbase + k] = 2.0 * (fftA.re[k] * pc - fftA.im[k] * ps)
+                ch[c].wIm[wbase + k] = 2.0 * (fftA.re[k] * ps + fftA.im[k] * pc)
+            }
+        }
+    }
+
+    // X_low: 8 slots of the previous frame and 32 of this one, for the
+    // bands below kx (FFmpeg's sbr_lf_gen).
+    fn lfGen(_ c: Int) {
+        for i in 0..(32 * 40) {
+            xLowRe[i] = 0.0
+            xLowIm[i] = 0.0
+        }
+        let buf = ch[c].ypos
+        for k in 0..kx1 {
+            for i in 8..40 {
+                let w = (buf * 32 + i - 8) * 32 + k
+                xLowRe[k * 40 + i] = ch[c].wRe[w]
+                xLowIm[k * 40 + i] = ch[c].wIm[w]
+            }
+        }
+        let other = 1 - buf
+        for k in 0..kx0 {
+            for i in 0..8 {
+                let w = (other * 32 + i + 24) * 32 + k
+                xLowRe[k * 40 + i] = ch[c].wRe[w]
+                xLowIm[k * 40 + i] = ch[c].wIm[w]
+            }
+        }
+    }
+
+    // Inverse filtering: the linear prediction coefficients alpha0 and
+    // alpha1 of each low band (4.6.18.6.2).
+    fn inverseFilter() {
+        for k in 0..k0 {
+            let b = k * 40
+            var r2 = xLowRe[b] * xLowRe[b + 2] + xLowIm[b] * xLowIm[b + 2]
+            var i2 = xLowRe[b] * xLowIm[b + 2] - xLowIm[b] * xLowRe[b + 2]
+            var r1 = 0.0
+            var i1 = 0.0
+            var r0 = 0.0
+            for i in 1..38 {
+                let xr = xLowRe[b + i]
+                let xi = xLowIm[b + i]
+                r0 += xr * xr + xi * xi
+                r1 += xr * xLowRe[b + i + 1] + xi * xLowIm[b + i + 1]
+                i1 += xr * xLowIm[b + i + 1] - xi * xLowRe[b + i + 1]
+                r2 += xr * xLowRe[b + i + 2] + xi * xLowIm[b + i + 2]
+                i2 += xr * xLowIm[b + i + 2] - xi * xLowRe[b + i + 2]
+            }
+            // phi[i][j] in FFmpeg's names.
+            let p01r = r2
+            let p01i = i2
+            let p21 = r0 + xLowRe[b] * xLowRe[b] + xLowIm[b] * xLowIm[b]
+            let p10 = r0 + xLowRe[b + 38] * xLowRe[b + 38] + xLowIm[b + 38] * xLowIm[b + 38]
+            let p11r = r1 + xLowRe[b] * xLowRe[b + 1] + xLowIm[b] * xLowIm[b + 1]
+            let p11i = i1 + xLowRe[b] * xLowIm[b + 1] - xLowIm[b] * xLowRe[b + 1]
+            let p00r = r1 + xLowRe[b + 38] * xLowRe[b + 39] + xLowIm[b + 38] * xLowIm[b + 39]
+            let p00i = i1 + xLowRe[b + 38] * xLowIm[b + 39] - xLowIm[b + 38] * xLowRe[b + 39]
+            let dk = p21 * p10 - (p11r * p11r + p11i * p11i) / sbrF32(1.000001)
+            var a1r = 0.0
+            var a1i = 0.0
+            if dk != 0.0 {
+                a1r = (p00r * p11r - p00i * p11i - p01r * p10) / dk
+                a1i = (p00r * p11i + p00i * p11r - p01i * p10) / dk
+            }
+            var a0r = 0.0
+            var a0i = 0.0
+            if p10 != 0.0 {
+                a0r = -(p00r + a1r * p11r + a1i * p11i) / p10
+                a0i = -(p00i + a1i * p11r - a1r * p11i) / p10
+            }
+            if a1r * a1r + a1i * a1i >= 16.0 || a0r * a0r + a0i * a0i >= 16.0 {
+                a1r = 0.0
+                a1i = 0.0
+                a0r = 0.0
+                a0i = 0.0
+            }
+            alpha0Re[k] = a0r
+            alpha0Im[k] = a0i
+            alpha1Re[k] = a1r
+            alpha1Im[k] = a1i
+        }
+    }
+
+    // Chirp factors (4.6.18.6.2).
+    fn chirp(_ c: Int) {
+        let tab = [0.0, 0.75, 0.9, 0.98]
+        for i in 0..nQ {
+            var nb = 0.0
+            if ch[c].invf[i] + ch[c].invf[5 + i] == 1 {
+                nb = 0.6
+            } else {
+                nb = tab[ch[c].invf[i]]
+            }
+            if nb < ch[c].bw[i] {
+                nb = 0.75 * nb + 0.25 * ch[c].bw[i]
+            } else {
+                nb = 0.90625 * nb + 0.09375 * ch[c].bw[i]
+            }
+            ch[c].bw[i] = if nb < 0.015625 { 0.0 } else { nb }
+        }
+    }
+
+    // HF generation (4.6.18.6.3): patches of low bands, filtered.
+    fn hfGen(_ c: Int) -> Bool {
+        var g = 0
+        var k = kx1
+        let start = 2 * ch[c].tEnv[0]
+        let end = 2 * ch[c].tEnv[ch[c].numEnv]
+        for j in 0..numPatches {
+            for x in 0..patchNum[j] {
+                let p = patchStart[j] + x
+                while g <= nQ && k >= fNoise[g] {
+                    g += 1
+                }
+                g -= 1
+                if g < 0 {
+                    error = "no SBR noise band for subband {k}"
+                    return false
+                }
+                let bw = ch[c].bw[g]
+                let a0 = alpha1Re[p] * bw * bw
+                let a1 = alpha1Im[p] * bw * bw
+                let a2 = alpha0Re[p] * bw
+                let a3 = alpha0Im[p] * bw
+                let hb = k * 40 + 2
+                let lb = p * 40 + 2
+                for i in start..end {
+                    xHighRe[hb + i] = xLowRe[lb + i - 2] * a0 - xLowIm[lb + i - 2] * a1 + xLowRe[lb + i - 1] * a2 - xLowIm[lb + i - 1] * a3 + xLowRe[lb + i]
+                    xHighIm[hb + i] = xLowIm[lb + i - 2] * a0 + xLowRe[lb + i - 2] * a1 + xLowIm[lb + i - 1] * a2 + xLowRe[lb + i - 1] * a3 + xLowIm[lb + i]
+                }
+                k += 1
+            }
+        }
+        while k < m1 + kx1 {
+            for i in 0..40 {
+                xHighRe[k * 40 + i] = 0.0
+                xHighIm[k * 40 + i] = 0.0
+            }
+            k += 1
+        }
+        true
+    }
+
+    // Mapping of envelopes, noise floors and sinusoids to subbands
+    // (4.6.18.7.2).
+    fn mapping(_ c: Int) -> Bool {
+        for i in 0..48 {
+            ch[c].sIndexMapped[48 + i] = 0
+        }
+        for row in 1..8 {
+            for i in 0..48 {
+                ch[c].sIndexMapped[row * 48 + i] = 0
+            }
+        }
+        let eA1 = ch[c].eA[1]
+        for e in 0..ch[c].numEnv {
+            let res = ch[c].freqRes[e + 1]
+            let ilim = if res == 1 { nHigh } else { nLow }
+            let table = if res == 1 { fHigh } else { fLow }
+            if kx1 != table[0] {
+                error = "SBR tables out of date"
+                turnOff()
+                return false
+            }
+            for i in 0..ilim {
+                for m in table[i]..table[i + 1] {
+                    eOrig[e * 48 + m - kx1] = ch[c].envFacs[(e + 1) * 48 + i]
+                }
+            }
+            let kq = if ch[c].numNoise > 1 && ch[c].tEnv[e] >= ch[c].tQ[1] { 1 } else { 0 }
+            for i in 0..nQ {
+                for m in fNoise[i]..fNoise[i + 1] {
+                    qMapped[e * 48 + m - kx1] = ch[c].noiseFacs[(kq + 1) * 5 + i]
+                }
+            }
+            for i in 0..nHigh {
+                if ch[c].addHarmonicFlag {
+                    let mid = (fHigh[i] + fHigh[i + 1]) >> 1
+                    let on = e >= eA1 || ch[c].sIndexMapped[mid - kx1] == 1
+                    ch[c].sIndexMapped[(e + 1) * 48 + mid - kx1] = if on { ch[c].addHarmonic[i] } else { 0 }
+                }
+            }
+            for i in 0..ilim {
+                var present = 0
+                for m in table[i]..table[i + 1] {
+                    if ch[c].sIndexMapped[(e + 1) * 48 + m - kx1] != 0 {
+                        present = 1
+                        break
+                    }
+                }
+                for m in table[i]..table[i + 1] {
+                    sMapped[e * 48 + m - kx1] = present
+                }
+            }
+        }
+        let last = ch[c].numEnv * 48
+        for i in 0..48 {
+            ch[c].sIndexMapped[i] = ch[c].sIndexMapped[last + i]
+        }
+        true
+    }
+
+    // Estimation of the current envelope (4.6.18.7.3).
+    fn envEstimate(_ c: Int) {
+        for e in 0..ch[c].numEnv {
+            let t0 = ch[c].tEnv[e]
+            let t1 = ch[c].tEnv[e + 1]
+            let ilb = t0 * 2 + 2
+            let iub = t1 * 2 + 2
+            if ilb >= 40 {
+                return
+            }
+            if interpolFreq == 1 {
+                let recip = 0.5 / Float(t1 - t0)
+                for m in 0..m1 {
+                    let b = (m + kx1) * 40
+                    var sum = 0.0
+                    for i in ilb..iub {
+                        sum += xHighRe[b + i] * xHighRe[b + i] + xHighIm[b + i] * xHighIm[b + i]
+                    }
+                    eCurr[e * 48 + m] = sum * recip
+                }
+            } else {
+                let size = 2 * (t1 - t0)
+                let res = ch[c].freqRes[e + 1]
+                let table = if res == 1 { fHigh } else { fLow }
+                let n = if res == 1 { nHigh } else { nLow }
+                for p in 0..n {
+                    var sum = 0.0
+                    for k in table[p]..table[p + 1] {
+                        let b = k * 40
+                        for i in ilb..iub {
+                            sum += xHighRe[b + i] * xHighRe[b + i] + xHighIm[b + i] * xHighIm[b + i]
+                        }
+                    }
+                    sum = sum / Float(size * (table[p + 1] - table[p]))
+                    for k in table[p]..table[p + 1] {
+                        eCurr[e * 48 + k - kx1] = sum
+                    }
+                }
+            }
+        }
+    }
+
+    // Levels of the additional components and the gains, with the
+    // limiter and its boost (4.6.18.7.4, 4.6.18.7.5).
+    fn gainCalc(_ c: Int) {
+        let eA0 = ch[c].eA[0]
+        let eA1 = ch[c].eA[1]
+        for e in 0..ch[c].numEnv {
+            let delta = if e == eA1 || e == eA0 { 0.0 } else { 1.0 }
+            let dflag = delta != 0.0
+            for k in 0..nLim {
+                let lo = fLim[k] - kx1
+                let hi = fLim[k + 1] - kx1
+                for m in lo..hi {
+                    let at = e * 48 + m
+                    let temp = eOrig[at] / (1.0 + qMapped[at])
+                    qM[at] = sqrt(temp * qMapped[at])
+                    sM[at] = sqrt(temp * Float(ch[c].sIndexMapped[(e + 1) * 48 + m]))
+                    if sMapped[at] == 0 {
+                        gain[at] = sqrt(eOrig[at] / ((1.0 + eCurr[at]) * (1.0 + qMapped[at] * delta)))
+                    } else {
+                        gain[at] = sqrt(eOrig[at] * qMapped[at] / ((1.0 + eCurr[at]) * (1.0 + qMapped[at])))
+                    }
+                    gain[at] += sbrFltMin
+                }
+                var s0 = 0.0
+                var s1 = 0.0
+                for m in lo..hi {
+                    s0 += eOrig[e * 48 + m]
+                    s1 += eCurr[e * 48 + m]
+                }
+                var gainMax = sbrLimGain[limiterGains] * sqrt((sbrFltEpsilon + s0) / (sbrFltEpsilon + s1))
+                gainMax = min(100000.0, gainMax)
+                for m in lo..hi {
+                    let at = e * 48 + m
+                    let qmMax = qM[at] * gainMax / gain[at]
+                    qM[at] = min(qM[at], qmMax)
+                    gain[at] = min(gain[at], gainMax)
+                }
+                s0 = 0.0
+                s1 = 0.0
+                for m in lo..hi {
+                    let at = e * 48 + m
+                    s0 += eOrig[at]
+                    s1 += eCurr[at] * gain[at] * gain[at] + sM[at] * sM[at]
+                    if dflag && sM[at] == 0.0 {
+                        s1 += qM[at] * qM[at]
+                    }
+                }
+                var boost = sqrt((sbrFltEpsilon + s0) / (sbrFltEpsilon + s1))
+                boost = min(1.584893192, boost)
+                for m in lo..hi {
+                    let at = e * 48 + m
+                    gain[at] *= boost
+                    qM[at] *= boost
+                    sM[at] *= boost
+                }
+            }
+        }
+    }
+
+    // Assembling the HF signal (4.6.18.7.5): gains smoothed in time,
+    // noise and sinusoids added, into Y[ypos].
+    fn hfAssemble(_ c: Int) {
+        let hSL = if smoothingMode == 1 { 0 } else { 4 }
+        let kx = kx1
+        let mMax = m1
+        var indexNoise = ch[c].indexNoise
+        var indexSine = ch[c].indexSine
+        let eA0 = ch[c].eA[0]
+        let eA1 = ch[c].eA[1]
+        let t0 = 2 * ch[c].tEnv[0]
+        if reset {
+            for i in 0..hSL {
+                for m in 0..mMax {
+                    ch[c].gTemp[(i + t0) * 48 + m] = gain[m]
+                    ch[c].qTemp[(i + t0) * 48 + m] = qM[m]
+                }
+            }
+        } else if hSL > 0 {
+            let old = 2 * ch[c].tEnvNumEnvOld
+            for i in 0..4 {
+                for m in 0..48 {
+                    ch[c].gTemp[(i + t0) * 48 + m] = ch[c].gTemp[(i + old) * 48 + m]
+                    ch[c].qTemp[(i + t0) * 48 + m] = ch[c].qTemp[(i + old) * 48 + m]
+                }
+            }
+        }
+        for e in 0..ch[c].numEnv {
+            for i in (2 * ch[c].tEnv[e])..(2 * ch[c].tEnv[e + 1]) {
+                for m in 0..mMax {
+                    ch[c].gTemp[(hSL + i) * 48 + m] = gain[e * 48 + m]
+                    ch[c].qTemp[(hSL + i) * 48 + m] = qM[e * 48 + m]
+                }
+            }
+        }
+        let ybuf = ch[c].ypos
+        for e in 0..ch[c].numEnv {
+            let transient = e == eA0 || e == eA1
+            for i in (2 * ch[c].tEnv[e])..(2 * ch[c].tEnv[e + 1]) {
+                if hSL > 0 && !transient {
+                    for m in 0..mMax {
+                        var gs = 0.0
+                        var qs = 0.0
+                        for j in 0..(hSL + 1) {
+                            gs += ch[c].gTemp[(i + hSL - j) * 48 + m] * sbrHSmooth[j]
+                            qs += ch[c].qTemp[(i + hSL - j) * 48 + m] * sbrHSmooth[j]
+                        }
+                        gFilt[m] = gs
+                        qFilt[m] = qs
+                    }
+                } else {
+                    for m in 0..mMax {
+                        gFilt[m] = ch[c].gTemp[(i + hSL) * 48 + m]
+                        qFilt[m] = ch[c].qTemp[i * 48 + m]
+                    }
+                }
+                let yb = (ybuf * 38 + i) * 64
+                for m in 0..mMax {
+                    let xb = (kx + m) * 40 + i + 2
+                    ch[c].yRe[yb + kx + m] = xHighRe[xb] * gFilt[m]
+                    ch[c].yIm[yb + kx + m] = xHighIm[xb] * gFilt[m]
+                }
+                if !transient {
+                    // Noise where there's no sinusoid, else the sinusoid.
+                    var noise = indexNoise
+                    let sign = if (kx & 1) == 1 { -1.0 } else { 1.0 }
+                    var phi1 = 0.0
+                    var phi0 = 0.0
+                    if indexSine == 0 {
+                        phi0 = 1.0
+                    } else if indexSine == 1 {
+                        phi1 = sign
+                    } else if indexSine == 2 {
+                        phi0 = -1.0
+                    } else {
+                        phi1 = -sign
+                    }
+                    for m in 0..mMax {
+                        noise = (noise + 1) & 0x1ff
+                        let s = sM[e * 48 + m]
+                        if s != 0.0 {
+                            ch[c].yRe[yb + kx + m] += s * phi0
+                            ch[c].yIm[yb + kx + m] += s * phi1
+                        } else {
+                            ch[c].yRe[yb + kx + m] += qFilt[m] * sbrNoiseTable[2 * noise]
+                            ch[c].yIm[yb + kx + m] += qFilt[m] * sbrNoiseTable[2 * noise + 1]
+                        }
+                        phi1 = -phi1
+                    }
+                } else {
+                    // Only the sinusoids (no noise in a transient envelope).
+                    let im = (indexSine & 1) == 1
+                    let a = if ((indexSine + (kx & 1)) & 2) != 0 { -1.0 } else { 1.0 }
+                    let b = if im { -a } else { a }
+                    for m in 0..mMax {
+                        let s = sM[e * 48 + m] * (if m % 2 == 0 { a } else { b })
+                        if im {
+                            ch[c].yIm[yb + kx + m] += s
+                        } else {
+                            ch[c].yRe[yb + kx + m] += s
+                        }
+                    }
+                }
+                indexNoise = (indexNoise + mMax) & 0x1ff
+                indexSine = (indexSine + 1) & 3
+            }
+        }
+        ch[c].indexNoise = indexNoise
+        ch[c].indexSine = indexSine
+    }
+
+    // The 64-band signal X for synthesis: low bands from X_low, high
+    // bands from this and the previous frame's Y (FFmpeg's sbr_x_gen).
+    fn xGen(_ c: Int) {
+        let base = c * 38 * 64
+        for i in 0..(38 * 64) {
+            xRe[base + i] = 0.0
+            xIm[base + i] = 0.0
+        }
+        let iTemp = max(2 * ch[c].tEnvNumEnvOld - 32, 0)
+        let y0 = (1 - ch[c].ypos) * 38 * 64
+        let y1 = ch[c].ypos * 38 * 64
+        var k = 0
+        while k < kx0 {
+            for i in 0..iTemp {
+                xRe[base + i * 64 + k] = xLowRe[k * 40 + i + 2]
+                xIm[base + i * 64 + k] = xLowIm[k * 40 + i + 2]
+            }
+            k += 1
+        }
+        while k < kx0 + m0 {
+            for i in 0..iTemp {
+                xRe[base + i * 64 + k] = ch[c].yRe[y0 + (i + 32) * 64 + k]
+                xIm[base + i * 64 + k] = ch[c].yIm[y0 + (i + 32) * 64 + k]
+            }
+            k += 1
+        }
+        k = 0
+        while k < kx1 {
+            for i in iTemp..38 {
+                xRe[base + i * 64 + k] = xLowRe[k * 40 + i + 2]
+                xIm[base + i * 64 + k] = xLowIm[k * 40 + i + 2]
+            }
+            k += 1
+        }
+        while k < kx1 + m1 {
+            for i in iTemp..32 {
+                xRe[base + i * 64 + k] = ch[c].yRe[y1 + i * 64 + k]
+                xIm[base + i * 64 + k] = ch[c].yIm[y1 + i * 64 + k]
+            }
+            k += 1
+        }
+    }
+
+    // Synthesis QMF bank (4.6.18.4.2): 32 slots of X[c] into 2048
+    // samples at out[o * 2048]. v lives in a longer buffer whose start
+    // moves back 128 per slot (instead of shifting 1152 values).
+    fn synthesis(_ c: Int, _ o: Int) {
+        let base = c * 38 * 64
+        for l in 0..32 {
+            if ch[c].vOff < 128 {
+                for i in 0..1152 {
+                    ch[c].synth[2304 - 1152 + i] = ch[c].synth[i]
+                }
+                ch[c].vOff = 2304 - 1152 - 128
+            } else {
+                ch[c].vOff -= 128
+            }
+            let v = ch[c].vOff
+            let xb = base + l * 64
+            for k in 0..64 {
+                let xr = xRe[xb + k]
+                let xi = xIm[xb + k]
+                let pc = sbrSynPre[k]
+                let ps = sbrSynPre[64 + k]
+                fftS.re[k] = (xr * pc - xi * ps) / 64.0
+                fftS.im[k] = (xr * ps + xi * pc) / 64.0
+                fftS.re[64 + k] = 0.0
+                fftS.im[64 + k] = 0.0
+            }
+            fftS.inverse()
+            for n in 0..128 {
+                ch[c].synth[v + n] = fftS.re[n] * sbrSynPost[n] - fftS.im[n] * sbrSynPost[128 + n]
+            }
+            let ob = o * 2048 + l * 64
+            for j in 0..64 {
+                var s = 0.0
+                var a = v + j
+                var w = j
+                for _ in 0..5 {
+                    s += ch[c].synth[a] * sbrQmfWindow[w]
+                    s += ch[c].synth[a + 192] * sbrQmfWindow[w + 64]
+                    a += 256
+                    w += 128
+                }
+                out[ob + j] = s
+            }
+        }
+    }
+
+    // Downsampled synthesis QMF bank (4.6.18.4.3): the 32 low bands of
+    // X[c] into 1024 samples at out[o * 1024], with the 64-value v shift
+    // and every other window coefficient.
+    fn synthesisDown(_ c: Int, _ o: Int) {
+        let base = c * 38 * 64
+        for l in 0..32 {
+            if ch[c].vOff < 64 {
+                for i in 0..576 {
+                    ch[c].synth[2304 - 576 + i] = ch[c].synth[i]
+                }
+                ch[c].vOff = 2304 - 576 - 64
+            } else {
+                ch[c].vOff -= 64
+            }
+            let v = ch[c].vOff
+            let xb = base + l * 64
+            for k in 0..32 {
+                let xr = xRe[xb + k]
+                let xi = xIm[xb + k]
+                let pc = sbrDownPre[k]
+                let ps = sbrDownPre[32 + k]
+                fftA.re[k] = (xr * pc - xi * ps) / 64.0
+                fftA.im[k] = (xr * ps + xi * pc) / 64.0
+                fftA.re[32 + k] = 0.0
+                fftA.im[32 + k] = 0.0
+            }
+            fftA.inverse()
+            for n in 0..64 {
+                ch[c].synth[v + n] = fftA.re[n] * sbrAnaPre[n] - fftA.im[n] * sbrAnaPre[64 + n]
+            }
+            let ob = o * 1024 + l * 32
+            for j in 0..32 {
+                var s = 0.0
+                var a = v + j
+                var w = 2 * j
+                for _ in 0..5 {
+                    s += ch[c].synth[a] * sbrQmfWindow[w]
+                    s += ch[c].synth[a + 96] * sbrQmfWindow[w + 64]
+                    a += 128
+                    w += 128
+                }
+                out[ob + j] = s
+            }
+        }
+    }
+
+    // Applies SBR to an element's channels: core samples (1024 per
+    // channel, in `input` at slot * 1024) to 2048 per channel in `out`.
+    // With PS, the one core channel becomes two.
+    fn apply(_ input: [Float], _ slot: Int, _ nch: Int, _ type: Int) {
+        if type != idAac {
+            if start && type != 3 {
+                error = "SBR data for another element type"
+            }
+            start = false
+            readyForDequant = false
+            kx1 = 32
+            m1 = 0
+        }
+        if start && !readyForDequant {
+            error = "no SBR data in this frame"
+            turnOff()
+        }
+        if !kxAndMPushed {
+            kx0 = kx1
+            m0 = m1
+        } else {
+            kxAndMPushed = false
+        }
+        if start {
+            dequant()
+            readyForDequant = false
+        }
+        for c in 0..nch {
+            analysis(c, input, (slot + c) * 1024)
+            lfGen(c)
+            ch[c].ypos = 1 - ch[c].ypos
+            if start {
+                inverseFilter()
+                chirp(c)
+                if hfGen(c) && mapping(c) {
+                    envEstimate(c)
+                    gainCalc(c)
+                    hfAssemble(c)
+                }
+            }
+            xGen(c)
+        }
+        var outCh = nch
+        if psOn && nch == 1 {
+            if ps.started {
+                ps.apply(xRe, xIm, kx1 + m1)
+                for i in 0..(38 * 64) {
+                    xRe[38 * 64 + i] = ps.rRe[i]
+                    xIm[38 * 64 + i] = ps.rIm[i]
+                    xRe[i] = ps.lRe[i]
+                    xIm[i] = ps.lIm[i]
+                }
+            } else {
+                for i in 0..(38 * 64) {
+                    xRe[38 * 64 + i] = xRe[i]
+                    xIm[38 * 64 + i] = xIm[i]
+                }
+            }
+            outCh = 2
+        }
+        for c in 0..outCh {
+            if downsampled {
+                synthesisDown(c, c)
+            } else {
+                synthesis(c, c)
+            }
+        }
+    }
+}
+
+fn sbrCeilLog2(_ n: Int) -> Int {
+    let t = [0, 1, 2, 2, 3, 3]
+    if n < 6 { t[n] } else { 3 }
+}
+
+fn sbrInTable(_ t: [Int], _ last: Int, _ v: Int) -> Bool {
+    for i in 0..(last + 1) {
+        if t[i] == v {
+            return true
+        }
+    }
+    false
+}
+
+// 2^x for whole x.
+fn sbrExp2(_ x: Int) -> Float {
+    pow(2.0, Float(x))
+}
+
+fn sbrNew(_ rate: Int, psOn: Bool) -> AacSbr {
+    var s = AacSbr(br: core.bitReader(Data()), ps: psNew(), fftA: sbrNewFft(64), fftS: sbrNewFft(128))
+    s.sampleRate = rate
+    s.psOn = psOn
+    s.ch = [sbrNewCh(), sbrNewCh()]
+    for _ in 0..(32 * 40) {
+        s.xLowRe.append(0.0)
+        s.xLowIm.append(0.0)
+    }
+    for _ in 0..(64 * 40) {
+        s.xHighRe.append(0.0)
+        s.xHighIm.append(0.0)
+    }
+    for _ in 0..64 {
+        s.alpha0Re.append(0.0)
+        s.alpha0Im.append(0.0)
+        s.alpha1Re.append(0.0)
+        s.alpha1Im.append(0.0)
+        s.gFilt.append(0.0)
+        s.qFilt.append(0.0)
+    }
+    for _ in 0..(2 * 38 * 64) {
+        s.xRe.append(0.0)
+        s.xIm.append(0.0)
+    }
+    for _ in 0..(7 * 48) {
+        s.eOrig.append(0.0)
+        s.qMapped.append(0.0)
+        s.sMapped.append(0)
+        s.eCurr.append(0.0)
+        s.qM.append(0.0)
+        s.sM.append(0.0)
+        s.gain.append(0.0)
+    }
+    for _ in 0..4096 {
+        s.out.append(0.0)
+    }
+    s
+}

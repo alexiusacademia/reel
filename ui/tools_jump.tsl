@@ -1,0 +1,129 @@
+// Two small dialogs: Jump to Time (a field that reads "1:23:45", "83:45",
+// "45s", "+30", "-1:00", "50%" … and shows where it goes before Enter
+// jumps) and the Sleep Timer (off, 15/30/45/60/90 minutes, the end of the
+// current item, or a custom number of minutes, with the time left).
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+// ---- jump to time ----
+
+// What the field's text means, for the line under it.
+public fn jumpPreview(_ text: String, position: Float, duration: Float) -> String {
+    if text.trim().isEmpty {
+        let of = if duration > 0.0 { " of {formatClock(duration)}" } else { "" }
+        return "Now at {formatClock(position)}{of}"
+    }
+    if let t = parseJumpTime(text, position: position, duration: duration) {
+        let of = if duration > 0.0 { " of {formatClock(duration)}" } else { "" }
+        return "Goes to {formatClock(t, tenths: t != Float(Int(t)))}{of}"
+    }
+    "Can't read that time"
+}
+
+// `position`, `duration`: where playback is and the file's length (-1 if
+// unknown); `onJump(t)`: go to t seconds; `onCancel()`. Fits in a sheet.
+public view JumpToTimeView(position: Float, duration: Float, onJump: fn(Float), onCancel: fn()) {
+    state text = ""
+
+    let target = parseJumpTime(text, position: position, duration: duration)
+
+    fn go() {
+        if let t = parseJumpTime(text, position: position, duration: duration) {
+            onJump(t)
+        }
+    }
+
+    VStack(spacing: 10, alignment: .leading) {
+        Text("Jump to Time").font(size: 15, weight: .semibold)
+        TextField("1:23:45", text: text)
+            .autofocus()
+            .onSubmit { go() }
+            .accessibilityLabel("Time to jump to")
+        Text(jumpPreview(text, position: position, duration: duration))
+            .font(size: 12)
+            .color(if target == nil && !text.trim().isEmpty { .red } else { .secondary })
+        Text("h:m:s, m:s, 45s or 1h30m; +30 or -1:00 from now; 50% of the length.")
+            .font(size: 11)
+            .color(.secondary)
+        HStack {
+            Spacer()
+            Button("Cancel") { onCancel() }
+            Button("Jump") { go() }.disabled(target == nil)
+        }
+    }
+    .padding(4)
+    .frame(width: 320)
+}
+
+// ---- sleep timer ----
+
+// The choices, as the picker's tags.
+public let sleepChoices = ["off", "15", "30", "45", "60", "90", "end", "custom"]
+
+// The timer a choice sets, in seconds: -1 off, 0 at the end of the
+// current item, otherwise how long until playback stops.
+public fn sleepTimerSeconds(_ choice: String, customMinutes: Int) -> Float {
+    match choice {
+        "off" -> -1.0
+        "end" -> 0.0
+        "custom" -> Float(max(1, customMinutes)) * 60.0
+        _ -> {
+            if let m = Int(choice) { Float(m) * 60.0 } else { -1.0 }
+        }
+    }
+}
+
+// The status line: "Off", "Stops in 12:34", "Stops at the end of this item (3:10)".
+public fn sleepTimerStatus(_ remaining: Float, choice: String) -> String {
+    if remaining < 0.0 {
+        return "The sleep timer is off."
+    }
+    if choice == "end" {
+        return "Playback stops at the end of this item ({formatClock(remaining)} left)."
+    }
+    "Playback stops in {formatClock(remaining)}."
+}
+
+// `choice`: one of sleepChoices; `customMinutes`: for "custom";
+// `remaining`: seconds until the timer stops playback, -1 when it isn't
+// running (the app counts it down); `onChange()`: Start or Turn Off was
+// pressed: start, restart or cancel the timer from choice and
+// customMinutes (sleepTimerSeconds says how long; 0 means at the end of
+// the current item).
+public view SleepTimerView(choice: bind String, customMinutes: bind Int, remaining: Float, onChange: fn()) {
+    VStack(spacing: 10, alignment: .leading) {
+        Text("Sleep Timer").font(size: 15, weight: .semibold)
+        Picker(selection: choice, style: .radio) {
+            Text("Off").tag("off")
+            Text("15 minutes").tag("15")
+            Text("30 minutes").tag("30")
+            Text("45 minutes").tag("45")
+            Text("1 hour").tag("60")
+            Text("1 hour 30 minutes").tag("90")
+            Text("At the end of the current item").tag("end")
+            Text("Custom").tag("custom")
+        }
+        HStack {
+            Stepper(value: customMinutes, step: 5, from: 1, to: 600).accessibilityLabel("Custom minutes")
+            Text("minutes").color(.secondary)
+        }
+        .padding(leading: 24)
+        .disabled(choice != "custom")
+        Text(sleepTimerStatus(remaining, choice: choice))
+            .font(size: 12)
+            .color(if remaining >= 0.0 { toolsAccent } else { .secondary })
+        HStack {
+            Spacer()
+            Button("Turn Off") {
+                choice = "off"
+                onChange()
+            }
+            .disabled(remaining < 0.0)
+            Button(if remaining >= 0.0 { "Restart" } else { "Start" }) { onChange() }
+                .disabled(choice == "off")
+        }
+    }
+    .padding(4)
+    .frame(width: 300)
+}

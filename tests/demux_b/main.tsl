@@ -1,0 +1,382 @@
+// Tests for the Matroska/WebM (demux/mkv.tsl) and Ogg (demux/ogg.tsl)
+// demuxers. Every MKV/WebM/Ogg/Opus fixture in tests/fixtures, and the
+// extra ones in tests/demux_b/fixtures (made by make_fixtures.sh: more
+// codecs through ffmpeg, plus hand-built files from synth.py for lacing,
+// live WebM, header stripping, Theora, chained and damaged files), is
+// compared with its F.ref.json: tracks, codec setup bytes, packets
+// (count, track, pts, duration, key flag, size, byte position), duration,
+// tags and chapters. Then a long synthetic MKV is timed.
+//
+// Differences from ffprobe that are expected (and allowed below):
+//   - ffprobe lists attached pictures as video tracks; Reel lists them as
+//     Media.attachments / Media.cover.
+//   - Packet positions: ffprobe gives a Matroska block's body start (Reel
+//     points at the frame, 4 bytes on) and an Ogg packet's page start.
+//   - Codec setup: ffmpeg stores Vorbis headers Xiph-laced, FLAC as the
+//     bare STREAMINFO and ALAC as a whole 'alac' atom; Reel uses core's
+//     forms (3 length-prefixed headers, "fLaC"+blocks, the bare cookie).
+//   - An MP3 block with a BlockDuration: ffmpeg's MP3 parser replaces it
+//     with the frame's full length; Reel keeps the BlockDuration.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../../demux"
+import "../../core"
+import "../../testkit"
+
+struct Checker {
+    passed: Int = 0
+    total: Int = 0
+
+    fn check(_ ok: Bool, _ what: String) {
+        total += 1
+        if ok {
+            passed += 1
+        } else {
+            print("FAIL: {what}")
+        }
+    }
+}
+
+let ownFixtures = "tests/demux_b/fixtures"
+
+fn loadRefAt(_ path: String) -> testkit.Ref {
+    let text = readFile(path + ".ref.json") ?? ""
+    let ref: testkit.Ref = fromJson(text) ?? testkit.Ref()
+    ref
+}
+
+// ffmpeg's Xiph-laced Vorbis/Theora extradata in core's 3-header form.
+fn xiphToCore(_ d: Data) -> Data {
+    if d.count < 3 || d[0] != 2 {
+        return d
+    }
+    var at = 1
+    var sizes: [Int] = []
+    for _ in 0..2 {
+        var s = 0
+        var more = true
+        while more {
+            let v = d[at]
+            at += 1
+            s += v
+            more = v == 255
+        }
+        sizes.append(s)
+    }
+    var out = Data()
+    let third = d.count - at - sizes[0] - sizes[1]
+    var from = at
+    for n in [sizes[0], sizes[1], third] {
+        out += Data(bytes: n.bytes(count: 4, bigEndian: true))
+        out += d.slice(from: from, to: from + n)
+        from += n
+    }
+    out
+}
+
+// Header `k` of core's 3-header form.
+fn mkvHeader(_ d: Data, _ k: Int) -> Data {
+    var at = 0
+    var i = 0
+    while at + 4 <= d.count {
+        let n = d.uint32(at: at, bigEndian: true)
+        if i == k {
+            return d.slice(from: at + 4, to: at + 4 + n)
+        }
+        at += 4 + n
+        i += 1
+    }
+    Data()
+}
+
+// The setup bytes Reel should give for a reference track.
+fn expectedExtra(_ t: testkit.RefTrack, _ mine: Data) -> Bool {
+    let want = testkit.hexToData(t.extraHex)
+    if t.codec == "vorbis" || t.codec == "theora" {
+        // ffmpeg empties the comment header in its copy: compare the
+        // identification and setup headers.
+        let w = xiphToCore(want)
+        return mkvHeader(mine, 0) == mkvHeader(w, 0) && mkvHeader(mine, 2) == mkvHeader(w, 2) && mkvHeader(mine, 2).count > 0
+    }
+    if (t.codec == "mpeg1" || t.codec == "mpeg2") && mine.isEmpty {
+        // No CodecPrivate in the file: ffmpeg's copy is the sequence
+        // header from the first frame; Reel's decoder reads it there.
+        return true
+    }
+    if t.codec == "flac" && want.count == 34 {
+        return mine.count >= 42 && mine.slice(from: 0, to: 4).latin1 == "fLaC" && mine.slice(from: 8, to: 42) == want
+    }
+    if t.codec == "alac" && want.count >= 36 {
+        return mine == want.slice(from: 12, to: want.count)
+    }
+    mine == want
+}
+
+fn compareFile(_ c: bind Checker, _ path: String, _ name: String) {
+    let file = readData(path) ?? Data()
+    let ref = loadRefAt(path)
+    let synth = ref.format.hasPrefix("synth")
+    let isOgg = name.hasSuffix(".ogg") || name.hasSuffix(".opus") || name.hasSuffix(".oga") || name.hasSuffix(".ogv")
+    c.check(!file.isEmpty && !ref.tracks.isEmpty, "{name}: fixture and reference are there")
+    let opened = demux.open(file, name: name)
+    if let e = opened.error() {
+        c.check(false, "{name}: opens ({e.message})")
+        return
+    }
+    let m = opened.value() ?? core.Media()
+    c.check(true, "{name}: opens")
+    let wantFormat = if isOgg { "ogg" } else if name.hasSuffix(".webm") { "webm" } else { "mkv" }
+    c.check(m.format == wantFormat, "{name}: format {m.format}, want {wantFormat}")
+
+    // Tracks (ffprobe's attached-picture tracks aren't tracks to Reel).
+    let refTracks = ref.tracks.filter { t in !t.isCover }
+    c.check(m.tracks.count == refTracks.count, "{name}: {m.tracks.count} tracks, want {refTracks.count}")
+    for (i, rt) in refTracks.enumerated() {
+        if i >= m.tracks.count {
+            break
+        }
+        let t = m.tracks[i]
+        var bad: [String] = []
+        if "{t.kind}" != rt.kind {
+            bad.append("kind {t.kind}/{rt.kind}")
+        }
+        if t.codec != rt.codec {
+            bad.append("codec {t.codec}/{rt.codec}")
+        }
+        if t.timescale != rt.timescale {
+            bad.append("timescale {t.timescale}/{rt.timescale}")
+        }
+        if !expectedExtra(rt, t.extra) {
+            bad.append("extra ({t.extra.count} bytes, ref {rt.extraHex.count / 2})")
+        }
+        if rt.kind == "video" {
+            if t.width != rt.width || t.height != rt.height {
+                bad.append("size {t.width}x{t.height}/{rt.width}x{rt.height}")
+            }
+            if t.sarNum * rt.sarDen != t.sarDen * rt.sarNum {
+                bad.append("sar {t.sarNum}:{t.sarDen}/{rt.sarNum}:{rt.sarDen}")
+            }
+            if rt.fpsNum > 0 && t.fpsNum * rt.fpsDen != t.fpsDen * rt.fpsNum {
+                bad.append("fps {t.fpsNum}/{t.fpsDen} vs {rt.fpsNum}/{rt.fpsDen}")
+            }
+        }
+        if rt.kind == "audio" {
+            if t.sampleRate != rt.sampleRate || t.channels != rt.channels {
+                bad.append("audio {t.sampleRate} Hz {t.channels} ch / {rt.sampleRate} Hz {rt.channels} ch")
+            }
+            if rt.codec == "pcm" && (t.pcm.bits != rt.pcm.bits || t.pcm.float != rt.pcm.float || t.pcm.bigEndian != rt.pcm.bigEndian || t.pcm.signed != rt.pcm.signed) {
+                bad.append("pcm format")
+            }
+        }
+        if t.language != rt.language {
+            bad.append("language '{t.language}'/'{rt.language}'")
+        }
+        if t.title != rt.title {
+            bad.append("title '{t.title}'/'{rt.title}'")
+        }
+        if t.isDefault != rt.isDefault {
+            bad.append("default {t.isDefault}")
+        }
+        if rt.duration != core.noTime && t.duration != rt.duration {
+            bad.append("duration {t.duration}/{rt.duration}")
+        }
+        c.check(bad.isEmpty, "{name} track {i}: " + bad.joined(separator: ", "))
+    }
+
+    // Packets (ffprobe's attached pictures have no position: left out).
+    let refPackets = ref.packets.filter { p in p.pos >= 0 }
+    c.check(m.packets.count == refPackets.count, "{name}: {m.packets.count} packets, want {refPackets.count}")
+    var wrong: [String] = []
+    var durationDiffs = 0
+    for (i, rp) in refPackets.enumerated() {
+        if i >= m.packets.count {
+            break
+        }
+        let p = m.packets[i]
+        var place = false
+        if synth {
+            place = p.offset == rp.pos
+        } else if isOgg {
+            // ffprobe's position is the page the packet starts on.
+            if rp.pos + 27 <= file.count && file.slice(from: rp.pos, to: rp.pos + 4).latin1 == "OggS" {
+                let nseg = file[rp.pos + 26]
+                var end = rp.pos + 27 + nseg
+                for k in 0..nseg {
+                    end += file[rp.pos + 27 + k]
+                }
+                place = p.offset > rp.pos && p.offset < end
+            }
+        } else {
+            place = p.offset == rp.pos + 4
+        }
+        var sizeOk = p.size == rp.size
+        if m.tracks[p.track].codec == "webvtt" && !synth {
+            // Matroska WebVTT blocks are "id\nsettings\ntext"; ffmpeg's
+            // packet is the text alone. Reel keeps the whole block.
+            sizeOk = p.size > rp.size
+        }
+        if p.track != rp.track || p.pts != rp.pts || p.key != rp.key || !sizeOk || !place {
+            if wrong.count < 4 {
+                wrong.append("#{i} t{p.track} pts {p.pts} key {p.key} size {p.size} at {p.offset} / t{rp.track} pts {rp.pts} key {rp.key} size {rp.size} pos {rp.pos}")
+            }
+        }
+        if p.duration != rp.duration {
+            let codec = m.tracks[p.track].codec
+            let explained = codec == "mp3" && i == refPackets.count - 1 && p.duration < rp.duration
+            if !explained {
+                durationDiffs += 1
+                if wrong.count < 4 {
+                    wrong.append("#{i} duration {p.duration}/{rp.duration}")
+                }
+            }
+        }
+        // The bytes are where the packet says (and complete).
+        if core.packetBytes(file, m, p).count != p.size + m.tracks[p.track].prefix.count {
+            if wrong.count < 4 {
+                wrong.append("#{i} bytes")
+            }
+        }
+    }
+    c.check(wrong.isEmpty, "{name} packets: " + wrong.joined(separator: "; "))
+    c.check(abs(m.duration - ref.duration) < 0.0015, "{name}: duration {m.duration}, want {ref.duration}")
+    var tagsBad: [String] = []
+    for (k, v) in ref.tags {
+        if (m.tags[k] ?? "(none)") != v {
+            tagsBad.append("{k}={m.tags[k] ?? "(none)"} want {v}")
+        }
+    }
+    c.check(tagsBad.isEmpty, "{name} tags: " + tagsBad.joined(separator: ", "))
+    var chaptersOk = m.chapters.count == ref.chapters.count
+    if chaptersOk {
+        for (i, rc) in ref.chapters.enumerated() {
+            let mc = m.chapters[i]
+            if abs(mc.start - rc.start) > 0.0005 || abs(mc.end - rc.end) > 0.0005 || mc.title != rc.title {
+                chaptersOk = false
+            }
+        }
+    }
+    c.check(chaptersOk, "{name}: {m.chapters.count} chapters, want {ref.chapters.count}")
+}
+
+// A long Matroska file, built here: `clusters` clusters of `blocks`
+// SimpleBlocks each (one video keyframe, then audio), like a movie's
+// worth of clusters with tiny frames.
+fn longMkv(clusters: Int, blocks: Int) -> Data {
+    // An element with a 1-byte size (bodies under 127 bytes).
+    fn el(_ id: [Int], _ body: Data) -> Data {
+        Data(bytes: id + [0x80 | body.count]) + body
+    }
+    var d = el([0x1A, 0x45, 0xDF, 0xA3], el([0x42, 0x82], Data(text: "matroska")))
+    // Segment of unknown size, Info (1 ms TimestampScale), Tracks.
+    d += Data(bytes: [0x18, 0x53, 0x80, 0x67, 0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF])
+    d += el([0x15, 0x49, 0xA9, 0x66], el([0x2A, 0xD7, 0xB1], Data(bytes: [0x0F, 0x42, 0x40])))
+    let video = el([0xAE], el([0xD7], Data(bytes: [1])) + el([0x83], Data(bytes: [1])) + el([0x86], Data(text: "V_VP8")) + el([0x23, 0xE3, 0x83], Data(bytes: [0x02, 0x62, 0x5A, 0x00])))
+    let audio = el([0xAE], el([0xD7], Data(bytes: [2])) + el([0x83], Data(bytes: [2])) + el([0x86], Data(text: "A_AC3")))
+    d += el([0x16, 0x54, 0xAE, 0x6B], video + audio)
+    let frameBytes = Data(bytes: [1, 2, 3, 4, 5, 6, 7, 8])
+    for c in 0..clusters {
+        let time = c * 1000
+        var body = Data(bytes: [0xE7, 0x84]) + Data(bytes: time.bytes(count: 4, bigEndian: true))
+        for b in 0..blocks {
+            let track = if b == 0 { 0x81 } else { 0x82 }
+            body += Data(bytes: [0xA3, 0x80 | (4 + frameBytes.count), track, 0, b * 10, 0x80])
+            body += frameBytes
+        }
+        d += Data(bytes: [0x1F, 0x43, 0xB6, 0x75, 0x10]) + Data(bytes: body.count.bytes(count: 3, bigEndian: true))
+        d += body
+    }
+    d
+}
+
+fn main() {
+    var c = Checker()
+    let shared = ["av1.mkv", "h264_high.mkv", "multi.mkv", "subs_ass.mkv", "subs_srt.mkv", "vp8.webm", "vp9.webm", "vorbis.ogg", "opus.opus", "opus_mono.ogg"]
+    for name in shared {
+        compareFile(c, testkit.fixturePath(name), name)
+    }
+    let own = ["vorbis.mka", "flac.mka", "pcm_s16.mka", "pcm_s24be.mka", "pcm_f32.mka", "pcm_u8.mka", "ac3.mka", "eac3.mka", "mp2.mka", "dts.mka", "alac.mka", "mpeg4.mkv", "mpeg2.mkv", "mpeg1.mkv", "mjpeg.mkv", "hevc.mkv", "aspect.mkv", "webvtt.mkv", "webvtt.webm", "attach.mkv", "tags.ogg", "flac.oga", "features.mkv", "live.webm", "damaged.mkv", "theora.ogv", "cover.opus", "vorbis_blocks.ogg"]
+    for name in own {
+        compareFile(c, joinPath(ownFixtures, name), name)
+    }
+
+    // Things the references don't cover.
+    let features = demux.mkvOpen(readData(joinPath(ownFixtures, "features.mkv")) ?? Data()).value() ?? core.Media()
+    if features.tracks.count == 8 && features.packets.count > 13 {
+        let f = readData(joinPath(ownFixtures, "features.mkv")) ?? Data()
+        let sub = features.packets[12]
+        c.check((core.packetBytes(f, features, sub).text ?? "") == "Hi: there", "header stripping: prefix put back")
+        c.check(features.tracks[2].isForced && !features.tracks[0].isForced, "FlagForced")
+        c.check(features.attachments.count == 2 && features.attachments[0].name == "font.ttf" && features.attachments[0].mime == "font/ttf", "attachments")
+        c.check(features.cover.count == 78 && features.cover[0] == 0x89, "cover.png attachment is the cover")
+        c.check(features.warnings.any(where: { w in w.contains("zlib") }), "zlib warning")
+        c.check(features.warnings.any(where: { w in w.contains("cue") }), "bad cue warning")
+        c.check(features.warnings.any(where: { w in w.contains("no listed track") }), "unknown track warning")
+    } else {
+        c.check(false, "features.mkv opens with 8 tracks")
+    }
+    let damaged = demux.mkvOpen(readData(joinPath(ownFixtures, "damaged.mkv")) ?? Data()).value() ?? core.Media()
+    c.check(damaged.warnings.any(where: { w in w.contains("damaged") }), "damaged bytes warning")
+    let theora = demux.oggOpen(readData(joinPath(ownFixtures, "theora.ogv")) ?? Data()).value() ?? core.Media()
+    c.check(theora.warnings.any(where: { w in w.contains("CRC") }), "bad CRC warning")
+    c.check(theora.packets.count == 10 && theora.packets[9].parts.count == 6, "Theora packet across three pages has three parts")
+    let opusCover = demux.oggOpen(readData(joinPath(ownFixtures, "cover.opus")) ?? Data()).value() ?? core.Media()
+    c.check(opusCover.cover == (readData(joinPath(ownFixtures, "cover.opus.jpg")) ?? Data()), "METADATA_BLOCK_PICTURE cover")
+
+    // Chained Ogg: two files one after the other.
+    let a = testkit.fixture("opus_mono.ogg")
+    let b = testkit.fixture("vorbis.ogg")
+    let chained = demux.oggOpen(a + b).value() ?? core.Media()
+    c.check(chained.tracks.count == 2 && chained.tracks[0].codec == "opus" && chained.tracks[1].codec == "vorbis", "chained Ogg: both links' streams are tracks")
+    c.check(chained.warnings.any(where: { w in w.contains("chained") }), "chained Ogg warning")
+    let vorbisFirst = chained.packets.first(where: { p in p.track == 1 })
+    let opusLast = chained.packets.last(where: { p in p.track == 0 })
+    if let v = vorbisFirst {
+        if let o = opusLast {
+            let vStart = core.seconds(v.pts, 44100)
+            let oEnd = core.seconds(o.pts + o.duration, 48000)
+            c.check(abs(vStart - (oEnd + core.seconds(-1024, 44100))) < 0.01, "chained Ogg: second link's times follow the first ({vStart} after {oEnd})")
+        }
+    }
+    // The second link starts where the first's audio ends (2.0 s, after
+    // the Opus pre-skip), and lasts 2.00127 s.
+    c.check(abs(chained.duration - (2.0 + 2.00127)) < 0.002, "chained Ogg duration {chained.duration}")
+
+    // Damaged input never stops the program.
+    let h = testkit.fixture("multi.mkv")
+    let cut = demux.mkvOpen(h.slice(from: 0, to: h.count / 2))
+    c.check(cut.isOk() && (cut.value()?.packets.count ?? 0) > 50, "a cut-off MKV still gives its first packets")
+    let o = testkit.fixture("opus.opus")
+    let cutOgg = demux.oggOpen(o.slice(from: 0, to: o.count / 2))
+    c.check(cutOgg.isOk() && (cutOgg.value()?.packets.count ?? 0) > 40, "a cut-off Ogg still gives its first packets")
+    var noise: [Int] = []
+    for i in 0..5000 {
+        noise.append((i * 7919 + 13) % 251)
+    }
+    var garbled = h.slice(from: 0, to: 2000) + Data(bytes: noise) + h.slice(from: 2000, to: h.count)
+    let g = demux.mkvOpen(garbled)
+    c.check(g.isOk(), "an MKV with noise in the middle opens")
+    garbled = Data()
+    c.check(demux.mkvOpen(Data(text: "not a matroska file at all")).error() != nil, "not Matroska: an error")
+    c.check(demux.oggOpen(Data(text: "OggS but nothing more")).error() != nil, "not Ogg: an error")
+
+    // Speed: 100 000 clusters of 10 blocks (a 4 GB movie has ~100k clusters).
+    let long = longMkv(clusters: 100000, blocks: 10)
+    let t0 = now()
+    let lm = demux.mkvOpen(long).value() ?? core.Media()
+    let ms = Int((now() - t0) * 1000.0)
+    c.check(lm.packets.count == 1000000 && lm.packets[999999].pts == 99999000 + 90, "long MKV: 1M packets ({lm.packets.count})")
+    print("time mkv 100k clusters, 1M blocks ({long.count / 1000000} MB): {ms} ms")
+    let o2 = testkit.fixture("opus.opus")
+    var bigOgg = Data()
+    for _ in 0..100 {
+        bigOgg += o2
+    }
+    let t1 = now()
+    let bo = demux.oggOpen(bigOgg).value() ?? core.Media()
+    let ms1 = Int((now() - t1) * 1000.0)
+    c.check(bo.tracks.count == 100 && bo.packets.count == 10100, "100 chained Opus files")
+    print("time ogg {bigOgg.count / 1000} KB, 100 links, 10100 packets: {ms1} ms")
+    print("demux_b: {c.passed} of {c.total} passed")
+}

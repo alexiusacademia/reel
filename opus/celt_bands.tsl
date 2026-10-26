@@ -1,0 +1,863 @@
+// Decoding the shape of each CELT band (RFC 6716 section 4.3.4): the
+// recursive band splitting with the split angle theta (4.3.4.4), mid/side
+// and intensity stereo, time-frequency changes with Haar transforms
+// (4.3.4.5), folding of lower bands into bands that got no pulses (4.3.4.3,
+// "spectral folding"), the PVQ codewords themselves (4.3.4.2, cwrs.c) with
+// the spreading rotation (4.3.4.3), and the anti-collapse noise (4.3.5).
+// Follows libopus bands.c / vq.c / cwrs.c (decoder side, float build).
+//
+// The reference passes pointers into several arrays; here every vector
+// lives in one work list `w` and is named by its offset:
+//   [0, N)                 X, the first channel's normalised coefficients
+//   [N, 2N)                Y, the second channel's
+//   [celtNormBase, ...)    norm and norm2, the folding sources
+//   [celtTmpBase, ...)     scratch for the (de)interleaving
+// An offset of -1 stands for the reference's NULL.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+let celtNormBase = 1920
+let celtNorm2Base = 1920 + 640
+let celtTmpBase = 1920 + 1280
+let celtWorkSize = 1920 + 1280 + 1024
+
+let celtExp2Table8 = [16384, 17866, 19483, 21247, 23170, 25267, 27554, 30048]
+let celtSpreadFactor = [15, 10, 5]
+
+struct CeltBands {
+    w: [Float] = celtZerosF(celtWorkSize)
+    iy: [Int] = celtZerosI(256)
+    collapse: [Int] = celtZerosI(42)
+    // The reference's band_ctx.
+    band: Int = 0
+    intensity: Int = 0
+    spread: Int = 2
+    tfChange: Int = 0
+    remainingBits: Int = 0
+    seed: Int = 0
+    avoidSplitNoise: Bool = false
+    disableInv: Bool = false
+
+    // compute_qn: how finely theta is quantised.
+    fn computeQn(_ n: Int, _ b: Int, _ offset: Int, _ pulseCap: Int, _ stereo: Bool) -> Int {
+        var n2 = 2 * n - 1
+        if stereo && n == 2 {
+            n2 -= 1
+        }
+        var qb = (b + n2 * offset) / n2
+        qb = min(b - pulseCap - 32, qb)
+        qb = min(64, qb)
+        if qb < 4 {
+            return 1
+        }
+        let qn = celtExp2Table8[qb & 7] >> (14 - (qb >> 3))
+        ((qn + 1) >> 1) << 1
+    }
+
+    // compute_theta (decoder side): reads the split angle. Returns inv,
+    // imid, iside, delta, itheta, qalloc and the updated b and fill.
+    fn computeTheta(rc: bind OpusRange, n: Int, bIn: Int, bb: Int, b0: Int, lm: Int, stereo: Bool, fillIn: Int) -> (Int, Int, Int, Int, Int, Int, Int, Int) {
+        var b = bIn
+        var fill = fillIn
+        let pulseCap = celtLogN[band] + lm * 8
+        let offset = (pulseCap >> 1) - (if stereo && n == 2 { 16 } else { 4 })
+        var qn = computeQn(n, b, offset, pulseCap, stereo)
+        if stereo && band >= intensity {
+            qn = 1
+        }
+        let tell = rc.tellFrac()
+        var itheta = 0
+        var inv = 0
+        if qn != 1 {
+            if stereo && n > 2 {
+                // A step pdf: probability 3 up to theta = pi/4, then 1.
+                let p0 = 3
+                let x0 = qn / 2
+                let ft = p0 * (x0 + 1) + x0
+                let fs = rc.decode(ft)
+                let x = if fs < (x0 + 1) * p0 { fs / p0 } else { x0 + 1 + (fs - (x0 + 1) * p0) }
+                let fl = if x <= x0 { p0 * x } else { (x - 1 - x0) + (x0 + 1) * p0 }
+                let fh = if x <= x0 { p0 * (x + 1) } else { (x - x0) + (x0 + 1) * p0 }
+                rc.update(fl, fh, ft)
+                itheta = x
+            } else if b0 > 1 || stereo {
+                // Uniform pdf.
+                itheta = rc.uint(qn + 1)
+            } else {
+                // Triangular pdf.
+                let half = qn >> 1
+                let ft = (half + 1) * (half + 1)
+                let fm = rc.decode(ft)
+                var fs = 0
+                var fl = 0
+                if fm < ((half * (half + 1)) >> 1) {
+                    itheta = (celtIsqrt32(8 * fm + 1) - 1) >> 1
+                    fs = itheta + 1
+                    fl = (itheta * (itheta + 1)) >> 1
+                } else {
+                    itheta = (2 * (qn + 1) - celtIsqrt32(8 * (ft - fm - 1) + 1)) >> 1
+                    fs = qn + 1 - itheta
+                    fl = ft - (((qn + 1 - itheta) * (qn + 2 - itheta)) >> 1)
+                }
+                rc.update(fl, fl + fs, ft)
+            }
+            itheta = (itheta * 16384) / qn
+        } else if stereo {
+            if b > 16 && remainingBits > 16 {
+                inv = if rc.bitLogp(2) { 1 } else { 0 }
+            }
+            if disableInv {
+                inv = 0
+            }
+            itheta = 0
+        }
+        let qalloc = rc.tellFrac() - tell
+        b -= qalloc
+        var imid = 0
+        var iside = 0
+        var delta = 0
+        if itheta == 0 {
+            imid = 32767
+            iside = 0
+            fill = fill & ((1 << bb) - 1)
+            delta = -16384
+        } else if itheta == 16384 {
+            imid = 0
+            iside = 32767
+            fill = fill & (((1 << bb) - 1) << bb)
+            delta = 16384
+        } else {
+            imid = celtBitexactCos(itheta)
+            iside = celtBitexactCos(16384 - itheta)
+            // The mid/side bit split that minimises the squared error.
+            delta = celtFracMul16((n - 1) << 7, celtBitexactLog2tan(iside, imid))
+        }
+        (inv, imid, iside, delta, itheta, qalloc, b, fill)
+    }
+
+    // quant_band_n1: a band of one coefficient per channel is just a sign.
+    fn bandN1(rc: bind OpusRange, x: Int, y: Int, lowbandOut: Int) -> Int {
+        var at = x
+        let channels = if y >= 0 { 2 } else { 1 }
+        for _ in 0..channels {
+            var sign = 0
+            if remainingBits >= 8 {
+                sign = rc.bits(1)
+                remainingBits -= 8
+            }
+            w[at] = if sign != 0 { -1.0 } else { 1.0 }
+            at = y
+        }
+        if lowbandOut >= 0 {
+            w[lowbandOut] = w[x]
+        }
+        1
+    }
+
+    // haar1: one level of Haar transform on interleaved blocks.
+    fn haar1(_ x: Int, _ n0In: Int, _ stride: Int) {
+        let n0 = n0In >> 1
+        let s = 0.70710678
+        for i in 0..stride {
+            for j in 0..n0 {
+                let a = x + stride * 2 * j + i
+                let b = x + stride * (2 * j + 1) + i
+                let t1 = s * w[a]
+                let t2 = s * w[b]
+                w[a] = t1 + t2
+                w[b] = t1 - t2
+            }
+        }
+    }
+
+    // deinterleave_hadamard / interleave_hadamard: between the short
+    // blocks' interleaved order and block order ("ordery" for Hadamard).
+    fn deinterleave(_ x: Int, _ n0: Int, _ stride: Int, _ hadamard: Bool) {
+        let n = n0 * stride
+        let t = celtTmpBase
+        if hadamard {
+            let ord = stride - 2
+            for i in 0..stride {
+                let oi = celtOrderyTable[ord + i]
+                for j in 0..n0 {
+                    w[t + oi * n0 + j] = w[x + j * stride + i]
+                }
+            }
+        } else {
+            for i in 0..stride {
+                for j in 0..n0 {
+                    w[t + i * n0 + j] = w[x + j * stride + i]
+                }
+            }
+        }
+        for i in 0..n {
+            w[x + i] = w[t + i]
+        }
+    }
+
+    fn interleave(_ x: Int, _ n0: Int, _ stride: Int, _ hadamard: Bool) {
+        let n = n0 * stride
+        let t = celtTmpBase
+        if hadamard {
+            let ord = stride - 2
+            for i in 0..stride {
+                let oi = celtOrderyTable[ord + i]
+                for j in 0..n0 {
+                    w[t + j * stride + i] = w[x + oi * n0 + j]
+                }
+            }
+        } else {
+            for i in 0..stride {
+                for j in 0..n0 {
+                    w[t + j * stride + i] = w[x + i * n0 + j]
+                }
+            }
+        }
+        for i in 0..n {
+            w[x + i] = w[t + i]
+        }
+    }
+
+    // renormalise_vector: scale to norm `gain`.
+    fn renormalise(_ x: Int, _ n: Int, _ gain: Float) {
+        var e = 1e-15
+        for i in 0..n {
+            e += w[x + i] * w[x + i]
+        }
+        let g = gain / sqrt(e)
+        for i in 0..n {
+            w[x + i] = g * w[x + i]
+        }
+    }
+
+    // exp_rotation1 and exp_rotation (section 4.3.4.3): spreading.
+    fn rotation1(_ x: Int, _ len: Int, _ stride: Int, _ c: Float, _ s: Float) {
+        let ms = -s
+        var i = 0
+        while i < len - stride {
+            let x1 = w[x + i]
+            let x2 = w[x + i + stride]
+            w[x + i + stride] = c * x2 + s * x1
+            w[x + i] = c * x1 + ms * x2
+            i += 1
+        }
+        i = len - 2 * stride - 1
+        while i >= 0 {
+            let x1 = w[x + i]
+            let x2 = w[x + i + stride]
+            w[x + i + stride] = c * x2 + s * x1
+            w[x + i] = c * x1 + ms * x2
+            i -= 1
+        }
+    }
+
+    fn expRotation(_ x: Int, _ lenIn: Int, _ dir: Int, _ stride: Int, _ k: Int, _ spreadMode: Int) {
+        if 2 * k >= lenIn || spreadMode == 0 {
+            return
+        }
+        let factor = celtSpreadFactor[spreadMode - 1]
+        let gain = Float(lenIn) / Float(lenIn + factor * k)
+        let theta = 0.5 * (gain * gain)
+        let c = cos(0.5 * pi * theta)
+        let s = cos(0.5 * pi * (1.0 - theta))
+        var stride2 = 0
+        if lenIn >= 8 * stride {
+            stride2 = 1
+            while (stride2 * stride2 + stride2) * stride + (stride >> 2) < lenIn {
+                stride2 += 1
+            }
+        }
+        let len = lenIn / stride
+        for i in 0..stride {
+            if dir < 0 {
+                if stride2 != 0 {
+                    rotation1(x + i * len, len, stride2, s, c)
+                }
+                rotation1(x + i * len, len, 1, c, s)
+            } else {
+                rotation1(x + i * len, len, 1, c, -s)
+                if stride2 != 0 {
+                    rotation1(x + i * len, len, stride2, s, -c)
+                }
+            }
+        }
+    }
+
+    // cwrsi (cwrs.c): codeword index -> pulse vector iy[0..<n]; returns
+    // the vector's squared norm.
+    fn cwrsi(_ nIn: Int, _ kIn: Int, _ iIn: Int) -> Int {
+        var n = nIn
+        var k = kIn
+        var i = iIn
+        var yy = 0
+        var at = 0
+        while n > 2 {
+            if k >= n {
+                // Lots of pulses.
+                var p = celtUrow(n, k + 1)
+                let s = if i >= p { -1 } else { 0 }
+                if s != 0 {
+                    i -= p
+                }
+                let k0 = k
+                let q = celtUrow(n, n)
+                if q > i {
+                    k = n
+                    while true {
+                        k -= 1
+                        p = celtUrow(k, n)
+                        if p <= i {
+                            break
+                        }
+                    }
+                } else {
+                    p = celtUrow(n, k)
+                    while p > i {
+                        k -= 1
+                        p = celtUrow(n, k)
+                    }
+                }
+                i -= p
+                let v = (k0 - k + s) ^ s
+                iy[at] = v
+                at += 1
+                yy += v * v
+            } else {
+                // Lots of dimensions.
+                var p = celtUrow(k, n)
+                let q = celtUrow(k + 1, n)
+                if p <= i && i < q {
+                    i -= p
+                    iy[at] = 0
+                    at += 1
+                } else {
+                    let s = if i >= q { -1 } else { 0 }
+                    if s != 0 {
+                        i -= q
+                    }
+                    let k0 = k
+                    while true {
+                        k -= 1
+                        p = celtUrow(k, n)
+                        if p <= i {
+                            break
+                        }
+                    }
+                    i -= p
+                    let v = (k0 - k + s) ^ s
+                    iy[at] = v
+                    at += 1
+                    yy += v * v
+                }
+            }
+            n -= 1
+        }
+        // n == 2
+        let p2 = 2 * k + 1
+        let s2 = if i >= p2 { -1 } else { 0 }
+        if s2 != 0 {
+            i -= p2
+        }
+        let k0 = k
+        k = (i + 1) >> 1
+        if k != 0 {
+            i -= 2 * k - 1
+        }
+        let v2 = (k0 - k + s2) ^ s2
+        iy[at] = v2
+        at += 1
+        yy += v2 * v2
+        // n == 1
+        let s1 = -i
+        let v1 = (k + s1) ^ s1
+        iy[at] = v1
+        yy += v1 * v1
+        yy
+    }
+
+    // alg_unquant (vq.c): K pulses in N dimensions, normalised to `gain`,
+    // rotated back, and the collapse mask of which short blocks got pulses.
+    fn algUnquant(rc: bind OpusRange, x: Int, n: Int, k: Int, spreadMode: Int, bb: Int, gain: Float) -> Int {
+        let idx = rc.uint(celtV(n, k))
+        let ryy = cwrsi(n, k, idx)
+        // normalise_residual
+        let g = gain / sqrt(Float(ryy))
+        for i in 0..n {
+            w[x + i] = g * Float(iy[i])
+        }
+        expRotation(x, n, -1, bb, k, spreadMode)
+        // extract_collapse_mask
+        if bb <= 1 {
+            return 1
+        }
+        let n0 = n / bb
+        var mask = 0
+        for i in 0..bb {
+            var any = 0
+            for j in 0..n0 {
+                any = any | iy[i * n0 + j]
+            }
+            if any != 0 {
+                mask = mask | (1 << i)
+            }
+        }
+        mask
+    }
+
+    // quant_partition (decoder side): a mono partition, split in two
+    // halves recursively while it has more bits than one PVQ codeword can
+    // use.
+    fn partition(rc: bind OpusRange, x: Int, nIn: Int, bIn: Int, bbIn: Int, lowband: Int, lmIn: Int, gain: Float, fillIn: Int) -> Int {
+        var n = nIn
+        var b = bIn
+        var bb = bbIn
+        var lm = lmIn
+        var fill = fillIn
+        let b0 = bb
+        var cm = 0
+        let cache = celtCacheIndex[(lm + 1) * 21 + band]
+        if lm != -1 && b > celtCacheBits[cache + celtCacheBits[cache]] + 12 && n > 2 {
+            n = n >> 1
+            let y = x + n
+            lm -= 1
+            if bb == 1 {
+                fill = (fill & 1) | (fill << 1)
+            }
+            bb = (bb + 1) >> 1
+            let (_, imid, iside, deltaIn, itheta, qalloc, b2, fill2) = computeTheta(rc: rc, n: n, bIn: b, bb: bb, b0: b0, lm: lm, stereo: false, fillIn: fill)
+            b = b2
+            fill = fill2
+            var delta = deltaIn
+            let mid = Float(imid) / 32768.0
+            let side = Float(iside) / 32768.0
+            // More bits to low-energy short blocks.
+            if b0 > 1 && (itheta & 0x3fff) != 0 {
+                if itheta > 8192 {
+                    delta -= delta >> (4 - lm)
+                } else {
+                    delta = min(0, delta + ((n << 3) >> (5 - lm)))
+                }
+            }
+            var mbits = max(0, min(b, (b - delta) / 2))
+            var sbits = b - mbits
+            remainingBits -= qalloc
+            let nextLowband2 = if lowband >= 0 { lowband + n } else { -1 }
+            var rebalance = remainingBits
+            if mbits >= sbits {
+                cm = partition(rc: rc, x: x, nIn: n, bIn: mbits, bbIn: bb, lowband: lowband, lmIn: lm, gain: gain * mid, fillIn: fill)
+                rebalance = mbits - (rebalance - remainingBits)
+                if rebalance > 24 && itheta != 0 {
+                    sbits += rebalance - 24
+                }
+                cm = cm | (partition(rc: rc, x: y, nIn: n, bIn: sbits, bbIn: bb, lowband: nextLowband2, lmIn: lm, gain: gain * side, fillIn: fill >> bb) << (b0 >> 1))
+            } else {
+                cm = partition(rc: rc, x: y, nIn: n, bIn: sbits, bbIn: bb, lowband: nextLowband2, lmIn: lm, gain: gain * side, fillIn: fill >> bb) << (b0 >> 1)
+                rebalance = sbits - (rebalance - remainingBits)
+                if rebalance > 24 && itheta != 16384 {
+                    mbits += rebalance - 24
+                }
+                cm = cm | partition(rc: rc, x: x, nIn: n, bIn: mbits, bbIn: bb, lowband: lowband, lmIn: lm, gain: gain * mid, fillIn: fill)
+            }
+            return cm
+        }
+        // No split: one PVQ codeword.
+        var q = celtBits2Pulses(band, lm, b)
+        var currBits = celtPulses2Bits(band, lm, q)
+        remainingBits -= currBits
+        // Never bust the budget.
+        while remainingBits < 0 && q > 0 {
+            remainingBits += currBits
+            q -= 1
+            currBits = celtPulses2Bits(band, lm, q)
+            remainingBits -= currBits
+        }
+        if q != 0 {
+            let k = celtGetPulses(q)
+            return algUnquant(rc: rc, x: x, n: n, k: k, spreadMode: spread, bb: bb, gain: gain)
+        }
+        // No pulses: fill the band anyway (folding or noise).
+        let cmMask = (1 << bb) - 1
+        fill = fill & cmMask
+        if fill == 0 {
+            for j in 0..n {
+                w[x + j] = 0.0
+            }
+            return 0
+        }
+        if lowband < 0 {
+            for j in 0..n {
+                seed = celtLcgRand(seed)
+                w[x + j] = celtSeedNoise(seed)
+            }
+            cm = cmMask
+        } else {
+            for j in 0..n {
+                seed = celtLcgRand(seed)
+                // About 48 dB below the normal folding level.
+                let t = if seed & 0x8000 != 0 { 1.0 / 256.0 } else { -1.0 / 256.0 }
+                w[x + j] = w[lowband + j] + t
+            }
+            cm = fill
+        }
+        renormalise(x, n, gain)
+        cm
+    }
+
+    // quant_band (decoder side): one band of one channel, with the
+    // time-frequency changes around the partition.
+    fn quantBand(rc: bind OpusRange, x: Int, n: Int, b: Int, bbIn: Int, lowbandIn: Int, lm: Int, lowbandOut: Int, gain: Float, lowbandScratch: Int, fillIn: Int) -> Int {
+        let n0 = n
+        var nB = n
+        var bb = bbIn
+        let b0In = bb
+        var lowband = lowbandIn
+        var fill = fillIn
+        var timeDivide = 0
+        var recombine = 0
+        let longBlocks = b0In == 1
+        var tf = tfChange
+        nB = nB / bb
+        if n == 1 {
+            return bandN1(rc: rc, x: x, y: -1, lowbandOut: lowbandOut)
+        }
+        if tf > 0 {
+            recombine = tf
+        }
+        // Band recombining to increase frequency resolution.
+        if lowbandScratch >= 0 && lowband >= 0 && (recombine != 0 || ((nB & 1) == 0 && tf < 0) || b0In > 1) {
+            for j in 0..n {
+                w[lowbandScratch + j] = w[lowband + j]
+            }
+            lowband = lowbandScratch
+        }
+        for k in 0..recombine {
+            if lowband >= 0 {
+                haar1(lowband, n >> k, 1 << k)
+            }
+            fill = celtBitInterleave[fill & 0xF] | (celtBitInterleave[fill >> 4] << 2)
+        }
+        bb = bb >> recombine
+        nB = nB << recombine
+        // Increasing the time resolution.
+        while (nB & 1) == 0 && tf < 0 {
+            if lowband >= 0 {
+                haar1(lowband, nB, bb)
+            }
+            fill = fill | (fill << bb)
+            bb = bb << 1
+            nB = nB >> 1
+            timeDivide += 1
+            tf += 1
+        }
+        let b0 = bb
+        let nB0 = nB
+        // Reorganize the samples in time order instead of frequency order.
+        if b0 > 1 && lowband >= 0 {
+            deinterleave(lowband, nB >> recombine, b0 << recombine, longBlocks)
+        }
+        var cm = partition(rc: rc, x: x, nIn: n, bIn: b, bbIn: bb, lowband: lowband, lmIn: lm, gain: gain, fillIn: fill)
+        // Undo the reorganisation.
+        if b0 > 1 {
+            interleave(x, nB >> recombine, b0 << recombine, longBlocks)
+        }
+        nB = nB0
+        bb = b0
+        for _ in 0..timeDivide {
+            bb = bb >> 1
+            nB = nB << 1
+            cm = cm | (cm >> bb)
+            haar1(x, nB, bb)
+        }
+        for k in 0..recombine {
+            cm = celtBitDeinterleave[cm]
+            haar1(x, n0 >> k, 1 << k)
+        }
+        bb = bb << recombine
+        // Scale the output for later folding.
+        if lowbandOut >= 0 {
+            let nn = sqrt(Float(n0))
+            for j in 0..n0 {
+                w[lowbandOut + j] = nn * w[x + j]
+            }
+        }
+        cm & ((1 << bb) - 1)
+    }
+
+    // stereo_merge: mid/side back to left/right.
+    fn stereoMerge(_ x: Int, _ y: Int, _ mid: Float, _ n: Int) {
+        var xp = 0.0
+        var side = 0.0
+        for j in 0..n {
+            xp += w[y + j] * w[x + j]
+            side += w[y + j] * w[y + j]
+        }
+        xp = mid * xp
+        let mid2 = mid
+        let el = mid2 * mid2 + side - 2.0 * xp
+        let er = mid2 * mid2 + side + 2.0 * xp
+        if er < 6e-4 || el < 6e-4 {
+            for j in 0..n {
+                w[y + j] = w[x + j]
+            }
+            return
+        }
+        let lgain = 1.0 / sqrt(el)
+        let rgain = 1.0 / sqrt(er)
+        for j in 0..n {
+            let l = mid * w[x + j]
+            let r = w[y + j]
+            w[x + j] = lgain * (l - r)
+            w[y + j] = rgain * (l + r)
+        }
+    }
+
+    // quant_band_stereo (decoder side).
+    fn quantBandStereo(rc: bind OpusRange, x: Int, y: Int, n: Int, bIn: Int, bb: Int, lowband: Int, lm: Int, lowbandOut: Int, lowbandScratch: Int, fillIn: Int) -> Int {
+        if n == 1 {
+            return bandN1(rc: rc, x: x, y: y, lowbandOut: lowbandOut)
+        }
+        let origFill = fillIn
+        let (inv, imid, iside, delta, itheta, qalloc, b, fill) = computeTheta(rc: rc, n: n, bIn: bIn, bb: bb, b0: bb, lm: lm, stereo: true, fillIn: fillIn)
+        let mid = Float(imid) / 32768.0
+        let side = Float(iside) / 32768.0
+        var cm = 0
+        if n == 2 {
+            // The side is orthogonal to the mid: one sign bit codes it.
+            var mbits = b
+            var sbits = 0
+            if itheta != 0 && itheta != 16384 {
+                sbits = 8
+            }
+            mbits -= sbits
+            let c = itheta > 8192
+            remainingBits -= qalloc + sbits
+            let x2 = if c { y } else { x }
+            let y2 = if c { x } else { y }
+            var sign = 0
+            if sbits != 0 {
+                sign = rc.bits(1)
+            }
+            let sgn = Float(1 - 2 * sign)
+            cm = quantBand(rc: rc, x: x2, n: n, b: mbits, bbIn: bb, lowbandIn: lowband, lm: lm, lowbandOut: lowbandOut, gain: 1.0, lowbandScratch: lowbandScratch, fillIn: origFill)
+            w[y2] = -sgn * w[x2 + 1]
+            w[y2 + 1] = sgn * w[x2]
+            w[x] = mid * w[x]
+            w[x + 1] = mid * w[x + 1]
+            w[y] = side * w[y]
+            w[y + 1] = side * w[y + 1]
+            var tmp = w[x]
+            w[x] = tmp - w[y]
+            w[y] = tmp + w[y]
+            tmp = w[x + 1]
+            w[x + 1] = tmp - w[y + 1]
+            w[y + 1] = tmp + w[y + 1]
+        } else {
+            var mbits = max(0, min(b, (b - delta) / 2))
+            var sbits = b - mbits
+            remainingBits -= qalloc
+            var rebalance = remainingBits
+            if mbits >= sbits {
+                cm = quantBand(rc: rc, x: x, n: n, b: mbits, bbIn: bb, lowbandIn: lowband, lm: lm, lowbandOut: lowbandOut, gain: 1.0, lowbandScratch: lowbandScratch, fillIn: fill)
+                rebalance = mbits - (rebalance - remainingBits)
+                if rebalance > 24 && itheta != 0 {
+                    sbits += rebalance - 24
+                }
+                cm = cm | quantBand(rc: rc, x: y, n: n, b: sbits, bbIn: bb, lowbandIn: -1, lm: lm, lowbandOut: -1, gain: side, lowbandScratch: -1, fillIn: fill >> bb)
+            } else {
+                cm = quantBand(rc: rc, x: y, n: n, b: sbits, bbIn: bb, lowbandIn: -1, lm: lm, lowbandOut: -1, gain: side, lowbandScratch: -1, fillIn: fill >> bb)
+                rebalance = sbits - (rebalance - remainingBits)
+                if rebalance > 24 && itheta != 16384 {
+                    mbits += rebalance - 24
+                }
+                cm = cm | quantBand(rc: rc, x: x, n: n, b: mbits, bbIn: bb, lowbandIn: lowband, lm: lm, lowbandOut: lowbandOut, gain: 1.0, lowbandScratch: lowbandScratch, fillIn: fill)
+            }
+        }
+        if n != 2 {
+            stereoMerge(x, y, mid, n)
+        }
+        if inv != 0 {
+            for j in 0..n {
+                w[y + j] = -w[y + j]
+            }
+        }
+        cm
+    }
+
+    // quant_all_bands (decoder side): every band from start to end.
+    // X is at w[0 ..< n], Y at w[n ..< 2n] when stereo. `seedIn` is the
+    // decoder's rng; the updated seed is left in `seed`.
+    fn quantAllBands(rc: bind OpusRange, start: Int, end: Int, stereo: Bool, pulses: [Int], shortBlocks: Bool, spreadMode: Int, dualStereoIn: Int, intensityIn: Int, tfRes: [Int], totalBits: Int, balanceIn: Int, lm: Int, codedBands: Int, seedIn: Int) {
+        let m = 1 << lm
+        let bb = if shortBlocks { m } else { 1 }
+        let nFrame = 120 * m
+        let c = if stereo { 2 } else { 1 }
+        let normOffset = m * celtEBands[start]
+        let norm = celtNormBase
+        let norm2 = celtNorm2Base
+        var lowbandScratch = m * celtEBands[20]
+        var lowbandOffset = 0
+        var updateLowband = true
+        var dualStereo = dualStereoIn
+        var balance = balanceIn
+        intensity = intensityIn
+        seed = seedIn
+        spread = spreadMode
+        avoidSplitNoise = bb > 1
+        for i in start..end {
+            band = i
+            let last = i == end - 1
+            let x = m * celtEBands[i]
+            let y = if stereo { nFrame + m * celtEBands[i] } else { -1 }
+            let n = m * celtEBands[i + 1] - m * celtEBands[i]
+            let tell = rc.tellFrac()
+            if i != start {
+                balance -= tell
+            }
+            remainingBits = totalBits - tell - 1
+            var b = 0
+            if i <= codedBands - 1 {
+                let currBalance = balance / min(3, codedBands - i)
+                b = max(0, min(16383, min(remainingBits + 1, pulses[i] + currBalance)))
+            }
+            if (m * celtEBands[i] - n >= m * celtEBands[start] || i == start + 1) && (updateLowband || lowbandOffset == 0) {
+                lowbandOffset = i
+            }
+            if i == start + 1 {
+                // special_hybrid_folding: duplicate enough of the first
+                // band's folding data to fold the second band.
+                let n1 = m * (celtEBands[start + 1] - celtEBands[start])
+                let n2 = m * (celtEBands[start + 2] - celtEBands[start + 1])
+                if n2 > n1 {
+                    for j in 0..(n2 - n1) {
+                        w[norm + n1 + j] = w[norm + 2 * n1 - n2 + j]
+                    }
+                    if dualStereo != 0 {
+                        for j in 0..(n2 - n1) {
+                            w[norm2 + n1 + j] = w[norm2 + 2 * n1 - n2 + j]
+                        }
+                    }
+                }
+            }
+            tfChange = tfRes[i]
+            if last {
+                lowbandScratch = -1
+            }
+            var xcm = 0
+            var ycm = 0
+            var effectiveLowband = -1
+            if lowbandOffset != 0 && (spreadMode != 3 || bb > 1 || tfChange < 0) {
+                // A conservative collapse mask for the bands we fold from.
+                effectiveLowband = max(0, m * celtEBands[lowbandOffset] - normOffset - n)
+                var foldStart = lowbandOffset
+                while true {
+                    foldStart -= 1
+                    if m * celtEBands[foldStart] <= effectiveLowband + normOffset {
+                        break
+                    }
+                }
+                var foldEnd = lowbandOffset - 1
+                while true {
+                    foldEnd += 1
+                    if !(foldEnd < i && m * celtEBands[foldEnd] < effectiveLowband + normOffset + n) {
+                        break
+                    }
+                }
+                var fi = foldStart
+                while true {
+                    xcm = xcm | collapse[fi * c]
+                    ycm = ycm | collapse[fi * c + c - 1]
+                    fi += 1
+                    if fi >= foldEnd {
+                        break
+                    }
+                }
+            } else {
+                xcm = (1 << bb) - 1
+                ycm = xcm
+            }
+            if dualStereo != 0 && i == intensity {
+                // Switch off dual stereo to do intensity.
+                dualStereo = 0
+                for j in 0..(m * celtEBands[i] - normOffset) {
+                    w[norm + j] = 0.5 * (w[norm + j] + w[norm2 + j])
+                }
+            }
+            let lowOut = if last { -1 } else { norm + m * celtEBands[i] - normOffset }
+            if dualStereo != 0 {
+                let lb = if effectiveLowband != -1 { norm + effectiveLowband } else { -1 }
+                xcm = quantBand(rc: rc, x: x, n: n, b: b / 2, bbIn: bb, lowbandIn: lb, lm: lm, lowbandOut: lowOut, gain: 1.0, lowbandScratch: lowbandScratch, fillIn: xcm)
+                let lb2 = if effectiveLowband != -1 { norm2 + effectiveLowband } else { -1 }
+                let lowOut2 = if last { -1 } else { norm2 + m * celtEBands[i] - normOffset }
+                ycm = quantBand(rc: rc, x: y, n: n, b: b / 2, bbIn: bb, lowbandIn: lb2, lm: lm, lowbandOut: lowOut2, gain: 1.0, lowbandScratch: lowbandScratch, fillIn: ycm)
+            } else {
+                let lb = if effectiveLowband != -1 { norm + effectiveLowband } else { -1 }
+                if stereo {
+                    xcm = quantBandStereo(rc: rc, x: x, y: y, n: n, bIn: b, bb: bb, lowband: lb, lm: lm, lowbandOut: lowOut, lowbandScratch: lowbandScratch, fillIn: xcm | ycm)
+                } else {
+                    xcm = quantBand(rc: rc, x: x, n: n, b: b, bbIn: bb, lowbandIn: lb, lm: lm, lowbandOut: lowOut, gain: 1.0, lowbandScratch: lowbandScratch, fillIn: xcm | ycm)
+                }
+                ycm = xcm
+            }
+            collapse[i * c] = xcm & 0xFF
+            collapse[i * c + c - 1] = ycm & 0xFF
+            balance += pulses[i] + tell
+            // Update the folding position only while there is 1 bit per
+            // sample of depth.
+            updateLowband = b > (n << 3)
+            avoidSplitNoise = false
+        }
+    }
+
+    // anti_collapse (section 4.3.5): noise into short blocks that got no
+    // pulses in a transient frame.
+    fn antiCollapse(lm: Int, stereo: Bool, size: Int, start: Int, end: Int, logE: [Float], prev1logE: [Float], prev2logE: [Float], pulses: [Int], seedIn: Int) -> Int {
+        var s = seedIn
+        let c = if stereo { 2 } else { 1 }
+        for i in start..end {
+            let n0 = celtEBands[i + 1] - celtEBands[i]
+            let depth = ((1 + pulses[i]) / n0) >> lm
+            let thresh = 0.5 * celtExp2(-0.125 * Float(depth))
+            let sqrt1 = 1.0 / sqrt(Float(n0 << lm))
+            for ch in 0..c {
+                var prev1 = prev1logE[ch * 21 + i]
+                var prev2 = prev2logE[ch * 21 + i]
+                if c == 1 {
+                    prev1 = max(prev1, prev1logE[21 + i])
+                    prev2 = max(prev2, prev2logE[21 + i])
+                }
+                var ediff = logE[ch * 21 + i] - min(prev1, prev2)
+                ediff = max(0.0, ediff)
+                var r = 2.0 * celtExp2(-ediff)
+                if lm == 3 {
+                    r *= 1.41421356
+                }
+                r = min(thresh, r)
+                r = r * sqrt1
+                let x = ch * size + (celtEBands[i] << lm)
+                var renorm = false
+                for k in 0..(1 << lm) {
+                    if collapse[i * c + ch] & (1 << k) == 0 {
+                        for j in 0..n0 {
+                            s = celtLcgRand(s)
+                            w[x + (j << lm) + k] = if s & 0x8000 != 0 { r } else { -r }
+                        }
+                        renorm = true
+                    }
+                }
+                if renorm {
+                    renormalise(x, n0 << lm, 1.0)
+                }
+            }
+        }
+        s
+    }
+}
+
+fn celtZerosI(_ n: Int) -> [Int] {
+    var out: [Int] = []
+    for _ in 0..n {
+        out.append(0)
+    }
+    out
+}

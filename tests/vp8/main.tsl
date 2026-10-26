@@ -1,0 +1,499 @@
+// Tests of the VP8 decoder (module vp8): every picture of every clip must
+// have the md5 libvpx (and ffmpeg's VP8 decoder, which agrees with it)
+// gives it.
+//
+//   build/conformance/vp8theora/vp8/*.ivf  the libvpx test vectors
+//                          vp80-00-comprehensive-001…018, vp80-01-intra,
+//                          -02-inter, -03-segmentation, -04-partitions,
+//                          -05-sharpness, -06-smallsize with their .md5
+//                          files (tests/vp8/fixtures/conformance.sh
+//                          downloads them)
+//   tests/fixtures/vp8.webm, t.vp8.ivf     the shared fixtures, also read
+//                          through demux.open
+//   tests/vp8/fixtures/*.ivf  clips made with ffmpeg's libvpx encoder by
+//                          make.sh: token partitions, error resilient,
+//                          odd and tiny sizes, versions 1-3 (bilinear,
+//                          simple filter, full-pixel), sharpness, realtime
+//                          mode, lowest quantiser, alt-ref, a size change
+// plus damaged packets (must never stop the program), reset after a seek,
+// skipNonReference, the two-stage pipeline, streamInfo, and timings of
+// the parser and reconstructor at 720p and 1080p
+// (build/scratch/vp8theora/clips, made by make.sh).
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../../vp8"
+import "../../core"
+import "../../demux"
+import "../../testkit"
+
+struct T {
+    passed: Int = 0
+    total: Int = 0
+
+    fn check(_ ok: Bool, _ what: String) {
+        total += 1
+        if ok {
+            passed += 1
+        } else {
+            print("FAIL: {what}")
+        }
+    }
+}
+
+// An IVF file's frames.
+struct Ivf {
+    width: Int = 0
+    height: Int = 0
+    packets: [Data] = []
+}
+
+fn readIvf(_ path: String) -> Ivf {
+    var out = Ivf()
+    let d = readData(path) ?? Data()
+    if d.count < 32 {
+        return out
+    }
+    out.width = d.uint16(at: 12)
+    out.height = d.uint16(at: 14)
+    var at = d.uint16(at: 6)
+    while at + 12 <= d.count {
+        let sz = d.uint32(at: at)
+        at += 12
+        if at + sz > d.count {
+            break
+        }
+        out.packets.append(d.slice(from: at, to: at + sz))
+        at += sz
+    }
+    out
+}
+
+// md5s from an ffmpeg framemd5 file.
+fn framemd5(_ path: String) -> [String] {
+    var out: [String] = []
+    for line in (readFile(path) ?? "").lines() {
+        if line.hasPrefix("#") {
+            continue
+        }
+        let parts = line.split(",")
+        if parts.count >= 6 {
+            out.append(parts[5].trim())
+        }
+    }
+    out
+}
+
+// md5s from a libvpx .md5 file ("<md5>  <name>").
+fn vpxMd5(_ path: String) -> [String] {
+    var out: [String] = []
+    for line in (readFile(path) ?? "").lines() {
+        let parts = line.trim().split(" ")
+        if parts.count >= 1 && parts[0].count == 32 {
+            out.append(parts[0])
+        }
+    }
+    out
+}
+
+// What decoding a clip gave.
+struct Seen {
+    pictures: Int = 0
+    mismatches: Int = 0
+    firstBad: Int = -1
+    frames: Int = 0
+    hidden: Int = 0
+    keyframes: Int = 0
+    partitions: Int = 1
+    versions: Int = 0
+    simple: Bool = false
+    sizes: Int = 0
+    segmentation: Bool = false
+    goldenUpdates: Int = 0
+    warnings: Int = 0
+    width: Int = 0
+    height: Int = 0
+}
+
+// Decodes packets through the two stages, comparing each picture's md5.
+fn decodeAll(_ packets: [Data], _ want: [String]) -> Seen {
+    var s = Seen()
+    var pl = vp8.newPipeline(core.Track(index: 0, kind: .video, codec: "vp8")).value() ?? vp8.Pipeline()
+    var lastW = 0
+    for (i, pk) in packets.enumerated() {
+        let step = vp8.parseStep(pl.parser, pk, pts: i, dts: i, key: false)
+        pl.parser = step.parser
+        for f in step.frames {
+            if f.kind != 0 {
+                continue
+            }
+            let h = f.hdr
+            s.frames += 1
+            if !h.show {
+                s.hidden += 1
+            }
+            if h.keyframe {
+                s.keyframes += 1
+            }
+            s.partitions = max(s.partitions, h.partitions)
+            s.versions = s.versions | (1 << h.version)
+            if h.simpleFilter && h.filterLevel > 0 {
+                s.simple = true
+            }
+            if h.segmentation {
+                s.segmentation = true
+            }
+            if !h.keyframe && (h.refreshGolden || h.copyGolden != 0) {
+                s.goldenUpdates += 1
+            }
+            if h.width != lastW {
+                s.sizes += 1
+                lastW = h.width
+            }
+        }
+        let rs = vp8.reconstructStep(pl.reconstructor, step.frames)
+        pl.reconstructor = rs.reconstructor
+        for p in rs.pictures {
+            let got = testkit.pictureMd5(p)
+            if s.pictures >= want.count || got != want[s.pictures] {
+                s.mismatches += 1
+                if s.firstBad < 0 {
+                    s.firstBad = s.pictures
+                }
+            }
+            s.pictures += 1
+            s.width = p.width
+            s.height = p.height
+        }
+    }
+    s.warnings = pl.parser.warnings.count + pl.reconstructor.warnings.count
+    s
+}
+
+// The packets of the first video track of a file read with demux.open.
+struct Opened {
+    ok: Bool = false
+    track: core.Track = core.Track(index: 0, kind: .video, codec: "")
+    packets: [Data] = []
+    pts: [Int] = []
+    keys: [Bool] = []
+}
+
+fn openVideo(_ path: String) -> Opened {
+    var o = Opened()
+    let file = readData(path) ?? Data()
+    let media = demux.open(file, name: path).value() ?? core.Media()
+    var vt = -1
+    for tr in media.tracks {
+        if tr.kind == .video && vt < 0 {
+            vt = tr.index
+            o.track = tr
+        }
+    }
+    if vt < 0 {
+        return o
+    }
+    o.ok = true
+    for p in media.packets {
+        if p.track == vt {
+            o.packets.append(core.packetBytes(file, media, p))
+            o.pts.append(p.pts)
+            o.keys.append(p.key)
+        }
+    }
+    o
+}
+
+// Milliseconds per picture of parse and reconstruct over a clip.
+struct Timing {
+    pictures: Int = 0
+    parseMs: Float = 0.0
+    reconMs: Float = 0.0
+    mismatches: Int = 0
+    predMs: Float = 0.0
+    filterMs: Float = 0.0
+    modesMs: Float = 0.0
+    tokensMs: Float = 0.0
+}
+
+fn timeClip(_ path: String, _ want: [String]) -> Timing {
+    var tm = Timing()
+    let ivf = readIvf(path)
+    var p = vp8.newPipeline(core.Track(index: 0, kind: .video, codec: "vp8")).value() ?? vp8.Pipeline()
+    var tp = 0.0
+    var tr = 0.0
+    for (i, pk) in ivf.packets.enumerated() {
+        let t0 = now()
+        let frames = p.parser.parse(pk, pts: i, dts: i, key: false)
+        let t1 = now()
+        var pics: [core.Picture] = []
+        for f in frames {
+            pics += p.reconstructor.reconstruct(f)
+        }
+        let t2 = now()
+        tp += t1 - t0
+        tr += t2 - t1
+        for pic in pics {
+            if tm.pictures >= want.count || testkit.pictureMd5(pic) != want[tm.pictures] {
+                tm.mismatches += 1
+            }
+            tm.pictures += 1
+        }
+    }
+    let n = Float(max(tm.pictures, 1))
+    tm.parseMs = tp * 1000.0 / n
+    tm.reconMs = tr * 1000.0 / n
+    tm.predMs = p.reconstructor.tPred * 1000.0 / n
+    tm.filterMs = p.reconstructor.tFilter * 1000.0 / n
+    tm.modesMs = p.parser.tModes * 1000.0 / n
+    tm.tokensMs = p.parser.tTokens * 1000.0 / n
+    tm
+}
+
+fn fmt(_ v: Float) -> String {
+    let r = Int(round(v * 10.0))
+    "{r / 10}.{r % 10}"
+}
+
+fn main() {
+    var t = T()
+
+    // ---- the libvpx test vectors ----
+    let cdir = "build/conformance/vp8theora/vp8"
+    var vectors = 0
+    var vectorsOk = 0
+    for line in (readFile(joinPath(cdir, "names.txt")) ?? "").lines() {
+        let name = line.trim()
+        if name.isEmpty {
+            continue
+        }
+        let path = joinPath(cdir, name + ".ivf")
+        let ivf = readIvf(path)
+        let want = vpxMd5(path + ".md5")
+        let s = decodeAll(ivf.packets, want)
+        vectors += 1
+        let ok = want.count > 0 && s.pictures == want.count && s.mismatches == 0
+        if ok {
+            vectorsOk += 1
+        }
+        t.check(ok, "{name}: {s.pictures} pictures, {s.mismatches} md5 mismatches (first {s.firstBad}) of {want.count}")
+        if name == "vp80-04-partitions-1405" {
+            t.check(s.partitions > 1, "{name} has several token partitions ({s.partitions})")
+        }
+        if name == "vp80-03-segmentation-1401" {
+            t.check(s.segmentation, "{name} uses segmentation")
+        }
+    }
+    t.check(vectors >= 61, "conformance vectors present ({vectors}): run tests/vp8/fixtures/conformance.sh")
+    print("vp8 conformance: {vectorsOk} of {vectors} vectors bit-exact")
+
+    // ---- the shared fixtures, through demux.open ----
+    let webm = openVideo(joinPath(testkit.fixtures, "vp8.webm"))
+    let wantWebm = testkit.frameMd5s("vp8.webm")
+    t.check(webm.ok && webm.track.codec == "vp8", "vp8.webm opens with a vp8 track")
+    if webm.ok {
+        var d = vp8.newDecoder(webm.track).value() ?? vp8.Decoder()
+        var n = 0
+        var same = 0
+        var ptsOk = true
+        for (i, pk) in webm.packets.enumerated() {
+            for p in d.decode(pk, pts: webm.pts[i], dts: webm.pts[i], key: webm.keys[i]) {
+                if n < wantWebm.count && testkit.pictureMd5(p) == wantWebm[n] {
+                    same += 1
+                }
+                if p.pts != webm.pts[i] {
+                    ptsOk = false
+                }
+                if n == 0 {
+                    t.check(p.key && p.depth == 8 && p.chroma == .yuv420 && p.width == 320 && p.height == 240, "first picture: key, 8-bit 4:2:0 320×240")
+                    t.check(p.matrix == .bt601, "matrix BT.601")
+                }
+                n += 1
+            }
+        }
+        t.check(same == wantWebm.count && n == wantWebm.count && wantWebm.count > 0, "vp8.webm: {same} of {wantWebm.count} pictures right ({n} decoded)")
+        t.check(ptsOk, "pictures carry their packet's pts")
+        let info = vp8.streamInfo(webm.track)
+        t.check(info == "VP8, 320×240", "streamInfo: \"{info}\"")
+        let fi = vp8.frameInfo(webm.packets[0])
+        t.check(fi == "VP8 version 0, 320×240", "frameInfo: \"{fi}\"")
+        // Reset: a seek into the middle shows nothing until a keyframe,
+        // then decoding from the start again is right.
+        d.reset()
+        var afterReset = 0
+        for (i, pk) in webm.packets.enumerated() {
+            if i >= 5 && !webm.keys[i] {
+                afterReset += d.decode(pk, pts: i, dts: i, key: false).count
+            }
+        }
+        t.check(afterReset == 0, "after reset nothing is shown before a keyframe ({afterReset})")
+        d.reset()
+        var again = 0
+        for (i, pk) in webm.packets.enumerated() {
+            for p in d.decode(pk, pts: i, dts: i, key: webm.keys[i]) {
+                if again < wantWebm.count && testkit.pictureMd5(p) == wantWebm[again] {
+                    again += 1
+                }
+            }
+        }
+        t.check(again == wantWebm.count, "after reset, decoding from the keyframe: {again} of {wantWebm.count} right")
+        t.check(d.flush().isEmpty, "flush holds nothing")
+    }
+    let tivf = openVideo(joinPath(testkit.fixtures, "t.vp8.ivf"))
+    let wantT = framemd5("tests/vp8/fixtures/t.vp8.ivf.framemd5")
+    t.check(tivf.ok && tivf.track.codec == "vp8", "t.vp8.ivf opens with a vp8 track")
+    if tivf.ok {
+        let s = decodeAll(tivf.packets, wantT)
+        t.check(s.pictures == wantT.count && s.mismatches == 0 && wantT.count > 0, "t.vp8.ivf: {s.pictures} pictures, {s.mismatches} md5 mismatches of {wantT.count}")
+    }
+
+    // ---- the basic clip remuxed into Matroska and AVI, via demux.open ----
+    let wantBasic = framemd5("tests/vp8/fixtures/vp8_basic.ivf.framemd5")
+    for c in ["mkv", "avi"] {
+        let o = openVideo("tests/vp8/fixtures/vp8_basic." + c)
+        t.check(o.ok && o.track.codec == "vp8", "vp8_basic.{c} opens with a vp8 track ({o.track.codec})")
+        if o.ok {
+            let s = decodeAll(o.packets, wantBasic)
+            t.check(s.pictures == wantBasic.count && s.mismatches == 0 && wantBasic.count > 0, "vp8_basic.{c}: {s.pictures} pictures, {s.mismatches} md5 mismatches of {wantBasic.count}")
+        }
+    }
+
+    // ---- the clips made by tests/vp8/fixtures/make.sh ----
+    let fx = "tests/vp8/fixtures"
+    let clips = ["vp8_basic", "vp8_parts", "vp8_errres", "vp8_odd", "vp8_tiny", "vp8_profile1", "vp8_profile2",
+                 "vp8_profile3", "vp8_sharp", "vp8_rt", "vp8_layers", "vp8_lowq", "vp8_altref", "vp8_sizes"]
+    for name in clips {
+        let path = joinPath(fx, name + ".ivf")
+        if !fileExists(path) {
+            t.check(false, "{name}.ivf is missing: run tests/vp8/fixtures/make.sh")
+            continue
+        }
+        let ivf = readIvf(path)
+        let w = framemd5(path + ".framemd5")
+        let s = decodeAll(ivf.packets, w)
+        t.check(s.pictures == w.count && s.mismatches == 0 && w.count > 0, "{name}: {s.pictures} pictures, {s.mismatches} md5 mismatches (first {s.firstBad}) of {w.count}")
+        if name == "vp8_parts" {
+            t.check(s.partitions == 8, "{name} has 8 token partitions ({s.partitions})")
+        }
+        if name == "vp8_tiny" {
+            t.check(s.width == 17 && s.height == 9, "{name} is 17×9 ({s.width}×{s.height})")
+        }
+        if name == "vp8_odd" {
+            t.check(s.width == 333 && s.height == 177, "{name} is 333×177 ({s.width}×{s.height})")
+        }
+        if name == "vp8_profile1" {
+            t.check(s.versions == 2 && s.simple, "{name} is version 1 with the simple loop filter")
+        }
+        if name == "vp8_profile2" {
+            t.check(s.versions == 4, "{name} is version 2")
+        }
+        if name == "vp8_profile3" {
+            t.check(s.versions == 8, "{name} is version 3 (full-pixel chroma)")
+        }
+        if name == "vp8_altref" {
+            t.check(s.hidden > 0 || s.goldenUpdates > 0, "{name} has hidden alt-ref frames or golden updates ({s.hidden}, {s.goldenUpdates})")
+        }
+        if name == "vp8_sizes" {
+            t.check(s.sizes == 2, "{name} changes size ({s.sizes} sizes)")
+        }
+    }
+
+    // ---- damage never stops the program ----
+    let base = readIvf(joinPath(fx, "vp8_altref.ivf"))
+    if base.packets.count > 10 {
+        var d = vp8.Decoder()
+        var shown = 0
+        var seed = 12345
+        for (i, pk) in base.packets.enumerated() {
+            var bytes = pk.bytes
+            if i % 3 == 1 {
+                for _ in 0..8 {
+                    seed = (seed * 1103515245 + 12345) & 0x7fffffff
+                    let at = 3 + seed % max(1, bytes.count - 3)
+                    if at < bytes.count {
+                        bytes[at] = (bytes[at] ^ (seed >> 8)) & 255
+                    }
+                }
+            }
+            if i % 7 == 3 {
+                bytes = bytes.prefix(bytes.count / 3)
+            }
+            if i % 11 == 5 {
+                bytes = []
+            }
+            shown += d.decode(Data(bytes: bytes), pts: i, dts: i, key: false).count
+        }
+        t.check(shown > 0 && !d.warnings.isEmpty, "damaged packets: decoding went on ({shown} pictures, {d.warnings.count} warnings)")
+        var g = vp8.Decoder()
+        for n in 0..300 {
+            var b: [Int] = []
+            for _ in 0..(n * 7 % 400) {
+                seed = (seed * 1103515245 + 12345) & 0x7fffffff
+                b.append((seed >> 7) & 255)
+            }
+            if n % 4 == 0 && b.count > 10 {
+                // A plausible keyframe header with random contents.
+                b[0] = b[0] & 0xf0
+                b[3] = 0x9d
+                b[4] = 0x01
+                b[5] = 0x2a
+                b[7] = b[7] & 0x0f
+                b[9] = b[9] & 0x0f
+            }
+            g.decode(Data(bytes: b), pts: n, dts: n, key: false)
+        }
+        t.check(true, "random packets: no crash")
+        var k = vp8.Decoder()
+        var kp = 0
+        for (i, pk) in base.packets.enumerated() {
+            let b = if i == 0 { pk.slice(from: 0, to: pk.count / 2) } else { pk }
+            kp += k.decode(b, pts: i, dts: i, key: i == 0).count
+        }
+        t.check(true, "truncated keyframe: {kp} pictures, no crash")
+        // A frame of zero bytes shows nothing.
+        var z = vp8.Decoder()
+        z.decode(base.packets[0], pts: 0, dts: 0, key: true)
+        t.check(z.decode(Data(), pts: 1, dts: 1, key: false).isEmpty, "an empty packet shows nothing")
+    }
+
+    // ---- skipNonReference: frames that refresh no reference ----
+    let rt = readIvf(joinPath(fx, "vp8_layers.ivf"))
+    if rt.packets.count > 0 {
+        var all = vp8.Decoder()
+        var skipping = vp8.Decoder()
+        skipping.skipNonReference = true
+        var a = 0
+        var b = 0
+        for (i, pk) in rt.packets.enumerated() {
+            a += all.decode(pk, pts: i, dts: i, key: false).count
+            b += skipping.decode(pk, pts: i, dts: i, key: false).count
+        }
+        t.check(b < a && b > 0, "skipNonReference: {b} of {a} pictures decoded")
+    }
+
+    // ---- not a VP8 track ----
+    let bad = vp8.newDecoder(core.Track(index: 0, kind: .video, codec: "vp9"))
+    t.check(bad.value() == nil, "newDecoder refuses a vp9 track")
+
+    // ---- timings ----
+    let cl = "build/scratch/vp8theora/clips"
+    for name in ["t720", "m720", "t1080", "m1080", "h1080"] {
+        let path = joinPath(cl, name + ".ivf")
+        if !fileExists(path) {
+            print("(no {path}: run tests/vp8/fixtures/make.sh for timings)")
+            continue
+        }
+        let tm = timeClip(path, framemd5(joinPath(cl, name + ".framemd5")))
+        t.check(tm.mismatches == 0 && tm.pictures > 0, "{name}: {tm.pictures} pictures, {tm.mismatches} md5 mismatches")
+        var size = if name.hasSuffix("720") { "720p" } else { "1080p" }
+        if name == "h1080" {
+            size = "1080p 8 Mbit/s"
+        }
+        print("time vp8 {size} ({name}) parse: {fmt(tm.parseMs)} ms per picture (modes {fmt(tm.modesMs)}, tokens {fmt(tm.tokensMs)})")
+        print("time vp8 {size} ({name}) reconstruct: {fmt(tm.reconMs)} ms per picture (prediction+residual {fmt(tm.predMs)}, loop filter {fmt(tm.filterMs)})")
+        print("time vp8 {size} ({name}): {fmt(tm.parseMs + tm.reconMs)} ms per picture")
+    }
+
+    print("vp8: {t.passed} of {t.total} passed")
+}

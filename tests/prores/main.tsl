@@ -1,0 +1,191 @@
+// Tests for the ProRes decoder: clips made by ffmpeg's two ProRes encoders
+// (tests/prores/fixtures, from tests/prores/make_fixtures.sh: prores_ks
+// profiles 0 to 5, prores_aw, odd sizes, interlaced top and bottom field
+// first, 4444 with alpha) and Apple-made FATE samples
+// (build/conformance/pro, when downloaded) against ffmpeg's framemd5,
+// all opened through demux.open (MOV); damaged packets; and the time per
+// picture at 1080p and 4K (build/scratch/pro/big, when made).
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../../core"
+import "../../testkit"
+import "../../demux"
+import "../../prores"
+
+struct Run {
+    ok: Bool = false
+    pictures: Int = 0
+    same: Int = 0
+    refs: Int = 0
+    ms: Float = 0.0
+    warnings: Int = 0
+    width: Int = 0
+    height: Int = 0
+    depth: Int = 0
+    chroma: core.Chroma = .yuv420
+    firstBad: Int = -1
+    info: String = ""
+}
+
+// The md5 column of an ffmpeg framemd5 file.
+fn md5sAt(_ path: String) -> [String] {
+    let text = readFile(path) ?? ""
+    var out: [String] = []
+    for line in text.lines() {
+        if line.hasPrefix("#") || line.trim().isEmpty {
+            continue
+        }
+        let parts = line.split(",")
+        if parts.count >= 6 {
+            out.append(parts[5].trim())
+        }
+    }
+    out
+}
+
+// Opens a MOV through demux.open, decodes its video track and compares
+// every picture with ffmpeg's md5 (path + ".framemd5").
+fn runFile(_ path: String, _ timeOnly: Bool = false) -> Run {
+    var r = Run()
+    let file = readData(path) ?? Data()
+    if file.isEmpty {
+        return r
+    }
+    let media = demux.open(file, name: path).value() ?? core.Media(format: "", duration: -1.0)
+    var vt = -1
+    for t in media.tracks {
+        if t.kind == .video && t.codec == "prores" {
+            vt = t.index
+            break
+        }
+    }
+    if vt < 0 {
+        return r
+    }
+    let track = media.tracks[vt]
+    r.info = prores.streamInfo(track)
+    var dec = prores.newDecoder(track).value() ?? prores.Decoder()
+    let md5s = md5sAt(path + ".framemd5")
+    r.refs = md5s.count
+    var t = 0.0
+    var pts: [Int] = []
+    for p in media.packets {
+        if p.track != vt {
+            continue
+        }
+        let bytes = core.packetBytes(file, media, p)
+        let t0 = now()
+        let pics = dec.decode(bytes, pts: p.pts, dts: p.dts, key: p.key)
+        t += now() - t0
+        for pic in pics {
+            if r.pictures < md5s.count && !timeOnly {
+                if testkit.pictureMd5(pic) == md5s[r.pictures] {
+                    r.same += 1
+                } else if r.firstBad < 0 {
+                    r.firstBad = r.pictures
+                }
+            }
+            pts.append(pic.pts)
+            r.width = pic.width
+            r.height = pic.height
+            r.depth = pic.depth
+            r.chroma = pic.chroma
+            r.pictures += 1
+        }
+    }
+    r.ms = t * 1000.0
+    r.warnings = dec.warnings.count
+    for w in dec.warnings {
+        print("  warning: {w}")
+        break
+    }
+    r.ok = true
+    r
+}
+
+fn fmt(_ x: Float) -> String {
+    x.formatted(decimals: 2)
+}
+
+fn main() {
+    var passed = 0
+    var total = 0
+    fn check(_ ok: Bool, _ what: String) {
+        total += 1
+        if ok { passed += 1 } else { print("FAIL: {what}") }
+    }
+
+    // ---- ffmpeg-made clips ----
+    let dir = "tests/prores/fixtures/"
+    let own = ["ks0.mov", "ks1.mov", "ks2.mov", "ks3.mov", "ks4.mov", "ks5.mov", "odd.mov", "hiq.mov", "aw3.mov", "aw4.mov", "tff.mov", "bff.mov", "il444.mov", "alpha.mov"]
+    for name in own {
+        let r = runFile(dir + name)
+        print("{name}: {r.pictures} pictures {r.width}×{r.height} {r.depth}-bit, md5 same {r.same} of {r.refs} ({r.info})")
+        check(r.ok && r.refs > 0 && r.pictures == r.refs && r.same == r.refs && r.warnings == 0, "{name}: bit-exact with ffmpeg (first different picture {r.firstBad})")
+    }
+    // Picture facts.
+    let f0 = readData(dir + "ks3.mov") ?? Data()
+    let m0 = demux.open(f0, name: "ks3.mov").value() ?? core.Media(format: "", duration: -1.0)
+    if m0.tracks.count > 0 && m0.packets.count > 1 {
+        let tr = m0.tracks[0]
+        var dec = prores.newDecoder(tr).value() ?? prores.Decoder()
+        let pics = dec.decode(core.packetBytes(f0, m0, m0.packets[1]), pts: m0.packets[1].pts, dts: m0.packets[1].dts, key: true)
+        check(pics.count == 1, "ks3: one picture per packet")
+        if let p = pics.first {
+            check(p.key && p.pts == m0.packets[1].pts && p.chroma == .yuv422 && p.depth == 10, "ks3: key, pts, 4:2:2 10-bit")
+            check(p.cStride * 2 == p.yStride && p.width == 208 && p.height == 112, "ks3: plane strides and size")
+            check(p.matrix == .bt601 || p.matrix == .bt709, "ks3: matrix {p.matrix}")
+            check(p.duration > 0, "ks3: duration {p.duration}")
+        }
+        check(dec.vendor == "Lavc", "ks3: vendor {dec.vendor}")
+        // Damage: a cut packet, garbage, and an empty one never stop the
+        // decoder; it shows the previous picture and warns.
+        let whole = core.packetBytes(f0, m0, m0.packets[0])
+        let cut = whole.slice(from: 0, to: whole.count / 2)
+        var junk = whole.slice(from: 0, to: 200)
+        for i in 0..2000 {
+            junk.append(byte: (i * 7919) & 255)
+        }
+        junk = junk + whole.slice(from: 2200, to: whole.count)
+        let w0 = dec.warnings.count
+        let a = dec.decode(cut, pts: 5, dts: 5, key: true)
+        let b = dec.decode(junk, pts: 6, dts: 6, key: true)
+        let c = dec.decode(Data(), pts: 7, dts: 7, key: true)
+        check(a.count == 1 && b.count == 1 && c.count == 1 && dec.warnings.count >= w0 + 2, "damaged packets: concealed with warnings ({dec.warnings.count - w0})")
+        let again = dec.decode(whole, pts: 8, dts: 8, key: true)
+        let md5s = md5sAt(dir + "ks3.mov.framemd5")
+        check(again.count == 1 && testkit.pictureMd5(again[0]) == md5s[0], "after damage the next frame is right again")
+        dec.reset()
+        check(dec.flush().isEmpty, "flush gives nothing (intra only)")
+    }
+    check(prores.streamInfo(core.Track(index: 0, kind: .video, codec: "prores", tag: "apch", width: 1920, height: 1080)) == "ProRes 422 HQ, 1920×1080, 10-bit 4:2:2", "streamInfo")
+    check(prores.newDecoder(core.Track(index: 0, kind: .video, codec: "h264")).value() == nil, "refuses other codecs")
+
+    // ---- FATE samples (Apple's encoder) ----
+    let conf = "build/conformance/pro/"
+    let fate = ["Sequence_1-Apple_ProRes_422_Proxy.mov", "Sequence_1-Apple_ProRes_422_LT.mov", "Sequence_1-Apple_ProRes_422.mov", "Sequence_1-Apple_ProRes_422_HQ.mov", "Sequence_1-Apple_ProRes_with_Alpha.mov", "prores4444_with_transparency.mov", "gray.mov"]
+    for name in fate {
+        let r = runFile(conf + name)
+        if !r.ok {
+            print("{name}: not there (skipped)")
+            continue
+        }
+        print("{name}: {r.pictures} pictures {r.width}×{r.height} {r.depth}-bit, md5 same {r.same} of {r.refs}; {fmt(r.ms / Float(max(1, r.pictures)))} ms each")
+        check(r.refs > 0 && r.pictures == r.refs && r.same == r.refs, "{name}: bit-exact with ffmpeg (first different picture {r.firstBad})")
+    }
+
+    // ---- Speed ----
+    let big = "build/scratch/pro/big/"
+    for name in ["prores_422_1080.mov", "prores_hq_1080.mov", "prores_4444_1080.mov", "prores_hq_2160.mov"] {
+        let r = runFile(big + name)
+        if !r.ok {
+            continue
+        }
+        check(r.same == r.refs && r.pictures == r.refs, "{name}: bit-exact")
+        print("time prores {name} per {r.width}×{r.height} picture: {fmt(r.ms / Float(max(1, r.pictures)))} ms")
+    }
+
+    print("prores: {passed} of {total} passed")
+}

@@ -1,0 +1,497 @@
+// Tests for the HEVC decoder (module hevc): every picture of the HEVC
+// fixtures must match its reference md5 bit for bit (ffmpeg's framemd5, or
+// the HM reference decoder's where ffmpeg 8.1 is known to differ); the two
+// stages (Parser, Reconstructor) run separately must give the same; random
+// access after reset() at a CRA picture drops its RASL pictures;
+// skipNonReference drops only pictures nothing refers to; damaged data
+// never stops the program; spsInfo describes the stream; and, when they
+// were downloaded into build/conformance/hevc, the JCT-VC HEVC_v1
+// conformance bitstreams. Prints per-picture times of 1080p x265 clips.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../../hevc"
+import "../../core"
+import "../../testkit"
+
+let hevcFixtures = "tests/hevc/fixtures"
+let hevcConformance = "build/conformance/hevc"
+
+struct HevcChecks {
+    passed: Int = 0
+    total: Int = 0
+
+    fn check(_ ok: Bool, _ what: String) {
+        total += 1
+        if ok {
+            passed += 1
+        } else {
+            print("FAIL: {what}")
+        }
+    }
+}
+
+fn main() {
+    var c = HevcChecks()
+    hevcTestContainer(c, "hevc.mp4", "Main @ L2, 320×240, 4:2:0 8-bit")
+    hevcTestContainer(c, "../hevc/fixtures/hevc10.mkv", "Main 10 @ L2, 320×240, 4:2:0 10-bit")
+    hevcTestFixtures(c)
+    hevcTestStages(c)
+    hevcTestRandomAccess(c)
+    hevcTestSkipNonReference(c)
+    hevcTestDamage(c)
+    hevcTestDamageMp4(c)
+    hevcTestConformance(c)
+    print("hevc: {c.passed} of {c.total} passed")
+}
+
+// Container fixtures (the shared MP4 and our MKV): hvcC setup,
+// length-prefixed packets with container pts, spsInfo.
+fn hevcTestContainer(_ c: bind HevcChecks, _ name: String, _ info: String) {
+    let file = testkit.fixture(name)
+    let ref = testkit.loadRef(name)
+    var media = testkit.mediaFromRef(file, ref)
+    if ref.format.hasPrefix("matroska") {
+        // ffprobe's pos is the Block body (track number vint, timecode,
+        // flags); its size is the frame's. testkit's skipBlockHeaders also
+        // shortens the packet (build/NEEDED.md), so skip the header here.
+        for p in media.packets {
+            if p.offset < file.count {
+                let first = file[p.offset]
+                var len = 1
+                while len < 8 && (first & (0x80 >> (len - 1))) == 0 {
+                    len += 1
+                }
+                p.offset += len + 3
+            }
+        }
+    }
+    let md5s = testkit.frameMd5s(name)
+    var vt = -1
+    for t in media.tracks {
+        if t.kind == .video && vt < 0 {
+            vt = t.index
+        }
+    }
+    if vt < 0 || md5s.isEmpty {
+        c.check(false, "{name}: no video track or reference")
+        return
+    }
+    let got = hevc.spsInfo(media.tracks[vt])
+    c.check(got == info, "{name}: spsInfo \"{got}\"")
+    let conf = hevc.parseHvcC(media.tracks[vt].extra)
+    c.check(conf.valid && conf.lengthSize == 4 && conf.nals.count >= 3, "{name}: hvcC valid {conf.valid}, length size {conf.lengthSize}, {conf.nals.count} NAL units")
+    let made = hevc.newDecoder(media.tracks[vt])
+    c.check(made.isOk(), "{name}: newDecoder failed")
+    var dec = made.value() ?? hevc.Decoder()
+    var sums: [String] = []
+    var keys = 0
+    var pts: [Int] = []
+    for p in media.packets {
+        if p.track != vt {
+            continue
+        }
+        for pic in dec.decode(core.packetBytes(file, media, p), pts: p.pts, dts: p.dts, key: p.key) {
+            sums.append(testkit.pictureMd5(pic))
+            pts.append(pic.pts)
+            if pic.key {
+                keys += 1
+            }
+        }
+    }
+    for pic in dec.flush() {
+        sums.append(testkit.pictureMd5(pic))
+        pts.append(pic.pts)
+    }
+    c.check(hevcSame(sums, md5s), "{name}: {hevcGood(sums, md5s)} of {md5s.count} pictures match ({sums.count} decoded)")
+    c.check(keys >= 1, "{name}: no picture marked key")
+    // With container presentation times, output order is display order.
+    var rising = true
+    for i in 1..max(1, pts.count) {
+        if pts[i] <= pts[i - 1] {
+            rising = false
+        }
+    }
+    c.check(rising, "{name}: pts don't rise in output order")
+}
+
+// Each picture's md5 of a reference file: ffmpeg's framemd5, or a plain
+// list of md5s (NAME.md5) which wins when present.
+fn hevcRefMd5s(_ path: String) -> [String] {
+    let plain = readFile(path + ".md5") ?? ""
+    var out: [String] = []
+    if plain != "" {
+        for line in plain.lines() {
+            let l = line.trim()
+            if !l.isEmpty && !l.hasPrefix("#") {
+                out.append(l)
+            }
+        }
+        return out
+    }
+    let text = readFile(path + ".framemd5") ?? ""
+    for line in text.lines() {
+        if line.hasPrefix("#") || line.trim().isEmpty {
+            continue
+        }
+        let parts = line.split(",")
+        if parts.count >= 6 {
+            out.append(parts[5].trim())
+        }
+    }
+    out
+}
+
+fn hevcSame(_ a: [String], _ b: [String]) -> Bool {
+    a.count == b.count && hevcGood(a, b) == b.count
+}
+
+fn hevcGood(_ a: [String], _ b: [String]) -> Int {
+    var n = 0
+    for i in 0..min(a.count, b.count) {
+        if a[i] == b[i] {
+            n += 1
+        }
+    }
+    n
+}
+
+// Start offsets of the access units of an Annex B stream (a new one at
+// each first slice of a picture, with the parameter sets and SEI before).
+fn hevcSplitAus(_ d: Data) -> [Int] {
+    var out: [Int] = []
+    var pending = -1
+    var i = 0
+    let n = d.count
+    while i + 5 < n {
+        if d[i] == 0 && d[i + 1] == 0 && d[i + 2] == 1 {
+            var s = i
+            if s > 0 && d[s - 1] == 0 {
+                s -= 1
+            }
+            let type = (d[i + 3] >> 1) & 63
+            if type < 32 {
+                if (d[i + 5] & 128) != 0 {
+                    out.append(if pending >= 0 { pending } else { s })
+                }
+                pending = -1
+            } else if pending < 0 && (type >= 32 && type <= 35 || type == 39) {
+                pending = s
+            }
+            i += 3
+        } else {
+            i += 1
+        }
+    }
+    if out.isEmpty {
+        out.append(0)
+    }
+    out[0] = 0
+    out
+}
+
+fn hevcAu(_ d: Data, _ aus: [Int], _ k: Int) -> Data {
+    let to = if k + 1 < aus.count { aus[k + 1] } else { d.count }
+    d.slice(from: aus[k], to: to)
+}
+
+// The NAL unit type of an access unit's first slice.
+fn hevcAuType(_ au: Data) -> Int {
+    var i = 0
+    while i + 4 < au.count {
+        if au[i] == 0 && au[i + 1] == 0 && au[i + 2] == 1 {
+            let t = (au[i + 3] >> 1) & 63
+            if t < 32 {
+                return t
+            }
+            i += 3
+        } else {
+            i += 1
+        }
+    }
+    -1
+}
+
+// Decodes an Annex B stream access unit by access unit; the md5 of each
+// picture output.
+fn hevcDecodeAll(_ d: Data, _ dec: bind hevc.Decoder) -> [String] {
+    var seconds = 0.0
+    return hevcDecodeTimed(d, dec, seconds)
+}
+
+// The same, adding the time spent decoding (not hashing) to seconds.
+fn hevcDecodeTimed(_ d: Data, _ dec: bind hevc.Decoder, _ seconds: bind Float) -> [String] {
+    let aus = hevcSplitAus(d)
+    var got: [String] = []
+    for k in 0..aus.count {
+        let t = now()
+        let pics = dec.decode(hevcAu(d, aus, k), pts: k, dts: k, key: false)
+        seconds += now() - t
+        for p in pics {
+            got.append(testkit.pictureMd5(p))
+        }
+    }
+    let t = now()
+    let pics = dec.flush()
+    seconds += now() - t
+    for p in pics {
+        got.append(testkit.pictureMd5(p))
+    }
+    got
+}
+
+fn hevcAnnexBDecoder() -> hevc.Decoder {
+    hevc.newDecoder(core.Track(index: 0, kind: .video, codec: "hevc")).value() ?? hevc.Decoder()
+}
+
+// Every stream in tests/hevc/fixtures, and the 1080p timings.
+fn hevcTestFixtures(_ c: bind HevcChecks) {
+    let names = (listFolder(hevcFixtures) ?? []).filter { n in n.hasSuffix(".hevc") }
+    c.check(names.count >= 20, "only {names.count} fixtures in {hevcFixtures} (run tests/hevc/make_fixtures.sh)")
+    for name in names {
+        let path = joinPath(hevcFixtures, name)
+        let d = readData(path) ?? Data()
+        let want = hevcRefMd5s(path)
+        var dec = hevcAnnexBDecoder()
+        dec.timing = true
+        var seconds = 0.0
+        let got = hevcDecodeTimed(d, dec, seconds)
+        let ms = seconds * 1000.0
+        c.check(want.count > 0 && hevcSame(got, want), "{name}: {hevcGood(got, want)} of {want.count} pictures match ({got.count} decoded)")
+        if name.hasPrefix("hevc_1080p") {
+            let depth = if name.hasSuffix("10.hevc") { "10-bit" } else { "8-bit" }
+            let n = Float(max(1, got.count))
+            print("time hevc 1080p {depth}: {Int(ms / n + 0.5)} ms per picture")
+            print("time hevc 1080p {depth} parse: {Int(dec.parseTime * 1000.0 / n + 0.5)} ms per picture")
+            print("time hevc 1080p {depth} reconstruct: {Int(dec.reconTime * 1000.0 / n + 0.5)} ms per picture")
+        }
+        if name == "hevc_1080p10.hevc" {
+            // spsInfo from in-stream parameter sets (an Annex B extra).
+            let aus = hevcSplitAus(d)
+            let first = hevcAu(d, aus, 0)
+            let info = hevc.spsInfo(core.Track(index: 0, kind: .video, codec: "hevc", extra: first))
+            c.check(info.hasPrefix("Main 10 @ L") && info.hasSuffix("1920×1080, 4:2:0 10-bit"), "{name}: spsInfo \"{info}\"")
+        }
+    }
+}
+
+// The two stages run separately (as the player pipelines them on two
+// cores) give the same pictures as the chained Decoder.
+fn hevcTestStages(_ c: bind HevcChecks) {
+    let name = "bframes.hevc"
+    let path = joinPath(hevcFixtures, name)
+    let d = readData(path) ?? Data()
+    let want = hevcRefMd5s(path)
+    var parser = hevc.newParser(core.Track(index: 0, kind: .video, codec: "hevc")).value() ?? hevc.Parser()
+    var parsed: [hevc.ParsedPicture] = []
+    let aus = hevcSplitAus(d)
+    for k in 0..aus.count {
+        parsed += parser.parse(hevcAu(d, aus, k), pts: k * 10, dts: k * 10, key: false)
+    }
+    parsed += parser.flush()
+    var recon = hevc.newReconstructor()
+    var got: [String] = []
+    var pts: [Int] = []
+    for p in parsed {
+        for pic in recon.reconstruct(p) {
+            got.append(testkit.pictureMd5(pic))
+            pts.append(pic.pts)
+        }
+    }
+    c.check(hevcSame(got, want), "stages on {name}: {hevcGood(got, want)} of {want.count} pictures match ({got.count} decoded)")
+    // Each picture carries the pts of its own packet: every packet's pts
+    // comes out once.
+    let sorted = pts.sorted()
+    var each = sorted.count == aus.count
+    for i in 0..min(sorted.count, aus.count) {
+        if sorted[i] != i * 10 {
+            each = false
+        }
+    }
+    c.check(each, "stages on {name}: pictures don't carry their packets' pts")
+}
+
+// After reset(), decoding from a CRA picture drops its RASL pictures and
+// gives the full decode's pictures from the CRA on.
+fn hevcTestRandomAccess(_ c: bind HevcChecks) {
+    let name = "open_gop.hevc"
+    let d = readData(joinPath(hevcFixtures, name)) ?? Data()
+    var full = hevcAnnexBDecoder()
+    let all = hevcDecodeAll(d, full)
+    let aus = hevcSplitAus(d)
+    var cras: [Int] = []
+    for k in 0..aus.count {
+        if hevcAuType(hevcAu(d, aus, k)) == 21 {
+            cras.append(k)
+        }
+    }
+    c.check(cras.count >= 2, "{name}: no second CRA picture")
+    if cras.count < 2 {
+        return
+    }
+    var dec = hevcAnnexBDecoder()
+    var got: [String] = []
+    var firstKey = false
+    // Decode a little, seek: reset, then go on from the second CRA.
+    for k in 0..3 {
+        dec.decode(hevcAu(d, aus, k), pts: k, dts: k, key: false)
+    }
+    dec.reset()
+    for k in cras[1]..aus.count {
+        for p in dec.decode(hevcAu(d, aus, k), pts: k, dts: k, key: false) {
+            if got.isEmpty {
+                firstKey = p.key
+            }
+            got.append(testkit.pictureMd5(p))
+        }
+    }
+    for p in dec.flush() {
+        got.append(testkit.pictureMd5(p))
+    }
+    var at = -1
+    if !got.isEmpty {
+        at = all.index(of: got[0]) ?? -1
+    }
+    var suffix = at >= 0 && all.count - at == got.count
+    if suffix {
+        for i in 0..got.count {
+            if got[i] != all[at + i] {
+                suffix = false
+            }
+        }
+    }
+    c.check(suffix && firstKey, "{name}: from the 2nd CRA: {got.count} pictures, first key {firstKey}, matches full decode from {at}")
+}
+
+// skipNonReference drops only pictures nothing refers to.
+fn hevcTestSkipNonReference(_ c: bind HevcChecks) {
+    let name = "bframes.hevc"
+    let d = readData(joinPath(hevcFixtures, name)) ?? Data()
+    var full = hevcAnnexBDecoder()
+    let all = hevcDecodeAll(d, full)
+    var dec = hevcAnnexBDecoder()
+    dec.skipNonReference = true
+    let got = hevcDecodeAll(d, dec)
+    var allKnown = true
+    for m in got {
+        if !all.contains(m) {
+            allKnown = false
+        }
+    }
+    c.check(got.count > 0 && got.count < all.count && allKnown, "{name}: skipNonReference gave {got.count} of {all.count} pictures, all from the full decode {allKnown}")
+}
+
+// Damaged data: bytes flipped, packets cut short or missing, garbage.
+// Decoding goes on (pictures keep coming) and warns.
+fn hevcTestDamage(_ c: bind HevcChecks) {
+    var seed = 12345
+    for name in ["bframes.hevc", "main10.hevc", "slices.hevc", "weighted.hevc", "p_only.hevc", "lossless.hevc"] {
+        let d = readData(joinPath(hevcFixtures, name)) ?? Data()
+        let aus = hevcSplitAus(d)
+        for variant in 0..12 {
+            var dec = hevcAnnexBDecoder()
+            var pics = 0
+            for k in 0..aus.count {
+                var au = hevcAu(d, aus, k)
+                seed = (seed * 1103515245 + 12345) & 0x7fffffff
+                let r = seed % 7
+                if k > 0 && r < 3 {
+                    var bytes = au.bytes
+                    let flips = 1 + (seed >> 8) % (4 + variant * 4)
+                    for f in 0..flips {
+                        seed = (seed * 1103515245 + 12345) & 0x7fffffff
+                        let at = 6 + (seed >> 4) % max(1, bytes.count - 6)
+                        if at < bytes.count {
+                            bytes[at] = bytes[at] ^ (1 << (f % 8))
+                        }
+                    }
+                    au = Data(bytes: bytes)
+                } else if k > 0 && r == 3 {
+                    au = au.slice(from: 0, to: au.count / 2)
+                } else if k > 0 && r == 4 && variant % 3 == 0 {
+                    continue
+                } else if r == 5 && variant % 4 == 1 {
+                    var g: [Int] = [0, 0, 1]
+                    for _ in 0..200 {
+                        seed = (seed * 1103515245 + 12345) & 0x7fffffff
+                        g.append((seed >> 7) & 255)
+                    }
+                    au = au + Data(bytes: g)
+                }
+                pics += dec.decode(au, pts: k, dts: k, key: false).count
+            }
+            pics += dec.flush().count
+            c.check(pics > 0, "damaged {name} variant {variant}: no pictures at all")
+        }
+    }
+}
+
+// Damaged length-prefixed packets (as from MP4 / Matroska), lengths
+// included, decode without stopping.
+fn hevcTestDamageMp4(_ c: bind HevcChecks) {
+    let name = "hevc.mp4"
+    let file = testkit.fixture(name)
+    let media = testkit.mediaFromRef(file, testkit.loadRef(name))
+    var seed = 777
+    for variant in 0..10 {
+        var dec = hevc.newDecoder(media.tracks[0]).value() ?? hevc.Decoder()
+        var pics = 0
+        for p in media.packets {
+            if p.track != 0 {
+                continue
+            }
+            var bytes = core.packetBytes(file, media, p).bytes
+            seed = (seed * 1103515245 + 12345) & 0x7fffffff
+            if seed % 3 == 0 && bytes.count > 8 {
+                for _ in 0..(1 + variant) {
+                    seed = (seed * 1103515245 + 12345) & 0x7fffffff
+                    let at = (seed >> 5) % bytes.count
+                    bytes[at] = bytes[at] ^ ((seed >> 3) & 255)
+                }
+            }
+            pics += dec.decode(Data(bytes: bytes), pts: p.pts, dts: p.dts, key: p.key).count
+        }
+        pics += dec.flush().count
+        c.check(pics > 0, "damaged {name} variant {variant}: no pictures at all")
+    }
+}
+
+// The JCT-VC HEVC_v1 conformance streams, when downloaded (see
+// build/conformance/hevc/fetch.sh, makeref.sh, makeref_hm.sh).
+fn hevcTestConformance(_ c: bind HevcChecks) {
+    let list = readFile(joinPath(hevcConformance, "list.tsv")) ?? ""
+    if list.isEmpty {
+        print("hevc: conformance streams not downloaded; skipped")
+        return
+    }
+    var passed: [String] = []
+    var failed: [String] = []
+    let t0 = now()
+    for line in list.lines() {
+        let f = line.split("\t")
+        if f.count < 2 {
+            continue
+        }
+        let name = f[0]
+        let d = readData(joinPath(hevcConformance, f[1])) ?? Data()
+        var dec = hevcAnnexBDecoder()
+        if name.hasPrefix("TSUNEQBD") {
+            // Luma and chroma of different bit depths: refused with a warning.
+            let got = hevcDecodeAll(d, dec)
+            c.check(got.isEmpty && dec.warnings.count > 0, "{name}: should be refused with a warning")
+            continue
+        }
+        let want = hevcRefMd5s(joinPath(hevcConformance, "ref_hm/" + name))
+        let got = hevcDecodeAll(d, dec)
+        let ok = want.count > 0 && hevcSame(got, want)
+        c.check(ok, "conformance {name}: {hevcGood(got, want)} of {want.count} pictures match ({got.count} decoded)")
+        if ok {
+            passed.append(name)
+        } else {
+            failed.append(name)
+        }
+    }
+    print("conformance: {passed.count} of {passed.count + failed.count} streams bit-exact")
+    print("time hevc conformance suite: {Int((now() - t0) * 1000.0)} ms")
+}

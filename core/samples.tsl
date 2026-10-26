@@ -1,0 +1,45 @@
+// Decoded sound, as every audio decoder hands it on.
+//
+// Samples are Floats from -1 to 1, interleaved (frame by frame: all the
+// channels of the first instant, then the next). Channels come in WAV
+// order for the set the stream has, named in `layout`:
+//   FL FR FC LFE BL BR FLC FRC BC SL SR (then TC TFL TFC TFR TBL TBC TBR)
+// so 5.1 is FL FR FC LFE BL BR or FL FR FC LFE SL SR, and stereo FL FR.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+public struct Samples {
+    rate: Int
+    channels: Int
+    data: [Float] = []
+    layout: [String] = []
+    // Ticks of the track's clock (core.noTime when not known).
+    pts: Int = -9223372036854775807
+
+    // Frames (instants) held.
+    frames: Int {
+        if channels <= 0 { 0 } else { data.count / channels }
+    }
+}
+
+// The usual layout for a channel count, when the stream doesn't name one.
+public fn defaultLayout(_ channels: Int) -> [String] {
+    match channels {
+        1 -> ["FC"]
+        2 -> ["FL", "FR"]
+        3 -> ["FL", "FR", "FC"]
+        4 -> ["FL", "FR", "BL", "BR"]
+        5 -> ["FL", "FR", "FC", "BL", "BR"]
+        6 -> ["FL", "FR", "FC", "LFE", "BL", "BR"]
+        7 -> ["FL", "FR", "FC", "LFE", "BC", "SL", "SR"]
+        8 -> ["FL", "FR", "FC", "LFE", "BL", "BR", "SL", "SR"]
+        _ -> {
+            var out: [String] = []
+            for i in 0..channels {
+                out.append("C{i + 1}")
+            }
+            out
+        }
+    }
+}

@@ -1,0 +1,84 @@
+// Tests for demux's dispatch (sniffing); each container has its own tests.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../../core"
+import "../../demux"
+import "../../testkit"
+import "../../vp9"
+
+fn main() {
+    var passed = 0
+    var total = 0
+    fn check(_ ok: Bool, _ what: String) {
+        total += 1
+        if ok { passed += 1 } else { print("FAIL: {what}") }
+    }
+    let cases = [("h264_baseline.mp4", "mp4"), ("mov.mov", "mp4"), ("aac_lc.m4a", "mp4"), ("h264_high.mkv", "mkv"), ("vp9.webm", "mkv"), ("mjpeg.avi", "avi"), ("vorbis.ogg", "ogg"), ("opus.opus", "ogg"), ("h264.ts", "ts"), ("mpeg2.mpg", "ps"), ("pcm_s16.wav", "wav"), ("pcm.aiff", "aiff"), ("mp3_cbr.mp3", "mp3"), ("aac_mono.aac", "aac"), ("flac.flac", "flac"), ("ac3.ac3", "ac3"), ("eac3.eac3", "eac3"), ("mp2.mp2", "mp3")]
+    for (name, want) in cases {
+        let got = demux.sniff(testkit.fixture(name), name: name)
+        check(got == want, "sniff {name}: {got}")
+    }
+    check(demux.sniff(Data(text: "hello"), name: "x.txt") == "", "not media")
+
+    // IVF: 50 frames, a keyframe every 10, as ffprobe counts them.
+    for codec in ["vp9", "vp8", "av1"] {
+        let name = "t.{codec}.ivf"
+        let file = testkit.fixture(name)
+        check(demux.sniff(file, name: name) == "ivf", "sniff {name}")
+        match demux.open(file, name: name) {
+            .ok(m) -> {
+                var keys = 0
+                for p in m.packets {
+                    if p.key { keys += 1 }
+                }
+                check(m.tracks.count == 1 && m.tracks[0].codec == codec && m.tracks[0].width == 320 && m.tracks[0].height == 240, "{name} track")
+                check(m.packets.count == 50 && keys == 5, "{name}: {m.packets.count} packets, {keys} keys")
+                check(abs(m.duration - 2.0) < 0.05, "{name} duration {m.duration}")
+                if codec == "vp9" {
+                    // Through the decoder, bit-exact with ffmpeg.
+                    let want = testkit.frameMd5s(name)
+                    var got: [String] = []
+                    match vp9.newDecoder(m.tracks[0]) {
+                        .ok(d0) -> {
+                            var d = d0
+                            for p in m.packets {
+                                for pic in d.decode(core.packetBytes(file, m, p), pts: p.pts, dts: p.dts, key: p.key) {
+                                    got.append(testkit.pictureMd5(pic))
+                                }
+                            }
+                            for pic in d.flush() {
+                                got.append(testkit.pictureMd5(pic))
+                            }
+                        }
+                        .failure(e) -> print("vp9: {e.message}")
+                    }
+                    check(got.count == 50 && got == want, "{name} decodes bit-exact ({got.count} of {want.count})")
+                }
+            }
+            .failure(e) -> check(false, "open {name}: {e.message}")
+        }
+    }
+    // TrueHD: rate and channels filled in from the first major sync for
+    // MP4 and M2TS; a raw stream cut mid-way is still recognised.
+    for name in ["thd_51.mp4", "thd_51.m2ts", "thd_51.mkv"] {
+        let file = readData("tests/truehd/fixtures/" + name) ?? Data()
+        match demux.open(file, name: name) {
+            .ok(m) -> {
+                var ok = false
+                for t in m.tracks {
+                    if t.codec == "truehd" {
+                        ok = t.sampleRate == 48000 && t.channels == 6 && t.layout.count == 6
+                    }
+                }
+                check(ok, "{name}: TrueHD rate and channels")
+            }
+            .failure(e) -> check(false, "open {name}: {e.message}")
+        }
+    }
+    let cut = readData("tests/truehd/fixtures/fate_51_cut.thd") ?? Data()
+    check(demux.sniff(cut.slice(from: 1000, to: cut.count), name: "") == "thd", "sniff TrueHD cut mid-stream")
+    check(demux.sniff(Data(), name: "song.wma") == "asf" && demux.sniff(Data(), name: "x.thd") == "thd", "sniff by extension")
+    print("demux: {passed} of {total} passed")
+}

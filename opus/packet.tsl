@@ -1,0 +1,231 @@
+// Opus packets (RFC 6716 section 3): the TOC byte (configuration, stereo
+// flag, frame count code) and the frame packing codes 0-3 with their frame
+// lengths and padding.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+// Section 3.1: the 32 configurations' modes, bandwidths and frame sizes.
+public enum OpusMode {
+    silk, hybrid, celt
+}
+
+// 1 narrowband (4 kHz), 2 mediumband (6), 3 wideband (8),
+// 4 superwideband (12), 5 fullband (20).
+public let opusNarrowband = 1
+public let opusMediumband = 2
+public let opusWideband = 3
+public let opusSuperwideband = 4
+public let opusFullband = 5
+
+// One packet taken apart: where each frame's bytes are.
+public struct OpusPacket {
+    toc: Int = 0
+    mode: OpusMode = .celt
+    bandwidth: Int = 5
+    // Samples per frame at 48 kHz (120 to 2880).
+    frameSize: Int = 960
+    stereo: Bool = false
+    // Frame start offsets in the packet's Data and their sizes in bytes.
+    offsets: [Int] = []
+    sizes: [Int] = []
+    // Where the packet ends (after its padding): the next stream's packet
+    // starts there in a multistream packet.
+    end: Int = 0
+}
+
+// The mode of a TOC byte (section 3.1, table 2).
+public fn opusTocMode(_ toc: Int) -> OpusMode {
+    if toc & 0x80 != 0 {
+        return .celt
+    }
+    if toc & 0x60 == 0x60 {
+        return .hybrid
+    }
+    OpusMode.silk
+}
+
+public fn opusTocBandwidth(_ toc: Int) -> Int {
+    let config = toc >> 3
+    if config < 12 {
+        // SILK-only: NB, MB, WB in groups of four.
+        return config / 4 + 1
+    }
+    if config < 16 {
+        // Hybrid: SWB, FB in pairs.
+        return if config < 14 { opusSuperwideband } else { opusFullband }
+    }
+    // CELT-only: NB, WB, SWB, FB (no MB) in groups of four.
+    let g = (config - 16) / 4
+    if g == 0 { opusNarrowband } else { g + 2 }
+}
+
+// Samples per frame at 48 kHz.
+public fn opusTocFrameSize(_ toc: Int) -> Int {
+    let config = toc >> 3
+    if config < 12 {
+        // 10, 20, 40, 60 ms.
+        let i = config % 4
+        return if i == 3 { 2880 } else { 480 << i }
+    }
+    if config < 16 {
+        // 10, 20 ms.
+        return 480 << (config % 2)
+    }
+    // 2.5, 5, 10, 20 ms.
+    120 << (config % 4)
+}
+
+// Section 3.2.1: a frame length of one or two bytes.
+fn opusParseSize(_ d: Data, _ at: Int, _ end: Int) -> (Int, Int) {
+    if at >= end {
+        return (-1, 0)
+    }
+    let b0 = d[at]
+    if b0 < 252 {
+        return (b0, 1)
+    }
+    if at + 1 >= end {
+        return (-1, 0)
+    }
+    (d[at + 1] * 4 + b0, 2)
+}
+
+// Takes apart the packet in d[from..<to]. nil when it breaks the rules of
+// section 3.4 (such packets are skipped).
+public fn opusParsePacket(_ d: Data, from: Int, to: Int, selfDelimited: Bool = false) -> OpusPacket? {
+    if to <= from {
+        return nil
+    }
+    let toc = d[from]
+    var p = OpusPacket(toc: toc)
+    p.mode = opusTocMode(toc)
+    p.bandwidth = opusTocBandwidth(toc)
+    p.frameSize = opusTocFrameSize(toc)
+    p.stereo = toc & 4 != 0
+    var at = from + 1
+    var end = to
+    var count = 1
+    var cbr = false
+    var pad = 0
+    var sizes: [Int] = []
+    match toc & 3 {
+        0 -> { count = 1 }
+        1 -> {
+            count = 2
+            cbr = true
+            if !selfDelimited {
+                if (end - at) & 1 != 0 {
+                    return nil
+                }
+                sizes.append((end - at) / 2)
+            }
+        }
+        2 -> {
+            count = 2
+            let (sz, n) = opusParseSize(d, at, end)
+            if sz < 0 || sz > end - at - n {
+                return nil
+            }
+            at += n
+            sizes.append(sz)
+        }
+        _ -> {
+            if end - at < 1 {
+                return nil
+            }
+            let ch = d[at]
+            at += 1
+            count = ch & 0x3f
+            if count <= 0 || p.frameSize * count > 5760 {
+                return nil
+            }
+            // Padding (bit 6): lengths 255 mean 254 more and another byte.
+            if ch & 0x40 != 0 {
+                while true {
+                    if at >= end {
+                        return nil
+                    }
+                    let pb = d[at]
+                    at += 1
+                    let tmp = if pb == 255 { 254 } else { pb }
+                    end -= tmp
+                    pad += tmp
+                    if pb != 255 {
+                        break
+                    }
+                }
+                if end < at {
+                    return nil
+                }
+            }
+            cbr = ch & 0x80 == 0
+            if !cbr {
+                var last = end - at
+                for _ in 0..(count - 1) {
+                    let (sz, n) = opusParseSize(d, at, end)
+                    if sz < 0 || sz > end - at - n {
+                        return nil
+                    }
+                    at += n
+                    last -= n + sz
+                    sizes.append(sz)
+                }
+                if last < 0 {
+                    return nil
+                }
+            } else if !selfDelimited {
+                let len = end - at
+                let each = len / count
+                if each * count != len {
+                    return nil
+                }
+                for _ in 0..(count - 1) {
+                    sizes.append(each)
+                }
+            }
+        }
+    }
+    if selfDelimited {
+        let (sz, n) = opusParseSize(d, at, end)
+        if sz < 0 || sz > end - at - n {
+            return nil
+        }
+        at += n
+        if cbr {
+            // CBR: every frame has the size given for the last one.
+            sizes = []
+            for _ in 0..(count - 1) {
+                sizes.append(sz)
+            }
+        }
+        sizes.append(sz)
+        end = at
+        for s in sizes {
+            end += s
+        }
+        if end + pad > to {
+            return nil
+        }
+    } else {
+        var used = 0
+        for s in sizes {
+            used += s
+        }
+        let last = end - at - used
+        if last < 0 || last > 1275 {
+            return nil
+        }
+        sizes.append(last)
+    }
+    for s in sizes {
+        if s > 1275 {
+            return nil
+        }
+        p.offsets.append(at)
+        p.sizes.append(s)
+        at += s
+    }
+    p.end = at + pad
+    p
+}

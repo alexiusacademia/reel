@@ -1,0 +1,393 @@
+// Tests for the dts module (DTS core, XCh/XXCH/X96/XBR, DTS-HD Master
+// Audio lossless) and demux/dts.tsl: frame headers and stream forms,
+// decoding against FFmpeg's output for this test's own fixtures
+// (tests/dts/fixtures, made by build/scratch/dts/make_fixtures.sh: FFmpeg
+// dca encoder streams in every stream form and in MKV/TS/MP4/WAV, and
+// small DTS-HD samples from FFmpeg's FATE suite, a DTS CD rip as PCM
+// WAV), the whole FATE set when
+// build/scratch/dts/get_conformance.sh has downloaded it, damaged input,
+// and decoding speed.
+//
+// Lossy core output is compared by SNR (FFmpeg decodes it in float);
+// lossless output must be bit-exact (the md5 of the 24-bit samples).
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../../dts"
+import "../../demux"
+import "../../core"
+import "../../testkit"
+
+let fixtureDir = "tests/dts/fixtures"
+let confDir = "build/conformance/dts"
+
+struct Decoded {
+    ok: Bool = false
+    samples: [Float] = []
+    rate: Int = 0
+    channels: Int = 0
+    layout: [String] = []
+    profile: String = ""
+    bits: Int = 0
+    packets: Int = 0
+    warnings: [String] = []
+    ms: Float = 0.0
+    trackRate: Int = 0
+    trackChannels: Int = 0
+    info: String = ""
+}
+
+// Opens a file through demux (dtsOpen for .dtshd, which demux.sniff
+// doesn't know), decodes its DTS track, and drops the encoder padding the
+// file's tags give (as FFmpeg does).
+fn decodeFile(_ path: String) -> Decoded {
+    var out = Decoded()
+    let data = readData(path) ?? Data()
+    let r = if path.hasSuffix(".dtshd") { demux.dtsOpen(data) } else { demux.open(data, name: path) }
+    let m = r.value() ?? core.Media()
+    var ti = -1
+    for t in m.tracks {
+        if t.codec == "dts" && ti < 0 {
+            ti = t.index
+        }
+    }
+    if ti < 0 {
+        return out
+    }
+    let track = m.tracks[ti]
+    out.trackRate = track.sampleRate
+    out.trackChannels = track.channels
+    out.info = dts.streamInfo(track)
+    var d = dts.newDecoder(track).value() ?? dts.Decoder()
+    let t0 = now()
+    for p in m.packets {
+        if p.track != ti {
+            continue
+        }
+        out.samples += d.decode(core.packetBytes(data, m, p), pts: p.pts).data
+        out.packets += 1
+    }
+    out.samples += d.flush().data
+    out.ms = (now() - t0) * 1000.0
+    out.ok = true
+    out.rate = d.rate
+    out.channels = d.channels
+    out.layout = d.layout
+    out.profile = d.profile
+    out.bits = d.bits
+    out.warnings = d.warnings
+    let nc = max(d.channels, 1)
+    let delay = Int(m.tags["delay"] ?? "0") ?? 0
+    let padding = Int(m.tags["padding"] ?? "0") ?? 0
+    if delay > 0 || padding > 0 {
+        let from = min(delay * nc, out.samples.count)
+        let to = max(from, out.samples.count - padding * nc)
+        out.samples = out.samples.slice(from: from, to: to)
+    }
+    out
+}
+
+// FFmpeg's output packed by make_fixtures.sh: zlib-compressed 24-bit
+// little-endian samples scaled by 2^21 (lossy DTS output can go a little
+// over full scale).
+fn ref24(_ path: String) -> [Float] {
+    let packed = readData(path) ?? Data()
+    let raw = packed.decompressed("zlib") ?? Data()
+    var out: [Float] = []
+    var i = 0
+    while i + 3 <= raw.count {
+        var v = raw[i] | (raw[i + 1] << 8) | (raw[i + 2] << 16)
+        if v >= 8388608 {
+            v -= 16777216
+        }
+        out.append(Float(v) / 2097152.0)
+        i += 3
+    }
+    out
+}
+
+fn readF32(_ path: String) -> [Float] {
+    let data = readData(path) ?? Data()
+    var out: [Float] = []
+    var i = 0
+    while i + 4 <= data.count {
+        out.append(data.float32(at: i))
+        i += 4
+    }
+    out
+}
+
+// The md5 of samples as 24-bit little-endian integers.
+fn md5of24(_ s: [Float]) -> String {
+    var d = Data()
+    for v in s {
+        var i = Int(round(v * 8388608.0))
+        if i < 0 {
+            i += 16777216
+        }
+        d.append(byte: i & 0xff)
+        d.append(byte: (i >> 8) & 0xff)
+        d.append(byte: (i >> 16) & 0xff)
+    }
+    d.hash("md5").hex
+}
+
+fn f1(_ x: Float) -> String {
+    let v = Int(x * 10.0 + 0.5)
+    "{v / 10}.{v % 10}"
+}
+
+fn main() {
+    var passed = 0
+    var total = 0
+    fn check(_ ok: Bool, _ what: String) {
+        total += 1
+        if ok {
+            passed += 1
+        } else {
+            print("FAIL: {what}")
+        }
+    }
+
+    // --- Headers and stream forms ---
+    let s51 = readData(joinPath(fixtureDir, "s51_48k.dts")) ?? Data()
+    let info = dts.frameInfo(s51, at: 0)
+    check(info.ok && info.form == 0 && info.rate == 48000 && info.channels == 6 && info.lfe && info.samples == 512, "s51_48k.dts header: {info.rate} Hz {info.channels} ch {info.samples} samples")
+    check(info.size > 96 && info.exssSize == 0 && info.bitrate > 0, "s51_48k.dts frame size {info.size}, bit rate {info.bitrate}")
+    let starts = dts.syncFrames(s51)
+    check(starts.count == 15 && starts[0] == 0 && starts[1] == info.size, "s51_48k.dts: {starts.count} frames")
+    var formsOk = true
+    for (name, form) in [("s51_le16.dts", 1), ("s51_be14.dts", 2), ("s51_le14.dts", 3)] {
+        let d = readData(joinPath(fixtureDir, name)) ?? Data()
+        let fi = dts.frameInfo(d, at: 0)
+        let n = dts.syncFrames(d).count
+        if !(fi.ok && fi.form == form && fi.rate == 48000 && fi.channels == 6 && n == 15) {
+            formsOk = false
+            print("    {name}: form {fi.form} ok {fi.ok} frames {n}")
+        }
+    }
+    check(formsOk, "little-endian and 14-bit forms: headers and frame counts")
+    let be14 = readData(joinPath(fixtureDir, "s51_be14.dts")) ?? Data()
+    let back = dts.dtsToBigEndian(be14, from: 0, to: dts.frameInfo(be14, at: 0).size, form: 2)
+    check(back.slice(from: 0, to: 64) == s51.slice(from: 0, to: 64), "14-bit form converts back to the 16-bit form")
+    let xllFile = readData(joinPath(fixtureDir, "xll_71_24_48_768_0.dtshd")) ?? Data()
+    let xllStarts = dts.syncFrames(xllFile)
+    let xi = if xllStarts.isEmpty { dts.FrameInfo() } else { dts.frameInfo(xllFile, at: xllStarts[0]) }
+    check(xi.ok && xi.xll && xi.hdRate == 48000 && xi.hdChannels == 8 && xi.hdBits == 24 && xi.exssSize > 0 && xi.hdSamples == 512, "DTS-HD MA header: XLL {xi.xll} {xi.hdRate} Hz {xi.hdChannels} ch {xi.hdBits}-bit {xi.hdSamples} samples")
+    let mt = demux.dtsOpen(xllFile).value() ?? core.Media()
+    check(mt.tracks.count == 1 && mt.packets.count == 6 && mt.tags["delay"] == "1024" && mt.tags["padding"] == "0", "dtsOpen on a .dtshd: STRMDATA frames {mt.packets.count}, delay {mt.tags["delay"] ?? "?"}")
+    if mt.tracks.count == 1 {
+        check(dts.streamInfo(mt.tracks[0]) == "DTS-HD MA 7.1, 48 kHz, 24-bit", "streamInfo: {dts.streamInfo(mt.tracks[0])}")
+    }
+    let raw = demux.open(s51, name: "s51_48k.dts").value() ?? core.Media()
+    check(raw.format == "dts" && raw.tracks.count == 1 && raw.packets.count == 15 && raw.packets[1].pts == 512 && raw.tracks[0].timescale == 48000 && raw.tracks[0].duration == 15 * 512, "demux.open on a raw .dts: {raw.packets.count} packets")
+    if raw.tracks.count == 1 {
+        check(dts.streamInfo(raw.tracks[0]) == "DTS 5.1, 48 kHz", "streamInfo: {dts.streamInfo(raw.tracks[0])}")
+        check(raw.packets[0].size == info.size && raw.packets[14].offset + raw.packets[14].size == s51.count, "packets cover the frames exactly")
+    }
+    check(dts.dtsWavLayout(0x3f) == ["FL", "FR", "FC", "LFE", "SL", "SR"], "5.1 WAV order")
+    check(dts.dtsWavLayout(0x1bf) == ["FL", "FR", "FC", "LFE", "BL", "BR", "SL", "SR"], "7.1 WAV order (Lsr/Rsr → BL/BR)")
+    check(dts.dtsWavLayout(0x7f) == ["FL", "FR", "FC", "LFE", "BC", "SL", "SR"], "6.1 WAV order (Cs → BC)")
+
+    // --- This test's FFmpeg-encoded core streams ---
+    let own = [
+        ("mono_22k.dts", 22050, ["FC"]),
+        ("stereo_44k_adpcm.dts", 44100, ["FL", "FR"]),
+        ("quad_48k.dts", 48000, ["FL", "FR", "SL", "SR"]),
+        ("s50_32k.dts", 32000, ["FL", "FR", "FC", "SL", "SR"]),
+        ("s51_48k.dts", 48000, ["FL", "FR", "FC", "LFE", "SL", "SR"]),
+    ]
+    var coreMs = 0.0
+    var coreSecs = 0.0
+    for (name, rate, layout) in own {
+        let r = decodeFile(joinPath(fixtureDir, name))
+        let want = ref24(joinPath(fixtureDir, name + ".ref24z"))
+        let s = testkit.snr(r.samples, want)
+        print("{name}: {r.rate} Hz {r.layout.joined(separator: " ")}, {r.samples.count} of {want.count} samples, SNR {f1(s)} dB")
+        check(r.ok && r.rate == rate && r.layout == layout && r.profile == "DTS" && r.warnings.isEmpty, "{name} format: {r.rate} {r.layout} {r.profile} warnings {r.warnings.count}")
+        check(r.samples.count == want.count && s >= 90.0, "{name} SNR {f1(s)} dB")
+        if name == "s51_48k.dts" {
+            coreMs += r.ms
+            coreSecs += Float(r.samples.count / 6) / 48000.0
+        }
+    }
+
+    // The same 5.1 stream in the other forms and in containers.
+    let s51want = ref24(joinPath(fixtureDir, "s51_48k.dts.ref24z"))
+    for name in ["s51_le16.dts", "s51_be14.dts", "s51_le14.dts", "s51.mkv", "s51.ts", "s51.mp4", "s51.wav", "s51_cd.wav"] {
+        let r = decodeFile(joinPath(fixtureDir, name))
+        let s = testkit.snr(r.samples, s51want)
+        print("{name}: {r.packets} packets, SNR {f1(s)} dB")
+        check(r.ok && r.channels == 6 && r.samples.count == s51want.count && s >= 90.0, "{name}: DTS track {r.ok}, {r.samples.count} of {s51want.count} samples, SNR {f1(s)} dB")
+    }
+
+    // A stream cut into packets that don't follow frames (as DTS in WAV
+    // comes): partial frames carry over to the next packet.
+    var chunked = dts.newDecoder(core.Track(index: 0, kind: .audio, codec: "dts")).value() ?? dts.Decoder()
+    var chunkOut: [Float] = []
+    var at = 0
+    while at < s51.count {
+        let end = min(s51.count, at + 4096)
+        chunkOut += chunked.decode(s51.slice(from: at, to: end), pts: 0).data
+        at = end
+    }
+    chunkOut += chunked.flush().data
+    check(chunkOut.count == s51want.count && testkit.snr(chunkOut, s51want) >= 90.0 && chunked.warnings.isEmpty, "4096-byte packets: {chunkOut.count} samples, {chunked.warnings.count} warnings")
+    let le14 = readData(joinPath(fixtureDir, "s51_le14.dts")) ?? Data()
+    var chunked14 = dts.newDecoder(core.Track(index: 0, kind: .audio, codec: "dts")).value() ?? dts.Decoder()
+    var chunk14Out: [Float] = []
+    at = 0
+    while at < le14.count {
+        let end = min(le14.count, at + 4000)
+        chunk14Out += chunked14.decode(le14.slice(from: at, to: end), pts: 0).data
+        at = end
+    }
+    chunk14Out += chunked14.flush().data
+    check(chunk14Out.count == s51want.count && testkit.snr(chunk14Out, s51want) >= 90.0, "14-bit stream in 4000-byte packets: {chunk14Out.count} samples")
+
+    // --- DTS-HD samples (FATE dcadec suite cuts) ---
+    for name in ["core_51_24_48_768_0.dtshd", "xch_61_24_48_768.dtshd", "xxch_71_24_48_2046.dtshd"] {
+        let r = decodeFile(joinPath(fixtureDir, name))
+        let want = ref24(joinPath(fixtureDir, name + ".ref24z"))
+        let s = testkit.snr(r.samples, want)
+        print("{name}: {r.profile}, {r.rate} Hz {r.layout.joined(separator: " ")}, SNR {f1(s)} dB")
+        check(r.ok && r.samples.count == want.count && s >= 90.0 && r.warnings.isEmpty, "{name}: {r.samples.count} of {want.count} samples, SNR {f1(s)} dB, {r.warnings.count} warnings")
+    }
+    let xch = decodeFile(joinPath(fixtureDir, "xch_61_24_48_768.dtshd"))
+    check(xch.profile == "DTS-ES" && xch.layout == ["FL", "FR", "FC", "LFE", "BC", "SL", "SR"], "XCh: 6.1 as {xch.layout}")
+    let xxch = decodeFile(joinPath(fixtureDir, "xxch_71_24_48_2046.dtshd"))
+    check(xxch.profile == "DTS-HD HRA" && xxch.channels == 8, "XXCH: {xxch.profile} {xxch.channels} channels")
+
+    let md5Text = readFile(joinPath(fixtureDir, "md5.txt")) ?? ""
+    var xllMs = 0.0
+    var xllSecs = 0.0
+    for line in md5Text.lines() {
+        let parts = line.split(" ")
+        if parts.count < 3 {
+            continue
+        }
+        let r = decodeFile(joinPath(fixtureDir, parts[0]))
+        let md5 = md5of24(r.samples)
+        let count = Int(parts[2]) ?? -1
+        print("{parts[0]}: {r.profile}, {r.rate} Hz {r.bits}-bit {r.layout.joined(separator: " ")}, {r.samples.count} samples, md5 {if md5 == parts[1] { "matches" } else { "differs" }}")
+        check(r.ok && r.samples.count == count && md5 == parts[1] && r.warnings.isEmpty, "{parts[0]} bit-exact: {r.samples.count} of {count} samples, md5 {md5}")
+        if parts[0] == "xll_71_24_48_768_0.dtshd" {
+            check(r.profile == "DTS-HD MA" && r.bits == 24 && r.channels == 8 && r.trackChannels == 8 && r.trackRate == 48000, "XLL 7.1 format and track")
+            xllMs += r.ms
+            xllSecs += Float(r.samples.count / 8) / 48000.0
+        }
+        if parts[0] == "xll_51_16_192_768_0.dtshd" {
+            check(r.rate == 192000 && r.bits == 16, "XLL 192 kHz (two frequency bands), 16-bit")
+        }
+        if parts[0] == "dtsx_7.1.4_24bit.dts" {
+            check(r.profile == "DTS-HD MA + DTS:X", "DTS:X extension detected: {r.profile}")
+        }
+    }
+
+    // --- The whole FATE set, when downloaded (get_conformance.sh) ---
+    let conf = ["core_51_24_48_768_0.dtshd", "core_51_24_48_768_1.dtshd", "x96_51_24_96_1509.dtshd", "x96_xch_61_24_96_3840.dtshd", "x96_xxch_71_24_96_3840.dtshd", "xbr_51_24_48_3840.dtshd", "xbr_xch_61_24_48_3840.dtshd", "xbr_xxch_71_24_48_3840.dtshd", "xch_61_24_48_768.dtshd", "xxch_71_24_48_2046.dtshd", "dts_es.dts", "xll_51_16_192_768_0.dtshd", "xll_51_16_192_768_1.dtshd", "xll_51_24_48_768.dtshd", "xll_51_24_48_none.dtshd", "xll_71_24_48_768_0.dtshd", "xll_71_24_48_768_1.dtshd", "xll_71_24_96_768.dtshd", "xll_x96_51_24_96_1509.dtshd", "xll_xch_61_24_48_768.dtshd", "dtsx_7.1.4_24bit.dts", "master_audio_7.1_24bit.dts"]
+    var found = 0
+    for name in conf {
+        let path = joinPath(confDir, name)
+        if !fileExists(path) || !fileExists(path + ".f32") {
+            continue
+        }
+        found += 1
+        let r = decodeFile(path)
+        let want = readF32(path + ".f32")
+        let s = testkit.snr(r.samples, want)
+        let lossless = name.hasPrefix("xll") || name.hasPrefix("dtsx") || name.hasPrefix("master")
+        let what = if lossless { if s >= 150.0 { "bit-exact" } else { "SNR {f1(s)} dB" } } else { "SNR {f1(s)} dB" }
+        print("conformance {name}: {r.profile}, {r.rate} Hz {r.layout.joined(separator: " ")}, {what}")
+        check(r.samples.count == want.count && (if lossless { s >= 150.0 } else { s >= 90.0 }), "conformance {name}: {r.samples.count} of {want.count} samples, {what}")
+        if name == "master_audio_7.1_24bit.dts" {
+            xllMs = r.ms
+            xllSecs = Float(r.samples.count / 8) / 48000.0
+        }
+        if name == "dts_es.dts" {
+            coreMs += r.ms
+            coreSecs += Float(r.samples.count / 7) / 48000.0
+        }
+    }
+    // FATE's dts.ts: DTS in a private stream (type 0x06) without
+    // descriptors, found by its first bytes.
+    let tsPath = joinPath(confDir, "dts.ts")
+    if fileExists(tsPath) && fileExists(tsPath + ".f32") {
+        let r = decodeFile(tsPath)
+        let want = readF32(tsPath + ".f32")
+        let s = testkit.snr(r.samples, want)
+        print("conformance dts.ts: {r.packets} packets, SNR {f1(s)} dB")
+        check(r.ok && r.samples.count == want.count && s >= 90.0, "conformance dts.ts: DTS track {r.ok}, {r.samples.count} of {want.count} samples, SNR {f1(s)} dB")
+    }
+    if found == 0 {
+        print("(no FATE samples in build/conformance/dts: run build/scratch/dts/get_conformance.sh)")
+    }
+
+    // --- Damaged and odd input ---
+    // Bytes flipped over most of the third frame: that frame is concealed
+    // or decodes wrongly, the length stays, the rest decodes.
+    var bytes = s51.bytes
+    let f2 = starts[2]
+    for i in 100..1500 {
+        bytes[f2 + i] = bytes[f2 + i] ^ 0x5a
+    }
+    let broken = Data(bytes: bytes)
+    var bd = dts.newDecoder(core.Track(index: 0, kind: .audio, codec: "dts")).value() ?? dts.Decoder()
+    var bout: [Float] = []
+    for (i, a) in starts.enumerated() {
+        let e = if i + 1 < starts.count { starts[i + 1] } else { broken.count }
+        bout += bd.decode(broken.slice(from: a, to: e), pts: 0).data
+    }
+    check(bout.count == s51want.count, "damaged stream keeps its length: {bout.count} of {s51want.count}")
+    check(bd.warnings.count >= 1 && bd.damaged >= 1, "damage warned: {bd.warnings.first ?? "none"}")
+    let tailFrom = 6 * 512 * 6
+    check(testkit.snr(bout.slice(from: tailFrom, to: bout.count), s51want.slice(from: tailFrom, to: s51want.count)) > 60.0, "frames after the damage decode")
+
+    var dec = dts.newDecoder(core.Track(index: 0, kind: .audio, codec: "dts")).value() ?? dts.Decoder()
+    check(dec.decode(Data(bytes: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]), pts: 0).data.isEmpty, "garbage gives no samples")
+    check(dec.decode(Data(), pts: 0).data.isEmpty, "empty packet")
+    check(dec.decode(s51.slice(from: 0, to: 500), pts: 0).data.isEmpty && dec.flush().data.isEmpty && dec.warnings.count >= 1, "cut-off frame: no samples, a warning at flush")
+    var two = dts.newDecoder(core.Track(index: 0, kind: .audio, codec: "dts")).value() ?? dts.Decoder()
+    let twoOut = two.decode(s51.slice(from: 0, to: starts[2]), pts: 777)
+    check(twoOut.frames == 1024 && twoOut.pts == 777 && testkit.snr(twoOut.data, s51want) > 90.0, "two frames in one packet: {twoOut.frames} frames")
+    two.reset()
+    let afterReset = two.decode(s51.slice(from: starts[5], to: starts[6]), pts: 0)
+    check(afterReset.frames == 512 && two.flush().data.isEmpty, "decodes after reset")
+    check(!dts.newDecoder(core.Track(index: 0, kind: .audio, codec: "ac3")).isOk(), "newDecoder refuses other codecs")
+    let fromTrack = dts.newDecoder(core.Track(index: 0, kind: .audio, codec: "dts", sampleRate: 48000, channels: 6)).value() ?? dts.Decoder()
+    check(fromTrack.rate == 48000 && fromTrack.channels == 6 && fromTrack.layout.count == 6 && fromTrack.delay == 0, "format from the track before the first frame")
+    // DTS-HD MA with bytes flipped in one frame's lossless data: the
+    // frames after it are bit-exact again.
+    let xm = demux.dtsOpen(xllFile).value() ?? core.Media()
+    var clean = dts.newDecoder(core.Track(index: 0, kind: .audio, codec: "dts")).value() ?? dts.Decoder()
+    var cleanOut: [Float] = []
+    for p in xm.packets {
+        cleanOut += clean.decode(core.packetBytes(xllFile, xm, p), pts: 0).data
+    }
+    var xb = xllFile.bytes
+    let hit = xm.packets[3]
+    for i in (hit.size / 2)..(hit.size / 2 + 400) {
+        xb[hit.offset + i] = xb[hit.offset + i] ^ 0x33
+    }
+    let xbroken = Data(bytes: xb)
+    var xd = dts.newDecoder(core.Track(index: 0, kind: .audio, codec: "dts")).value() ?? dts.Decoder()
+    var xout: [Float] = []
+    for p in xm.packets {
+        xout += xd.decode(core.packetBytes(xbroken, xm, p), pts: 0).data
+    }
+    let after = 4 * 512 * 8
+    check(xout.count == cleanOut.count && xout.slice(from: after, to: xout.count) == cleanOut.slice(from: after, to: cleanOut.count), "damaged DTS-HD MA frame: {xout.count / 8} samples, the next frames bit-exact, {xd.warnings.count} warnings")
+
+    // --- Speed ---
+    if coreMs > 0.0 {
+        print("time dts 5.1 core decode: {Int(coreMs)} ms for {f1(coreSecs)} s")
+        print("dts core speed: {Int(coreSecs * 1000.0 / coreMs)}x real time")
+    }
+    if xllMs > 0.0 {
+        print("time dts-hd ma 7.1 decode: {Int(xllMs)} ms for {f1(xllSecs)} s")
+        print("dts-hd ma 7.1 speed: {Int(xllSecs * 1000.0 / xllMs)}x real time")
+    }
+
+    print("dts: {passed} of {total} passed")
+}

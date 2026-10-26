@@ -1,0 +1,2542 @@
+// The MPEG-4 Part 2 video decoder (ISO/IEC 14496-2, Simple and Advanced
+// Simple profiles: what Xvid, DivX 4/5/6 and ffmpeg's "mpeg4" encoder make).
+//
+// A packet holds one VOP (video object plane: a picture), sometimes with
+// headers before it; DivX "packed bitstream" AVIs put a P-VOP and the
+// B-VOP after it in one chunk, and the next chunk is a placeholder (a VOP
+// that isn't coded), so the second VOP is held until then. VOPs are I
+// (intra), P (predicted from the previous I/P), B (from the previous and
+// next I/P) and S (P with global motion compensation, "GMC").
+//
+// Each VOP is split into 16×16 macroblocks (6.3.6): four 8×8 luma blocks
+// and one block of each chroma plane. Their DCT coefficients are coded with
+// the tables of tables.tsl, quantised with the H.263 or the MPEG method
+// (7.4.4), and intra blocks predict their DC and first row or column from
+// a neighbour (7.4.3). Inter macroblocks carry one, four or two (field)
+// motion vectors (7.6), coded as differences from a prediction.
+//
+// Pictures come out in display order: an I/P/S picture is held until the
+// next one is decoded (the B pictures between them come out first), unless
+// the stream says it has no B-VOPs (low_delay). Each picture gets the
+// smallest time stamp among the packets not yet matched to a picture, which
+// is the packet's own pts reordered with it for containers that give pts,
+// and the right time for AVI, which only gives decode order.
+//
+// Where the standard leaves room (IDCT rounding, edges of pictures whose
+// size isn't a multiple of 16) or encoders disagree with it, this decoder
+// does what ffmpeg does, so pictures match ffmpeg's bit for bit: its ARM64
+// simple IDCT (Xvid's IDCT for Xvid streams), references read up to the
+// macroblock-aligned edge with 8×8 blocks first clipped to the visible
+// size, zero colocated vectors in interlaced direct mode (see
+// standardFieldDirect), and the DC clipping and DivX workarounds it applies
+// by the encoder versions found in user data.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../core"
+
+public struct Decoder {
+    // When true, B-VOPs (which nothing refers to) are skipped.
+    skipNonReference: Bool = false
+    // Damaged or unsupported data found; decoding goes on.
+    warnings: [String] = []
+    // Direct mode of interlaced B-VOPs: scale the colocated field vectors
+    // as the standard says (7.6.9.5.2) instead of ffmpeg's zero vectors.
+    standardFieldDirect: Bool = false
+
+    trackSarNum: Int = 1
+    trackSarDen: Int = 1
+    vol: M4Vol = M4Vol()
+    vop: M4Vop = M4Vop()
+    br: core.BitReader = core.bitReader(Data())
+
+    // Geometry: picture size, macroblocks, plane strides.
+    width: Int = 0
+    height: Int = 0
+    mbw: Int = 0
+    mbh: Int = 0
+    mbCount: Int = 0
+    mbNumBits: Int = 1
+    ys: Int = 0
+    cs: Int = 0
+    lumaBlocks: Int = 0
+
+    // The pictures (references, the one being written) and the block and
+    // prediction scratch lists.
+    pics: M4Pics = M4Pics()
+    refCount: Int = 0
+
+    // Output.
+    out: [core.Picture] = []
+    held: core.Picture = core.Picture(width: 0, height: 0)
+    hasHeld: Bool = false
+    times: [Int] = []
+    curTime: Int = 0
+    pending: Data = Data()
+    hasPending: Bool = false
+    // A packet held two VOPs: the stream is "packed" (DivX/Xvid).
+    packed: Bool = false
+    warnedNoVol: Bool = false
+    warnCount: Int = 0
+
+    // Time (6.3.5 modulo_time_base / vop_time_increment).
+    timeBase: Int = 0
+    lastTimeBase: Int = 0
+    lastNonBTime: Int = 0
+    ppTime: Int = 0
+    pbTime: Int = 0
+    ppFieldTime: Int = 0
+    pbFieldTime: Int = 0
+    tFrame: Int = 0
+
+    // The VOP being decoded.
+    type: Int = 0
+    qscale: Int = 1
+    rounding: Int = 0
+    fcodeF: Int = 1
+    fcodeB: Int = 1
+    dcThr: Int = 99
+    altScan: Bool = false
+    tff: Bool = false
+    qpel: Bool = false
+    gmc: Bool = false
+    sliceId: Int = 0
+    slice: Int = 0
+    mbErr: Bool = false
+    dcClipBug: Bool = false
+    hpelChromaBug: Bool = false
+    directBlockBug: Bool = false
+    // Streams from Xvid use its IDCT (as ffmpeg does).
+    xvidIdct: Bool = false
+
+    // Per macroblock of the VOP being decoded: its video packet, quantiser,
+    // kind of motion (0 one vector, 1 four, 2 field), skipped flag; per 8×8
+    // luma block its vector; per field of a field-predicted macroblock its
+    // reference field and vector.
+    mbSlice: [Int] = []
+    mbQ: [Int] = []
+    mbKind: [Int] = []
+    mbSkip: [Int] = []
+    mvX: [Int] = []
+    mvY: [Int] = []
+    fldSel: [Int] = []
+    fldX: [Int] = []
+    fldY: [Int] = []
+    // The same for the most recent reference (for B-VOP direct mode).
+    colKind: [Int] = []
+    colSkip: [Int] = []
+    colX: [Int] = []
+    colY: [Int] = []
+    colFldSel: [Int] = []
+    colFldX: [Int] = []
+    colFldY: [Int] = []
+
+    // Intra prediction: per block (luma blocks, then U, then V) its DC
+    // (dequantised) and its first column (1…7) and row (9…15) of levels.
+    dcVal: [Int] = []
+    acVal: [Int] = []
+
+    // Data partitioning: per macroblock, its type (0 skipped, 1 inter, 2
+    // four vectors, 3 intra, 4 GMC, 5 skipped GMC), coded block pattern,
+    // ac_pred_flag,
+    // and the six DC levels.
+    dpType: [Int] = []
+    dpCbp: [Int] = []
+    dpAc: [Int] = []
+    dpDc: [Int] = []
+
+    // Scratch.
+    // The macroblock's vectors: four blocks × (x, y), forward and backward;
+    // field references; for field motion entries 0…3 are field 0 x, y and
+    // field 1 x, y.
+    mvF: [Int] = [0, 0, 0, 0, 0, 0, 0, 0]
+    mvB: [Int] = [0, 0, 0, 0, 0, 0, 0, 0]
+    fsF: [Int] = [0, 1]
+    fsB: [Int] = [0, 1]
+    lastMv: [Int] = [0, 0, 0, 0, 0, 0, 0, 0]
+    predX: Int = 0
+    predY: Int = 0
+    cbp: Int = 0
+    acPred: Bool = false
+    intraDcVlc: Bool = true
+    fieldDct: Bool = false
+    // dcPredict's answers.
+    pIdx: Int = 0
+    pA: Int = -1
+    pC: Int = -1
+    pQa: Int = 1
+    pQc: Int = 1
+    pDir: Int = 0
+    pPredQ: Int = 0
+    pScale: Int = 8
+    // GMC: luma x, y and chroma x, y offsets, the warp's derivatives
+    // (x per x, x per y, y per x, y per y), the fixed point shift, and how
+    // many warping points are really used (1 = a translation).
+    spriteOffset: [Int] = [0, 0, 0, 0]
+    spriteDelta: [Int] = [0, 0, 0, 0]
+    spriteShift: Int = 0
+    gmcPoints: Int = 1
+
+    // ---------------------------------------------------------------------
+    // Public interface.
+
+    fn decode(_ packet: Data, pts: Int, dts: Int, key: Bool) -> [core.Picture] {
+        out = []
+        curTime = if pts != core.noTime { pts } else { dts }
+        times.append(curTime)
+        if hasPending {
+            let p = pending
+            pending = Data()
+            hasPending = false
+            decodeChunk(p)
+            if isPlaceholder(packet) {
+                return takeOut()
+            }
+        } else if (packed || vol.divxPacked) && isPlaceholder(packet) {
+            // The placeholder after a run of B-VOPs in a packed stream: its
+            // time is that of the reference shown next.
+            return takeOut()
+        }
+        decodeChunk(packet)
+        takeOut()
+    }
+
+    fn flush() -> [core.Picture] {
+        out = []
+        if hasPending {
+            let p = pending
+            pending = Data()
+            hasPending = false
+            decodeChunk(p)
+        }
+        if hasHeld {
+            emit(held)
+            hasHeld = false
+            held = core.Picture(width: 0, height: 0)
+        }
+        times = []
+        takeOut()
+    }
+
+    fn reset() {
+        refCount = 0
+        hasHeld = false
+        held = core.Picture(width: 0, height: 0)
+        hasPending = false
+        pending = Data()
+        times = []
+        out = []
+    }
+
+    // ---------------------------------------------------------------------
+    // Packets, start codes and headers.
+
+    // One VLC symbol (see m4Vlc).
+    fn vlc(_ lut: [Int], _ bits: Int) -> Int {
+        let e = lut[br.peek(bits)]
+        if e == 0 {
+            return -1
+        }
+        br.skip(e & 31)
+        e >> 5
+    }
+
+    fn xbits(_ n: Int) -> Int {
+        if n == 0 {
+            return 0
+        }
+        let v = br.bits(n)
+        if (v >> (n - 1)) == 0 {
+            return v - (1 << n) + 1
+        }
+        v
+    }
+
+    // The headers in a track's setup bytes.
+    fn readHeaders(_ data: Data) {
+        var sc = m4FindStart(data, 0)
+        while sc >= 0 {
+            let next = m4FindStart(data, sc + 4)
+            let end = if next < 0 { data.count } else { next }
+            let code = data[sc + 3]
+            if code != 0xB6 {
+                header(code, data, from: sc + 4, to: end)
+            }
+            sc = next
+        }
+    }
+
+    fn takeOut() -> [core.Picture] {
+        let o = out
+        out = []
+        o
+    }
+
+    fn warn(_ s: String) {
+        warnCount += 1
+        if warnings.count < 200 {
+            warnings.append(s)
+        }
+    }
+
+    // Handles every start code in `data`; a second VOP is kept for the
+    // next packet (packed bitstream).
+    fn decodeChunk(_ data: Data) {
+        var sc = m4FindStart(data, 0)
+        var vops = 0
+        if sc < 0 {
+            if data.count > 8 {
+                warn("packet without a start code")
+            }
+            dropTime(curTime)
+            return
+        }
+        while sc >= 0 {
+            let code = data[sc + 3]
+            let next = m4FindStart(data, sc + 4)
+            let end = if next < 0 { data.count } else { next }
+            if code == 0xB6 {
+                if vops > 0 {
+                    pending = data.slice(from: sc, to: data.count)
+                    hasPending = true
+                    packed = true
+                    return
+                }
+                decodeVop(data, from: sc, to: end)
+                vops += 1
+            } else {
+                header(code, data, from: sc + 4, to: end)
+            }
+            sc = next
+        }
+        if vops == 0 {
+            // Headers only.
+            dropTime(curTime)
+        }
+    }
+
+    // The placeholder chunk after a packed P+B chunk: a VOP that isn't
+    // coded, on its own.
+    fn isPlaceholder(_ data: Data) -> Bool {
+        let sc = m4FindStart(data, 0)
+        if sc < 0 || data[sc + 3] != 0xB6 || !vol.seen {
+            return data.count < 8
+        }
+        var r = core.bitReaderRange(data, from: sc + 4, to: data.count)
+        var h = M4Vop()
+        h.parse(r, vol)
+        !h.coded
+    }
+
+    fn header(_ code: Int, _ data: Data, from: Int, to: Int) {
+        br = core.bitReaderRange(data, from: from, to: to)
+        if code >= 0x20 && code <= 0x2F {
+            vol.parseLayer(br)
+            if !vol.unsupported.isEmpty {
+                warn("can't decode this MPEG-4 video: {vol.unsupported}")
+                return
+            }
+            setupGeometry()
+        } else if code == 0xB5 {
+            vol.parseVisualObject(br)
+        } else if code == 0xB2 {
+            vol.parseUserData(data, from: from, to: to)
+            applyWorkarounds()
+        } else if code == 0xB3 {
+            let hours = br.bits(5)
+            let minutes = br.bits(6)
+            br.skip(1)
+            let seconds = br.bits(6)
+            timeBase = seconds + 60 * (minutes + 60 * hours)
+        }
+    }
+
+    // Encoder bugs ffmpeg works around, where they are cheap to copy.
+    fn applyWorkarounds() {
+        dcClipBug = vol.xvidBuild >= 0 && vol.xvidBuild <= 32
+        xvidIdct = vol.xvidBuild >= 0
+        hpelChromaBug = vol.divxVersion >= 0
+        directBlockBug = vol.divxVersion >= 0 || (vol.lavcBuild >= 0 && vol.lavcBuild < 4655)
+    }
+
+    fn setupGeometry() {
+        let w = vol.width
+        let h = vol.height
+        if w == width && h == height && !pics.pastY.isEmpty {
+            return
+        }
+        width = w
+        height = h
+        mbw = (w + 15) / 16
+        mbh = (h + 15) / 16
+        mbCount = mbw * mbh
+        var b = 0
+        while (1 << b) < mbCount {
+            b += 1
+        }
+        mbNumBits = max(b, 1)
+        ys = mbw * 16
+        cs = mbw * 8
+        lumaBlocks = 4 * mbCount
+        pics.setup(ys: ys, cs: cs, rows: mbh * 16, edgeW: mbw * 16, edgeH: mbh * 16)
+        refCount = 0
+        mbSlice = core.filled(mbCount, -1)
+        mbQ = core.filled(mbCount, 1)
+        mbKind = core.zeros(mbCount)
+        mbSkip = core.zeros(mbCount)
+        mvX = core.zeros(lumaBlocks)
+        mvY = core.zeros(lumaBlocks)
+        fldSel = core.zeros(2 * mbCount)
+        fldX = core.zeros(2 * mbCount)
+        fldY = core.zeros(2 * mbCount)
+        colKind = mbKind
+        colSkip = mbSkip
+        colX = mvX
+        colY = mvY
+        colFldSel = fldSel
+        colFldX = fldX
+        colFldY = fldY
+        dcVal = core.filled(lumaBlocks + 2 * mbCount, 1024)
+        acVal = core.zeros(16 * (lumaBlocks + 2 * mbCount))
+        dpType = core.zeros(mbCount)
+        dpCbp = core.zeros(mbCount)
+        dpAc = core.zeros(mbCount)
+        dpDc = core.zeros(6 * mbCount)
+    }
+
+    // ---------------------------------------------------------------------
+    // Time stamps and output.
+
+    fn dropTime(_ t: Int) {
+        var i = 0
+        while i < times.count {
+            if times[i] == t {
+                times.remove(at: i)
+                return
+            }
+            i += 1
+        }
+    }
+
+    fn popMinTime() -> Int {
+        if times.isEmpty {
+            return core.noTime
+        }
+        var best = 0
+        for i in 1..times.count {
+            if times[i] < times[best] {
+                best = i
+            }
+        }
+        times.remove(at: best)
+    }
+
+    fn emit(_ p: core.Picture) {
+        var q = p
+        q.pts = popMinTime()
+        out.append(q)
+    }
+
+    fn makePicture(_ y: [Int], _ u: [Int], _ v: [Int], key: Bool) -> core.Picture {
+        var p = core.Picture(width: width, height: height)
+        p.y = y
+        p.u = u
+        p.v = v
+        p.yStride = ys
+        p.cStride = cs
+        p.key = key
+        p.fullRange = vol.fullRange
+        let m = vol.matrixCoefficients
+        if m == 1 {
+            p.matrix = .bt709
+        } else if m == 5 || m == 6 {
+            p.matrix = .bt601
+        } else if m == 9 || m == 10 {
+            p.matrix = .bt2020
+        } else {
+            p.matrix = core.guessMatrix(width: width, height: height)
+        }
+        if vol.hasSar {
+            p.sarNum = vol.sarNum
+            p.sarDen = vol.sarDen
+        } else {
+            p.sarNum = trackSarNum
+            p.sarDen = trackSarDen
+        }
+        p
+    }
+
+    // A reference picture is done: it becomes the newest reference and is
+    // shown after the B pictures that come before it.
+    fn finishReference(key: Bool) {
+
+        let pic = makePicture(pics.curY, pics.curU, pics.curV, key: key)
+        pics.pastY = pics.futY
+        pics.pastU = pics.futU
+        pics.pastV = pics.futV
+        pics.futY = pics.curY
+        pics.futU = pics.curU
+        pics.futV = pics.curV
+        pics.curY = []
+        pics.curU = []
+        pics.curV = []
+        refCount = min(refCount + 1, 2)
+        // The tables become the colocated ones for the next B-VOPs.
+        let k = colKind
+        colKind = mbKind
+        mbKind = k
+        let s = colSkip
+        colSkip = mbSkip
+        mbSkip = s
+        let x = colX
+        colX = mvX
+        mvX = x
+        let y = colY
+        colY = mvY
+        mvY = y
+        let fs = colFldSel
+        colFldSel = fldSel
+        fldSel = fs
+        let fx = colFldX
+        colFldX = fldX
+        fldX = fx
+        let fy = colFldY
+        colFldY = fldY
+        fldY = fy
+        if vol.lowDelay {
+            emit(pic)
+        } else {
+            if hasHeld {
+                emit(held)
+            }
+            held = pic
+            hasHeld = true
+        }
+    }
+
+    // A VOP that isn't coded: the newest reference again.
+    fn repeatReference() {
+        let pic = makePicture(pics.futY, pics.futU, pics.futV, key: false)
+        pics.pastY = pics.futY
+        pics.pastU = pics.futU
+        pics.pastV = pics.futV
+        refCount = min(refCount + 1, 2)
+        for i in 0..mbCount {
+            colSkip[i] = 1
+            colKind[i] = 0
+        }
+        for i in 0..lumaBlocks {
+            colX[i] = 0
+            colY[i] = 0
+        }
+        if vol.lowDelay {
+            emit(pic)
+        } else {
+            if hasHeld {
+                emit(held)
+            }
+            held = pic
+            hasHeld = true
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // VOPs.
+
+    fn decodeVop(_ data: Data, from: Int, to: Int) {
+        br = core.bitReaderRange(data, from: from + 4, to: to)
+        vop.parse(br, vol)
+        if !vol.seen {
+            if !warnedNoVol {
+                warn("a VOP came before any video object layer header")
+                warnedNoVol = true
+            }
+            dropTime(curTime)
+            return
+        }
+        if !vop.problem.isEmpty {
+            warn("VOP skipped: {vop.problem}")
+            dropTime(curTime)
+            return
+        }
+        if !vop.coded {
+            if vop.type != 2 && refCount > 0 {
+                repeatReference()
+            } else {
+                dropTime(curTime)
+            }
+            return
+        }
+        type = vop.type
+        // Time distances for direct mode (7.6.9.4.1), as ffmpeg works them
+        // out.
+        if type != 2 {
+            lastTimeBase = timeBase
+            timeBase += vop.moduloTime
+            let time = timeBase * vol.timeRes + vop.timeIncrement
+            ppTime = time - lastNonBTime
+            lastNonBTime = time
+        } else {
+            let time = (lastTimeBase + vop.moduloTime) * vol.timeRes + vop.timeIncrement
+            pbTime = ppTime - (lastNonBTime - time)
+            if ppTime <= pbTime || ppTime <= ppTime - pbTime || ppTime <= 0 {
+                popMinTime()
+                return
+            }
+            if tFrame == 0 {
+                tFrame = pbTime
+            }
+            if tFrame == 0 {
+                tFrame = 1
+            }
+            let base = m4RoundedDiv(lastNonBTime - ppTime, tFrame)
+            ppFieldTime = (m4RoundedDiv(lastNonBTime, tFrame) - base) * 2
+            pbFieldTime = (m4RoundedDiv(time, tFrame) - base) * 2
+            if ppFieldTime <= pbFieldTime || pbFieldTime <= 1 {
+                pbFieldTime = 2
+                ppFieldTime = 4
+                if vol.interlaced {
+                    popMinTime()
+                    return
+                }
+            }
+        }
+        if type == 2 {
+            if refCount < 2 || skipNonReference {
+                popMinTime()
+                return
+            }
+            if vol.lowDelay {
+                warn("B-VOP in a stream marked low delay")
+                vol.lowDelay = false
+            }
+        } else if type != 0 && refCount == 0 {
+            dropTime(curTime)
+            return
+        }
+        qscale = vop.quant
+        rounding = if type == 2 { 0 } else { vop.rounding }
+        fcodeF = vop.fcodeF
+        fcodeB = vop.fcodeB
+        dcThr = m4DcThreshold[vop.intraDcThr]
+        altScan = vop.altScan
+        tff = vop.topFieldFirst
+        qpel = vol.quarterSample
+        gmc = type == 3 && vol.spriteEnable == 2
+        if gmc {
+            setupGmc()
+        }
+        if type == 2 {
+            pics.curY = pics.bY
+            pics.curU = pics.bU
+            pics.curV = pics.bV
+            pics.bY = []
+            pics.bU = []
+            pics.bV = []
+            decodeBMacroblocks()
+            let pic = makePicture(pics.curY, pics.curU, pics.curV, key: false)
+            pics.bY = pics.curY
+            pics.bU = pics.curU
+            pics.bV = pics.curV
+            pics.curY = []
+            pics.curU = []
+            pics.curV = []
+            emit(pic)
+            return
+        }
+        pics.curY = pics.pastY
+        pics.curU = pics.pastU
+        pics.curV = pics.pastV
+        pics.pastY = []
+        pics.pastU = []
+        pics.pastV = []
+        if vol.dataPartitioned {
+            decodePartitionedMacroblocks()
+        } else {
+            decodeRefMacroblocks()
+        }
+        // The old past reference was released into cur; finishReference
+        // moves fut to past.
+        finishReference(key: type == 0)
+    }
+
+    // Zeros of the resync marker after its stuffing (6.3.5.2).
+    fn resyncZeros() -> Int {
+        if type == 0 {
+            return 16
+        }
+        if type == 2 {
+            return max(fcodeF, fcodeB, 2) + 15
+        }
+        fcodeF + 15
+    }
+
+    // Whether a resync marker (stuffing to the byte boundary, then the
+    // marker) starts here.
+    fn atResync() -> Bool {
+        if vol.resyncDisable && !vol.dataPartitioned {
+            return false
+        }
+        let z = resyncZeros()
+        let k = 8 - (br.position & 7)
+        if br.left < k + z + 1 {
+            return false
+        }
+        let v = br.peek(k + z + 1)
+        let stuffing = (1 << (k - 1)) - 1
+        v == ((stuffing << (z + 1)) | 1)
+    }
+
+    // After damage: moves to the next byte-aligned resync marker of this
+    // VOP and returns true, or false when there is none.
+    fn seekResync() -> Bool {
+        let z = resyncZeros()
+        let data = br.data
+        var p = (br.position + 7) / 8
+        let end = br.end
+        let rest = z - 16
+        while p + 3 <= end {
+            if data[p] == 0 && data[p + 1] == 0 {
+                let b = data[p + 2]
+                if b == 1 {
+                    // A start code: the VOP ends here.
+                    return false
+                }
+                // z zeros then a 1: the third byte holds the rest.
+                if rest < 8 && (b >> (7 - rest)) == 1 {
+                    br.seek(toBit: p * 8)
+                    resyncAligned = true
+                    return true
+                }
+            }
+            p += 1
+        }
+        false
+    }
+
+    // Set by seekResync when the marker starts right at the reader (no
+    // stuffing before it).
+    resyncAligned: Bool = false
+
+    fn atResyncOrAligned() -> Bool {
+        if resyncAligned {
+            return true
+        }
+        atResync()
+    }
+
+    // Reads a video packet header (6.2.5.2) at a resync marker; returns the
+    // packet's first macroblock or -1.
+    fn readPacketHeaderAny() -> Int {
+        let z = resyncZeros()
+        if resyncAligned {
+            resyncAligned = false
+            br.skip(z + 1)
+        } else {
+            let k = 8 - (br.position & 7)
+            br.skip(k + z + 1)
+        }
+        readPacketBody()
+    }
+
+    fn readPacketBody() -> Int {
+        let mb = br.bits(mbNumBits)
+        let q = br.bits(vol.quantPrecision)
+        if q != 0 {
+            qscale = q
+        }
+        if br.flag() {
+            var n = 0
+            while br.bits(1) == 1 && n < 100 {
+                n += 1
+            }
+            br.skip(1)
+            br.skip(vol.timeBits)
+            br.skip(1)
+            br.skip(5)
+            if gmc && vol.spritePoints > 0 {
+                vop.parseTrajectory(br, vol)
+            }
+            if type != 0 {
+                br.skip(3)
+            }
+            if type == 2 {
+                br.skip(3)
+            }
+        }
+        if br.overrun || mb >= mbCount {
+            return -1
+        }
+        mb
+    }
+
+    fn newSlice() {
+        sliceId += 1
+        slice = sliceId
+        for i in 0..8 {
+            lastMv[i] = 0
+        }
+    }
+
+    // I-, P- and S-VOPs without data partitioning.
+    fn decodeRefMacroblocks() {
+        newSlice()
+        var mb = 0
+        while mb < mbCount {
+            if mb > 0 && atResyncOrAligned() {
+                let next = readPacketHeaderAny()
+                if next < 0 || next < mb {
+                    warn("damaged video packet header")
+                    concealFrom(mb, mbCount)
+                    return
+                }
+                if next > mb {
+                    warn("macroblocks {mb}…{next - 1} missing")
+                    concealFrom(mb, next)
+                }
+                mb = next
+                newSlice()
+            }
+            let x = mb % mbw
+            let y = mb / mbw
+            mbSlice[mb] = slice
+            mbErr = false
+            gmcX = x
+            gmcY = y
+            var ok = if type == 0 { iMacroblock(x, y, mb) } else { pMacroblock(x, y, mb) }
+            if br.overrun {
+                ok = false
+            }
+            if !ok {
+                warn("damaged macroblock {mb} in a {m4TypeName(type)}-VOP")
+                concealFrom(mb, mb + 1)
+                mb += 1
+                if !seekResync() {
+                    concealFrom(mb, mbCount)
+                    return
+                }
+                continue
+            }
+            mb += 1
+        }
+    }
+
+    // B-VOPs.
+    fn decodeBMacroblocks() {
+        newSlice()
+        var mb = 0
+        while mb < mbCount {
+            if mb > 0 && atResyncOrAligned() {
+                let next = readPacketHeaderAny()
+                if next < 0 || next < mb {
+                    warn("damaged video packet header")
+                    concealFrom(mb, mbCount)
+                    return
+                }
+                if next > mb {
+                    warn("macroblocks {mb}…{next - 1} missing")
+                    concealFrom(mb, next)
+                }
+                mb = next
+                newSlice()
+            }
+            let x = mb % mbw
+            let y = mb / mbw
+            if x == 0 {
+                for i in 0..8 {
+                    lastMv[i] = 0
+                }
+            }
+            mbSlice[mb] = slice
+            mbErr = false
+            var ok = bMacroblock(x, y, mb)
+            if br.overrun {
+                ok = false
+            }
+            if !ok {
+                warn("damaged macroblock {mb} in a B-VOP")
+                concealFrom(mb, mb + 1)
+                mb += 1
+                if !seekResync() {
+                    concealFrom(mb, mbCount)
+                    return
+                }
+                continue
+            }
+            mb += 1
+        }
+    }
+
+    // Damaged or missing macroblocks: copied from the newest reference (or
+    // grey before there is one).
+    fn concealFrom(_ from: Int, _ to: Int) {
+        var mb = from
+        while mb < min(to, mbCount) {
+            let x = mb % mbw
+            let y = mb / mbw
+            if refCount > 0 {
+                pics.copyMb(1, x, y)
+            } else {
+                pics.greyMb(x, y)
+            }
+            if type != 2 {
+                mbSlice[mb] = -1
+                mbKind[mb] = 0
+                mbSkip[mb] = 0
+                setBlockMvs(x, y, 0, 0)
+                resetIntraPred(x, y, mb)
+            }
+            mb += 1
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Macroblock layer (6.2.6).
+
+    fn dquant() {
+        qscale = min(max(qscale + m4Dquant[br.bits(2)], 1), 31)
+    }
+
+    fn setBlockMvs(_ x: Int, _ y: Int, _ mx: Int, _ my: Int) {
+        let bw = 2 * mbw
+        let i = 2 * y * bw + 2 * x
+        mvX[i] = mx
+        mvX[i + 1] = mx
+        mvX[i + bw] = mx
+        mvX[i + bw + 1] = mx
+        mvY[i] = my
+        mvY[i + 1] = my
+        mvY[i + bw] = my
+        mvY[i + bw + 1] = my
+    }
+
+    // A non-intra macroblock: its blocks predict nothing (7.4.3: DC 1024,
+    // AC 0).
+    fn resetIntraPred(_ x: Int, _ y: Int, _ mb: Int) {
+        let bw = 2 * mbw
+        let i = 2 * y * bw + 2 * x
+        resetBlock(i)
+        resetBlock(i + 1)
+        resetBlock(i + bw)
+        resetBlock(i + bw + 1)
+        resetBlock(lumaBlocks + mb)
+        resetBlock(lumaBlocks + mbCount + mb)
+    }
+
+    fn resetBlock(_ i: Int) {
+        dcVal[i] = 1024
+        let o = i * 16
+        for k in 0..16 {
+            acVal[o + k] = 0
+        }
+    }
+
+    fn iMacroblock(_ x: Int, _ y: Int, _ mb: Int) -> Bool {
+        var mcbpc = vlc(m4IntraMcbpc, m4IntraMcbpcBits)
+        while mcbpc == 8 {
+            mcbpc = vlc(m4IntraMcbpc, m4IntraMcbpcBits)
+        }
+        if mcbpc < 0 {
+            return false
+        }
+        acPred = br.flag()
+        let cbpy = vlc(m4Cbpy, m4CbpyBits)
+        if cbpy < 0 {
+            return false
+        }
+        cbp = (cbpy << 2) | (mcbpc & 3)
+        intraDcVlc = qscale < dcThr
+        if mcbpc >= 4 {
+            dquant()
+        }
+        fieldDct = if vol.interlaced { br.flag() } else { false }
+        mbQ[mb] = qscale
+        mbKind[mb] = 0
+        mbSkip[mb] = 0
+        setBlockMvs(x, y, 0, 0)
+        intraBlocks(x, y, mb)
+    }
+
+    fn intraBlocks(_ x: Int, _ y: Int, _ mb: Int) -> Bool {
+        for n in 0..6 {
+            dcPredict(n, x, y, mb)
+            var diff = 0
+            if intraDcVlc {
+                let size = if n < 4 { vlc(m4DcLum, m4DcLumBits) } else { vlc(m4DcChrom, m4DcChromBits) }
+                if size < 0 {
+                    return false
+                }
+                if size > 0 {
+                    diff = xbits(size)
+                    if size > 8 {
+                        br.skip(1)
+                    }
+                }
+            }
+            if !intraBlockData(n, x, y, coded: ((cbp >> (5 - n)) & 1) == 1, haveDc: intraDcVlc, dcLevel: diff + pPredQ) {
+                return false
+            }
+        }
+        true
+    }
+
+    fn pMacroblock(_ x: Int, _ y: Int, _ mb: Int) -> Bool {
+        // Macroblock stuffing (not_coded 0 and the stuffing mcbpc) comes
+        // before a macroblock any number of times.
+        var mcbpc = 20
+        while mcbpc == 20 {
+            if br.flag() {
+                return notCoded(x, y, mb)
+            }
+            mcbpc = vlc(m4InterMcbpc, m4InterMcbpcBits)
+            if br.overrun {
+                return false
+            }
+        }
+        if mcbpc < 0 {
+            return false
+        }
+        let mt = mcbpc >> 2
+        mbSkip[mb] = 0
+        if mt >= 3 {
+            acPred = br.flag()
+            let cbpy = vlc(m4Cbpy, m4CbpyBits)
+            if cbpy < 0 {
+                return false
+            }
+            cbp = (cbpy << 2) | (mcbpc & 3)
+            intraDcVlc = qscale < dcThr
+            if mt == 4 {
+                dquant()
+            }
+            fieldDct = if vol.interlaced { br.flag() } else { false }
+            mbQ[mb] = qscale
+            mbKind[mb] = 0
+            setBlockMvs(x, y, 0, 0)
+            return intraBlocks(x, y, mb)
+        }
+        var mcsel = false
+        if gmc && mt != 2 {
+            mcsel = br.flag()
+        }
+        let cbpy = vlc(m4Cbpy, m4CbpyBits)
+        if cbpy < 0 {
+            return false
+        }
+        cbp = ((15 - cbpy) << 2) | (mcbpc & 3)
+        if mt == 1 {
+            dquant()
+        }
+        fieldDct = false
+        if vol.interlaced && cbp != 0 {
+            fieldDct = br.flag()
+        }
+        mbQ[mb] = qscale
+        resetIntraPred(x, y, mb)
+        var kind = 0
+        if mt == 2 {
+            kind = 1
+            let bw = 2 * mbw
+            for b in 0..4 {
+                predMv(x, y, b)
+                let mx = readMv(predX, fcodeF)
+                let my = readMv(predY, fcodeF)
+                let i = (2 * y + (b >> 1)) * bw + 2 * x + (b & 1)
+                mvX[i] = mx
+                mvY[i] = my
+                mvF[2 * b] = mx
+                mvF[2 * b + 1] = my
+            }
+        } else if mcsel {
+            let ax = gmcAmv(0)
+            let ay = gmcAmv(1)
+            setBlockMvs(x, y, ax, ay)
+            mbKind[mb] = 0
+            if mbErr {
+                return false
+            }
+            gmcPredict(x, y)
+            putPrediction(x, y, average: false)
+            return interResidual(x, y)
+        } else if vol.interlaced && br.flag() {
+            kind = 2
+            fsF[0] = br.bit()
+            fsF[1] = br.bit()
+            predMv(x, y, 0)
+            for f in 0..2 {
+                mvF[2 * f] = readMv(predX, fcodeF)
+                mvF[2 * f + 1] = readMv(predY / 2, fcodeF)
+                fldSel[2 * mb + f] = fsF[f]
+                fldX[2 * mb + f] = mvF[2 * f]
+                fldY[2 * mb + f] = mvF[2 * f + 1]
+            }
+            let sx = mvF[0] + mvF[2]
+            let sy = mvF[1] + mvF[3]
+            setBlockMvs(x, y, (sx >> 1) | (sx & 1), sy)
+        } else {
+            predMv(x, y, 0)
+            let mx = readMv(predX, fcodeF)
+            let my = readMv(predY, fcodeF)
+            mvF[0] = mx
+            mvF[1] = my
+            setBlockMvs(x, y, mx, my)
+        }
+        mbKind[mb] = kind
+        if mbErr {
+            return false
+        }
+        predict(ref: 1, dir: 0, slot: 0, kind: kind, x: x, y: y)
+        putPrediction(x, y, average: false)
+        interResidual(x, y)
+    }
+
+    // not_coded (6.3.6.1): GMC prediction in an S-VOP, else a copy.
+    fn notCoded(_ x: Int, _ y: Int, _ mb: Int) -> Bool {
+        mbQ[mb] = qscale
+        resetIntraPred(x, y, mb)
+        mbKind[mb] = 0
+        if gmc {
+            mbSkip[mb] = 0
+            setBlockMvs(x, y, gmcAmv(0), gmcAmv(1))
+            gmcPredict(x, y)
+            putPrediction(x, y, average: false)
+        } else {
+            mbSkip[mb] = 1
+            setBlockMvs(x, y, 0, 0)
+            copyFromFuture(x, y)
+        }
+        true
+    }
+
+    fn copyFromFuture(_ x: Int, _ y: Int) {
+        pics.copyMb(1, x, y)
+    }
+
+    fn copyFromPast(_ x: Int, _ y: Int) {
+        pics.copyMb(0, x, y)
+    }
+
+    fn interResidual(_ x: Int, _ y: Int) -> Bool {
+        if cbp == 0 {
+            return true
+        }
+        for n in 0..6 {
+            if ((cbp >> (5 - n)) & 1) == 1 {
+                if !interBlock(n, x, y) {
+                    return false
+                }
+            }
+        }
+        true
+    }
+
+    fn bMacroblock(_ x: Int, _ y: Int, _ mb: Int) -> Bool {
+        if colSkip[mb] == 1 {
+            // The macroblock was skipped in the newest reference: this one
+            // isn't coded either, and copies the past reference (6.3.6.2).
+            copyFromPast(x, y)
+            return true
+        }
+        var mbt = 0
+        var skipped = false
+        cbp = 0
+        fieldDct = false
+        var fieldPred = false
+        if br.flag() {
+            skipped = true
+        } else {
+            let modb2 = br.flag()
+            mbt = vlc(m4BType, m4BTypeBits)
+            if mbt < 0 {
+                return false
+            }
+            if !modb2 {
+                cbp = br.bits(6)
+            }
+            if mbt != 0 && cbp != 0 {
+                if br.flag() {
+                    let up = br.flag()
+                    qscale = min(max(qscale + (if up { 2 } else { -2 }), 1), 31)
+                }
+            }
+            if vol.interlaced {
+                if cbp != 0 {
+                    fieldDct = br.flag()
+                }
+                if mbt != 0 && br.flag() {
+                    fieldPred = true
+                    if mbt == 1 || mbt == 3 {
+                        fsF[0] = br.bit()
+                        fsF[1] = br.bit()
+                    }
+                    if mbt == 1 || mbt == 2 {
+                        fsB[0] = br.bit()
+                        fsB[1] = br.bit()
+                    }
+                }
+            }
+        }
+        var kindF = 0
+        var kindB = 0
+        let useF = mbt == 0 || mbt == 1 || mbt == 3
+        let useB = mbt == 0 || mbt == 1 || mbt == 2
+        if mbt == 0 {
+            var dx = 0
+            var dy = 0
+            if !skipped {
+                dx = readMv(0, 1)
+                dy = readMv(0, 1)
+            }
+            kindF = setDirect(mb, dx, dy)
+            kindB = kindF
+        } else if !fieldPred {
+            if useF {
+                let mx = readMv(lastMv[0], fcodeF)
+                let my = readMv(lastMv[1], fcodeF)
+                mvF[0] = mx
+                mvF[1] = my
+                lastMv[0] = mx
+                lastMv[1] = my
+                lastMv[2] = mx
+                lastMv[3] = my
+            }
+            if useB {
+                let mx = readMv(lastMv[4], fcodeB)
+                let my = readMv(lastMv[5], fcodeB)
+                mvB[0] = mx
+                mvB[1] = my
+                lastMv[4] = mx
+                lastMv[5] = my
+                lastMv[6] = mx
+                lastMv[7] = my
+            }
+        } else {
+            kindF = 2
+            kindB = 2
+            if useF {
+                for f in 0..2 {
+                    let mx = readMv(lastMv[2 * f], fcodeF)
+                    let my = readMv(lastMv[2 * f + 1] / 2, fcodeF)
+                    mvF[2 * f] = mx
+                    mvF[2 * f + 1] = my
+                    lastMv[2 * f] = mx
+                    lastMv[2 * f + 1] = my * 2
+                }
+            }
+            if useB {
+                for f in 0..2 {
+                    let mx = readMv(lastMv[4 + 2 * f], fcodeB)
+                    let my = readMv(lastMv[4 + 2 * f + 1] / 2, fcodeB)
+                    mvB[2 * f] = mx
+                    mvB[2 * f + 1] = my
+                    lastMv[4 + 2 * f] = mx
+                    lastMv[4 + 2 * f + 1] = my * 2
+                }
+            }
+        }
+        if mbErr {
+            return false
+        }
+        if useF && useB {
+            predict(ref: 0, dir: 0, slot: 0, kind: kindF, x: x, y: y)
+            predict(ref: 1, dir: 1, slot: 1, kind: kindB, x: x, y: y)
+            putPrediction(x, y, average: true)
+        } else if useF {
+            predict(ref: 0, dir: 0, slot: 0, kind: kindF, x: x, y: y)
+            putPrediction(x, y, average: false)
+        } else {
+            predict(ref: 1, dir: 1, slot: 0, kind: kindB, x: x, y: y)
+            putPrediction(x, y, average: false)
+        }
+        interResidual(x, y)
+    }
+
+    // Direct mode (7.6.9.5): vectors from the colocated macroblock of the
+    // newest reference, scaled by the time distances, plus the delta.
+    // Returns the kind of motion.
+    fn setDirect(_ mb: Int, _ dx: Int, _ dy: Int) -> Int {
+        let ck = colKind[mb]
+        let pp = ppTime
+        let pb = pbTime
+        let x = mb % mbw
+        let y = mb / mbw
+        let bw = 2 * mbw
+        if ck == 2 {
+            for i in 0..2 {
+                let fs = colFldSel[2 * mb + i]
+                fsF[i] = fs
+                fsB[i] = i
+                var tpp = 0
+                var tpb = 0
+                if tff {
+                    tpp = ppFieldTime - fs + i
+                    tpb = pbFieldTime - fs + i
+                } else {
+                    tpp = ppFieldTime + fs - i
+                    tpb = pbFieldTime + fs - i
+                }
+                if tpp == 0 {
+                    tpp = 1
+                }
+                // The colocated field vectors. ffmpeg's decoder reads them
+                // from a table only its encoder fills, so it uses zero
+                // vectors here; pictures match ffmpeg that way, and the
+                // standard's way is kept behind standardFieldDirect.
+                var cx = 0
+                var cy = 0
+                if standardFieldDirect {
+                    cx = colFldX[2 * mb + i]
+                    cy = colFldY[2 * mb + i]
+                }
+                let fx = cx * tpb / tpp + dx
+                let fy = cy * tpb / tpp + dy
+                mvF[2 * i] = fx
+                mvF[2 * i + 1] = fy
+                mvB[2 * i] = if dx != 0 { fx - cx } else { cx * (tpb - tpp) / tpp }
+                mvB[2 * i + 1] = if dy != 0 { fy - cy } else { cy * (tpb - tpp) / tpp }
+            }
+            return 2
+        }
+        let blocks = if ck == 1 { 4 } else { 1 }
+        for b in 0..blocks {
+            let i = (2 * y + (b >> 1)) * bw + 2 * x + (b & 1)
+            let px = colX[i]
+            let py = colY[i]
+            let fx = px * pb / pp + dx
+            let fy = py * pb / pp + dy
+            mvF[2 * b] = fx
+            mvF[2 * b + 1] = fy
+            mvB[2 * b] = if dx != 0 { fx - px } else { px * (pb - pp) / pp }
+            mvB[2 * b + 1] = if dy != 0 { fy - py } else { py * (pb - pp) / pp }
+        }
+        if ck == 1 {
+            return 1
+        }
+        if qpel && !directBlockBug {
+            for b in 1..4 {
+                mvF[2 * b] = mvF[0]
+                mvF[2 * b + 1] = mvF[1]
+                mvB[2 * b] = mvB[0]
+                mvB[2 * b + 1] = mvB[1]
+            }
+            return 1
+        }
+        0
+    }
+
+    // ---------------------------------------------------------------------
+    // Motion vectors (7.6.3, 7.6.5).
+
+    // motion_code and motion_residual (6.3.6.3), added to the prediction
+    // and wrapped into the range of fcode.
+    fn readMv(_ pred: Int, _ fcode: Int) -> Int {
+        let code = vlc(m4Mv, m4MvBits)
+        if code < 0 {
+            mbErr = true
+            return 0
+        }
+        if code == 0 {
+            return pred
+        }
+        let sign = br.bit()
+        var v = code
+        let shift = fcode - 1
+        if shift > 0 {
+            v = (((code - 1) << shift) | br.bits(shift)) + 1
+        }
+        if sign == 1 {
+            v = -v
+        }
+        v += pred
+        let m = 1 << (5 + fcode)
+        ((v + (m >> 1)) & (m - 1)) - (m >> 1)
+    }
+
+    // The median prediction of a block's vector from its left, above and
+    // above-right neighbours (7.6.5); candidates outside the VOP or the
+    // video packet don't count.
+    fn predMv(_ x: Int, _ y: Int, _ b: Int) {
+        let bw = 2 * mbw
+        let bx = 2 * x + (b & 1)
+        let by = 2 * y + (b >> 1)
+        let off = if b == 0 { 2 } else if b == 3 { -1 } else { 1 }
+        var ax = 0
+        var ay = 0
+        var bxv = 0
+        var byv = 0
+        var cx = 0
+        var cy = 0
+        var valid = 0
+        var va = false
+        var vb = false
+        var vc = false
+        if bx - 1 >= 0 && mbSlice[(by >> 1) * mbw + ((bx - 1) >> 1)] == slice {
+            va = true
+            ax = mvX[by * bw + bx - 1]
+            ay = mvY[by * bw + bx - 1]
+            valid += 1
+        }
+        if by - 1 >= 0 && mbSlice[((by - 1) >> 1) * mbw + (bx >> 1)] == slice {
+            vb = true
+            bxv = mvX[(by - 1) * bw + bx]
+            byv = mvY[(by - 1) * bw + bx]
+            valid += 1
+        }
+        let ccx = bx + off
+        if by - 1 >= 0 && ccx >= 0 && ccx < bw && mbSlice[((by - 1) >> 1) * mbw + (ccx >> 1)] == slice {
+            vc = true
+            cx = mvX[(by - 1) * bw + ccx]
+            cy = mvY[(by - 1) * bw + ccx]
+            valid += 1
+        }
+        if valid == 1 {
+            if va {
+                predX = ax
+                predY = ay
+            } else if vb {
+                predX = bxv
+                predY = byv
+            } else {
+                predX = cx
+                predY = cy
+            }
+            return
+        }
+        if valid == 0 {
+            predX = 0
+            predY = 0
+            return
+        }
+        predX = m4Median(ax, bxv, cx)
+        predY = m4Median(ay, byv, cy)
+    }
+
+    // ---------------------------------------------------------------------
+    // Motion compensation into predBuf (slot 0 or 1, 384 samples each:
+    // luma 16×16, then U and V 8×8).
+
+    fn mvAt(_ dir: Int, _ i: Int) -> Int {
+        if dir == 0 { mvF[i] } else { mvB[i] }
+    }
+
+    // Predicts the macroblock at (x, y) from reference `ref` (0 past, 1
+    // newest) with the vectors of `dir` (0 mvF, 1 mvB).
+    fn predict(ref: Int, dir: Int, slot: Int, kind: Int, x: Int, y: Int) {
+        let o = slot * 384
+        let rnd = rounding
+        if kind == 0 {
+            let mx = mvAt(dir, 0)
+            let my = mvAt(dir, 1)
+            if qpel {
+                pics.fetchRef(ref, 0, -1, x * 16 + (mx >> 2), y * 16 + (my >> 2), 17, 17)
+                pics.qpel(ts: 17, dOff: o, dStride: 16, n: 16, dx: mx & 3, dy: my & 3, rnd: rnd)
+                let hx = mx / 2
+                let hy = my / 2
+                chroma(ref, o, x, y, (hx >> 1) | (hx & 1), (hy >> 1) | (hy & 1))
+            } else {
+                pics.fetchRef(ref, 0, -1, x * 16 + (mx >> 1), y * 16 + (my >> 1), 17, 17)
+                pics.hpel(ts: 17, dOff: o, dStride: 16, w: 16, h: 16, dxy: (mx & 1) | ((my & 1) << 1), rnd: rnd)
+                chroma(ref, o, x, y, (mx >> 1) | (mx & 1), (my >> 1) | (my & 1))
+            }
+        } else if kind == 1 {
+            var sx = 0
+            var sy = 0
+            for b in 0..4 {
+                let mx = mvAt(dir, 2 * b)
+                let my = mvAt(dir, 2 * b + 1)
+                let bx = (b & 1) * 8
+                let by = (b >> 1) * 8
+                // ffmpeg clips 8×8 blocks to the visible picture first
+                // (dropping the fraction at the far edge); the reference is
+                // still read up to its macroblock edge.
+                if qpel {
+                    var bsx = x * 16 + bx + (mx >> 2)
+                    var bsy = y * 16 + by + (my >> 2)
+                    var fx = mx & 3
+                    var fy = my & 3
+                    bsx = min(max(bsx, -16), width)
+                    if bsx == width {
+                        fx = 0
+                    }
+                    bsy = min(max(bsy, -16), height)
+                    if bsy == height {
+                        fy = 0
+                    }
+                    pics.fetchRef(ref, 0, -1, bsx, bsy, 9, 9)
+                    pics.qpel(ts: 9, dOff: o + by * 16 + bx, dStride: 16, n: 8, dx: fx, dy: fy, rnd: rnd)
+                    sx += mx / 2
+                    sy += my / 2
+                } else {
+                    var bsx = x * 16 + bx + (mx >> 1)
+                    var bsy = y * 16 + by + (my >> 1)
+                    bsx = min(max(bsx, -16), width)
+                    bsy = min(max(bsy, -16), height)
+                    var dxy = 0
+                    if bsx != width {
+                        dxy = mx & 1
+                    }
+                    if bsy != height {
+                        dxy = dxy | ((my & 1) << 1)
+                    }
+                    pics.fetchRef(ref, 0, -1, bsx, bsy, 9, 9)
+                    pics.hpel(ts: 9, dOff: o + by * 16 + bx, dStride: 16, w: 8, h: 8, dxy: dxy, rnd: rnd)
+                    sx += mx
+                    sy += my
+                }
+            }
+            let cx = m4ChromaRound[sx & 15] + ((sx >> 3) & ~1)
+            let cy = m4ChromaRound[sy & 15] + ((sy >> 3) & ~1)
+            // ffmpeg's chroma_4mv_motion clips to the visible chroma size.
+            var csx = x * 8 + (cx >> 1)
+            var csy = y * 8 + (cy >> 1)
+            var dxy = (cx & 1) | ((cy & 1) << 1)
+            csx = min(max(csx, -8), width >> 1)
+            if csx == (width >> 1) {
+                dxy = dxy & 2
+            }
+            csy = min(max(csy, -8), height >> 1)
+            if csy == (height >> 1) {
+                dxy = dxy & 1
+            }
+            for p in 1..3 {
+                pics.fetchRef(ref, p, -1, csx, csy, 9, 9)
+                pics.hpel(ts: 9, dOff: o + 192 + p * 64, dStride: 8, w: 8, h: 8, dxy: dxy, rnd: rounding)
+            }
+        } else {
+            for f in 0..2 {
+                let fs = if dir == 0 { fsF[f] } else { fsB[f] }
+                let mx = mvAt(dir, 2 * f)
+                let my = mvAt(dir, 2 * f + 1)
+                var cx = 0
+                var cy = 0
+                if qpel {
+                    for k in 0..2 {
+                        pics.fetchRef(ref, 0, fs, x * 16 + k * 8 + (mx >> 2), y * 8 + (my >> 2), 9, 9)
+                        pics.qpel(ts: 9, dOff: o + f * 16 + k * 8, dStride: 32, n: 8, dx: mx & 3, dy: my & 3, rnd: rnd)
+                    }
+                    let hx = mx / 2
+                    let hy = my >> 1
+                    cx = (hx >> 1) | (hx & 1)
+                    cy = (hy >> 1) | (hy & 1)
+                } else {
+                    pics.fetchRef(ref, 0, fs, x * 16 + (mx >> 1), y * 8 + (my >> 1), 17, 9)
+                    pics.hpel(ts: 17, dOff: o + f * 16, dStride: 32, w: 16, h: 8, dxy: (mx & 1) | ((my & 1) << 1), rnd: rnd)
+                    cx = (mx >> 1) | (mx & 1)
+                    cy = if hpelChromaBug { my >> 1 } else { (my >> 1) | (my & 1) }
+                }
+                for p in 1..3 {
+                    pics.fetchRef(ref, p, fs, x * 8 + (cx >> 1), y * 4 + (cy >> 1), 9, 5)
+                    pics.hpel(ts: 9, dOff: o + 192 + p * 64 + f * 8, dStride: 16, w: 8, h: 4, dxy: (cx & 1) | ((cy & 1) << 1), rnd: rnd)
+                }
+            }
+        }
+    }
+
+    // Chroma prediction of a frame macroblock; cx, cy in chroma half
+    // samples.
+    fn chroma(_ ref: Int, _ o: Int, _ x: Int, _ y: Int, _ cx: Int, _ cy: Int) {
+        let dxy = (cx & 1) | ((cy & 1) << 1)
+        for p in 1..3 {
+            pics.fetchRef(ref, p, -1, x * 8 + (cx >> 1), y * 8 + (cy >> 1), 9, 9)
+            pics.hpel(ts: 9, dOff: o + 192 + p * 64, dStride: 8, w: 8, h: 8, dxy: dxy, rnd: rounding)
+        }
+    }
+
+    fn putPrediction(_ x: Int, _ y: Int, average: Bool) {
+        pics.putPrediction(x, y, average: average)
+    }
+
+    // ---------------------------------------------------------------------
+    // GMC (7.8): the S-VOP's warping points give an affine (or simpler)
+    // map from this picture to the reference; macroblocks with mcsel are
+    // predicted through it. Worked out as ffmpeg does (its
+    // mpeg4_decode_sprite_trajectory and gmc functions), so pictures match.
+
+    fn setupGmc() {
+        let points = min(vol.spritePoints, 3)
+        let acc = vol.spriteAccuracy
+        let a = 2 << acc
+        let rho = 3 - acc
+        let r = 16 / a
+        let w = width
+        let h = height
+        var alpha = 1
+        var beta = 0
+        while (1 << alpha) < w {
+            alpha += 1
+        }
+        while (1 << beta) < h {
+            beta += 1
+        }
+        let w2 = 1 << alpha
+        let h2 = 1 << beta
+        let d0x = vop.traj[0]
+        let d0y = vop.traj[1]
+        let d1x = if points > 1 { vop.traj[2] } else { 0 }
+        let d1y = if points > 1 { vop.traj[3] } else { 0 }
+        let d2x = if points > 2 { vop.traj[4] } else { 0 }
+        let d2y = if points > 2 { vop.traj[5] } else { 0 }
+        // Sprite reference points (vop corners (0,0), (w,0), (0,h)); the
+        // trajectories are in half samples, the points in 1/a samples.
+        let ha = a >> 1
+        let sr0x = ha * d0x
+        let sr0y = ha * d0y
+        let sr1x = ha * (2 * w + d0x + d1x)
+        let sr1y = ha * (d0y + d1y)
+        let sr2x = ha * (d0x + d2x)
+        let sr2y = ha * (2 * h + d0y + d2y)
+        // Virtual points at distances w2, h2 (7.8.4).
+        let v0x = 16 * w2 + m4RoundedDivAny((w - w2) * (r * sr0x) + w2 * (r * sr1x - 16 * w), w)
+        let v0y = m4RoundedDivAny((w - w2) * (r * sr0y) + w2 * (r * sr1y), w)
+        let v1x = m4RoundedDivAny((h - h2) * (r * sr0x) + h2 * (r * sr2x), h)
+        let v1y = 16 * h2 + m4RoundedDivAny((h - h2) * (r * sr0y) + h2 * (r * sr2y - 16 * h), h)
+        var o0x = 0
+        var o0y = 0
+        var o1x = 0
+        var o1y = 0
+        var dxx = a
+        var dxy = 0
+        var dyx = 0
+        var dyy = a
+        var s0 = 0
+        var s1 = 0
+        if points <= 1 {
+            o0x = sr0x
+            o0y = sr0y
+            o1x = (sr0x >> 1) | (sr0x & 1)
+            o1y = (sr0y >> 1) | (sr0y & 1)
+        } else if points == 2 {
+            o0x = sr0x * (1 << (alpha + rho)) + (1 << (alpha + rho - 1))
+            o0y = sr0y * (1 << (alpha + rho)) + (1 << (alpha + rho - 1))
+            o1x = (-r * sr0x + v0x) + (r * sr0y - v0y) + 2 * w2 * r * sr0x - 16 * w2 + (1 << (alpha + rho + 1))
+            o1y = (-r * sr0y + v0y) + (-r * sr0x + v0x) + 2 * w2 * r * sr0y - 16 * w2 + (1 << (alpha + rho + 1))
+            dxx = -r * sr0x + v0x
+            dxy = r * sr0y - v0y
+            dyx = -r * sr0y + v0y
+            dyy = -r * sr0x + v0x
+            s0 = alpha + rho
+            s1 = alpha + rho + 2
+        } else {
+            let mab = min(alpha, beta)
+            let w3 = w2 >> mab
+            let h3 = h2 >> mab
+            let sh = alpha + beta + rho - mab
+            o0x = sr0x * (1 << sh) + (1 << (sh - 1))
+            o0y = sr0y * (1 << sh) + (1 << (sh - 1))
+            o1x = (-r * sr0x + v0x) * h3 + (-r * sr0x + v1x) * w3 + 2 * w2 * h3 * r * sr0x - 16 * w2 * h3 + (1 << (sh + 1))
+            o1y = (-r * sr0y + v0y) * h3 + (-r * sr0y + v1y) * w3 + 2 * w2 * h3 * r * sr0y - 16 * w2 * h3 + (1 << (sh + 1))
+            dxx = (-r * sr0x + v0x) * h3
+            dxy = (-r * sr0x + v1x) * w3
+            dyx = (-r * sr0y + v0y) * h3
+            dyy = (-r * sr0y + v1y) * w3
+            s0 = sh
+            s1 = sh + 2
+        }
+        gmcPoints = 1
+        if dxx == (a << s0) && dxy == 0 && dyx == 0 && dyy == (a << s0) {
+            // Only a translation.
+            o0x = o0x >> s0
+            o0y = o0y >> s0
+            o1x = o1x >> s1
+            o1y = o1y >> s1
+            dxx = a
+            dxy = 0
+            dyx = 0
+            dyy = a
+            s0 = 0
+            s1 = 0
+        } else {
+            let shy = 16 - s0
+            let shc = 16 - s1
+            let limit = 2147483647
+            if shy < 0 || shc < 0 || abs(o0x) >= (limit >> shy) || abs(o0y) >= (limit >> shy) || abs(o1x) >= (limit >> shc) || abs(o1y) >= (limit >> shc) || abs(dxx) >= (limit >> shy) || abs(dxy) >= (limit >> shy) || abs(dyx) >= (limit >> shy) || abs(dyy) >= (limit >> shy) {
+                warn("GMC warp out of range")
+                o0x = 0
+                o0y = 0
+                o1x = 0
+                o1y = 0
+                dxx = a
+                dxy = 0
+                dyx = 0
+                dyy = a
+            } else {
+                o0x = o0x << shy
+                o0y = o0y << shy
+                o1x = o1x << shc
+                o1y = o1y << shc
+                dxx = dxx << shy
+                dxy = dxy << shy
+                dyx = dyx << shy
+                dyy = dyy << shy
+                gmcPoints = points
+            }
+            s0 = 16
+            s1 = 16
+        }
+        spriteOffset[0] = o0x
+        spriteOffset[1] = o0y
+        spriteOffset[2] = o1x
+        spriteOffset[3] = o1y
+        spriteDelta[0] = dxx
+        spriteDelta[1] = dxy
+        spriteDelta[2] = dyx
+        spriteDelta[3] = dyy
+        spriteShift = s0
+    }
+
+    // The macroblock's average GMC vector (7.8.7.3, ffmpeg's get_amv), in
+    // half or quarter samples.
+    fn gmcAmv(_ c: Int) -> Int {
+        let a = vol.spriteAccuracy
+        var sum = 0
+        if gmcPoints == 1 {
+            sum = m4RShift(spriteOffset[c] * (if qpel { 2 } else { 1 }), a)
+        } else {
+            var dx = if c == 0 { spriteDelta[0] } else { spriteDelta[2] }
+            var dy = if c == 0 { spriteDelta[1] } else { spriteDelta[3] }
+            let shift = spriteShift
+            if c == 1 {
+                dy -= 1 << (shift + a + 1)
+            } else {
+                dx -= 1 << (shift + a + 1)
+            }
+            let mbV = spriteOffset[c] + dx * gmcX * 16 + dy * gmcY * 16
+            for yy in 0..16 {
+                var v = mbV + dy * yy
+                for _ in 0..16 {
+                    sum += v >> shift
+                    v += dx
+                }
+            }
+            sum = m4RShift(sum, a + 8 - (if qpel { 1 } else { 0 }))
+        }
+        let len = 1 << (fcodeF + 4)
+        if sum < -len {
+            sum = -len
+        } else if sum >= len {
+            sum = len - 1
+        }
+        sum
+    }
+
+    // gmcAmv needs the macroblock's position.
+    gmcX: Int = 0
+    gmcY: Int = 0
+
+    fn gmcPredict(_ x: Int, _ y: Int) {
+        let acc = vol.spriteAccuracy
+        if gmcPoints > 1 {
+            let rnd = (1 << (2 * acc + 1)) - rounding
+            let d00 = spriteDelta[0]
+            let d01 = spriteDelta[1]
+            let d10 = spriteDelta[2]
+            let d11 = spriteDelta[3]
+            let ox = spriteOffset[0] + d00 * x * 16 + d01 * y * 16
+            let oy = spriteOffset[1] + d10 * x * 16 + d11 * y * 16
+            pics.gmcWarp(pics.futY, ys, 0, 16, 16, 16, ox, oy, d00, d01, d10, d11, acc + 1, rnd, pics.edgeW, pics.edgeH)
+            let cx = spriteOffset[2] + d00 * x * 8 + d01 * y * 8
+            let cy = spriteOffset[3] + d10 * x * 8 + d11 * y * 8
+            pics.gmcWarp(pics.futU, cs, 256, 8, 8, 8, cx, cy, d00, d01, d10, d11, acc + 1, rnd, (pics.edgeW + 1) >> 1, (pics.edgeH + 1) >> 1)
+            pics.gmcWarp(pics.futV, cs, 320, 8, 8, 8, cx, cy, d00, d01, d10, d11, acc + 1, rnd, (pics.edgeW + 1) >> 1, (pics.edgeH + 1) >> 1)
+            return
+        }
+        var mx = spriteOffset[0]
+        var my = spriteOffset[1]
+        var sx = x * 16 + (mx >> (acc + 1))
+        var sy = y * 16 + (my >> (acc + 1))
+        mx = mx << (3 - acc)
+        my = my << (3 - acc)
+        sx = min(max(sx, -16), width)
+        if sx == width {
+            mx = 0
+        }
+        sy = min(max(sy, -16), height)
+        if sy == height {
+            my = 0
+        }
+        pics.fetchRef(1, 0, -1, sx, sy, 17, 17)
+        if ((mx | my) & 7) != 0 {
+            pics.gmc1(ts: 17, dOff: 0, dStride: 16, w: 16, h: 16, fx: mx & 15, fy: my & 15, rounder: 128 - rounding)
+        } else {
+            let dxy = ((mx >> 3) & 1) | ((my >> 2) & 2)
+            pics.hpel(ts: 17, dOff: 0, dStride: 16, w: 16, h: 16, dxy: dxy, rnd: rounding)
+        }
+        var cx = spriteOffset[2]
+        var cy = spriteOffset[3]
+        var csx = x * 8 + (cx >> (acc + 1))
+        var csy = y * 8 + (cy >> (acc + 1))
+        cx = cx << (3 - acc)
+        cy = cy << (3 - acc)
+        csx = min(max(csx, -8), width >> 1)
+        if csx == (width >> 1) {
+            cx = 0
+        }
+        csy = min(max(csy, -8), height >> 1)
+        if csy == (height >> 1) {
+            cy = 0
+        }
+        for p in 1..3 {
+            pics.fetchRef(1, p, -1, csx, csy, 9, 9)
+            pics.gmc1(ts: 9, dOff: 192 + p * 64, dStride: 8, w: 8, h: 8, fx: cx & 15, fy: cy & 15, rounder: 128 - rounding)
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Blocks (6.2.8, 7.4).
+
+    // Works out the DC prediction of intra block n (7.4.3.1): the
+    // neighbours' indexes, the direction (0 from the left, 1 from above),
+    // and the predicted quantised DC.
+    fn dcPredict(_ n: Int, _ x: Int, _ y: Int, _ mb: Int) {
+        var ia = -1
+        var ib = -1
+        var ic = -1
+        if n < 4 {
+            let bw = 2 * mbw
+            let bx = 2 * x + (n & 1)
+            let by = 2 * y + (n >> 1)
+            pIdx = by * bw + bx
+            if bx > 0 && mbSlice[(by >> 1) * mbw + ((bx - 1) >> 1)] == slice {
+                ia = pIdx - 1
+                pQa = mbQ[(by >> 1) * mbw + ((bx - 1) >> 1)]
+            }
+            if bx > 0 && by > 0 && mbSlice[((by - 1) >> 1) * mbw + ((bx - 1) >> 1)] == slice {
+                ib = pIdx - bw - 1
+            }
+            if by > 0 && mbSlice[((by - 1) >> 1) * mbw + (bx >> 1)] == slice {
+                ic = pIdx - bw
+                pQc = mbQ[((by - 1) >> 1) * mbw + (bx >> 1)]
+            }
+            pScale = m4LumaDcScale[qscale]
+        } else {
+            let base = lumaBlocks + (n - 4) * mbCount
+            pIdx = base + mb
+            if x > 0 && mbSlice[mb - 1] == slice {
+                ia = pIdx - 1
+                pQa = mbQ[mb - 1]
+            }
+            if x > 0 && y > 0 && mbSlice[mb - mbw - 1] == slice {
+                ib = pIdx - mbw - 1
+            }
+            if y > 0 && mbSlice[mb - mbw] == slice {
+                ic = pIdx - mbw
+                pQc = mbQ[mb - mbw]
+            }
+            pScale = m4ChromaDcScale[qscale]
+        }
+        pA = ia
+        pC = ic
+        let fa = if ia >= 0 { dcVal[ia] } else { 1024 }
+        let fb = if ib >= 0 { dcVal[ib] } else { 1024 }
+        let fc = if ic >= 0 { dcVal[ic] } else { 1024 }
+        var pred = fa
+        pDir = 0
+        if abs(fa - fb) < abs(fb - fc) {
+            pred = fc
+            pDir = 1
+        }
+        pPredQ = (pred + (pScale >> 1)) / pScale
+    }
+
+    fn clearBlock() {
+        for i in 0..64 {
+            pics.blk[i] = 0
+        }
+    }
+
+    // The rest of intra block n after dcPredict: its AC coefficients (when
+    // coded), DC and AC prediction, dequantisation and IDCT. When haveDc
+    // the DC level is already known (dcLevel, prediction included); else
+    // the DC is the first coefficient read.
+    fn intraBlockData(_ n: Int, _ x: Int, _ y: Int, coded: Bool, haveDc: Bool, dcLevel: Int) -> Bool {
+        clearBlock()
+        let scanBase = if altScan { 128 } else if acPred { (if pDir == 0 { 128 } else { 64 }) } else { 0 }
+        if coded {
+            if !readCoefs(intra: true, start: if haveDc { 1 } else { 0 }, scanBase: scanBase) {
+                return false
+            }
+        }
+        var level = dcLevel
+        if !haveDc {
+            level = pics.blk[0] + pPredQ
+        }
+        pics.blk[0] = level
+        var stored = level * pScale
+        if stored < 0 {
+            stored = 0
+        } else if stored > 2047 && !dcClipBug {
+            stored = 2047
+        }
+        dcVal[pIdx] = stored
+        if acPred {
+            if pDir == 0 {
+                if pA >= 0 {
+                    let o = pA * 16
+                    for i in 1..8 {
+                        var v = acVal[o + i]
+                        if pQa != qscale {
+                            v = m4RoundedDiv(v * pQa, qscale)
+                        }
+                        pics.blk[i * 8] += v
+                    }
+                }
+            } else {
+                if pC >= 0 {
+                    let o = pC * 16 + 8
+                    for i in 1..8 {
+                        var v = acVal[o + i]
+                        if pQc != qscale {
+                            v = m4RoundedDiv(v * pQc, qscale)
+                        }
+                        pics.blk[i] += v
+                    }
+                }
+            }
+        }
+        let o = pIdx * 16
+        for i in 1..8 {
+            acVal[o + i] = pics.blk[i * 8]
+            acVal[o + 8 + i] = pics.blk[i]
+        }
+        // Dequantisation (7.4.4.2 H.263 method, 7.4.4.1 MPEG method).
+        pics.blk[0] = level * pScale
+        var any = false
+        if vol.mpegQuant {
+            let q2 = 2 * qscale
+            var sum = pics.blk[0]
+            for i in 1..64 {
+                let l = pics.blk[i]
+                if l != 0 {
+                    any = true
+                    let a = if l < 0 { -l } else { l }
+                    let v = (a * q2 * vol.intraMatrix[i]) >> 4
+                    let s = if l < 0 { -v } else { v }
+                    pics.blk[i] = s
+                    sum += s
+                }
+            }
+            if (sum & 1) == 0 {
+                pics.blk[63] = pics.blk[63] ^ 1
+                any = true
+            }
+        } else {
+            let qmul = 2 * qscale
+            let qadd = (qscale - 1) | 1
+            for i in 1..64 {
+                let l = pics.blk[i]
+                if l != 0 {
+                    any = true
+                    pics.blk[i] = if l < 0 { l * qmul - qadd } else { l * qmul + qadd }
+                }
+            }
+        }
+        putBlock(n, x, y, add: false, dcOnly: !any)
+        true
+    }
+
+    fn interBlock(_ n: Int, _ x: Int, _ y: Int) -> Bool {
+        clearBlock()
+        let scanBase = if altScan { 128 } else { 0 }
+        if !readCoefs(intra: false, start: 0, scanBase: scanBase) {
+            return false
+        }
+        var any = false
+        if vol.mpegQuant {
+            let q2 = 2 * qscale
+            var sum = 0
+            for i in 0..64 {
+                let l = pics.blk[i]
+                if l != 0 {
+                    let a = if l < 0 { -l } else { l }
+                    let v = (((a << 1) + 1) * q2 * vol.interMatrix[i]) >> 5
+                    let s = if l < 0 { -v } else { v }
+                    pics.blk[i] = s
+                    sum += s
+                    if i != 0 {
+                        any = true
+                    }
+                }
+            }
+            if (sum & 1) == 0 {
+                pics.blk[63] = pics.blk[63] ^ 1
+                any = true
+            }
+        } else {
+            let qmul = 2 * qscale
+            let qadd = (qscale - 1) | 1
+            for i in 0..64 {
+                let l = pics.blk[i]
+                if l != 0 {
+                    var v = if l < 0 { l * qmul - qadd } else { l * qmul + qadd }
+                    if v < -2048 {
+                        v = -2048
+                    } else if v > 2047 {
+                        v = 2047
+                    }
+                    pics.blk[i] = v
+                    if i != 0 {
+                        any = true
+                    }
+                }
+            }
+        }
+        putBlock(n, x, y, add: true, dcOnly: !any)
+        true
+    }
+
+    // The IDCT of the block into the picture (field order when fieldDct).
+    fn putBlock(_ n: Int, _ x: Int, _ y: Int, add: Bool, dcOnly: Bool) {
+        var plane = 0
+        var off = 0
+        var stride = ys
+        if n < 4 {
+            if fieldDct {
+                off = (y * 16 + (n >> 1)) * ys + x * 16 + (n & 1) * 8
+                stride = 2 * ys
+            } else {
+                off = (y * 16 + (n >> 1) * 8) * ys + x * 16 + (n & 1) * 8
+            }
+        } else {
+            plane = n - 3
+            off = y * 8 * cs + x * 8
+            stride = cs
+        }
+        if xvidIdct {
+            pics.xvidIdct(plane, off, stride, add: add)
+        } else {
+            pics.idct(plane, off, stride, add: add, dcOnly: dcOnly)
+        }
+    }
+
+    // DCT coefficients (6.2.8, Tables B-16/B-17 and escapes 7.4.1.3): raw
+    // levels into blk at their raster places, from scan position `start`.
+    fn readCoefs(intra: Bool, start: Int, scanBase: Int) -> Bool {
+        var pos = start
+        while true {
+            let e = if intra { m4IntraCoef[br.peek(12)] } else { m4InterCoef[br.peek(12)] }
+            if e == 0 {
+                return false
+            }
+            br.skip(e & 31)
+            var level = (e >> 5) & 31
+            var run = (e >> 10) & 63
+            var last = (e >> 16) & 1
+            if level == 0 {
+                // Escape.
+                let mode = br.peek(2)
+                if mode < 2 {
+                    // Type 1: level offset by LMAX.
+                    br.skip(1)
+                    let e2 = if intra { m4IntraCoef[br.peek(12)] } else { m4InterCoef[br.peek(12)] }
+                    if e2 == 0 || ((e2 >> 5) & 31) == 0 {
+                        return false
+                    }
+                    br.skip(e2 & 31)
+                    level = (e2 >> 5) & 31
+                    run = (e2 >> 10) & 63
+                    last = (e2 >> 16) & 1
+                    level += if intra { m4IntraLmax[last * 64 + run] } else { m4InterLmax[last * 64 + run] }
+                    if br.bit() == 1 {
+                        level = -level
+                    }
+                } else if mode == 2 {
+                    // Type 2: run offset by RMAX + 1.
+                    br.skip(2)
+                    let e2 = if intra { m4IntraCoef[br.peek(12)] } else { m4InterCoef[br.peek(12)] }
+                    if e2 == 0 || ((e2 >> 5) & 31) == 0 {
+                        return false
+                    }
+                    br.skip(e2 & 31)
+                    level = (e2 >> 5) & 31
+                    run = (e2 >> 10) & 63
+                    last = (e2 >> 16) & 1
+                    run += 1 + (if intra { m4IntraRmax[last * 64 + level] } else { m4InterRmax[last * 64 + level] })
+                    if br.bit() == 1 {
+                        level = -level
+                    }
+                } else {
+                    // Type 3: fixed length last, run, level.
+                    br.skip(2)
+                    last = br.bit()
+                    run = br.bits(6)
+                    br.skip(1)
+                    level = br.signed(12)
+                    br.skip(1)
+                }
+            } else if br.bit() == 1 {
+                level = -level
+            }
+            pos += run
+            if pos > 63 {
+                return false
+            }
+            pics.blk[m4Scans[scanBase + pos]] = level
+            pos += 1
+            if last == 1 {
+                return true
+            }
+        }
+        true
+    }
+
+    // ---------------------------------------------------------------------
+    // Data partitioning (6.2.6.1 / 6.2.7): per video packet, first the
+    // macroblock headers and motion (and intra DCs of I-VOPs), a marker,
+    // then cbpy, quantiser changes (and the DCs of intra macroblocks of
+    // P-VOPs), then all the DCT data.
+
+    fn decodePartitionedMacroblocks() {
+        if vol.interlaced {
+            warn("interlaced data partitioning isn't supported")
+        }
+        newSlice()
+        var mb = 0
+        var first = true
+        while mb < mbCount {
+            if !first {
+                if !atResyncOrAligned() {
+                    concealFrom(mb, mbCount)
+                    return
+                }
+                let next = readPacketHeaderAny()
+                if next < 0 || next < mb {
+                    warn("damaged video packet header")
+                    concealFrom(mb, mbCount)
+                    return
+                }
+                if next > mb {
+                    warn("macroblocks {mb}…{next - 1} missing")
+                    concealFrom(mb, next)
+                }
+                mb = next
+                newSlice()
+            }
+            first = false
+            let end = partitionA(mb)
+            if end < 0 {
+                warn("damaged first partition in a {m4TypeName(type)}-VOP")
+                concealFrom(mb, mbCount)
+                if !seekResync() {
+                    return
+                }
+                // Find where the next packet starts and conceal up to it.
+                continue
+            }
+            if !partitionB(mb, end) {
+                warn("damaged second partition in a {m4TypeName(type)}-VOP")
+                textureConceal(mb, end)
+                mb = end
+                if !seekResync() {
+                    concealFrom(mb, mbCount)
+                    return
+                }
+                continue
+            }
+            var m = mb
+            var ok = true
+            while m < end {
+                if ok {
+                    ok = partitionTexture(m)
+                    if br.overrun {
+                        ok = false
+                    }
+                    if !ok {
+                        warn("damaged texture partition in a {m4TypeName(type)}-VOP")
+                    }
+                }
+                if !ok {
+                    textureConceal(m, m + 1)
+                }
+                m += 1
+            }
+            mb = end
+            if !ok && mb < mbCount {
+                if !seekResync() {
+                    concealFrom(mb, mbCount)
+                    return
+                }
+            }
+        }
+    }
+
+    // Motion/DC partition; returns the macroblock after the packet's last
+    // one, or -1.
+    fn partitionA(_ start: Int) -> Int {
+        var mb = start
+        while mb < mbCount {
+            if type == 0 {
+                if br.peek(19) == 0x6B001 {
+                    br.skip(19)
+                    return mb
+                }
+            } else if br.peek(17) == 0x1F001 {
+                br.skip(17)
+                return mb
+            }
+            let x = mb % mbw
+            let y = mb / mbw
+            mbSlice[mb] = slice
+            mbErr = false
+            gmcX = x
+            gmcY = y
+            if type == 0 {
+                var mcbpc = vlc(m4IntraMcbpc, m4IntraMcbpcBits)
+                while mcbpc == 8 {
+                    if br.peek(19) == 0x6B001 {
+                        break
+                    }
+                    mcbpc = vlc(m4IntraMcbpc, m4IntraMcbpcBits)
+                }
+                if mcbpc == 8 {
+                    continue
+                }
+                if mcbpc < 0 {
+                    return -1
+                }
+                dpType[mb] = 3
+                dpCbp[mb] = mcbpc & 3
+                intraDcVlc = qscale < dcThr
+                if mcbpc >= 4 {
+                    dquant()
+                }
+                mbQ[mb] = qscale
+                mbKind[mb] = 0
+                mbSkip[mb] = 0
+                setBlockMvs(x, y, 0, 0)
+                if !partitionDcs(x, y, mb) {
+                    return -1
+                }
+            } else {
+                // Stuffing (not_coded 0, mcbpc stuffing) may come first.
+                var mcbpc = 20
+                var skipped = false
+                while mcbpc == 20 {
+                    if br.peek(17) == 0x1F001 {
+                        break
+                    }
+                    if br.flag() {
+                        skipped = true
+                        break
+                    }
+                    mcbpc = vlc(m4InterMcbpc, m4InterMcbpcBits)
+                    if br.overrun {
+                        return -1
+                    }
+                }
+                if skipped {
+                    mbQ[mb] = qscale
+                    mbKind[mb] = 0
+                    resetIntraPred(x, y, mb)
+                    if gmc {
+                        dpType[mb] = 5
+                        mbSkip[mb] = 0
+                        setBlockMvs(x, y, gmcAmv(0), gmcAmv(1))
+                    } else {
+                        dpType[mb] = 0
+                        mbSkip[mb] = 1
+                        setBlockMvs(x, y, 0, 0)
+                    }
+                    dpCbp[mb] = 0
+                    mb += 1
+                    continue
+                }
+                if mcbpc == 20 {
+                    continue
+                }
+                if mcbpc < 0 {
+                    return -1
+                }
+                let mt = mcbpc >> 2
+                mbSkip[mb] = 0
+                mbKind[mb] = 0
+                // cbpc and the dquant flag; cbpy comes in partition B.
+                dpCbp[mb] = (mcbpc & 3) | (if mt == 1 || mt == 4 { 64 } else { 0 })
+                if mt >= 3 {
+                    dpType[mb] = 3
+                    mbQ[mb] = qscale
+                    setBlockMvs(x, y, 0, 0)
+                } else {
+                    resetIntraPred(x, y, mb)
+                    var mcsel = false
+                    if gmc && mt != 2 {
+                        mcsel = br.flag()
+                    }
+                    if mt == 2 {
+                        dpType[mb] = 2
+                        mbKind[mb] = 1
+                        let bw = 2 * mbw
+                        for b in 0..4 {
+                            predMv(x, y, b)
+                            let mx = readMv(predX, fcodeF)
+                            let my = readMv(predY, fcodeF)
+                            let i = (2 * y + (b >> 1)) * bw + 2 * x + (b & 1)
+                            mvX[i] = mx
+                            mvY[i] = my
+                        }
+                    } else if mcsel {
+                        dpType[mb] = 4
+                        setBlockMvs(x, y, gmcAmv(0), gmcAmv(1))
+                    } else {
+                        dpType[mb] = 1
+                        predMv(x, y, 0)
+                        let mx = readMv(predX, fcodeF)
+                        let my = readMv(predY, fcodeF)
+                        setBlockMvs(x, y, mx, my)
+                    }
+                }
+            }
+            if mbErr || br.overrun {
+                return -1
+            }
+            mb += 1
+        }
+        // The marker after the VOP's last macroblock.
+        if type == 0 && br.peek(19) == 0x6B001 {
+            br.skip(19)
+            return mb
+        }
+        if type != 0 && br.peek(17) == 0x1F001 {
+            br.skip(17)
+            return mb
+        }
+        -1
+    }
+
+    // The DCs of an intra macroblock in a data partition.
+    fn partitionDcs(_ x: Int, _ y: Int, _ mb: Int) -> Bool {
+        for n in 0..6 {
+            dcPredict(n, x, y, mb)
+            var diff = 0
+            if intraDcVlc {
+                let size = if n < 4 { vlc(m4DcLum, m4DcLumBits) } else { vlc(m4DcChrom, m4DcChromBits) }
+                if size < 0 {
+                    return false
+                }
+                if size > 0 {
+                    diff = xbits(size)
+                    if size > 8 {
+                        br.skip(1)
+                    }
+                }
+                let level = diff + pPredQ
+                dpDc[6 * mb + n] = level
+                // Store the DC now: the next blocks predict from it.
+                var stored = level * pScale
+                if stored < 0 {
+                    stored = 0
+                } else if stored > 2047 && !dcClipBug {
+                    stored = 2047
+                }
+                dcVal[pIdx] = stored
+            }
+        }
+        dpAc[mb] = if intraDcVlc { 1 } else { 0 }
+        true
+    }
+
+    // Partition B: ac_pred_flag and cbpy (and for P-VOPs dquant and the
+    // DCs of intra macroblocks).
+    fn partitionB(_ start: Int, _ end: Int) -> Bool {
+        var mb = start
+        while mb < end {
+            let x = mb % mbw
+            let y = mb / mbw
+            let t = dpType[mb]
+            if type == 0 {
+                let ac = br.flag()
+                let cbpy = vlc(m4Cbpy, m4CbpyBits)
+                if cbpy < 0 {
+                    return false
+                }
+                dpCbp[mb] = (cbpy << 2) | dpCbp[mb]
+                // bit 1 of dpAc: ac_pred_flag; bit 0: the DCs were coded.
+                dpAc[mb] = dpAc[mb] | (if ac { 2 } else { 0 })
+            } else if t >= 1 && t <= 4 {
+                var ac = false
+                if t == 3 {
+                    ac = br.flag()
+                }
+                let cbpy = vlc(m4Cbpy, m4CbpyBits)
+                if cbpy < 0 {
+                    return false
+                }
+                let c = dpCbp[mb]
+                let cbpyv = if t == 3 { cbpy } else { 15 - cbpy }
+                if t == 3 {
+                    intraDcVlc = qscale < dcThr
+                }
+                if (c & 64) != 0 {
+                    dquant()
+                }
+                mbQ[mb] = qscale
+                dpCbp[mb] = (cbpyv << 2) | (c & 3)
+                if t == 3 {
+                    dpAc[mb] = (if ac { 2 } else { 0 }) | (if intraDcVlc { 1 } else { 0 })
+                    if intraDcVlc {
+                        if !partitionDcs(x, y, mb) {
+                            return false
+                        }
+                        dpAc[mb] = (if ac { 2 } else { 0 }) | 1
+                    }
+                }
+            }
+            mb += 1
+        }
+        !br.overrun
+    }
+
+    fn partitionTexture(_ mb: Int) -> Bool {
+        let x = mb % mbw
+        let y = mb / mbw
+        let t = dpType[mb]
+        cbp = dpCbp[mb] & 63
+        fieldDct = false
+        qscale = mbQ[mb]
+        if t == 3 {
+            acPred = (dpAc[mb] & 2) != 0
+            let haveDc = (dpAc[mb] & 1) != 0
+            if vol.reversibleVlc {
+                // Reversible VLCs aren't supported: show the DCs only.
+                for n in 0..6 {
+                    dcPredict(n, x, y, mb)
+                    acPred = false
+                    if !intraBlockData(n, x, y, coded: false, haveDc: true, dcLevel: if haveDc { dpDc[6 * mb + n] } else { pPredQ }) {
+                        return false
+                    }
+                }
+                return true
+            }
+            for n in 0..6 {
+                dcPredict(n, x, y, mb)
+                if !intraBlockData(n, x, y, coded: ((cbp >> (5 - n)) & 1) == 1, haveDc: haveDc, dcLevel: dpDc[6 * mb + n]) {
+                    return false
+                }
+            }
+            return true
+        }
+        if t == 0 {
+            copyFromFuture(x, y)
+            return true
+        }
+        if t == 4 || t == 5 {
+            gmcPredict(x, y)
+            putPrediction(x, y, average: false)
+        } else {
+            let bw = 2 * mbw
+            for b in 0..4 {
+                let i = (2 * y + (b >> 1)) * bw + 2 * x + (b & 1)
+                mvF[2 * b] = mvX[i]
+                mvF[2 * b + 1] = mvY[i]
+            }
+            predict(ref: 1, dir: 0, slot: 0, kind: if t == 2 { 1 } else { 0 }, x: x, y: y)
+            putPrediction(x, y, average: false)
+        }
+        if vol.reversibleVlc {
+            return true
+        }
+        interResidual(x, y)
+    }
+
+    // Texture lost: inter macroblocks keep their motion compensation, intra
+    // ones are shown from their DCs.
+    fn textureConceal(_ from: Int, _ to: Int) {
+        var mb = from
+        while mb < to {
+            let x = mb % mbw
+            let y = mb / mbw
+            let t = dpType[mb]
+            qscale = mbQ[mb]
+            if t == 3 {
+                acPred = false
+                fieldDct = false
+                let haveDc = (dpAc[mb] & 1) != 0
+                for n in 0..6 {
+                    dcPredict(n, x, y, mb)
+                    intraBlockData(n, x, y, coded: false, haveDc: true, dcLevel: if haveDc { dpDc[6 * mb + n] } else { pPredQ })
+                }
+            } else if t == 0 {
+                copyFromFuture(x, y)
+            } else if t == 4 || t == 5 {
+                gmcPredict(x, y)
+                putPrediction(x, y, average: false)
+            } else {
+                let bw = 2 * mbw
+                for b in 0..4 {
+                    let i = (2 * y + (b >> 1)) * bw + 2 * x + (b & 1)
+                    mvF[2 * b] = mvX[i]
+                    mvF[2 * b + 1] = mvY[i]
+                }
+                predict(ref: 1, dir: 0, slot: 0, kind: if t == 2 { 1 } else { 0 }, x: x, y: y)
+                putPrediction(x, y, average: false)
+            }
+            mb += 1
+        }
+    }
+}
+
+// Opens a decoder for an "mpeg4" track; the headers in `extra` (VOS, VO,
+// VOL), when there are any, are read right away.
+public fn newDecoder(_ track: core.Track) -> Result<Decoder> {
+    if track.codec != "mpeg4" {
+        return Result.failure(error: Error("the mpeg4 decoder can't decode {track.codec}"))
+    }
+    var d = Decoder()
+    d.trackSarNum = max(track.sarNum, 1)
+    d.trackSarDen = max(track.sarDen, 1)
+    if !track.extra.isEmpty {
+        d.readHeaders(track.extra)
+    }
+    Result.ok(value: d)
+}
+
+// The position of the next 00 00 01 at or after `from`, or -1.
+fn m4FindStart(_ data: Data, _ from: Int) -> Int {
+    var i = from
+    let n = data.count - 3
+    while i < n {
+        if data[i + 2] > 1 {
+            i += 3
+        } else if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
+            return i
+        } else {
+            i += 1
+        }
+    }
+    -1
+}
+
+fn m4Median(_ a: Int, _ b: Int, _ c: Int) -> Int {
+    max(min(a, b), min(max(a, b), c))
+}
+
+// The same for any sign of b (ffmpeg's ROUNDED_DIV).
+fn m4RoundedDivAny(_ a: Int, _ b: Int) -> Int {
+    if a >= 0 {
+        return (a + (b >> 1)) / b
+    }
+    (a - (b >> 1)) / b
+}
+
+// ffmpeg's RSHIFT: a shift right rounding halves away from zero.
+fn m4RShift(_ a: Int, _ b: Int) -> Int {
+    if a > 0 {
+        return (a + ((1 << b) >> 1)) >> b
+    }
+    (a + ((1 << b) >> 1) - 1) >> b
+}
+
+// Division rounded to the nearest, halves away from zero (the "//" of the
+// standard); b > 0.
+fn m4RoundedDiv(_ a: Int, _ b: Int) -> Int {
+    if a >= 0 {
+        return (a + (b >> 1)) / b
+    }
+    (a - (b >> 1)) / b
+}
+
+fn m4TypeName(_ t: Int) -> String {
+    if t == 0 { "I" } else if t == 1 { "P" } else if t == 2 { "B" } else { "S" }
+}
+
+

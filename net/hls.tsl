@@ -1,0 +1,704 @@
+// HTTP Live Streaming playlists: master (multivariant) and media
+// playlists, as RFC 8216 describes them, plus items of the later HLS
+// specification drafts (rfc8216bis) that matter to a player:
+// EXT-X-DEFINE variable substitution, EXT-X-GAP, EXT-X-BITRATE,
+// AVERAGE-BANDWIDTH / FRAME-RATE / VIDEO-RANGE, CHANNELS.
+//
+// Tags followed (RFC 8216 §4.3): EXTM3U, EXT-X-VERSION; media segment tags
+// EXTINF, EXT-X-BYTERANGE, EXT-X-DISCONTINUITY, EXT-X-KEY, EXT-X-MAP,
+// EXT-X-PROGRAM-DATE-TIME, EXT-X-DATERANGE (kept as text); media playlist
+// tags EXT-X-TARGETDURATION, EXT-X-MEDIA-SEQUENCE,
+// EXT-X-DISCONTINUITY-SEQUENCE, EXT-X-ENDLIST, EXT-X-PLAYLIST-TYPE,
+// EXT-X-I-FRAMES-ONLY; master tags EXT-X-MEDIA, EXT-X-STREAM-INF,
+// EXT-X-I-FRAME-STREAM-INF, EXT-X-SESSION-DATA, EXT-X-SESSION-KEY;
+// EXT-X-INDEPENDENT-SEGMENTS, EXT-X-START. Attribute lists per §4.2.
+// Live reloading per §6.3.4, the live start point per §6.3.3.
+// Low-latency parts (EXT-X-PART…) are skipped: whole segments still play.
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+public struct HlsKey {
+    // "NONE", "AES-128" or "SAMPLE-AES" (Reel decrypts AES-128 only).
+    method: String = "NONE"
+    uri: String = ""
+    // 16 bytes, or empty: then the IV is the media sequence number.
+    iv: Data = Data()
+    keyFormat: String = "identity"
+    keyFormatVersions: String = ""
+}
+
+// EXT-X-MAP: the initialisation section (fMP4 init segment, or TS
+// PAT/PMT) that segments need before them.
+public struct HlsMap {
+    uri: String = ""
+    // Byte range, -1 when the whole resource.
+    offset: Int = -1
+    length: Int = -1
+}
+
+public struct HlsSegment {
+    // Absolute (resolved against the playlist's URL).
+    uri: String
+    duration: Float = 0.0
+    title: String = ""
+    // Media sequence number (§4.3.3.2).
+    sequence: Int = 0
+    // EXT-X-BYTERANGE: offset and length, -1 when the whole resource.
+    offset: Int = -1
+    length: Int = -1
+    // A discontinuity comes before this segment.
+    discontinuity: Bool = false
+    // The discontinuity sequence number this segment belongs to: segments
+    // with the same number share one timestamp timeline.
+    discontinuitySequence: Int = 0
+    key: HlsKey = HlsKey()
+    map: HlsMap = HlsMap()
+    // EXT-X-PROGRAM-DATE-TIME of the segment's first sample (seconds since
+    // 1970, carried forward over later segments), or -1.
+    programDateTime: Float = -1.0
+    // The tag's own text when the segment had one ("" otherwise).
+    dateText: String = ""
+    // Seconds from the start of the playlist (for a live playlist: from
+    // the first segment Reel saw; see hlsMerge).
+    start: Float = 0.0
+    // EXT-X-GAP: the segment is missing; don't load it.
+    gap: Bool = false
+    // EXT-X-BITRATE in kbit/s, 0 when not given.
+    bitrate: Int = 0
+}
+
+public struct HlsVariant {
+    uri: String
+    // Peak bits per second.
+    bandwidth: Int = 0
+    averageBandwidth: Int = 0
+    // RFC 6381 codec list, e.g. "avc1.64001f,mp4a.40.2".
+    codecs: String = ""
+    width: Int = 0
+    height: Int = 0
+    frameRate: Float = 0.0
+    hdcp: String = ""
+    videoRange: String = ""
+    // Group ids of EXT-X-MEDIA renditions to use with this variant.
+    audio: String = ""
+    video: String = ""
+    subtitles: String = ""
+    closedCaptions: String = ""
+    // From EXT-X-I-FRAME-STREAM-INF (trick play), not for normal playback.
+    iFrameOnly: Bool = false
+}
+
+// EXT-X-MEDIA: an alternative rendition (§4.3.4.1).
+public struct HlsRendition {
+    // "AUDIO", "VIDEO", "SUBTITLES" or "CLOSED-CAPTIONS".
+    type: String
+    groupId: String = ""
+    name: String = ""
+    language: String = ""
+    assocLanguage: String = ""
+    isDefault: Bool = false
+    autoselect: Bool = false
+    forced: Bool = false
+    // Empty when the rendition is in the variant's own stream.
+    uri: String = ""
+    instreamId: String = ""
+    characteristics: String = ""
+    // "2", "6", "16/JOC" …
+    channels: String = ""
+}
+
+public struct HlsSessionData {
+    id: String
+    value: String = ""
+    uri: String = ""
+    language: String = ""
+}
+
+public struct HlsPlaylist {
+    // Where it was loaded from: the base for its relative URIs.
+    url: String = ""
+    // A master (multivariant) playlist lists variants; a media playlist
+    // lists segments.
+    isMaster: Bool = false
+    version: Int = 1
+    independentSegments: Bool = false
+    // EXT-X-START: where to start (seconds, negative from the end).
+    hasStart: Bool = false
+    startOffset: Float = 0.0
+    startPrecise: Bool = false
+
+    // Master playlist. Variants sorted by bandwidth, lowest first.
+    variants: [HlsVariant] = []
+    iFrameVariants: [HlsVariant] = []
+    renditions: [HlsRendition] = []
+    sessionKeys: [HlsKey] = []
+    sessionData: [HlsSessionData] = []
+
+    // Media playlist.
+    targetDuration: Float = 0.0
+    mediaSequence: Int = 0
+    discontinuitySequence: Int = 0
+    endList: Bool = false
+    // "VOD", "EVENT" or "" (a live playlist that may slide).
+    playlistType: String = ""
+    iFramesOnly: Bool = false
+    segments: [HlsSegment] = []
+    // EXT-X-DATERANGE tags, as written (attribute lists).
+    dateRanges: [String] = []
+    // Problems that didn't stop it.
+    warnings: [String] = []
+
+    // Whether more segments may come (no EXT-X-ENDLIST).
+    isLive: Bool { !isMaster && !endList }
+
+    // Total seconds of the listed segments.
+    duration: Float {
+        var d = 0.0
+        for s in segments {
+            d += s.duration
+        }
+        d
+    }
+
+    // Where the listed segments end, in the playlist's timeline.
+    end: Float {
+        if segments.isEmpty {
+            return 0.0
+        }
+        let l = segments[segments.count - 1]
+        l.start + l.duration
+    }
+
+    // The renditions of one type and group.
+    fn renditionsOf(_ type: String, group: String) -> [HlsRendition] {
+        renditions.filter { r in r.type == type && r.groupId == group }
+    }
+
+    // The index of the segment playing at `seconds`, or -1.
+    fn segmentAt(_ seconds: Float) -> Int {
+        var found = -1
+        for (i, s) in segments.enumerated() {
+            if s.start <= seconds + 0.000001 {
+                found = i
+            } else {
+                break
+            }
+        }
+        if found >= 0 && found == segments.count - 1 {
+            let l = segments[found]
+            if seconds >= l.start + l.duration && endList {
+                return -1
+            }
+        }
+        found
+    }
+
+    // The index of the segment with a media sequence number, or -1.
+    fn indexOf(sequence: Int) -> Int {
+        if segments.isEmpty {
+            return -1
+        }
+        let i = sequence - segments[0].sequence
+        if i >= 0 && i < segments.count && segments[i].sequence == sequence {
+            return i
+        }
+        for (k, s) in segments.enumerated() {
+            if s.sequence == sequence {
+                return k
+            }
+        }
+        -1
+    }
+}
+
+// Whether text looks like an HLS playlist.
+public fn isHlsPlaylist(_ text: String) -> Bool {
+    text.trimStart().hasPrefix("#EXTM3U") && (text.contains("#EXT-X-") || text.contains("#EXTINF"))
+}
+
+// Parses a playlist. `url` is where it came from (relative URIs are
+// resolved against it); `variables` are values for EXT-X-DEFINE IMPORT
+// (from the master playlist that led here).
+public fn parseHls(_ text: String, url: String = "", variables: [String: String] = [:]) -> Result<HlsPlaylist> {
+    var lines = text.lines()
+    if lines.isEmpty {
+        return Result.failure(error: Error("HLS: empty playlist"))
+    }
+    // A UTF-8 byte order mark may come first.
+    var first = lines[0].trim()
+    if first.hasPrefix(Data(bytes: [0xef, 0xbb, 0xbf]).text ?? "\t") {
+        first = first.substring(from: 1, to: first.count)
+    }
+    if first != "#EXTM3U" {
+        return Result.failure(error: Error("HLS: the playlist doesn't start with #EXTM3U"))
+    }
+    var pl = HlsPlaylist(url: url)
+    var vars = variables
+    var defined: [String: String] = [:]
+    // The state of the segment being described.
+    var seq = 0
+    var seqSet = false
+    var disc = 0
+    var pendingDisc = false
+    var pendingDur = -1.0
+    var pendingTitle = ""
+    var pendingOffset = -1
+    var pendingLength = -1
+    var nextRangeStart = 0
+    var lastRangeUri = ""
+    var key = HlsKey()
+    var map = HlsMap()
+    var pdt = -1.0
+    var pdtText = ""
+    var pdtFresh = false
+    var gap = false
+    var bitrate = 0
+    var start = 0.0
+    var pendingVariant = HlsVariant(uri: "")
+    var expectVariantUri = false
+    var sawSegmentTag = false
+    var sawMasterTag = false
+    var i = 1
+    while i < lines.count {
+        var line = lines[i].trim()
+        i += 1
+        if line.isEmpty {
+            continue
+        }
+        if line.contains("\{$") {
+            line = hlsSubstitute(line, defined)
+        }
+        if !line.hasPrefix("#") {
+            // A URI line.
+            let uri = resolveUrl(url, line)
+            if expectVariantUri {
+                var v = pendingVariant
+                v.uri = uri
+                pl.variants.append(v)
+                expectVariantUri = false
+                continue
+            }
+            if pendingDur < 0.0 {
+                pl.warnings.append("HLS: a URI without #EXTINF: {line}")
+                pendingDur = pl.targetDuration
+            }
+            var s = HlsSegment(uri: uri, duration: pendingDur, title: pendingTitle, sequence: seq)
+            s.discontinuity = pendingDisc
+            s.discontinuitySequence = disc
+            s.key = key
+            s.map = map
+            s.gap = gap
+            s.bitrate = bitrate
+            s.start = start
+            if pendingLength >= 0 {
+                s.length = pendingLength
+                if pendingOffset >= 0 {
+                    s.offset = pendingOffset
+                } else if lastRangeUri == uri {
+                    s.offset = nextRangeStart
+                } else {
+                    s.offset = 0
+                }
+                nextRangeStart = s.offset + s.length
+                lastRangeUri = uri
+            }
+            if pdt >= 0.0 {
+                s.programDateTime = pdt
+                if pdtFresh {
+                    s.dateText = pdtText
+                }
+                pdt += pendingDur
+            }
+            pl.segments.append(s)
+            start += pendingDur
+            seq += 1
+            pendingDisc = false
+            pendingDur = -1.0
+            pendingTitle = ""
+            pendingOffset = -1
+            pendingLength = -1
+            gap = false
+            pdtFresh = false
+            continue
+        }
+        if !line.hasPrefix("#EXT") {
+            continue
+        }
+        var tag = line
+        var value = ""
+        if let c = line.find(":") {
+            tag = line.substring(from: 0, to: c)
+            value = line.substring(from: c + 1, to: line.count)
+        }
+        match tag {
+            "#EXT-X-VERSION" -> {
+                pl.version = parseInt(value.trim()).valueOr(1)
+            }
+            "#EXT-X-INDEPENDENT-SEGMENTS" -> {
+                pl.independentSegments = true
+            }
+            "#EXT-X-START" -> {
+                let a = hlsAttributes(value)
+                pl.hasStart = true
+                pl.startOffset = parseFloat(a["TIME-OFFSET"] ?? "0").valueOr(0.0)
+                pl.startPrecise = (a["PRECISE"] ?? "") == "YES"
+            }
+            "#EXT-X-DEFINE" -> {
+                let a = hlsAttributes(value)
+                if let n = a["NAME"] {
+                    defined[n] = a["VALUE"] ?? ""
+                    vars[n] = a["VALUE"] ?? ""
+                } else if let n = a["IMPORT"] {
+                    defined[n] = vars[n] ?? ""
+                } else if let n = a["QUERYPARAM"] {
+                    defined[n] = hlsQueryParam(url, n)
+                }
+            }
+            "#EXT-X-STREAM-INF" -> {
+                sawMasterTag = true
+                pendingVariant = hlsVariant(hlsAttributes(value), url)
+                expectVariantUri = true
+            }
+            "#EXT-X-I-FRAME-STREAM-INF" -> {
+                sawMasterTag = true
+                let a = hlsAttributes(value)
+                var v = hlsVariant(a, url)
+                v.iFrameOnly = true
+                v.uri = resolveUrl(url, a["URI"] ?? "")
+                pl.iFrameVariants.append(v)
+            }
+            "#EXT-X-MEDIA" -> {
+                sawMasterTag = true
+                let a = hlsAttributes(value)
+                var r = HlsRendition(type: a["TYPE"] ?? "")
+                r.groupId = a["GROUP-ID"] ?? ""
+                r.name = a["NAME"] ?? ""
+                r.language = a["LANGUAGE"] ?? ""
+                r.assocLanguage = a["ASSOC-LANGUAGE"] ?? ""
+                r.isDefault = (a["DEFAULT"] ?? "") == "YES"
+                r.autoselect = (a["AUTOSELECT"] ?? "") == "YES"
+                r.forced = (a["FORCED"] ?? "") == "YES"
+                if let u = a["URI"] {
+                    r.uri = resolveUrl(url, u)
+                }
+                r.instreamId = a["INSTREAM-ID"] ?? ""
+                r.characteristics = a["CHARACTERISTICS"] ?? ""
+                r.channels = a["CHANNELS"] ?? ""
+                pl.renditions.append(r)
+            }
+            "#EXT-X-SESSION-DATA" -> {
+                sawMasterTag = true
+                let a = hlsAttributes(value)
+                var sd = HlsSessionData(id: a["DATA-ID"] ?? "")
+                sd.value = a["VALUE"] ?? ""
+                if let u = a["URI"] {
+                    sd.uri = resolveUrl(url, u)
+                }
+                sd.language = a["LANGUAGE"] ?? ""
+                pl.sessionData.append(sd)
+            }
+            "#EXT-X-SESSION-KEY" -> {
+                sawMasterTag = true
+                pl.sessionKeys.append(hlsKey(hlsAttributes(value), url))
+            }
+            "#EXTINF" -> {
+                sawSegmentTag = true
+                var d = value
+                if let c = value.find(",") {
+                    d = value.substring(from: 0, to: c)
+                    pendingTitle = value.substring(from: c + 1, to: value.count).trim()
+                }
+                pendingDur = parseFloat(d.trim()).valueOr(0.0)
+            }
+            "#EXT-X-BYTERANGE" -> {
+                let v = value.trim()
+                if let at = v.find("@") {
+                    pendingLength = parseInt(v.substring(from: 0, to: at)).valueOr(0)
+                    pendingOffset = parseInt(v.substring(from: at + 1, to: v.count)).valueOr(0)
+                } else {
+                    pendingLength = parseInt(v).valueOr(0)
+                    pendingOffset = -1
+                }
+            }
+            "#EXT-X-TARGETDURATION" -> {
+                sawSegmentTag = true
+                pl.targetDuration = parseFloat(value.trim()).valueOr(0.0)
+            }
+            "#EXT-X-MEDIA-SEQUENCE" -> {
+                seq = parseInt(value.trim()).valueOr(0)
+                seqSet = true
+                pl.mediaSequence = seq
+            }
+            "#EXT-X-DISCONTINUITY-SEQUENCE" -> {
+                disc = parseInt(value.trim()).valueOr(0)
+                pl.discontinuitySequence = disc
+            }
+            "#EXT-X-DISCONTINUITY" -> {
+                pendingDisc = true
+                if !pl.segments.isEmpty {
+                    disc += 1
+                }
+            }
+            "#EXT-X-KEY" -> {
+                key = hlsKey(hlsAttributes(value), url)
+                if key.method != "NONE" && key.method != "AES-128" {
+                    pl.warnings.append("HLS: encryption {key.method} isn't supported")
+                }
+            }
+            "#EXT-X-MAP" -> {
+                let a = hlsAttributes(value)
+                map = HlsMap(uri: resolveUrl(url, a["URI"] ?? ""))
+                if let br = a["BYTERANGE"] {
+                    if let at = br.find("@") {
+                        map.length = parseInt(br.substring(from: 0, to: at)).valueOr(0)
+                        map.offset = parseInt(br.substring(from: at + 1, to: br.count)).valueOr(0)
+                    } else {
+                        map.length = parseInt(br).valueOr(0)
+                        map.offset = 0
+                    }
+                }
+            }
+            "#EXT-X-PROGRAM-DATE-TIME" -> {
+                pdtText = value.trim()
+                pdt = hlsParseDate(pdtText)
+                pdtFresh = true
+            }
+            "#EXT-X-DATERANGE" -> {
+                pl.dateRanges.append(value)
+            }
+            "#EXT-X-GAP" -> {
+                gap = true
+            }
+            "#EXT-X-BITRATE" -> {
+                bitrate = parseInt(value.trim()).valueOr(0)
+            }
+            "#EXT-X-ENDLIST" -> {
+                pl.endList = true
+            }
+            "#EXT-X-PLAYLIST-TYPE" -> {
+                pl.playlistType = value.trim()
+            }
+            "#EXT-X-I-FRAMES-ONLY" -> {
+                pl.iFramesOnly = true
+            }
+            _ -> {}
+        }
+    }
+    if !seqSet {
+        pl.mediaSequence = 0
+    }
+    pl.isMaster = sawMasterTag && pl.segments.isEmpty
+    if pl.isMaster {
+        pl.variants = pl.variants.sorted(by: { a, b in a.bandwidth < b.bandwidth })
+    } else if !sawSegmentTag && pl.segments.isEmpty {
+        pl.warnings.append("HLS: a playlist without segments")
+    }
+    if pl.playlistType == "VOD" {
+        pl.endList = true
+    }
+    Result.ok(value: pl)
+}
+
+// §4.2 attribute lists: NAME=value pairs separated by commas; values are
+// numbers, quoted strings or enumerated strings. Quotes are removed.
+public fn hlsAttributes(_ text: String) -> [String: String] {
+    var out: [String: String] = [:]
+    let b = Data(text: text)
+    let n = b.count
+    var i = 0
+    while i < n {
+        while i < n && (b[i] == 32 || b[i] == 44) {
+            i += 1
+        }
+        let ns = i
+        while i < n && b[i] != 61 && b[i] != 44 {
+            i += 1
+        }
+        let name = b.slice(from: ns, to: i).latin1.trim()
+        if i >= n || b[i] != 61 {
+            i += 1
+            continue
+        }
+        i += 1
+        var v = ""
+        if i < n && b[i] == 34 {
+            i += 1
+            let vs = i
+            while i < n && b[i] != 34 {
+                i += 1
+            }
+            v = b.slice(from: vs, to: i).text ?? ""
+            i += 1
+        } else {
+            let vs = i
+            while i < n && b[i] != 44 {
+                i += 1
+            }
+            v = (b.slice(from: vs, to: i).text ?? "").trim()
+        }
+        if !name.isEmpty {
+            out[name] = v
+        }
+    }
+    out
+}
+
+fn hlsVariant(_ a: [String: String], _ base: String) -> HlsVariant {
+    var v = HlsVariant(uri: "")
+    v.bandwidth = parseInt(a["BANDWIDTH"] ?? "0").valueOr(0)
+    v.averageBandwidth = parseInt(a["AVERAGE-BANDWIDTH"] ?? "0").valueOr(0)
+    v.codecs = a["CODECS"] ?? ""
+    if let r = a["RESOLUTION"] {
+        let wh = r.lowercase().split("x")
+        if wh.count == 2 {
+            v.width = parseInt(wh[0]).valueOr(0)
+            v.height = parseInt(wh[1]).valueOr(0)
+        }
+    }
+    v.frameRate = parseFloat(a["FRAME-RATE"] ?? "0").valueOr(0.0)
+    v.hdcp = a["HDCP-LEVEL"] ?? ""
+    v.videoRange = a["VIDEO-RANGE"] ?? ""
+    v.audio = a["AUDIO"] ?? ""
+    v.video = a["VIDEO"] ?? ""
+    v.subtitles = a["SUBTITLES"] ?? ""
+    v.closedCaptions = a["CLOSED-CAPTIONS"] ?? ""
+    v
+}
+
+fn hlsKey(_ a: [String: String], _ base: String) -> HlsKey {
+    var k = HlsKey(method: a["METHOD"] ?? "NONE")
+    if let u = a["URI"] {
+        k.uri = resolveUrl(base, u)
+    }
+    if let iv = a["IV"] {
+        k.iv = hexIv(iv)
+    }
+    k.keyFormat = a["KEYFORMAT"] ?? "identity"
+    k.keyFormatVersions = a["KEYFORMATVERSIONS"] ?? ""
+    k
+}
+
+// {$name} substitution (rfc8216bis §4.3): only defined names change.
+fn hlsSubstitute(_ line: String, _ vars: [String: String]) -> String {
+    var s = line
+    for (k, v) in vars {
+        s = s.replace("\{$" + k + "}", with: v)
+    }
+    s
+}
+
+fn hlsQueryParam(_ url: String, _ name: String) -> String {
+    let u = parseUrl(url)
+    for part in u.query.split("&") {
+        let kv = part.split("=")
+        if kv.count >= 2 && percentDecode(kv[0]) == name {
+            return percentDecode(kv[1])
+        }
+    }
+    ""
+}
+
+// ISO 8601 / RFC 3339 dates as HLS and DASH write them, to seconds since
+// 1970; -1 when unreadable.
+public fn hlsParseDate(_ text: String) -> Float {
+    var t = text.trim()
+    if t.isEmpty {
+        return -1.0
+    }
+    // "+0000" zone forms → "+00:00".
+    let n = t.count
+    if n > 5 {
+        let z = t.substring(from: n - 5, to: n)
+        if (z.hasPrefix("+") || z.hasPrefix("-")) && !z.contains(":") && t.contains("T") {
+            t = t.substring(from: 0, to: n - 2) + ":" + t.substring(from: n - 2, to: n)
+        }
+    }
+    if let d = parseDate(t, format: "iso", timeZone: "UTC") {
+        return d
+    }
+    // A date without a zone: UTC.
+    if let d = parseDate(t + "Z", format: "iso", timeZone: "UTC") {
+        return d
+    }
+    -1.0
+}
+
+// The delay before reloading a live media playlist (§6.3.4): the target
+// duration after a reload that brought new segments, half of it when the
+// playlist hadn't changed.
+public fn hlsReloadDelay(_ pl: HlsPlaylist, changed: Bool) -> Float {
+    var t = pl.targetDuration
+    if t <= 0.0 {
+        t = 6.0
+    }
+    if !changed {
+        return t / 2.0
+    }
+    if !pl.segments.isEmpty {
+        let last = pl.segments[pl.segments.count - 1].duration
+        if last > 0.0 {
+            return last
+        }
+    }
+    t
+}
+
+// Merges a reloaded live playlist with the previous one: segments keep
+// their start times by media sequence number (so the timeline doesn't
+// jump as the window slides), new segments continue it, and segments that
+// fell out of the window are dropped. Gives the merged playlist and
+// whether new segments came.
+public fn hlsMerge(_ old: HlsPlaylist, _ new: HlsPlaylist) -> (HlsPlaylist, Bool) {
+    var m = new
+    if old.segments.isEmpty || new.segments.isEmpty {
+        return (m, !new.segments.isEmpty)
+    }
+    let oldLast = old.segments[old.segments.count - 1].sequence
+    let newLast = new.segments[new.segments.count - 1].sequence
+    let changed = newLast > oldLast || (new.endList && !old.endList)
+    // Find a segment both have; shift the new timeline onto the old one.
+    var shift = 0.0
+    var found = false
+    for s in new.segments {
+        let k = old.indexOf(sequence: s.sequence)
+        if k >= 0 {
+            shift = old.segments[k].start - s.start
+            found = true
+            break
+        }
+    }
+    if !found {
+        // No overlap (we fell behind the window): continue after the old
+        // end, as far on as the sequence numbers say.
+        let gapSegments = Float(new.segments[0].sequence - oldLast - 1)
+        shift = old.end + max(gapSegments, 0.0) * new.targetDuration - new.segments[0].start
+    }
+    for i in 0..m.segments.count {
+        m.segments[i].start += shift
+    }
+    (m, changed)
+}
+
+// The segment index to start a live playlist at (§6.3.3: no closer than
+// three target durations to the end), or EXT-X-START when given.
+public fn hlsLiveStart(_ pl: HlsPlaylist) -> Int {
+    if pl.segments.isEmpty {
+        return 0
+    }
+    if pl.hasStart {
+        let at = if pl.startOffset < 0.0 { pl.end + pl.startOffset } else { pl.segments[0].start + pl.startOffset }
+        return max(0, pl.segmentAt(at))
+    }
+    if pl.endList {
+        return 0
+    }
+    let limit = pl.end - 3.0 * pl.targetDuration
+    var best = 0
+    for (i, s) in pl.segments.enumerated() {
+        if s.start <= limit + 0.001 {
+            best = i
+        }
+    }
+    best
+}

@@ -1,0 +1,471 @@
+// DVD-Video titles: from the parsed IFOs (ifo.tsl) and the title VOB files
+// of each title set to `disc.Title`s.
+//
+// How a title plays (DVD-Video, as the public format notes describe it):
+// the VMG title table names the title set (VTS) and the title in it; the
+// VTS chapter table (PTT) lists each chapter as a program of a program
+// chain (PGC); a PGC plays its cells in order; a cell is a run of sectors
+// of the title set's VOB area (VTS_nn_1.VOB … VTS_nn_9.VOB taken as one
+// run of 2048-byte sectors). Cells in an angle block are alternatives:
+// only one angle's cell plays (the first by default). A program starts at
+// its entry cell, so a chapter starts where that cell does.
+//
+// Streams: the PGC's audio / subpicture control words say which of the
+// title set's streams are available and which substream number each one
+// is in the VOBs (AC-3 0x80+n, DTS 0x88+n, LPCM 0xA0+n in private stream
+// 1, MPEG audio stream 0xC0+n, subpictures 0x20+n) — the keys Reel's PS
+// demuxer gives its tracks (demux/ps.tsl: 0xBD00 | substream).
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+import "../core"
+
+public struct DvdInfo {
+    vmg: DvdVmg = DvdVmg()
+    // Index = title set number − 1; a set that couldn't be read has
+    // number 0.
+    sets: [DvdVts] = []
+    // Title VOB files of each set, in order.
+    vobs: [[DiscFile]] = []
+    warnings: [String] = []
+}
+
+// Reads the IFOs of a disc's VIDEO_TS folder (falling back to the .BUP
+// copies when an .IFO is missing or damaged).
+public fn readDvdInfo(_ fs: DiscFs) -> Result<DvdInfo> {
+    var info = DvdInfo()
+    var vmgR = Result<DvdVmg>.failure(error: Error("VIDEO_TS/VIDEO_TS.IFO not found"))
+    if let d = discReadName(fs, "VIDEO_TS/VIDEO_TS.IFO") {
+        vmgR = parseVmg(d)
+    }
+    if !vmgR.isOk() {
+        if let d = discReadName(fs, "VIDEO_TS/VIDEO_TS.BUP") {
+            let b = parseVmg(d)
+            if b.isOk() {
+                info.warnings.append("VIDEO_TS.IFO unreadable; used VIDEO_TS.BUP")
+                vmgR = b
+            }
+        }
+    }
+    info.vmg = try vmgR
+    info.warnings += info.vmg.warnings
+    var count = info.vmg.titleSets
+    for t in info.vmg.titles {
+        count = max(count, t.titleSet)
+    }
+    count = min(count, 99)
+    for n in 1..(count + 1) {
+        let nn = "{n}".padStart(2, with: "0")
+        var r = Result<DvdVts>.failure(error: Error("VTS_{nn}_0.IFO not found"))
+        if let d = discReadName(fs, "VIDEO_TS/VTS_{nn}_0.IFO") {
+            r = parseVts(d, number: n)
+        }
+        if !r.isOk() {
+            if let d = discReadName(fs, "VIDEO_TS/VTS_{nn}_0.BUP") {
+                let b = parseVts(d, number: n)
+                if b.isOk() {
+                    info.warnings.append("VTS_{nn}_0.IFO unreadable; used VTS_{nn}_0.BUP")
+                    r = b
+                }
+            }
+        }
+        match r {
+            .ok(v) -> {
+                info.sets.append(v)
+                info.warnings += v.warnings
+            }
+            .failure(e) -> {
+                info.sets.append(DvdVts())
+                info.warnings.append("title set {n}: {e.message}")
+            }
+        }
+        var vobs: [DiscFile] = []
+        for k in 1..10 {
+            if let f = discFind(fs, "VIDEO_TS/VTS_{nn}_{k}.VOB") {
+                vobs.append(f)
+            } else {
+                break
+            }
+        }
+        info.vobs.append(vobs)
+    }
+    Result.ok(value: info)
+}
+
+// The byte ranges of the sectors first…last of a title set's VOB area:
+// (path, from, to, first sector of the piece).
+fn dvdRanges(_ vobs: [DiscFile], _ first: Int, _ last: Int) -> [(String, Int, Int, Int)] {
+    var out: [(String, Int, Int, Int)] = []
+    let a = first * 2048
+    let b = (last + 1) * 2048
+    var base = 0
+    for f in vobs {
+        let lo = max(a, base)
+        let hi = min(b, base + f.size)
+        if hi > lo {
+            var at = lo
+            for (path, x, y) in discFileRanges(f, lo - base, hi - base) {
+                out.append((path, x, y, at / 2048))
+                at += y - x
+            }
+        }
+        base += f.size
+    }
+    out
+}
+
+fn dvdAudioNote(_ ext: Int) -> String {
+    match ext {
+        2 -> "Visually impaired"
+        3 -> "Director's comments"
+        4 -> "Alternate director's comments"
+        _ -> ""
+    }
+}
+
+fn dvdSubNote(_ ext: Int) -> String {
+    match ext {
+        2 -> "Large"
+        3 -> "Children"
+        5 -> "Captions"
+        6 -> "Large captions"
+        7 -> "Children's captions"
+        9 -> "Forced"
+        13 -> "Director's comments"
+        14 -> "Large director's comments"
+        15 -> "Children's director's comments"
+        _ -> ""
+    }
+}
+
+// The streams a PGC offers in a title set.
+fn dvdStreams(_ vts: DvdVts, _ pgc: DvdPgc) -> [Stream] {
+    var out: [Stream] = []
+    let va = vts.video
+    var v = Stream(kind: core.TrackKind.video, codec: if va.coding == 0 { "mpeg1" } else { "mpeg2" })
+    v.id = 0xE0
+    v.width = va.width
+    v.height = va.height
+    v.aspect = if va.aspect == 3 { "16:9" } else { "4:3" }
+    if va.standard == 1 {
+        v.fpsNum = 25
+        v.fpsDen = 1
+    } else {
+        v.fpsNum = 30000
+        v.fpsDen = 1001
+    }
+    out.append(v)
+    var i = 0
+    while i < vts.audio.count && i < pgc.audioControl.count {
+        let ctl = pgc.audioControl[i]
+        if (ctl >> 15) & 1 == 1 {
+            let a = vts.audio[i]
+            let n = (ctl >> 8) & 7
+            var s = Stream(kind: core.TrackKind.audio, codec: "unknown:dvd{a.coding}")
+            s.number = i
+            match a.coding {
+                0 -> {
+                    s.codec = "ac3"
+                    s.id = 0xBD80 + n
+                }
+                6 -> {
+                    s.codec = "dts"
+                    s.id = 0xBD88 + n
+                }
+                4 -> {
+                    s.codec = if a.bits == 16 { "pcm" } else { "unknown:pcm_dvd" }
+                    s.id = 0xBDA0 + n
+                    s.bitsPerSample = a.bits
+                }
+                2, 3 -> {
+                    s.codec = "mp2"
+                    s.id = 0xC0 + n
+                }
+                _ -> {
+                    s.id = 0xBD80 + n
+                }
+            }
+            s.channels = a.channels
+            s.sampleRate = a.sampleRate
+            s.languageCode = a.languageCode
+            s.language = discLanguage3(a.languageCode)
+            s.note = dvdAudioNote(a.extension)
+            out.append(s)
+        }
+        i += 1
+    }
+    i = 0
+    while i < vts.subs.count && i < pgc.subControl.count {
+        let ctl = pgc.subControl[i]
+        if (ctl >> 31) & 1 == 1 {
+            let a = vts.subs[i]
+            let n = if va.aspect == 0 { (ctl >> 24) & 0x1F } else { (ctl >> 16) & 0x1F }
+            var s = Stream(kind: core.TrackKind.subtitle, codec: "dvdsub")
+            s.number = i
+            s.id = 0xBD20 + n
+            s.width = va.width
+            s.height = va.height
+            s.languageCode = a.languageCode
+            s.language = discLanguage3(a.languageCode)
+            s.note = dvdSubNote(a.extension)
+            s.forced = a.extension == 9
+            out.append(s)
+        }
+        i += 1
+    }
+    out
+}
+
+// One title (as the VMG title table lists it), playing angle `angle`.
+public fn dvdTitle(_ info: DvdInfo, _ e: DvdTitleEntry, angle: Int = 1) -> Title {
+    var t = Title(number: e.number)
+    t.kind = "dvd"
+    t.name = "Title {e.number}"
+    t.titleSet = e.titleSet
+    t.vtsTitle = e.vtsTitle
+    t.angles = max(1, e.angles)
+    t.angle = max(1, min(angle, t.angles))
+    if e.titleSet < 1 || e.titleSet > info.sets.count {
+        return t
+    }
+    let vts = info.sets[e.titleSet - 1]
+    let vobs = info.vobs[e.titleSet - 1]
+    if vts.number == 0 {
+        return t
+    }
+    var ptt: [Int] = []
+    if e.vtsTitle >= 1 && e.vtsTitle <= vts.ptts.count {
+        ptt = vts.ptts[e.vtsTitle - 1]
+    }
+    // The PGCs in the order the chapters name them.
+    var order: [Int] = []
+    var k = 0
+    while k + 1 < ptt.count {
+        let pg = ptt[k]
+        if pg >= 1 && pg <= vts.pgcs.count && !order.contains(pg) {
+            order.append(pg)
+        }
+        k += 2
+    }
+    if order.isEmpty {
+        // No chapter table: the entry PGC of this title.
+        var i = 0
+        while i < vts.pgcs.count {
+            if vts.pgcs[i].entry && vts.pgcs[i].titleNumber == e.vtsTitle {
+                order.append(i + 1)
+                break
+            }
+            i += 1
+        }
+    }
+    if order.isEmpty {
+        return t
+    }
+    let first = vts.pgcs[order[0] - 1]
+    t.streams = dvdStreams(vts, first)
+    t.width = vts.video.width
+    t.height = vts.video.height
+    t.aspect = if vts.video.aspect == 3 { "16:9" } else { "4:3" }
+    for c in first.palette {
+        t.palette.append(dYcbcrToRgba(c >> 16, c & 255, (c >> 8) & 255))
+    }
+    t.pgcs = order
+
+    var time = 0.0
+    var pos = 0
+    // Start time of each cell of each PGC played (by order index).
+    var cellTimes: [[Float]] = []
+    var pgcTimes: [Float] = []
+    for pgcn in order {
+        let pgc = vts.pgcs[pgcn - 1]
+        pgcTimes.append(time)
+        var starts: [Float] = []
+        // Angle blocks: each cell's angle number and its block's size.
+        var angleOf: [Int] = []
+        var blockSize: [Int] = []
+        var ci = 0
+        var inBlock = 0
+        while ci < pgc.cells.count {
+            let c = pgc.cells[ci]
+            if c.blockType == 1 && c.blockMode != 0 {
+                if c.blockMode == 1 || inBlock == 0 {
+                    inBlock = 1
+                } else {
+                    inBlock += 1
+                }
+                angleOf.append(inBlock)
+                if c.blockMode == 3 {
+                    inBlock = 0
+                }
+            } else {
+                angleOf.append(0)
+                inBlock = 0
+            }
+            ci += 1
+        }
+        // Block sizes: walk back from each block's last cell.
+        ci = 0
+        while ci < pgc.cells.count {
+            var size = 0
+            if angleOf[ci] > 0 {
+                var j = ci
+                while j + 1 < pgc.cells.count && angleOf[j + 1] > angleOf[j] {
+                    j += 1
+                }
+                size = angleOf[j]
+            }
+            blockSize.append(size)
+            ci += 1
+        }
+        var firstSeg = true
+        ci = 0
+        while ci < pgc.cells.count {
+            let c = pgc.cells[ci]
+            starts.append(time)
+            var chosen = true
+            if angleOf[ci] > 0 {
+                chosen = angleOf[ci] == min(t.angle, blockSize[ci])
+            }
+            if chosen {
+                if c.lastSector < c.firstSector {
+                    t.warnings.append("PGC {pgcn} cell {ci + 1} has no sectors")
+                } else {
+                    let ranges = dvdRanges(vobs, c.firstSector, c.lastSector)
+                    var got = 0
+                    for r in ranges {
+                        got += r.2 - r.1
+                    }
+                    if got < (c.lastSector - c.firstSector + 1) * 2048 {
+                        t.warnings.append("PGC {pgcn} cell {ci + 1}: sectors {c.firstSector}–{c.lastSector} go past the VOB files")
+                    }
+                    var cellTime = time
+                    var piece = 0
+                    for (path, a, b, s0) in ranges {
+                        var seg = Segment(path: path, from: a, to: b)
+                        seg.start = cellTime
+                        seg.duration = if piece == 0 { c.duration } else { 0.0 }
+                        seg.pos = pos
+                        seg.cell = ci + 1
+                        seg.pgc = pgcn
+                        seg.firstSector = s0
+                        seg.lastSector = s0 + (b - a) / 2048 - 1
+                        seg.discontinuity = piece == 0 && (firstSeg || c.stcDiscontinuity)
+                        seg.interleaved = c.interleaved
+                        t.segments.append(seg)
+                        if piece == 0 {
+                            // A cell starts on a VOBU; a piece after a
+                            // VOB file boundary needn't.
+                            t.points.append(SeekPoint(time: cellTime, pos: pos))
+                        }
+                        pos += b - a
+                        piece += 1
+                        firstSeg = false
+                    }
+                    // Pieces after a VOB file boundary keep the cell's
+                    // time; split their duration by bytes.
+                    if piece > 1 {
+                        let n = t.segments.count
+                        let total = Float(max(1, (c.lastSector - c.firstSector + 1) * 2048))
+                        var at = cellTime
+                        var q = n - piece
+                        while q < n {
+                            let len = Float(t.segments[q].to - t.segments[q].from)
+                            t.segments[q].start = at
+                            t.segments[q].duration = c.duration * len / total
+                            at += t.segments[q].duration
+                            q += 1
+                        }
+                    }
+                }
+                if c.interleaved && !t.warnings.contains("interleaved cells: call disc.resolveInterleaved before playing") {
+                    t.warnings.append("interleaved cells: call disc.resolveInterleaved before playing")
+                }
+                time += c.duration
+            }
+            ci += 1
+        }
+        cellTimes.append(starts)
+        // Time map: entry i is (i + 1) · unit seconds into the PGC.
+        if pgcn - 1 < vts.timeMaps.count {
+            let map = vts.timeMaps[pgcn - 1]
+            if map.unit > 0 {
+                let pgcStart = pgcTimes[pgcTimes.count - 1]
+                var i = 0
+                while i < map.sectors.count {
+                    let s = map.sectors[i]
+                    for seg in t.segments {
+                        if seg.pgc == pgcn && s >= seg.firstSector && s <= seg.lastSector {
+                            t.points.append(SeekPoint(time: pgcStart + Float((i + 1) * map.unit), pos: seg.pos + (s - seg.firstSector) * 2048))
+                            break
+                        }
+                    }
+                    i += 1
+                }
+            }
+        }
+    }
+    t.duration = time
+
+    // Chapters: program pgn of PGC pgcn starts at its entry cell.
+    k = 0
+    var n = 1
+    while k + 1 < ptt.count {
+        let pgcn = ptt[k]
+        let pgn = ptt[k + 1]
+        var oi = 0
+        while oi < order.count && order[oi] != pgcn {
+            oi += 1
+        }
+        if oi < order.count {
+            let pgc = vts.pgcs[pgcn - 1]
+            var start = pgcTimes[oi]
+            if pgn >= 1 && pgn <= pgc.programMap.count {
+                let cell = pgc.programMap[pgn - 1]
+                if cell >= 1 && cell <= cellTimes[oi].count {
+                    start = cellTimes[oi][cell - 1]
+                }
+            }
+            t.chapters.append(core.Chapter(start: start, title: "Chapter {n}"))
+            n += 1
+        }
+        k += 2
+    }
+    var c = 0
+    while c < t.chapters.count {
+        t.chapters[c].end = if c + 1 < t.chapters.count { t.chapters[c + 1].start } else { t.duration }
+        c += 1
+    }
+    discFinishTitle(t)
+}
+
+// All titles of a DVD (angle 1), with the main feature marked: the longest
+// title (the first of equally long ones).
+public fn dvdTitles(_ info: DvdInfo) -> [Title] {
+    var out: [Title] = []
+    for e in info.vmg.titles {
+        out.append(dvdTitle(info, e))
+    }
+    out
+}
+
+// The idx text a "dvdsub" track's `extra` takes (subs/dvdsub.tsl
+// parseIdx): the picture size and the title's palette.
+public fn dvdsubIdx(_ t: Title) -> String {
+    var cols: [String] = []
+    for c in t.palette {
+        cols.append(dHex2(c >> 24 & 255) + dHex2(c >> 16 & 255) + dHex2(c >> 8 & 255))
+    }
+    let w = if t.width > 0 { t.width } else { 720 }
+    let h = if t.height > 0 { t.height } else { 480 }
+    var text = "# made by Reel from the DVD's IFO\nsize: {w}x{h}\n"
+    if !cols.isEmpty {
+        text += "palette: " + cols.joined(separator: ", ") + "\n"
+    }
+    text
+}
+
+// The `extra` bytes for a dvdsub track of this title.
+public fn dvdsubExtra(_ t: Title) -> Data {
+    Data(text: dvdsubIdx(t))
+}

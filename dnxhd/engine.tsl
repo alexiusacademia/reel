@@ -1,0 +1,2993 @@
+// The DNxHD/DNxHR macroblock engine (SMPTE ST 2019-1 §7–8): reads one
+// row of macroblocks — quantiser, then 8 (4:2:2) or 12 (4:4:4) blocks of
+// DC size + difference and AC level/run codes in zigzag order — scales
+// the coefficients by quantiser × weight, and runs ffmpeg's integer
+// "simple IDCT" for the bit depth into the planes, so pictures match
+// ffmpeg bit for bit (its ARM NEON 8-bit IDCT, as on this Mac, and the C
+// 10- and 12-bit ones).
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+struct DxEngine {
+    // Planes (whole macroblocks; interlaced frames hold both fields) and
+    // the one being written (swapped in from y/u/v).
+    y: [Int] = []
+    u: [Int] = []
+    v: [Int] = []
+    pl: [Int] = []
+    yStride: Int = 0
+    cStride: Int = 0
+    depth: Int = 8
+    full: Bool = false
+    mbaff: Bool = false
+    mbW: Int = 0
+
+    // Per CID: the AC table (16-bit prefix -> len | eob << 5 | flags << 6 |
+    // level << 8), the DC table (7-bit prefix -> len | size << 8), the
+    // run table (10-bit prefix -> len | run << 8), weights.
+    cid: Int = -1
+    acTab: [Int] = []
+    acTab2: [Int] = []
+    dcTab: [Int] = []
+    runTab: [Int] = []
+    lumaW: [Int] = []
+    chromaW: [Int] = []
+    // Dequantisation for the current quantiser: per zigzag index the
+    // scale and the added rounding/bias, luma 0…63, chroma 64…127.
+    scale: [Int] = []
+    add: [Int] = []
+    lastQ: Int = -1
+    indexBits: Int = 4
+    levelBias: Int = 32
+    levelShift: Int = 6
+    dcShift: Int = 0
+    zigzag: [Int] = []
+    rowsUpTo: [Int] = []
+
+    // 12 blocks of coefficients (raster order), their last zigzag index.
+    blk: [Int] = []
+    last: [Int] = []
+    lastDc: [Int] = [0, 0, 0]
+
+    // Bit reader over d[bp…be): bits in the low bc bits of bb.
+    d: Data = Data()
+    bp: Int = 0
+    be: Int = 0
+    bb: Int = 0
+    bc: Int = 0
+    bad: Bool = false
+    // The ACT bit of the last macroblock (4:4:4 colour transform used).
+    actSeen: Bool = false
+
+    fn setup() {
+        blk = dxFilled(12 * 64, 0)
+        last = dxFilled(12, 0)
+        scale = dxFilled(128, 0)
+        add = dxFilled(128, 0)
+        zigzag = dxZigzag
+        rowsUpTo = dxFilled(64, 0)
+        var m = 0
+        for i in 0..64 {
+            m = m | (1 << (zigzag[i] >> 3))
+            rowsUpTo[i] = m
+        }
+    }
+
+    // Makes the lookup tables of a compression ID.
+    fn useCid(_ c: DxCid) {
+        if c.cid == cid {
+            return
+        }
+        cid = c.cid
+        lastQ = -1
+        lumaW = dxTable(c.lumaWeight)
+        chromaW = dxTable(c.chromaWeight)
+        // AC: 257 symbols, codes up to 16 bits.
+        let codes = dxTable(c.acCodes)
+        let bits = dxTable(c.acBits)
+        let info = dxTable(c.acInfo)
+        // Two levels: the first 11 bits, then 5 more for longer codes
+        // (keeps the hot table small enough for the L1 cache).
+        var full16 = dxFilled(65536, 0)
+        for k in 0..codes.count {
+            let len = bits[k]
+            if len == 0 || len > 16 {
+                continue
+            }
+            let eob = if k == c.eobIndex { 1 } else { 0 }
+            let e = len | (eob << 5) | (info[2 * k + 1] << 6) | (info[2 * k] << 8)
+            let first = codes[k] << (16 - len)
+            for p in 0..(1 << (16 - len)) {
+                full16[first + p] = e
+            }
+        }
+        acTab = dxFilled(2048, 0)
+        acTab2 = []
+        for p in 0..2048 {
+            let e = full16[p << 5]
+            if e != 0 && (e & 31) <= 11 {
+                acTab[p] = e
+            } else {
+                var any = false
+                for q in 0..32 {
+                    if full16[(p << 5) + q] != 0 {
+                        any = true
+                    }
+                }
+                if any {
+                    acTab[p] = (1 << 62) | (acTab2.count << 32)
+                    for q in 0..32 {
+                        acTab2.append(full16[(p << 5) + q])
+                    }
+                }
+            }
+        }
+        let dcc = dxTable(c.dcCodes)
+        let dcb = dxTable(c.dcBits)
+        dcTab = dxFilled(128, 0)
+        for k in 0..dcc.count {
+            let len = dcb[k]
+            let first = dcc[k] << (7 - len)
+            for p in 0..(1 << (7 - len)) {
+                dcTab[first + p] = len | (k << 8)
+            }
+        }
+        let rc = dxTable(c.runCodes)
+        let rb = dxTable(c.runBits)
+        let rv = dxTable(c.run)
+        runTab = dxFilled(1024, 0)
+        for k in 0..rc.count {
+            let len = rb[k]
+            let first = rc[k] << (10 - len)
+            for p in 0..(1 << (10 - len)) {
+                runTab[first + p] = len | (rv[k] << 8)
+            }
+        }
+    }
+
+    // ---- Bits ----
+
+    fn startBits(_ data: Data, _ from: Int, _ end: Int) {
+        d = data
+        bp = from
+        be = end
+        bb = 0
+        bc = 0
+        bad = false
+    }
+
+    // Loads bytes until more than 32 bits are held (zeros past the end).
+    fn refill() {
+        if bc <= 32 && bp + 4 <= be {
+            bb = (bb << 32) | d.uint32(at: bp, bigEndian: true)
+            bp += 4
+            bc += 32
+            return
+        }
+        while bc <= 48 {
+            var byte = 0
+            if bp < be {
+                byte = d[bp]
+            }
+            bb = (bb << 8) | byte
+            bp += 1
+            bc += 8
+        }
+    }
+
+    fn bits(_ n: Int) -> Int {
+        if bc < n {
+            refill()
+        }
+        bc -= n
+        (bb >> bc) & ((1 << n) - 1)
+    }
+
+    // ---- A macroblock (§7.3.3, §8) ----
+
+    // Sets the scales for quantiser q.
+    fn setQ(_ q: Int) {
+        lastQ = q
+        for i in 0..64 {
+            let sl = q * lumaW[i]
+            let sc = q * chromaW[i]
+            scale[i] = sl
+            scale[64 + i] = sc
+            var al = sl >> 1
+            var ac = sc >> 1
+            if levelBias < 32 || lumaW[i] != levelBias {
+                al += levelBias
+            }
+            if levelBias < 32 || chromaW[i] != levelBias {
+                ac += levelBias
+            }
+            add[i] = al
+            add[64 + i] = ac
+        }
+    }
+
+    // Reads block n of a macroblock (component comp, chroma weights when
+    // chroma) into blk. False when damaged.
+    fn block(_ n: Int, _ comp: Int, _ chroma: Bool) -> Bool {
+        let base = n << 6
+        let s0 = if chroma { 64 } else { 0 }
+        // DC: a size code, then that many bits of difference (§8.2).
+        if bc < 33 {
+            refill()
+        }
+        let de = dcTab[(bb >> (bc - 7)) & 127]
+        if de == 0 {
+            bad = true
+            return false
+        }
+        bc -= de & 255
+        let size = de >> 8
+        var dc = lastDc[comp]
+        if size > 0 {
+            if bc < size {
+                refill()
+            }
+            bc -= size
+            let raw = (bb >> bc) & ((1 << size) - 1)
+            var diff = raw
+            if (raw >> (size - 1)) == 0 {
+                diff = raw - ((1 << size) - 1)
+            }
+            dc += diff << dcShift
+            lastDc[comp] = dc
+        }
+        blk[base] = ((dc + 32768) & 65535) - 32768
+        // AC: symbols until end of block (§8.3).
+        var cache = bb
+        var cnt = bc
+        var at = bp
+        let end = be
+        var i = 0
+        let ib = indexBits
+        let shift = levelShift
+        while true {
+            if cnt < 33 {
+                if at + 4 <= end {
+                    cache = (cache << 32) | d.uint32(at: at, bigEndian: true)
+                    at += 4
+                    cnt += 32
+                } else {
+                    while cnt <= 48 {
+                        var byte = 0
+                        if at < end {
+                            byte = d[at]
+                        }
+                        cache = (cache << 8) | byte
+                        at += 1
+                        cnt += 8
+                    }
+                }
+            }
+            var e = acTab[(cache >> (cnt - 11)) & 2047]
+            if e >= (1 << 62) {
+                e = acTab2[((e >> 32) & 0x3fffffff) + ((cache >> (cnt - 16)) & 31)]
+            }
+            if e == 0 {
+                bad = true
+                break
+            }
+            cnt -= e & 31
+            if (e & 32) != 0 {
+                break
+            }
+            var level = e >> 8
+            cnt -= 1
+            let neg = ((cache >> cnt) & 1) == 1
+            if (e & 64) != 0 {
+                cnt -= ib
+                level += ((cache >> cnt) & ((1 << ib) - 1)) << 7
+            }
+            if (e & 128) != 0 {
+                if cnt < 10 {
+                    while cnt <= 48 {
+                        var byte = 0
+                        if at < end {
+                            byte = d[at]
+                        }
+                        cache = (cache << 8) | byte
+                        at += 1
+                        cnt += 8
+                    }
+                }
+                let r = runTab[(cache >> (cnt - 10)) & 1023]
+                if r == 0 {
+                    bad = true
+                    break
+                }
+                cnt -= r & 255
+                i += r >> 8
+            }
+            i += 1
+            if i > 63 {
+                bad = true
+                break
+            }
+            var lv = (level * scale[s0 + i] + add[s0 + i]) >> shift
+            if neg {
+                lv = -lv
+            }
+            if lv > 32767 || lv < -32768 {
+                lv = ((lv + 32768) & 65535) - 32768
+            }
+            blk[base + zigzag[i]] = lv
+            last[n] = i
+        }
+        bb = cache
+        bc = cnt
+        bp = at
+        !bad
+    }
+
+    // Decodes the macroblock at (x, row): field -1 for progressive
+    // frames, else the field (0 top, 1 bottom) whose rows it fills.
+    fn macroblock(_ x: Int, _ row: Int, _ field: Int) -> Bool {
+        var interlacedMb = false
+        var q = 0
+        if mbaff {
+            interlacedMb = bits(1) == 1
+            q = bits(10)
+        } else {
+            q = bits(11)
+        }
+        if bits(1) == 1 {
+            actSeen = true
+        }
+        if q != lastQ {
+            setQ(q)
+        }
+        let nb = if full { 12 } else { 8 }
+        for n in 0..nb {
+            var comp = 0
+            if full {
+                comp = (n >> 1) % 3
+            } else if (n & 2) != 0 {
+                comp = 1 + (n & 1)
+            }
+            if !block(n, comp, comp != 0) {
+                clearBlocks()
+                return false
+            }
+        }
+        // Placement (§8.5): lines are doubled in interlaced frames (one
+        // field's lines) and again in interlaced macroblocks.
+        var ys = yStride
+        var cs = cStride
+        var yOff = (row * 16) * ys + x * 16
+        let cw = if full { 16 } else { 8 }
+        var cOff = (row * 16) * cs + x * cw
+        if field >= 0 {
+            ys = ys * 2
+            cs = cs * 2
+            yOff = (row * 16) * ys + x * 16 + field * yStride
+            cOff = (row * 16) * cs + x * cw + field * cStride
+        }
+        var yDown = 8 * ys
+        var cDown = 8 * cs
+        if interlacedMb {
+            yDown = ys
+            cDown = cs
+            ys = ys * 2
+            cs = cs * 2
+        }
+        swapIn(0)
+        if full {
+            put(0, yOff, ys)
+            put(1, yOff + 8, ys)
+            put(6, yOff + yDown, ys)
+            put(7, yOff + yDown + 8, ys)
+        } else {
+            put(0, yOff, ys)
+            put(1, yOff + 8, ys)
+            put(4, yOff + yDown, ys)
+            put(5, yOff + yDown + 8, ys)
+        }
+        swapIn(0)
+        swapIn(1)
+        if full {
+            put(2, cOff, cs)
+            put(3, cOff + 8, cs)
+            put(8, cOff + cDown, cs)
+            put(9, cOff + cDown + 8, cs)
+        } else {
+            put(2, cOff, cs)
+            put(6, cOff + cDown, cs)
+        }
+        swapIn(1)
+        swapIn(2)
+        if full {
+            put(4, cOff, cs)
+            put(5, cOff + 8, cs)
+            put(10, cOff + cDown, cs)
+            put(11, cOff + cDown + 8, cs)
+        } else {
+            put(3, cOff, cs)
+            put(7, cOff + cDown, cs)
+        }
+        swapIn(2)
+        true
+    }
+
+    // Decodes one row of macroblocks from data[from…end).
+    fn row(_ data: Data, _ from: Int, _ end: Int, _ row: Int, _ field: Int) -> Bool {
+        startBits(data, from, end)
+        let dc0 = 1 << (depth + 2)
+        lastDc[0] = dc0
+        lastDc[1] = dc0
+        lastDc[2] = dc0
+        for x in 0..mbW {
+            if !macroblock(x, row, field) {
+                return false
+            }
+        }
+        true
+    }
+
+    fn clearBlocks() {
+        for i in 0..blk.count {
+            blk[i] = 0
+        }
+        for i in 0..12 {
+            last[i] = 0
+        }
+    }
+
+    // Transforms block b into pl at off (stride in samples) and leaves
+    // the block zero.
+    fn put(_ b: Int, _ off: Int, _ stride: Int) {
+        let m = rowsUpTo[last[b]]
+        last[b] = 0
+        if depth == 8 {
+            idct8(b, m, off, stride)
+        } else if depth == 10 {
+            idct10(b, m, off, stride)
+        } else {
+            idct12(b, m, off, stride)
+        }
+    }
+
+    fn swapIn(_ plane: Int) {
+        if plane == 0 {
+            let t = y
+            y = pl
+            pl = t
+        } else if plane == 1 {
+            let t = u
+            u = pl
+            pl = t
+        } else {
+            let t = v
+            v = pl
+            pl = t
+        }
+    }
+
+    // ---- IDCTs ----
+
+    // Generated by tests/prores/genidct.py (ffmpeg's simple IDCT: rows
+    // shift 11, columns 20, output clipped to 0…255).
+    fn idct8(_ b: Int, _ m: Int, _ off: Int, _ stride: Int) {
+        let s = b << 6
+        var r0c0 = 0
+        var r0c1 = 0
+        var r0c2 = 0
+        var r0c3 = 0
+        var r0c4 = 0
+        var r0c5 = 0
+        var r0c6 = 0
+        var r0c7 = 0
+        var r1c0 = 0
+        var r1c1 = 0
+        var r1c2 = 0
+        var r1c3 = 0
+        var r1c4 = 0
+        var r1c5 = 0
+        var r1c6 = 0
+        var r1c7 = 0
+        var r2c0 = 0
+        var r2c1 = 0
+        var r2c2 = 0
+        var r2c3 = 0
+        var r2c4 = 0
+        var r2c5 = 0
+        var r2c6 = 0
+        var r2c7 = 0
+        var r3c0 = 0
+        var r3c1 = 0
+        var r3c2 = 0
+        var r3c3 = 0
+        var r3c4 = 0
+        var r3c5 = 0
+        var r3c6 = 0
+        var r3c7 = 0
+        var r4c0 = 0
+        var r4c1 = 0
+        var r4c2 = 0
+        var r4c3 = 0
+        var r4c4 = 0
+        var r4c5 = 0
+        var r4c6 = 0
+        var r4c7 = 0
+        var r5c0 = 0
+        var r5c1 = 0
+        var r5c2 = 0
+        var r5c3 = 0
+        var r5c4 = 0
+        var r5c5 = 0
+        var r5c6 = 0
+        var r5c7 = 0
+        var r6c0 = 0
+        var r6c1 = 0
+        var r6c2 = 0
+        var r6c3 = 0
+        var r6c4 = 0
+        var r6c5 = 0
+        var r6c6 = 0
+        var r6c7 = 0
+        var r7c0 = 0
+        var r7c1 = 0
+        var r7c2 = 0
+        var r7c3 = 0
+        var r7c4 = 0
+        var r7c5 = 0
+        var r7c6 = 0
+        var r7c7 = 0
+        if true {
+            let x0 = blk[s]
+            let x1 = blk[s + 1]
+            let x2 = blk[s + 2]
+            let x3 = blk[s + 3]
+            let x4 = blk[s + 4]
+            let x5 = blk[s + 5]
+            let x6 = blk[s + 6]
+            let x7 = blk[s + 7]
+            blk[s] = 0
+            blk[s + 1] = 0
+            blk[s + 2] = 0
+            blk[s + 3] = 0
+            blk[s + 4] = 0
+            blk[s + 5] = 0
+            blk[s + 6] = 0
+            blk[s + 7] = 0
+            if (x1 | x2 | x3 | x4 | x5 | x6 | x7) == 0 {
+                let v = ((((16383 * x0 + 1024) >> 11) + 32768) & 65535) - 32768
+                r0c0 = v
+                r0c1 = v
+                r0c2 = v
+                r0c3 = v
+                r0c4 = v
+                r0c5 = v
+                r0c6 = v
+                r0c7 = v
+            } else {
+                var a0 = 16383 * x0 + 1024
+                var a1 = a0
+                var a2 = a0
+                var a3 = a0
+                a0 += 21407 * x2
+                a1 += 8867 * x2
+                a2 -= 8867 * x2
+                a3 -= 21407 * x2
+                var b0 = 22725 * x1 + 19266 * x3
+                var b1 = 19266 * x1 - 4520 * x3
+                var b2 = 12873 * x1 - 22725 * x3
+                var b3 = 4520 * x1 - 12873 * x3
+                if (x4 | x5 | x6 | x7) != 0 {
+                    a0 += 16383 * x4 + 8867 * x6
+                    a1 += -16383 * x4 - 21407 * x6
+                    a2 += -16383 * x4 + 21407 * x6
+                    a3 += 16383 * x4 - 8867 * x6
+                    b0 += 12873 * x5 + 4520 * x7
+                    b1 += -22725 * x5 - 12873 * x7
+                    b2 += 4520 * x5 + 19266 * x7
+                    b3 += 19266 * x5 - 22725 * x7
+                }
+                r0c0 = ((((a0 + b0) >> 11) + 32768) & 65535) - 32768
+                r0c1 = ((((a1 + b1) >> 11) + 32768) & 65535) - 32768
+                r0c2 = ((((a2 + b2) >> 11) + 32768) & 65535) - 32768
+                r0c3 = ((((a3 + b3) >> 11) + 32768) & 65535) - 32768
+                r0c4 = ((((a3 - b3) >> 11) + 32768) & 65535) - 32768
+                r0c5 = ((((a2 - b2) >> 11) + 32768) & 65535) - 32768
+                r0c6 = ((((a1 - b1) >> 11) + 32768) & 65535) - 32768
+                r0c7 = ((((a0 - b0) >> 11) + 32768) & 65535) - 32768
+            }
+        }
+        if (m & 2) != 0 {
+            let x0 = blk[s + 8]
+            let x1 = blk[s + 8 + 1]
+            let x2 = blk[s + 8 + 2]
+            let x3 = blk[s + 8 + 3]
+            let x4 = blk[s + 8 + 4]
+            let x5 = blk[s + 8 + 5]
+            let x6 = blk[s + 8 + 6]
+            let x7 = blk[s + 8 + 7]
+            blk[s + 8] = 0
+            blk[s + 8 + 1] = 0
+            blk[s + 8 + 2] = 0
+            blk[s + 8 + 3] = 0
+            blk[s + 8 + 4] = 0
+            blk[s + 8 + 5] = 0
+            blk[s + 8 + 6] = 0
+            blk[s + 8 + 7] = 0
+            if (x1 | x2 | x3 | x4 | x5 | x6 | x7) == 0 {
+                let v = ((((16383 * x0 + 1024) >> 11) + 32768) & 65535) - 32768
+                r1c0 = v
+                r1c1 = v
+                r1c2 = v
+                r1c3 = v
+                r1c4 = v
+                r1c5 = v
+                r1c6 = v
+                r1c7 = v
+            } else {
+                var a0 = 16383 * x0 + 1024
+                var a1 = a0
+                var a2 = a0
+                var a3 = a0
+                a0 += 21407 * x2
+                a1 += 8867 * x2
+                a2 -= 8867 * x2
+                a3 -= 21407 * x2
+                var b0 = 22725 * x1 + 19266 * x3
+                var b1 = 19266 * x1 - 4520 * x3
+                var b2 = 12873 * x1 - 22725 * x3
+                var b3 = 4520 * x1 - 12873 * x3
+                if (x4 | x5 | x6 | x7) != 0 {
+                    a0 += 16383 * x4 + 8867 * x6
+                    a1 += -16383 * x4 - 21407 * x6
+                    a2 += -16383 * x4 + 21407 * x6
+                    a3 += 16383 * x4 - 8867 * x6
+                    b0 += 12873 * x5 + 4520 * x7
+                    b1 += -22725 * x5 - 12873 * x7
+                    b2 += 4520 * x5 + 19266 * x7
+                    b3 += 19266 * x5 - 22725 * x7
+                }
+                r1c0 = ((((a0 + b0) >> 11) + 32768) & 65535) - 32768
+                r1c1 = ((((a1 + b1) >> 11) + 32768) & 65535) - 32768
+                r1c2 = ((((a2 + b2) >> 11) + 32768) & 65535) - 32768
+                r1c3 = ((((a3 + b3) >> 11) + 32768) & 65535) - 32768
+                r1c4 = ((((a3 - b3) >> 11) + 32768) & 65535) - 32768
+                r1c5 = ((((a2 - b2) >> 11) + 32768) & 65535) - 32768
+                r1c6 = ((((a1 - b1) >> 11) + 32768) & 65535) - 32768
+                r1c7 = ((((a0 - b0) >> 11) + 32768) & 65535) - 32768
+            }
+        }
+        if (m & 4) != 0 {
+            let x0 = blk[s + 16]
+            let x1 = blk[s + 16 + 1]
+            let x2 = blk[s + 16 + 2]
+            let x3 = blk[s + 16 + 3]
+            let x4 = blk[s + 16 + 4]
+            let x5 = blk[s + 16 + 5]
+            let x6 = blk[s + 16 + 6]
+            let x7 = blk[s + 16 + 7]
+            blk[s + 16] = 0
+            blk[s + 16 + 1] = 0
+            blk[s + 16 + 2] = 0
+            blk[s + 16 + 3] = 0
+            blk[s + 16 + 4] = 0
+            blk[s + 16 + 5] = 0
+            blk[s + 16 + 6] = 0
+            blk[s + 16 + 7] = 0
+            if (x1 | x2 | x3 | x4 | x5 | x6 | x7) == 0 {
+                let v = ((((16383 * x0 + 1024) >> 11) + 32768) & 65535) - 32768
+                r2c0 = v
+                r2c1 = v
+                r2c2 = v
+                r2c3 = v
+                r2c4 = v
+                r2c5 = v
+                r2c6 = v
+                r2c7 = v
+            } else {
+                var a0 = 16383 * x0 + 1024
+                var a1 = a0
+                var a2 = a0
+                var a3 = a0
+                a0 += 21407 * x2
+                a1 += 8867 * x2
+                a2 -= 8867 * x2
+                a3 -= 21407 * x2
+                var b0 = 22725 * x1 + 19266 * x3
+                var b1 = 19266 * x1 - 4520 * x3
+                var b2 = 12873 * x1 - 22725 * x3
+                var b3 = 4520 * x1 - 12873 * x3
+                if (x4 | x5 | x6 | x7) != 0 {
+                    a0 += 16383 * x4 + 8867 * x6
+                    a1 += -16383 * x4 - 21407 * x6
+                    a2 += -16383 * x4 + 21407 * x6
+                    a3 += 16383 * x4 - 8867 * x6
+                    b0 += 12873 * x5 + 4520 * x7
+                    b1 += -22725 * x5 - 12873 * x7
+                    b2 += 4520 * x5 + 19266 * x7
+                    b3 += 19266 * x5 - 22725 * x7
+                }
+                r2c0 = ((((a0 + b0) >> 11) + 32768) & 65535) - 32768
+                r2c1 = ((((a1 + b1) >> 11) + 32768) & 65535) - 32768
+                r2c2 = ((((a2 + b2) >> 11) + 32768) & 65535) - 32768
+                r2c3 = ((((a3 + b3) >> 11) + 32768) & 65535) - 32768
+                r2c4 = ((((a3 - b3) >> 11) + 32768) & 65535) - 32768
+                r2c5 = ((((a2 - b2) >> 11) + 32768) & 65535) - 32768
+                r2c6 = ((((a1 - b1) >> 11) + 32768) & 65535) - 32768
+                r2c7 = ((((a0 - b0) >> 11) + 32768) & 65535) - 32768
+            }
+        }
+        if (m & 8) != 0 {
+            let x0 = blk[s + 24]
+            let x1 = blk[s + 24 + 1]
+            let x2 = blk[s + 24 + 2]
+            let x3 = blk[s + 24 + 3]
+            let x4 = blk[s + 24 + 4]
+            let x5 = blk[s + 24 + 5]
+            let x6 = blk[s + 24 + 6]
+            let x7 = blk[s + 24 + 7]
+            blk[s + 24] = 0
+            blk[s + 24 + 1] = 0
+            blk[s + 24 + 2] = 0
+            blk[s + 24 + 3] = 0
+            blk[s + 24 + 4] = 0
+            blk[s + 24 + 5] = 0
+            blk[s + 24 + 6] = 0
+            blk[s + 24 + 7] = 0
+            if (x1 | x2 | x3 | x4 | x5 | x6 | x7) == 0 {
+                let v = ((((16383 * x0 + 1024) >> 11) + 32768) & 65535) - 32768
+                r3c0 = v
+                r3c1 = v
+                r3c2 = v
+                r3c3 = v
+                r3c4 = v
+                r3c5 = v
+                r3c6 = v
+                r3c7 = v
+            } else {
+                var a0 = 16383 * x0 + 1024
+                var a1 = a0
+                var a2 = a0
+                var a3 = a0
+                a0 += 21407 * x2
+                a1 += 8867 * x2
+                a2 -= 8867 * x2
+                a3 -= 21407 * x2
+                var b0 = 22725 * x1 + 19266 * x3
+                var b1 = 19266 * x1 - 4520 * x3
+                var b2 = 12873 * x1 - 22725 * x3
+                var b3 = 4520 * x1 - 12873 * x3
+                if (x4 | x5 | x6 | x7) != 0 {
+                    a0 += 16383 * x4 + 8867 * x6
+                    a1 += -16383 * x4 - 21407 * x6
+                    a2 += -16383 * x4 + 21407 * x6
+                    a3 += 16383 * x4 - 8867 * x6
+                    b0 += 12873 * x5 + 4520 * x7
+                    b1 += -22725 * x5 - 12873 * x7
+                    b2 += 4520 * x5 + 19266 * x7
+                    b3 += 19266 * x5 - 22725 * x7
+                }
+                r3c0 = ((((a0 + b0) >> 11) + 32768) & 65535) - 32768
+                r3c1 = ((((a1 + b1) >> 11) + 32768) & 65535) - 32768
+                r3c2 = ((((a2 + b2) >> 11) + 32768) & 65535) - 32768
+                r3c3 = ((((a3 + b3) >> 11) + 32768) & 65535) - 32768
+                r3c4 = ((((a3 - b3) >> 11) + 32768) & 65535) - 32768
+                r3c5 = ((((a2 - b2) >> 11) + 32768) & 65535) - 32768
+                r3c6 = ((((a1 - b1) >> 11) + 32768) & 65535) - 32768
+                r3c7 = ((((a0 - b0) >> 11) + 32768) & 65535) - 32768
+            }
+        }
+        if (m & 16) != 0 {
+            let x0 = blk[s + 32]
+            let x1 = blk[s + 32 + 1]
+            let x2 = blk[s + 32 + 2]
+            let x3 = blk[s + 32 + 3]
+            let x4 = blk[s + 32 + 4]
+            let x5 = blk[s + 32 + 5]
+            let x6 = blk[s + 32 + 6]
+            let x7 = blk[s + 32 + 7]
+            blk[s + 32] = 0
+            blk[s + 32 + 1] = 0
+            blk[s + 32 + 2] = 0
+            blk[s + 32 + 3] = 0
+            blk[s + 32 + 4] = 0
+            blk[s + 32 + 5] = 0
+            blk[s + 32 + 6] = 0
+            blk[s + 32 + 7] = 0
+            if (x1 | x2 | x3 | x4 | x5 | x6 | x7) == 0 {
+                let v = ((((16383 * x0 + 1024) >> 11) + 32768) & 65535) - 32768
+                r4c0 = v
+                r4c1 = v
+                r4c2 = v
+                r4c3 = v
+                r4c4 = v
+                r4c5 = v
+                r4c6 = v
+                r4c7 = v
+            } else {
+                var a0 = 16383 * x0 + 1024
+                var a1 = a0
+                var a2 = a0
+                var a3 = a0
+                a0 += 21407 * x2
+                a1 += 8867 * x2
+                a2 -= 8867 * x2
+                a3 -= 21407 * x2
+                var b0 = 22725 * x1 + 19266 * x3
+                var b1 = 19266 * x1 - 4520 * x3
+                var b2 = 12873 * x1 - 22725 * x3
+                var b3 = 4520 * x1 - 12873 * x3
+                if (x4 | x5 | x6 | x7) != 0 {
+                    a0 += 16383 * x4 + 8867 * x6
+                    a1 += -16383 * x4 - 21407 * x6
+                    a2 += -16383 * x4 + 21407 * x6
+                    a3 += 16383 * x4 - 8867 * x6
+                    b0 += 12873 * x5 + 4520 * x7
+                    b1 += -22725 * x5 - 12873 * x7
+                    b2 += 4520 * x5 + 19266 * x7
+                    b3 += 19266 * x5 - 22725 * x7
+                }
+                r4c0 = ((((a0 + b0) >> 11) + 32768) & 65535) - 32768
+                r4c1 = ((((a1 + b1) >> 11) + 32768) & 65535) - 32768
+                r4c2 = ((((a2 + b2) >> 11) + 32768) & 65535) - 32768
+                r4c3 = ((((a3 + b3) >> 11) + 32768) & 65535) - 32768
+                r4c4 = ((((a3 - b3) >> 11) + 32768) & 65535) - 32768
+                r4c5 = ((((a2 - b2) >> 11) + 32768) & 65535) - 32768
+                r4c6 = ((((a1 - b1) >> 11) + 32768) & 65535) - 32768
+                r4c7 = ((((a0 - b0) >> 11) + 32768) & 65535) - 32768
+            }
+        }
+        if (m & 32) != 0 {
+            let x0 = blk[s + 40]
+            let x1 = blk[s + 40 + 1]
+            let x2 = blk[s + 40 + 2]
+            let x3 = blk[s + 40 + 3]
+            let x4 = blk[s + 40 + 4]
+            let x5 = blk[s + 40 + 5]
+            let x6 = blk[s + 40 + 6]
+            let x7 = blk[s + 40 + 7]
+            blk[s + 40] = 0
+            blk[s + 40 + 1] = 0
+            blk[s + 40 + 2] = 0
+            blk[s + 40 + 3] = 0
+            blk[s + 40 + 4] = 0
+            blk[s + 40 + 5] = 0
+            blk[s + 40 + 6] = 0
+            blk[s + 40 + 7] = 0
+            if (x1 | x2 | x3 | x4 | x5 | x6 | x7) == 0 {
+                let v = ((((16383 * x0 + 1024) >> 11) + 32768) & 65535) - 32768
+                r5c0 = v
+                r5c1 = v
+                r5c2 = v
+                r5c3 = v
+                r5c4 = v
+                r5c5 = v
+                r5c6 = v
+                r5c7 = v
+            } else {
+                var a0 = 16383 * x0 + 1024
+                var a1 = a0
+                var a2 = a0
+                var a3 = a0
+                a0 += 21407 * x2
+                a1 += 8867 * x2
+                a2 -= 8867 * x2
+                a3 -= 21407 * x2
+                var b0 = 22725 * x1 + 19266 * x3
+                var b1 = 19266 * x1 - 4520 * x3
+                var b2 = 12873 * x1 - 22725 * x3
+                var b3 = 4520 * x1 - 12873 * x3
+                if (x4 | x5 | x6 | x7) != 0 {
+                    a0 += 16383 * x4 + 8867 * x6
+                    a1 += -16383 * x4 - 21407 * x6
+                    a2 += -16383 * x4 + 21407 * x6
+                    a3 += 16383 * x4 - 8867 * x6
+                    b0 += 12873 * x5 + 4520 * x7
+                    b1 += -22725 * x5 - 12873 * x7
+                    b2 += 4520 * x5 + 19266 * x7
+                    b3 += 19266 * x5 - 22725 * x7
+                }
+                r5c0 = ((((a0 + b0) >> 11) + 32768) & 65535) - 32768
+                r5c1 = ((((a1 + b1) >> 11) + 32768) & 65535) - 32768
+                r5c2 = ((((a2 + b2) >> 11) + 32768) & 65535) - 32768
+                r5c3 = ((((a3 + b3) >> 11) + 32768) & 65535) - 32768
+                r5c4 = ((((a3 - b3) >> 11) + 32768) & 65535) - 32768
+                r5c5 = ((((a2 - b2) >> 11) + 32768) & 65535) - 32768
+                r5c6 = ((((a1 - b1) >> 11) + 32768) & 65535) - 32768
+                r5c7 = ((((a0 - b0) >> 11) + 32768) & 65535) - 32768
+            }
+        }
+        if (m & 64) != 0 {
+            let x0 = blk[s + 48]
+            let x1 = blk[s + 48 + 1]
+            let x2 = blk[s + 48 + 2]
+            let x3 = blk[s + 48 + 3]
+            let x4 = blk[s + 48 + 4]
+            let x5 = blk[s + 48 + 5]
+            let x6 = blk[s + 48 + 6]
+            let x7 = blk[s + 48 + 7]
+            blk[s + 48] = 0
+            blk[s + 48 + 1] = 0
+            blk[s + 48 + 2] = 0
+            blk[s + 48 + 3] = 0
+            blk[s + 48 + 4] = 0
+            blk[s + 48 + 5] = 0
+            blk[s + 48 + 6] = 0
+            blk[s + 48 + 7] = 0
+            if (x1 | x2 | x3 | x4 | x5 | x6 | x7) == 0 {
+                let v = ((((16383 * x0 + 1024) >> 11) + 32768) & 65535) - 32768
+                r6c0 = v
+                r6c1 = v
+                r6c2 = v
+                r6c3 = v
+                r6c4 = v
+                r6c5 = v
+                r6c6 = v
+                r6c7 = v
+            } else {
+                var a0 = 16383 * x0 + 1024
+                var a1 = a0
+                var a2 = a0
+                var a3 = a0
+                a0 += 21407 * x2
+                a1 += 8867 * x2
+                a2 -= 8867 * x2
+                a3 -= 21407 * x2
+                var b0 = 22725 * x1 + 19266 * x3
+                var b1 = 19266 * x1 - 4520 * x3
+                var b2 = 12873 * x1 - 22725 * x3
+                var b3 = 4520 * x1 - 12873 * x3
+                if (x4 | x5 | x6 | x7) != 0 {
+                    a0 += 16383 * x4 + 8867 * x6
+                    a1 += -16383 * x4 - 21407 * x6
+                    a2 += -16383 * x4 + 21407 * x6
+                    a3 += 16383 * x4 - 8867 * x6
+                    b0 += 12873 * x5 + 4520 * x7
+                    b1 += -22725 * x5 - 12873 * x7
+                    b2 += 4520 * x5 + 19266 * x7
+                    b3 += 19266 * x5 - 22725 * x7
+                }
+                r6c0 = ((((a0 + b0) >> 11) + 32768) & 65535) - 32768
+                r6c1 = ((((a1 + b1) >> 11) + 32768) & 65535) - 32768
+                r6c2 = ((((a2 + b2) >> 11) + 32768) & 65535) - 32768
+                r6c3 = ((((a3 + b3) >> 11) + 32768) & 65535) - 32768
+                r6c4 = ((((a3 - b3) >> 11) + 32768) & 65535) - 32768
+                r6c5 = ((((a2 - b2) >> 11) + 32768) & 65535) - 32768
+                r6c6 = ((((a1 - b1) >> 11) + 32768) & 65535) - 32768
+                r6c7 = ((((a0 - b0) >> 11) + 32768) & 65535) - 32768
+            }
+        }
+        if (m & 128) != 0 {
+            let x0 = blk[s + 56]
+            let x1 = blk[s + 56 + 1]
+            let x2 = blk[s + 56 + 2]
+            let x3 = blk[s + 56 + 3]
+            let x4 = blk[s + 56 + 4]
+            let x5 = blk[s + 56 + 5]
+            let x6 = blk[s + 56 + 6]
+            let x7 = blk[s + 56 + 7]
+            blk[s + 56] = 0
+            blk[s + 56 + 1] = 0
+            blk[s + 56 + 2] = 0
+            blk[s + 56 + 3] = 0
+            blk[s + 56 + 4] = 0
+            blk[s + 56 + 5] = 0
+            blk[s + 56 + 6] = 0
+            blk[s + 56 + 7] = 0
+            if (x1 | x2 | x3 | x4 | x5 | x6 | x7) == 0 {
+                let v = ((((16383 * x0 + 1024) >> 11) + 32768) & 65535) - 32768
+                r7c0 = v
+                r7c1 = v
+                r7c2 = v
+                r7c3 = v
+                r7c4 = v
+                r7c5 = v
+                r7c6 = v
+                r7c7 = v
+            } else {
+                var a0 = 16383 * x0 + 1024
+                var a1 = a0
+                var a2 = a0
+                var a3 = a0
+                a0 += 21407 * x2
+                a1 += 8867 * x2
+                a2 -= 8867 * x2
+                a3 -= 21407 * x2
+                var b0 = 22725 * x1 + 19266 * x3
+                var b1 = 19266 * x1 - 4520 * x3
+                var b2 = 12873 * x1 - 22725 * x3
+                var b3 = 4520 * x1 - 12873 * x3
+                if (x4 | x5 | x6 | x7) != 0 {
+                    a0 += 16383 * x4 + 8867 * x6
+                    a1 += -16383 * x4 - 21407 * x6
+                    a2 += -16383 * x4 + 21407 * x6
+                    a3 += 16383 * x4 - 8867 * x6
+                    b0 += 12873 * x5 + 4520 * x7
+                    b1 += -22725 * x5 - 12873 * x7
+                    b2 += 4520 * x5 + 19266 * x7
+                    b3 += 19266 * x5 - 22725 * x7
+                }
+                r7c0 = ((((a0 + b0) >> 11) + 32768) & 65535) - 32768
+                r7c1 = ((((a1 + b1) >> 11) + 32768) & 65535) - 32768
+                r7c2 = ((((a2 + b2) >> 11) + 32768) & 65535) - 32768
+                r7c3 = ((((a3 + b3) >> 11) + 32768) & 65535) - 32768
+                r7c4 = ((((a3 - b3) >> 11) + 32768) & 65535) - 32768
+                r7c5 = ((((a2 - b2) >> 11) + 32768) & 65535) - 32768
+                r7c6 = ((((a1 - b1) >> 11) + 32768) & 65535) - 32768
+                r7c7 = ((((a0 - b0) >> 11) + 32768) & 65535) - 32768
+            }
+        }
+        if m == 1 {
+            let v0 = max(0, min(255, (16383 * (r0c0 + 32)) >> 20))
+            let v1 = max(0, min(255, (16383 * (r0c1 + 32)) >> 20))
+            let v2 = max(0, min(255, (16383 * (r0c2 + 32)) >> 20))
+            let v3 = max(0, min(255, (16383 * (r0c3 + 32)) >> 20))
+            let v4 = max(0, min(255, (16383 * (r0c4 + 32)) >> 20))
+            let v5 = max(0, min(255, (16383 * (r0c5 + 32)) >> 20))
+            let v6 = max(0, min(255, (16383 * (r0c6 + 32)) >> 20))
+            let v7 = max(0, min(255, (16383 * (r0c7 + 32)) >> 20))
+            var o = off
+            for _ in 0..8 {
+                pl[o] = v0
+                pl[o + 1] = v1
+                pl[o + 2] = v2
+                pl[o + 3] = v3
+                pl[o + 4] = v4
+                pl[o + 5] = v5
+                pl[o + 6] = v6
+                pl[o + 7] = v7
+                o += stride
+            }
+            return
+        }
+        let hiRows = m > 15
+        if true {
+            var a0 = 16383 * (r0c0 + 32)
+            var a1 = a0
+            var a2 = a0
+            var a3 = a0
+            a0 += 21407 * r2c0
+            a1 += 8867 * r2c0
+            a2 -= 8867 * r2c0
+            a3 -= 21407 * r2c0
+            var b0 = 22725 * r1c0 + 19266 * r3c0
+            var b1 = 19266 * r1c0 - 4520 * r3c0
+            var b2 = 12873 * r1c0 - 22725 * r3c0
+            var b3 = 4520 * r1c0 - 12873 * r3c0
+            if hiRows {
+                a0 += 16383 * r4c0 + 8867 * r6c0
+                a1 += -16383 * r4c0 - 21407 * r6c0
+                a2 += -16383 * r4c0 + 21407 * r6c0
+                a3 += 16383 * r4c0 - 8867 * r6c0
+                b0 += 12873 * r5c0 + 4520 * r7c0
+                b1 += -22725 * r5c0 - 12873 * r7c0
+                b2 += 4520 * r5c0 + 19266 * r7c0
+                b3 += 19266 * r5c0 - 22725 * r7c0
+            }
+            let o = off + 0
+            pl[o] = max(0, min(255, (a0 + b0) >> 20))
+            pl[o + stride] = max(0, min(255, (a1 + b1) >> 20))
+            pl[o + 2 * stride] = max(0, min(255, (a2 + b2) >> 20))
+            pl[o + 3 * stride] = max(0, min(255, (a3 + b3) >> 20))
+            pl[o + 4 * stride] = max(0, min(255, (a3 - b3) >> 20))
+            pl[o + 5 * stride] = max(0, min(255, (a2 - b2) >> 20))
+            pl[o + 6 * stride] = max(0, min(255, (a1 - b1) >> 20))
+            pl[o + 7 * stride] = max(0, min(255, (a0 - b0) >> 20))
+        }
+        if true {
+            var a0 = 16383 * (r0c1 + 32)
+            var a1 = a0
+            var a2 = a0
+            var a3 = a0
+            a0 += 21407 * r2c1
+            a1 += 8867 * r2c1
+            a2 -= 8867 * r2c1
+            a3 -= 21407 * r2c1
+            var b0 = 22725 * r1c1 + 19266 * r3c1
+            var b1 = 19266 * r1c1 - 4520 * r3c1
+            var b2 = 12873 * r1c1 - 22725 * r3c1
+            var b3 = 4520 * r1c1 - 12873 * r3c1
+            if hiRows {
+                a0 += 16383 * r4c1 + 8867 * r6c1
+                a1 += -16383 * r4c1 - 21407 * r6c1
+                a2 += -16383 * r4c1 + 21407 * r6c1
+                a3 += 16383 * r4c1 - 8867 * r6c1
+                b0 += 12873 * r5c1 + 4520 * r7c1
+                b1 += -22725 * r5c1 - 12873 * r7c1
+                b2 += 4520 * r5c1 + 19266 * r7c1
+                b3 += 19266 * r5c1 - 22725 * r7c1
+            }
+            let o = off + 1
+            pl[o] = max(0, min(255, (a0 + b0) >> 20))
+            pl[o + stride] = max(0, min(255, (a1 + b1) >> 20))
+            pl[o + 2 * stride] = max(0, min(255, (a2 + b2) >> 20))
+            pl[o + 3 * stride] = max(0, min(255, (a3 + b3) >> 20))
+            pl[o + 4 * stride] = max(0, min(255, (a3 - b3) >> 20))
+            pl[o + 5 * stride] = max(0, min(255, (a2 - b2) >> 20))
+            pl[o + 6 * stride] = max(0, min(255, (a1 - b1) >> 20))
+            pl[o + 7 * stride] = max(0, min(255, (a0 - b0) >> 20))
+        }
+        if true {
+            var a0 = 16383 * (r0c2 + 32)
+            var a1 = a0
+            var a2 = a0
+            var a3 = a0
+            a0 += 21407 * r2c2
+            a1 += 8867 * r2c2
+            a2 -= 8867 * r2c2
+            a3 -= 21407 * r2c2
+            var b0 = 22725 * r1c2 + 19266 * r3c2
+            var b1 = 19266 * r1c2 - 4520 * r3c2
+            var b2 = 12873 * r1c2 - 22725 * r3c2
+            var b3 = 4520 * r1c2 - 12873 * r3c2
+            if hiRows {
+                a0 += 16383 * r4c2 + 8867 * r6c2
+                a1 += -16383 * r4c2 - 21407 * r6c2
+                a2 += -16383 * r4c2 + 21407 * r6c2
+                a3 += 16383 * r4c2 - 8867 * r6c2
+                b0 += 12873 * r5c2 + 4520 * r7c2
+                b1 += -22725 * r5c2 - 12873 * r7c2
+                b2 += 4520 * r5c2 + 19266 * r7c2
+                b3 += 19266 * r5c2 - 22725 * r7c2
+            }
+            let o = off + 2
+            pl[o] = max(0, min(255, (a0 + b0) >> 20))
+            pl[o + stride] = max(0, min(255, (a1 + b1) >> 20))
+            pl[o + 2 * stride] = max(0, min(255, (a2 + b2) >> 20))
+            pl[o + 3 * stride] = max(0, min(255, (a3 + b3) >> 20))
+            pl[o + 4 * stride] = max(0, min(255, (a3 - b3) >> 20))
+            pl[o + 5 * stride] = max(0, min(255, (a2 - b2) >> 20))
+            pl[o + 6 * stride] = max(0, min(255, (a1 - b1) >> 20))
+            pl[o + 7 * stride] = max(0, min(255, (a0 - b0) >> 20))
+        }
+        if true {
+            var a0 = 16383 * (r0c3 + 32)
+            var a1 = a0
+            var a2 = a0
+            var a3 = a0
+            a0 += 21407 * r2c3
+            a1 += 8867 * r2c3
+            a2 -= 8867 * r2c3
+            a3 -= 21407 * r2c3
+            var b0 = 22725 * r1c3 + 19266 * r3c3
+            var b1 = 19266 * r1c3 - 4520 * r3c3
+            var b2 = 12873 * r1c3 - 22725 * r3c3
+            var b3 = 4520 * r1c3 - 12873 * r3c3
+            if hiRows {
+                a0 += 16383 * r4c3 + 8867 * r6c3
+                a1 += -16383 * r4c3 - 21407 * r6c3
+                a2 += -16383 * r4c3 + 21407 * r6c3
+                a3 += 16383 * r4c3 - 8867 * r6c3
+                b0 += 12873 * r5c3 + 4520 * r7c3
+                b1 += -22725 * r5c3 - 12873 * r7c3
+                b2 += 4520 * r5c3 + 19266 * r7c3
+                b3 += 19266 * r5c3 - 22725 * r7c3
+            }
+            let o = off + 3
+            pl[o] = max(0, min(255, (a0 + b0) >> 20))
+            pl[o + stride] = max(0, min(255, (a1 + b1) >> 20))
+            pl[o + 2 * stride] = max(0, min(255, (a2 + b2) >> 20))
+            pl[o + 3 * stride] = max(0, min(255, (a3 + b3) >> 20))
+            pl[o + 4 * stride] = max(0, min(255, (a3 - b3) >> 20))
+            pl[o + 5 * stride] = max(0, min(255, (a2 - b2) >> 20))
+            pl[o + 6 * stride] = max(0, min(255, (a1 - b1) >> 20))
+            pl[o + 7 * stride] = max(0, min(255, (a0 - b0) >> 20))
+        }
+        if true {
+            var a0 = 16383 * (r0c4 + 32)
+            var a1 = a0
+            var a2 = a0
+            var a3 = a0
+            a0 += 21407 * r2c4
+            a1 += 8867 * r2c4
+            a2 -= 8867 * r2c4
+            a3 -= 21407 * r2c4
+            var b0 = 22725 * r1c4 + 19266 * r3c4
+            var b1 = 19266 * r1c4 - 4520 * r3c4
+            var b2 = 12873 * r1c4 - 22725 * r3c4
+            var b3 = 4520 * r1c4 - 12873 * r3c4
+            if hiRows {
+                a0 += 16383 * r4c4 + 8867 * r6c4
+                a1 += -16383 * r4c4 - 21407 * r6c4
+                a2 += -16383 * r4c4 + 21407 * r6c4
+                a3 += 16383 * r4c4 - 8867 * r6c4
+                b0 += 12873 * r5c4 + 4520 * r7c4
+                b1 += -22725 * r5c4 - 12873 * r7c4
+                b2 += 4520 * r5c4 + 19266 * r7c4
+                b3 += 19266 * r5c4 - 22725 * r7c4
+            }
+            let o = off + 4
+            pl[o] = max(0, min(255, (a0 + b0) >> 20))
+            pl[o + stride] = max(0, min(255, (a1 + b1) >> 20))
+            pl[o + 2 * stride] = max(0, min(255, (a2 + b2) >> 20))
+            pl[o + 3 * stride] = max(0, min(255, (a3 + b3) >> 20))
+            pl[o + 4 * stride] = max(0, min(255, (a3 - b3) >> 20))
+            pl[o + 5 * stride] = max(0, min(255, (a2 - b2) >> 20))
+            pl[o + 6 * stride] = max(0, min(255, (a1 - b1) >> 20))
+            pl[o + 7 * stride] = max(0, min(255, (a0 - b0) >> 20))
+        }
+        if true {
+            var a0 = 16383 * (r0c5 + 32)
+            var a1 = a0
+            var a2 = a0
+            var a3 = a0
+            a0 += 21407 * r2c5
+            a1 += 8867 * r2c5
+            a2 -= 8867 * r2c5
+            a3 -= 21407 * r2c5
+            var b0 = 22725 * r1c5 + 19266 * r3c5
+            var b1 = 19266 * r1c5 - 4520 * r3c5
+            var b2 = 12873 * r1c5 - 22725 * r3c5
+            var b3 = 4520 * r1c5 - 12873 * r3c5
+            if hiRows {
+                a0 += 16383 * r4c5 + 8867 * r6c5
+                a1 += -16383 * r4c5 - 21407 * r6c5
+                a2 += -16383 * r4c5 + 21407 * r6c5
+                a3 += 16383 * r4c5 - 8867 * r6c5
+                b0 += 12873 * r5c5 + 4520 * r7c5
+                b1 += -22725 * r5c5 - 12873 * r7c5
+                b2 += 4520 * r5c5 + 19266 * r7c5
+                b3 += 19266 * r5c5 - 22725 * r7c5
+            }
+            let o = off + 5
+            pl[o] = max(0, min(255, (a0 + b0) >> 20))
+            pl[o + stride] = max(0, min(255, (a1 + b1) >> 20))
+            pl[o + 2 * stride] = max(0, min(255, (a2 + b2) >> 20))
+            pl[o + 3 * stride] = max(0, min(255, (a3 + b3) >> 20))
+            pl[o + 4 * stride] = max(0, min(255, (a3 - b3) >> 20))
+            pl[o + 5 * stride] = max(0, min(255, (a2 - b2) >> 20))
+            pl[o + 6 * stride] = max(0, min(255, (a1 - b1) >> 20))
+            pl[o + 7 * stride] = max(0, min(255, (a0 - b0) >> 20))
+        }
+        if true {
+            var a0 = 16383 * (r0c6 + 32)
+            var a1 = a0
+            var a2 = a0
+            var a3 = a0
+            a0 += 21407 * r2c6
+            a1 += 8867 * r2c6
+            a2 -= 8867 * r2c6
+            a3 -= 21407 * r2c6
+            var b0 = 22725 * r1c6 + 19266 * r3c6
+            var b1 = 19266 * r1c6 - 4520 * r3c6
+            var b2 = 12873 * r1c6 - 22725 * r3c6
+            var b3 = 4520 * r1c6 - 12873 * r3c6
+            if hiRows {
+                a0 += 16383 * r4c6 + 8867 * r6c6
+                a1 += -16383 * r4c6 - 21407 * r6c6
+                a2 += -16383 * r4c6 + 21407 * r6c6
+                a3 += 16383 * r4c6 - 8867 * r6c6
+                b0 += 12873 * r5c6 + 4520 * r7c6
+                b1 += -22725 * r5c6 - 12873 * r7c6
+                b2 += 4520 * r5c6 + 19266 * r7c6
+                b3 += 19266 * r5c6 - 22725 * r7c6
+            }
+            let o = off + 6
+            pl[o] = max(0, min(255, (a0 + b0) >> 20))
+            pl[o + stride] = max(0, min(255, (a1 + b1) >> 20))
+            pl[o + 2 * stride] = max(0, min(255, (a2 + b2) >> 20))
+            pl[o + 3 * stride] = max(0, min(255, (a3 + b3) >> 20))
+            pl[o + 4 * stride] = max(0, min(255, (a3 - b3) >> 20))
+            pl[o + 5 * stride] = max(0, min(255, (a2 - b2) >> 20))
+            pl[o + 6 * stride] = max(0, min(255, (a1 - b1) >> 20))
+            pl[o + 7 * stride] = max(0, min(255, (a0 - b0) >> 20))
+        }
+        if true {
+            var a0 = 16383 * (r0c7 + 32)
+            var a1 = a0
+            var a2 = a0
+            var a3 = a0
+            a0 += 21407 * r2c7
+            a1 += 8867 * r2c7
+            a2 -= 8867 * r2c7
+            a3 -= 21407 * r2c7
+            var b0 = 22725 * r1c7 + 19266 * r3c7
+            var b1 = 19266 * r1c7 - 4520 * r3c7
+            var b2 = 12873 * r1c7 - 22725 * r3c7
+            var b3 = 4520 * r1c7 - 12873 * r3c7
+            if hiRows {
+                a0 += 16383 * r4c7 + 8867 * r6c7
+                a1 += -16383 * r4c7 - 21407 * r6c7
+                a2 += -16383 * r4c7 + 21407 * r6c7
+                a3 += 16383 * r4c7 - 8867 * r6c7
+                b0 += 12873 * r5c7 + 4520 * r7c7
+                b1 += -22725 * r5c7 - 12873 * r7c7
+                b2 += 4520 * r5c7 + 19266 * r7c7
+                b3 += 19266 * r5c7 - 22725 * r7c7
+            }
+            let o = off + 7
+            pl[o] = max(0, min(255, (a0 + b0) >> 20))
+            pl[o + stride] = max(0, min(255, (a1 + b1) >> 20))
+            pl[o + 2 * stride] = max(0, min(255, (a2 + b2) >> 20))
+            pl[o + 3 * stride] = max(0, min(255, (a3 + b3) >> 20))
+            pl[o + 4 * stride] = max(0, min(255, (a3 - b3) >> 20))
+            pl[o + 5 * stride] = max(0, min(255, (a2 - b2) >> 20))
+            pl[o + 6 * stride] = max(0, min(255, (a1 - b1) >> 20))
+            pl[o + 7 * stride] = max(0, min(255, (a0 - b0) >> 20))
+        }
+    }
+
+    // Generated by tests/prores/genidct.py (ffmpeg's simple IDCT: rows
+    // shift 12, columns 19, output clipped to 0…1023).
+    fn idct10(_ b: Int, _ m: Int, _ off: Int, _ stride: Int) {
+        let s = b << 6
+        var r0c0 = 0
+        var r0c1 = 0
+        var r0c2 = 0
+        var r0c3 = 0
+        var r0c4 = 0
+        var r0c5 = 0
+        var r0c6 = 0
+        var r0c7 = 0
+        var r1c0 = 0
+        var r1c1 = 0
+        var r1c2 = 0
+        var r1c3 = 0
+        var r1c4 = 0
+        var r1c5 = 0
+        var r1c6 = 0
+        var r1c7 = 0
+        var r2c0 = 0
+        var r2c1 = 0
+        var r2c2 = 0
+        var r2c3 = 0
+        var r2c4 = 0
+        var r2c5 = 0
+        var r2c6 = 0
+        var r2c7 = 0
+        var r3c0 = 0
+        var r3c1 = 0
+        var r3c2 = 0
+        var r3c3 = 0
+        var r3c4 = 0
+        var r3c5 = 0
+        var r3c6 = 0
+        var r3c7 = 0
+        var r4c0 = 0
+        var r4c1 = 0
+        var r4c2 = 0
+        var r4c3 = 0
+        var r4c4 = 0
+        var r4c5 = 0
+        var r4c6 = 0
+        var r4c7 = 0
+        var r5c0 = 0
+        var r5c1 = 0
+        var r5c2 = 0
+        var r5c3 = 0
+        var r5c4 = 0
+        var r5c5 = 0
+        var r5c6 = 0
+        var r5c7 = 0
+        var r6c0 = 0
+        var r6c1 = 0
+        var r6c2 = 0
+        var r6c3 = 0
+        var r6c4 = 0
+        var r6c5 = 0
+        var r6c6 = 0
+        var r6c7 = 0
+        var r7c0 = 0
+        var r7c1 = 0
+        var r7c2 = 0
+        var r7c3 = 0
+        var r7c4 = 0
+        var r7c5 = 0
+        var r7c6 = 0
+        var r7c7 = 0
+        if true {
+            let x0 = blk[s]
+            let x1 = blk[s + 1]
+            let x2 = blk[s + 2]
+            let x3 = blk[s + 3]
+            let x4 = blk[s + 4]
+            let x5 = blk[s + 5]
+            let x6 = blk[s + 6]
+            let x7 = blk[s + 7]
+            blk[s] = 0
+            blk[s + 1] = 0
+            blk[s + 2] = 0
+            blk[s + 3] = 0
+            blk[s + 4] = 0
+            blk[s + 5] = 0
+            blk[s + 6] = 0
+            blk[s + 7] = 0
+            if (x1 | x2 | x3 | x4 | x5 | x6 | x7) == 0 {
+                let v = (((x0 << 2) + 32768) & 65535) - 32768
+                r0c0 = v
+                r0c1 = v
+                r0c2 = v
+                r0c3 = v
+                r0c4 = v
+                r0c5 = v
+                r0c6 = v
+                r0c7 = v
+            } else {
+                var a0 = 16384 * x0 + 2048
+                var a1 = a0
+                var a2 = a0
+                var a3 = a0
+                a0 += 21407 * x2
+                a1 += 8867 * x2
+                a2 -= 8867 * x2
+                a3 -= 21407 * x2
+                var b0 = 22725 * x1 + 19265 * x3
+                var b1 = 19265 * x1 - 4520 * x3
+                var b2 = 12873 * x1 - 22725 * x3
+                var b3 = 4520 * x1 - 12873 * x3
+                if (x4 | x5 | x6 | x7) != 0 {
+                    a0 += 16384 * x4 + 8867 * x6
+                    a1 += -16384 * x4 - 21407 * x6
+                    a2 += -16384 * x4 + 21407 * x6
+                    a3 += 16384 * x4 - 8867 * x6
+                    b0 += 12873 * x5 + 4520 * x7
+                    b1 += -22725 * x5 - 12873 * x7
+                    b2 += 4520 * x5 + 19265 * x7
+                    b3 += 19265 * x5 - 22725 * x7
+                }
+                r0c0 = ((((a0 + b0) >> 12) + 32768) & 65535) - 32768
+                r0c1 = ((((a1 + b1) >> 12) + 32768) & 65535) - 32768
+                r0c2 = ((((a2 + b2) >> 12) + 32768) & 65535) - 32768
+                r0c3 = ((((a3 + b3) >> 12) + 32768) & 65535) - 32768
+                r0c4 = ((((a3 - b3) >> 12) + 32768) & 65535) - 32768
+                r0c5 = ((((a2 - b2) >> 12) + 32768) & 65535) - 32768
+                r0c6 = ((((a1 - b1) >> 12) + 32768) & 65535) - 32768
+                r0c7 = ((((a0 - b0) >> 12) + 32768) & 65535) - 32768
+            }
+        }
+        if (m & 2) != 0 {
+            let x0 = blk[s + 8]
+            let x1 = blk[s + 8 + 1]
+            let x2 = blk[s + 8 + 2]
+            let x3 = blk[s + 8 + 3]
+            let x4 = blk[s + 8 + 4]
+            let x5 = blk[s + 8 + 5]
+            let x6 = blk[s + 8 + 6]
+            let x7 = blk[s + 8 + 7]
+            blk[s + 8] = 0
+            blk[s + 8 + 1] = 0
+            blk[s + 8 + 2] = 0
+            blk[s + 8 + 3] = 0
+            blk[s + 8 + 4] = 0
+            blk[s + 8 + 5] = 0
+            blk[s + 8 + 6] = 0
+            blk[s + 8 + 7] = 0
+            if (x1 | x2 | x3 | x4 | x5 | x6 | x7) == 0 {
+                let v = (((x0 << 2) + 32768) & 65535) - 32768
+                r1c0 = v
+                r1c1 = v
+                r1c2 = v
+                r1c3 = v
+                r1c4 = v
+                r1c5 = v
+                r1c6 = v
+                r1c7 = v
+            } else {
+                var a0 = 16384 * x0 + 2048
+                var a1 = a0
+                var a2 = a0
+                var a3 = a0
+                a0 += 21407 * x2
+                a1 += 8867 * x2
+                a2 -= 8867 * x2
+                a3 -= 21407 * x2
+                var b0 = 22725 * x1 + 19265 * x3
+                var b1 = 19265 * x1 - 4520 * x3
+                var b2 = 12873 * x1 - 22725 * x3
+                var b3 = 4520 * x1 - 12873 * x3
+                if (x4 | x5 | x6 | x7) != 0 {
+                    a0 += 16384 * x4 + 8867 * x6
+                    a1 += -16384 * x4 - 21407 * x6
+                    a2 += -16384 * x4 + 21407 * x6
+                    a3 += 16384 * x4 - 8867 * x6
+                    b0 += 12873 * x5 + 4520 * x7
+                    b1 += -22725 * x5 - 12873 * x7
+                    b2 += 4520 * x5 + 19265 * x7
+                    b3 += 19265 * x5 - 22725 * x7
+                }
+                r1c0 = ((((a0 + b0) >> 12) + 32768) & 65535) - 32768
+                r1c1 = ((((a1 + b1) >> 12) + 32768) & 65535) - 32768
+                r1c2 = ((((a2 + b2) >> 12) + 32768) & 65535) - 32768
+                r1c3 = ((((a3 + b3) >> 12) + 32768) & 65535) - 32768
+                r1c4 = ((((a3 - b3) >> 12) + 32768) & 65535) - 32768
+                r1c5 = ((((a2 - b2) >> 12) + 32768) & 65535) - 32768
+                r1c6 = ((((a1 - b1) >> 12) + 32768) & 65535) - 32768
+                r1c7 = ((((a0 - b0) >> 12) + 32768) & 65535) - 32768
+            }
+        }
+        if (m & 4) != 0 {
+            let x0 = blk[s + 16]
+            let x1 = blk[s + 16 + 1]
+            let x2 = blk[s + 16 + 2]
+            let x3 = blk[s + 16 + 3]
+            let x4 = blk[s + 16 + 4]
+            let x5 = blk[s + 16 + 5]
+            let x6 = blk[s + 16 + 6]
+            let x7 = blk[s + 16 + 7]
+            blk[s + 16] = 0
+            blk[s + 16 + 1] = 0
+            blk[s + 16 + 2] = 0
+            blk[s + 16 + 3] = 0
+            blk[s + 16 + 4] = 0
+            blk[s + 16 + 5] = 0
+            blk[s + 16 + 6] = 0
+            blk[s + 16 + 7] = 0
+            if (x1 | x2 | x3 | x4 | x5 | x6 | x7) == 0 {
+                let v = (((x0 << 2) + 32768) & 65535) - 32768
+                r2c0 = v
+                r2c1 = v
+                r2c2 = v
+                r2c3 = v
+                r2c4 = v
+                r2c5 = v
+                r2c6 = v
+                r2c7 = v
+            } else {
+                var a0 = 16384 * x0 + 2048
+                var a1 = a0
+                var a2 = a0
+                var a3 = a0
+                a0 += 21407 * x2
+                a1 += 8867 * x2
+                a2 -= 8867 * x2
+                a3 -= 21407 * x2
+                var b0 = 22725 * x1 + 19265 * x3
+                var b1 = 19265 * x1 - 4520 * x3
+                var b2 = 12873 * x1 - 22725 * x3
+                var b3 = 4520 * x1 - 12873 * x3
+                if (x4 | x5 | x6 | x7) != 0 {
+                    a0 += 16384 * x4 + 8867 * x6
+                    a1 += -16384 * x4 - 21407 * x6
+                    a2 += -16384 * x4 + 21407 * x6
+                    a3 += 16384 * x4 - 8867 * x6
+                    b0 += 12873 * x5 + 4520 * x7
+                    b1 += -22725 * x5 - 12873 * x7
+                    b2 += 4520 * x5 + 19265 * x7
+                    b3 += 19265 * x5 - 22725 * x7
+                }
+                r2c0 = ((((a0 + b0) >> 12) + 32768) & 65535) - 32768
+                r2c1 = ((((a1 + b1) >> 12) + 32768) & 65535) - 32768
+                r2c2 = ((((a2 + b2) >> 12) + 32768) & 65535) - 32768
+                r2c3 = ((((a3 + b3) >> 12) + 32768) & 65535) - 32768
+                r2c4 = ((((a3 - b3) >> 12) + 32768) & 65535) - 32768
+                r2c5 = ((((a2 - b2) >> 12) + 32768) & 65535) - 32768
+                r2c6 = ((((a1 - b1) >> 12) + 32768) & 65535) - 32768
+                r2c7 = ((((a0 - b0) >> 12) + 32768) & 65535) - 32768
+            }
+        }
+        if (m & 8) != 0 {
+            let x0 = blk[s + 24]
+            let x1 = blk[s + 24 + 1]
+            let x2 = blk[s + 24 + 2]
+            let x3 = blk[s + 24 + 3]
+            let x4 = blk[s + 24 + 4]
+            let x5 = blk[s + 24 + 5]
+            let x6 = blk[s + 24 + 6]
+            let x7 = blk[s + 24 + 7]
+            blk[s + 24] = 0
+            blk[s + 24 + 1] = 0
+            blk[s + 24 + 2] = 0
+            blk[s + 24 + 3] = 0
+            blk[s + 24 + 4] = 0
+            blk[s + 24 + 5] = 0
+            blk[s + 24 + 6] = 0
+            blk[s + 24 + 7] = 0
+            if (x1 | x2 | x3 | x4 | x5 | x6 | x7) == 0 {
+                let v = (((x0 << 2) + 32768) & 65535) - 32768
+                r3c0 = v
+                r3c1 = v
+                r3c2 = v
+                r3c3 = v
+                r3c4 = v
+                r3c5 = v
+                r3c6 = v
+                r3c7 = v
+            } else {
+                var a0 = 16384 * x0 + 2048
+                var a1 = a0
+                var a2 = a0
+                var a3 = a0
+                a0 += 21407 * x2
+                a1 += 8867 * x2
+                a2 -= 8867 * x2
+                a3 -= 21407 * x2
+                var b0 = 22725 * x1 + 19265 * x3
+                var b1 = 19265 * x1 - 4520 * x3
+                var b2 = 12873 * x1 - 22725 * x3
+                var b3 = 4520 * x1 - 12873 * x3
+                if (x4 | x5 | x6 | x7) != 0 {
+                    a0 += 16384 * x4 + 8867 * x6
+                    a1 += -16384 * x4 - 21407 * x6
+                    a2 += -16384 * x4 + 21407 * x6
+                    a3 += 16384 * x4 - 8867 * x6
+                    b0 += 12873 * x5 + 4520 * x7
+                    b1 += -22725 * x5 - 12873 * x7
+                    b2 += 4520 * x5 + 19265 * x7
+                    b3 += 19265 * x5 - 22725 * x7
+                }
+                r3c0 = ((((a0 + b0) >> 12) + 32768) & 65535) - 32768
+                r3c1 = ((((a1 + b1) >> 12) + 32768) & 65535) - 32768
+                r3c2 = ((((a2 + b2) >> 12) + 32768) & 65535) - 32768
+                r3c3 = ((((a3 + b3) >> 12) + 32768) & 65535) - 32768
+                r3c4 = ((((a3 - b3) >> 12) + 32768) & 65535) - 32768
+                r3c5 = ((((a2 - b2) >> 12) + 32768) & 65535) - 32768
+                r3c6 = ((((a1 - b1) >> 12) + 32768) & 65535) - 32768
+                r3c7 = ((((a0 - b0) >> 12) + 32768) & 65535) - 32768
+            }
+        }
+        if (m & 16) != 0 {
+            let x0 = blk[s + 32]
+            let x1 = blk[s + 32 + 1]
+            let x2 = blk[s + 32 + 2]
+            let x3 = blk[s + 32 + 3]
+            let x4 = blk[s + 32 + 4]
+            let x5 = blk[s + 32 + 5]
+            let x6 = blk[s + 32 + 6]
+            let x7 = blk[s + 32 + 7]
+            blk[s + 32] = 0
+            blk[s + 32 + 1] = 0
+            blk[s + 32 + 2] = 0
+            blk[s + 32 + 3] = 0
+            blk[s + 32 + 4] = 0
+            blk[s + 32 + 5] = 0
+            blk[s + 32 + 6] = 0
+            blk[s + 32 + 7] = 0
+            if (x1 | x2 | x3 | x4 | x5 | x6 | x7) == 0 {
+                let v = (((x0 << 2) + 32768) & 65535) - 32768
+                r4c0 = v
+                r4c1 = v
+                r4c2 = v
+                r4c3 = v
+                r4c4 = v
+                r4c5 = v
+                r4c6 = v
+                r4c7 = v
+            } else {
+                var a0 = 16384 * x0 + 2048
+                var a1 = a0
+                var a2 = a0
+                var a3 = a0
+                a0 += 21407 * x2
+                a1 += 8867 * x2
+                a2 -= 8867 * x2
+                a3 -= 21407 * x2
+                var b0 = 22725 * x1 + 19265 * x3
+                var b1 = 19265 * x1 - 4520 * x3
+                var b2 = 12873 * x1 - 22725 * x3
+                var b3 = 4520 * x1 - 12873 * x3
+                if (x4 | x5 | x6 | x7) != 0 {
+                    a0 += 16384 * x4 + 8867 * x6
+                    a1 += -16384 * x4 - 21407 * x6
+                    a2 += -16384 * x4 + 21407 * x6
+                    a3 += 16384 * x4 - 8867 * x6
+                    b0 += 12873 * x5 + 4520 * x7
+                    b1 += -22725 * x5 - 12873 * x7
+                    b2 += 4520 * x5 + 19265 * x7
+                    b3 += 19265 * x5 - 22725 * x7
+                }
+                r4c0 = ((((a0 + b0) >> 12) + 32768) & 65535) - 32768
+                r4c1 = ((((a1 + b1) >> 12) + 32768) & 65535) - 32768
+                r4c2 = ((((a2 + b2) >> 12) + 32768) & 65535) - 32768
+                r4c3 = ((((a3 + b3) >> 12) + 32768) & 65535) - 32768
+                r4c4 = ((((a3 - b3) >> 12) + 32768) & 65535) - 32768
+                r4c5 = ((((a2 - b2) >> 12) + 32768) & 65535) - 32768
+                r4c6 = ((((a1 - b1) >> 12) + 32768) & 65535) - 32768
+                r4c7 = ((((a0 - b0) >> 12) + 32768) & 65535) - 32768
+            }
+        }
+        if (m & 32) != 0 {
+            let x0 = blk[s + 40]
+            let x1 = blk[s + 40 + 1]
+            let x2 = blk[s + 40 + 2]
+            let x3 = blk[s + 40 + 3]
+            let x4 = blk[s + 40 + 4]
+            let x5 = blk[s + 40 + 5]
+            let x6 = blk[s + 40 + 6]
+            let x7 = blk[s + 40 + 7]
+            blk[s + 40] = 0
+            blk[s + 40 + 1] = 0
+            blk[s + 40 + 2] = 0
+            blk[s + 40 + 3] = 0
+            blk[s + 40 + 4] = 0
+            blk[s + 40 + 5] = 0
+            blk[s + 40 + 6] = 0
+            blk[s + 40 + 7] = 0
+            if (x1 | x2 | x3 | x4 | x5 | x6 | x7) == 0 {
+                let v = (((x0 << 2) + 32768) & 65535) - 32768
+                r5c0 = v
+                r5c1 = v
+                r5c2 = v
+                r5c3 = v
+                r5c4 = v
+                r5c5 = v
+                r5c6 = v
+                r5c7 = v
+            } else {
+                var a0 = 16384 * x0 + 2048
+                var a1 = a0
+                var a2 = a0
+                var a3 = a0
+                a0 += 21407 * x2
+                a1 += 8867 * x2
+                a2 -= 8867 * x2
+                a3 -= 21407 * x2
+                var b0 = 22725 * x1 + 19265 * x3
+                var b1 = 19265 * x1 - 4520 * x3
+                var b2 = 12873 * x1 - 22725 * x3
+                var b3 = 4520 * x1 - 12873 * x3
+                if (x4 | x5 | x6 | x7) != 0 {
+                    a0 += 16384 * x4 + 8867 * x6
+                    a1 += -16384 * x4 - 21407 * x6
+                    a2 += -16384 * x4 + 21407 * x6
+                    a3 += 16384 * x4 - 8867 * x6
+                    b0 += 12873 * x5 + 4520 * x7
+                    b1 += -22725 * x5 - 12873 * x7
+                    b2 += 4520 * x5 + 19265 * x7
+                    b3 += 19265 * x5 - 22725 * x7
+                }
+                r5c0 = ((((a0 + b0) >> 12) + 32768) & 65535) - 32768
+                r5c1 = ((((a1 + b1) >> 12) + 32768) & 65535) - 32768
+                r5c2 = ((((a2 + b2) >> 12) + 32768) & 65535) - 32768
+                r5c3 = ((((a3 + b3) >> 12) + 32768) & 65535) - 32768
+                r5c4 = ((((a3 - b3) >> 12) + 32768) & 65535) - 32768
+                r5c5 = ((((a2 - b2) >> 12) + 32768) & 65535) - 32768
+                r5c6 = ((((a1 - b1) >> 12) + 32768) & 65535) - 32768
+                r5c7 = ((((a0 - b0) >> 12) + 32768) & 65535) - 32768
+            }
+        }
+        if (m & 64) != 0 {
+            let x0 = blk[s + 48]
+            let x1 = blk[s + 48 + 1]
+            let x2 = blk[s + 48 + 2]
+            let x3 = blk[s + 48 + 3]
+            let x4 = blk[s + 48 + 4]
+            let x5 = blk[s + 48 + 5]
+            let x6 = blk[s + 48 + 6]
+            let x7 = blk[s + 48 + 7]
+            blk[s + 48] = 0
+            blk[s + 48 + 1] = 0
+            blk[s + 48 + 2] = 0
+            blk[s + 48 + 3] = 0
+            blk[s + 48 + 4] = 0
+            blk[s + 48 + 5] = 0
+            blk[s + 48 + 6] = 0
+            blk[s + 48 + 7] = 0
+            if (x1 | x2 | x3 | x4 | x5 | x6 | x7) == 0 {
+                let v = (((x0 << 2) + 32768) & 65535) - 32768
+                r6c0 = v
+                r6c1 = v
+                r6c2 = v
+                r6c3 = v
+                r6c4 = v
+                r6c5 = v
+                r6c6 = v
+                r6c7 = v
+            } else {
+                var a0 = 16384 * x0 + 2048
+                var a1 = a0
+                var a2 = a0
+                var a3 = a0
+                a0 += 21407 * x2
+                a1 += 8867 * x2
+                a2 -= 8867 * x2
+                a3 -= 21407 * x2
+                var b0 = 22725 * x1 + 19265 * x3
+                var b1 = 19265 * x1 - 4520 * x3
+                var b2 = 12873 * x1 - 22725 * x3
+                var b3 = 4520 * x1 - 12873 * x3
+                if (x4 | x5 | x6 | x7) != 0 {
+                    a0 += 16384 * x4 + 8867 * x6
+                    a1 += -16384 * x4 - 21407 * x6
+                    a2 += -16384 * x4 + 21407 * x6
+                    a3 += 16384 * x4 - 8867 * x6
+                    b0 += 12873 * x5 + 4520 * x7
+                    b1 += -22725 * x5 - 12873 * x7
+                    b2 += 4520 * x5 + 19265 * x7
+                    b3 += 19265 * x5 - 22725 * x7
+                }
+                r6c0 = ((((a0 + b0) >> 12) + 32768) & 65535) - 32768
+                r6c1 = ((((a1 + b1) >> 12) + 32768) & 65535) - 32768
+                r6c2 = ((((a2 + b2) >> 12) + 32768) & 65535) - 32768
+                r6c3 = ((((a3 + b3) >> 12) + 32768) & 65535) - 32768
+                r6c4 = ((((a3 - b3) >> 12) + 32768) & 65535) - 32768
+                r6c5 = ((((a2 - b2) >> 12) + 32768) & 65535) - 32768
+                r6c6 = ((((a1 - b1) >> 12) + 32768) & 65535) - 32768
+                r6c7 = ((((a0 - b0) >> 12) + 32768) & 65535) - 32768
+            }
+        }
+        if (m & 128) != 0 {
+            let x0 = blk[s + 56]
+            let x1 = blk[s + 56 + 1]
+            let x2 = blk[s + 56 + 2]
+            let x3 = blk[s + 56 + 3]
+            let x4 = blk[s + 56 + 4]
+            let x5 = blk[s + 56 + 5]
+            let x6 = blk[s + 56 + 6]
+            let x7 = blk[s + 56 + 7]
+            blk[s + 56] = 0
+            blk[s + 56 + 1] = 0
+            blk[s + 56 + 2] = 0
+            blk[s + 56 + 3] = 0
+            blk[s + 56 + 4] = 0
+            blk[s + 56 + 5] = 0
+            blk[s + 56 + 6] = 0
+            blk[s + 56 + 7] = 0
+            if (x1 | x2 | x3 | x4 | x5 | x6 | x7) == 0 {
+                let v = (((x0 << 2) + 32768) & 65535) - 32768
+                r7c0 = v
+                r7c1 = v
+                r7c2 = v
+                r7c3 = v
+                r7c4 = v
+                r7c5 = v
+                r7c6 = v
+                r7c7 = v
+            } else {
+                var a0 = 16384 * x0 + 2048
+                var a1 = a0
+                var a2 = a0
+                var a3 = a0
+                a0 += 21407 * x2
+                a1 += 8867 * x2
+                a2 -= 8867 * x2
+                a3 -= 21407 * x2
+                var b0 = 22725 * x1 + 19265 * x3
+                var b1 = 19265 * x1 - 4520 * x3
+                var b2 = 12873 * x1 - 22725 * x3
+                var b3 = 4520 * x1 - 12873 * x3
+                if (x4 | x5 | x6 | x7) != 0 {
+                    a0 += 16384 * x4 + 8867 * x6
+                    a1 += -16384 * x4 - 21407 * x6
+                    a2 += -16384 * x4 + 21407 * x6
+                    a3 += 16384 * x4 - 8867 * x6
+                    b0 += 12873 * x5 + 4520 * x7
+                    b1 += -22725 * x5 - 12873 * x7
+                    b2 += 4520 * x5 + 19265 * x7
+                    b3 += 19265 * x5 - 22725 * x7
+                }
+                r7c0 = ((((a0 + b0) >> 12) + 32768) & 65535) - 32768
+                r7c1 = ((((a1 + b1) >> 12) + 32768) & 65535) - 32768
+                r7c2 = ((((a2 + b2) >> 12) + 32768) & 65535) - 32768
+                r7c3 = ((((a3 + b3) >> 12) + 32768) & 65535) - 32768
+                r7c4 = ((((a3 - b3) >> 12) + 32768) & 65535) - 32768
+                r7c5 = ((((a2 - b2) >> 12) + 32768) & 65535) - 32768
+                r7c6 = ((((a1 - b1) >> 12) + 32768) & 65535) - 32768
+                r7c7 = ((((a0 - b0) >> 12) + 32768) & 65535) - 32768
+            }
+        }
+        if m == 1 {
+            let v0 = max(0, min(1023, (16384 * (r0c0 + 16)) >> 19))
+            let v1 = max(0, min(1023, (16384 * (r0c1 + 16)) >> 19))
+            let v2 = max(0, min(1023, (16384 * (r0c2 + 16)) >> 19))
+            let v3 = max(0, min(1023, (16384 * (r0c3 + 16)) >> 19))
+            let v4 = max(0, min(1023, (16384 * (r0c4 + 16)) >> 19))
+            let v5 = max(0, min(1023, (16384 * (r0c5 + 16)) >> 19))
+            let v6 = max(0, min(1023, (16384 * (r0c6 + 16)) >> 19))
+            let v7 = max(0, min(1023, (16384 * (r0c7 + 16)) >> 19))
+            var o = off
+            for _ in 0..8 {
+                pl[o] = v0
+                pl[o + 1] = v1
+                pl[o + 2] = v2
+                pl[o + 3] = v3
+                pl[o + 4] = v4
+                pl[o + 5] = v5
+                pl[o + 6] = v6
+                pl[o + 7] = v7
+                o += stride
+            }
+            return
+        }
+        let hiRows = m > 15
+        if true {
+            var a0 = 16384 * (r0c0 + 16)
+            var a1 = a0
+            var a2 = a0
+            var a3 = a0
+            a0 += 21407 * r2c0
+            a1 += 8867 * r2c0
+            a2 -= 8867 * r2c0
+            a3 -= 21407 * r2c0
+            var b0 = 22725 * r1c0 + 19265 * r3c0
+            var b1 = 19265 * r1c0 - 4520 * r3c0
+            var b2 = 12873 * r1c0 - 22725 * r3c0
+            var b3 = 4520 * r1c0 - 12873 * r3c0
+            if hiRows {
+                a0 += 16384 * r4c0 + 8867 * r6c0
+                a1 += -16384 * r4c0 - 21407 * r6c0
+                a2 += -16384 * r4c0 + 21407 * r6c0
+                a3 += 16384 * r4c0 - 8867 * r6c0
+                b0 += 12873 * r5c0 + 4520 * r7c0
+                b1 += -22725 * r5c0 - 12873 * r7c0
+                b2 += 4520 * r5c0 + 19265 * r7c0
+                b3 += 19265 * r5c0 - 22725 * r7c0
+            }
+            let o = off + 0
+            pl[o] = max(0, min(1023, (a0 + b0) >> 19))
+            pl[o + stride] = max(0, min(1023, (a1 + b1) >> 19))
+            pl[o + 2 * stride] = max(0, min(1023, (a2 + b2) >> 19))
+            pl[o + 3 * stride] = max(0, min(1023, (a3 + b3) >> 19))
+            pl[o + 4 * stride] = max(0, min(1023, (a3 - b3) >> 19))
+            pl[o + 5 * stride] = max(0, min(1023, (a2 - b2) >> 19))
+            pl[o + 6 * stride] = max(0, min(1023, (a1 - b1) >> 19))
+            pl[o + 7 * stride] = max(0, min(1023, (a0 - b0) >> 19))
+        }
+        if true {
+            var a0 = 16384 * (r0c1 + 16)
+            var a1 = a0
+            var a2 = a0
+            var a3 = a0
+            a0 += 21407 * r2c1
+            a1 += 8867 * r2c1
+            a2 -= 8867 * r2c1
+            a3 -= 21407 * r2c1
+            var b0 = 22725 * r1c1 + 19265 * r3c1
+            var b1 = 19265 * r1c1 - 4520 * r3c1
+            var b2 = 12873 * r1c1 - 22725 * r3c1
+            var b3 = 4520 * r1c1 - 12873 * r3c1
+            if hiRows {
+                a0 += 16384 * r4c1 + 8867 * r6c1
+                a1 += -16384 * r4c1 - 21407 * r6c1
+                a2 += -16384 * r4c1 + 21407 * r6c1
+                a3 += 16384 * r4c1 - 8867 * r6c1
+                b0 += 12873 * r5c1 + 4520 * r7c1
+                b1 += -22725 * r5c1 - 12873 * r7c1
+                b2 += 4520 * r5c1 + 19265 * r7c1
+                b3 += 19265 * r5c1 - 22725 * r7c1
+            }
+            let o = off + 1
+            pl[o] = max(0, min(1023, (a0 + b0) >> 19))
+            pl[o + stride] = max(0, min(1023, (a1 + b1) >> 19))
+            pl[o + 2 * stride] = max(0, min(1023, (a2 + b2) >> 19))
+            pl[o + 3 * stride] = max(0, min(1023, (a3 + b3) >> 19))
+            pl[o + 4 * stride] = max(0, min(1023, (a3 - b3) >> 19))
+            pl[o + 5 * stride] = max(0, min(1023, (a2 - b2) >> 19))
+            pl[o + 6 * stride] = max(0, min(1023, (a1 - b1) >> 19))
+            pl[o + 7 * stride] = max(0, min(1023, (a0 - b0) >> 19))
+        }
+        if true {
+            var a0 = 16384 * (r0c2 + 16)
+            var a1 = a0
+            var a2 = a0
+            var a3 = a0
+            a0 += 21407 * r2c2
+            a1 += 8867 * r2c2
+            a2 -= 8867 * r2c2
+            a3 -= 21407 * r2c2
+            var b0 = 22725 * r1c2 + 19265 * r3c2
+            var b1 = 19265 * r1c2 - 4520 * r3c2
+            var b2 = 12873 * r1c2 - 22725 * r3c2
+            var b3 = 4520 * r1c2 - 12873 * r3c2
+            if hiRows {
+                a0 += 16384 * r4c2 + 8867 * r6c2
+                a1 += -16384 * r4c2 - 21407 * r6c2
+                a2 += -16384 * r4c2 + 21407 * r6c2
+                a3 += 16384 * r4c2 - 8867 * r6c2
+                b0 += 12873 * r5c2 + 4520 * r7c2
+                b1 += -22725 * r5c2 - 12873 * r7c2
+                b2 += 4520 * r5c2 + 19265 * r7c2
+                b3 += 19265 * r5c2 - 22725 * r7c2
+            }
+            let o = off + 2
+            pl[o] = max(0, min(1023, (a0 + b0) >> 19))
+            pl[o + stride] = max(0, min(1023, (a1 + b1) >> 19))
+            pl[o + 2 * stride] = max(0, min(1023, (a2 + b2) >> 19))
+            pl[o + 3 * stride] = max(0, min(1023, (a3 + b3) >> 19))
+            pl[o + 4 * stride] = max(0, min(1023, (a3 - b3) >> 19))
+            pl[o + 5 * stride] = max(0, min(1023, (a2 - b2) >> 19))
+            pl[o + 6 * stride] = max(0, min(1023, (a1 - b1) >> 19))
+            pl[o + 7 * stride] = max(0, min(1023, (a0 - b0) >> 19))
+        }
+        if true {
+            var a0 = 16384 * (r0c3 + 16)
+            var a1 = a0
+            var a2 = a0
+            var a3 = a0
+            a0 += 21407 * r2c3
+            a1 += 8867 * r2c3
+            a2 -= 8867 * r2c3
+            a3 -= 21407 * r2c3
+            var b0 = 22725 * r1c3 + 19265 * r3c3
+            var b1 = 19265 * r1c3 - 4520 * r3c3
+            var b2 = 12873 * r1c3 - 22725 * r3c3
+            var b3 = 4520 * r1c3 - 12873 * r3c3
+            if hiRows {
+                a0 += 16384 * r4c3 + 8867 * r6c3
+                a1 += -16384 * r4c3 - 21407 * r6c3
+                a2 += -16384 * r4c3 + 21407 * r6c3
+                a3 += 16384 * r4c3 - 8867 * r6c3
+                b0 += 12873 * r5c3 + 4520 * r7c3
+                b1 += -22725 * r5c3 - 12873 * r7c3
+                b2 += 4520 * r5c3 + 19265 * r7c3
+                b3 += 19265 * r5c3 - 22725 * r7c3
+            }
+            let o = off + 3
+            pl[o] = max(0, min(1023, (a0 + b0) >> 19))
+            pl[o + stride] = max(0, min(1023, (a1 + b1) >> 19))
+            pl[o + 2 * stride] = max(0, min(1023, (a2 + b2) >> 19))
+            pl[o + 3 * stride] = max(0, min(1023, (a3 + b3) >> 19))
+            pl[o + 4 * stride] = max(0, min(1023, (a3 - b3) >> 19))
+            pl[o + 5 * stride] = max(0, min(1023, (a2 - b2) >> 19))
+            pl[o + 6 * stride] = max(0, min(1023, (a1 - b1) >> 19))
+            pl[o + 7 * stride] = max(0, min(1023, (a0 - b0) >> 19))
+        }
+        if true {
+            var a0 = 16384 * (r0c4 + 16)
+            var a1 = a0
+            var a2 = a0
+            var a3 = a0
+            a0 += 21407 * r2c4
+            a1 += 8867 * r2c4
+            a2 -= 8867 * r2c4
+            a3 -= 21407 * r2c4
+            var b0 = 22725 * r1c4 + 19265 * r3c4
+            var b1 = 19265 * r1c4 - 4520 * r3c4
+            var b2 = 12873 * r1c4 - 22725 * r3c4
+            var b3 = 4520 * r1c4 - 12873 * r3c4
+            if hiRows {
+                a0 += 16384 * r4c4 + 8867 * r6c4
+                a1 += -16384 * r4c4 - 21407 * r6c4
+                a2 += -16384 * r4c4 + 21407 * r6c4
+                a3 += 16384 * r4c4 - 8867 * r6c4
+                b0 += 12873 * r5c4 + 4520 * r7c4
+                b1 += -22725 * r5c4 - 12873 * r7c4
+                b2 += 4520 * r5c4 + 19265 * r7c4
+                b3 += 19265 * r5c4 - 22725 * r7c4
+            }
+            let o = off + 4
+            pl[o] = max(0, min(1023, (a0 + b0) >> 19))
+            pl[o + stride] = max(0, min(1023, (a1 + b1) >> 19))
+            pl[o + 2 * stride] = max(0, min(1023, (a2 + b2) >> 19))
+            pl[o + 3 * stride] = max(0, min(1023, (a3 + b3) >> 19))
+            pl[o + 4 * stride] = max(0, min(1023, (a3 - b3) >> 19))
+            pl[o + 5 * stride] = max(0, min(1023, (a2 - b2) >> 19))
+            pl[o + 6 * stride] = max(0, min(1023, (a1 - b1) >> 19))
+            pl[o + 7 * stride] = max(0, min(1023, (a0 - b0) >> 19))
+        }
+        if true {
+            var a0 = 16384 * (r0c5 + 16)
+            var a1 = a0
+            var a2 = a0
+            var a3 = a0
+            a0 += 21407 * r2c5
+            a1 += 8867 * r2c5
+            a2 -= 8867 * r2c5
+            a3 -= 21407 * r2c5
+            var b0 = 22725 * r1c5 + 19265 * r3c5
+            var b1 = 19265 * r1c5 - 4520 * r3c5
+            var b2 = 12873 * r1c5 - 22725 * r3c5
+            var b3 = 4520 * r1c5 - 12873 * r3c5
+            if hiRows {
+                a0 += 16384 * r4c5 + 8867 * r6c5
+                a1 += -16384 * r4c5 - 21407 * r6c5
+                a2 += -16384 * r4c5 + 21407 * r6c5
+                a3 += 16384 * r4c5 - 8867 * r6c5
+                b0 += 12873 * r5c5 + 4520 * r7c5
+                b1 += -22725 * r5c5 - 12873 * r7c5
+                b2 += 4520 * r5c5 + 19265 * r7c5
+                b3 += 19265 * r5c5 - 22725 * r7c5
+            }
+            let o = off + 5
+            pl[o] = max(0, min(1023, (a0 + b0) >> 19))
+            pl[o + stride] = max(0, min(1023, (a1 + b1) >> 19))
+            pl[o + 2 * stride] = max(0, min(1023, (a2 + b2) >> 19))
+            pl[o + 3 * stride] = max(0, min(1023, (a3 + b3) >> 19))
+            pl[o + 4 * stride] = max(0, min(1023, (a3 - b3) >> 19))
+            pl[o + 5 * stride] = max(0, min(1023, (a2 - b2) >> 19))
+            pl[o + 6 * stride] = max(0, min(1023, (a1 - b1) >> 19))
+            pl[o + 7 * stride] = max(0, min(1023, (a0 - b0) >> 19))
+        }
+        if true {
+            var a0 = 16384 * (r0c6 + 16)
+            var a1 = a0
+            var a2 = a0
+            var a3 = a0
+            a0 += 21407 * r2c6
+            a1 += 8867 * r2c6
+            a2 -= 8867 * r2c6
+            a3 -= 21407 * r2c6
+            var b0 = 22725 * r1c6 + 19265 * r3c6
+            var b1 = 19265 * r1c6 - 4520 * r3c6
+            var b2 = 12873 * r1c6 - 22725 * r3c6
+            var b3 = 4520 * r1c6 - 12873 * r3c6
+            if hiRows {
+                a0 += 16384 * r4c6 + 8867 * r6c6
+                a1 += -16384 * r4c6 - 21407 * r6c6
+                a2 += -16384 * r4c6 + 21407 * r6c6
+                a3 += 16384 * r4c6 - 8867 * r6c6
+                b0 += 12873 * r5c6 + 4520 * r7c6
+                b1 += -22725 * r5c6 - 12873 * r7c6
+                b2 += 4520 * r5c6 + 19265 * r7c6
+                b3 += 19265 * r5c6 - 22725 * r7c6
+            }
+            let o = off + 6
+            pl[o] = max(0, min(1023, (a0 + b0) >> 19))
+            pl[o + stride] = max(0, min(1023, (a1 + b1) >> 19))
+            pl[o + 2 * stride] = max(0, min(1023, (a2 + b2) >> 19))
+            pl[o + 3 * stride] = max(0, min(1023, (a3 + b3) >> 19))
+            pl[o + 4 * stride] = max(0, min(1023, (a3 - b3) >> 19))
+            pl[o + 5 * stride] = max(0, min(1023, (a2 - b2) >> 19))
+            pl[o + 6 * stride] = max(0, min(1023, (a1 - b1) >> 19))
+            pl[o + 7 * stride] = max(0, min(1023, (a0 - b0) >> 19))
+        }
+        if true {
+            var a0 = 16384 * (r0c7 + 16)
+            var a1 = a0
+            var a2 = a0
+            var a3 = a0
+            a0 += 21407 * r2c7
+            a1 += 8867 * r2c7
+            a2 -= 8867 * r2c7
+            a3 -= 21407 * r2c7
+            var b0 = 22725 * r1c7 + 19265 * r3c7
+            var b1 = 19265 * r1c7 - 4520 * r3c7
+            var b2 = 12873 * r1c7 - 22725 * r3c7
+            var b3 = 4520 * r1c7 - 12873 * r3c7
+            if hiRows {
+                a0 += 16384 * r4c7 + 8867 * r6c7
+                a1 += -16384 * r4c7 - 21407 * r6c7
+                a2 += -16384 * r4c7 + 21407 * r6c7
+                a3 += 16384 * r4c7 - 8867 * r6c7
+                b0 += 12873 * r5c7 + 4520 * r7c7
+                b1 += -22725 * r5c7 - 12873 * r7c7
+                b2 += 4520 * r5c7 + 19265 * r7c7
+                b3 += 19265 * r5c7 - 22725 * r7c7
+            }
+            let o = off + 7
+            pl[o] = max(0, min(1023, (a0 + b0) >> 19))
+            pl[o + stride] = max(0, min(1023, (a1 + b1) >> 19))
+            pl[o + 2 * stride] = max(0, min(1023, (a2 + b2) >> 19))
+            pl[o + 3 * stride] = max(0, min(1023, (a3 + b3) >> 19))
+            pl[o + 4 * stride] = max(0, min(1023, (a3 - b3) >> 19))
+            pl[o + 5 * stride] = max(0, min(1023, (a2 - b2) >> 19))
+            pl[o + 6 * stride] = max(0, min(1023, (a1 - b1) >> 19))
+            pl[o + 7 * stride] = max(0, min(1023, (a0 - b0) >> 19))
+        }
+    }
+
+    // Generated by tests/prores/genidct.py (ffmpeg's simple IDCT: rows
+    // shift 16, columns 17, output clipped to 0…4095).
+    fn idct12(_ b: Int, _ m: Int, _ off: Int, _ stride: Int) {
+        let s = b << 6
+        var r0c0 = 0
+        var r0c1 = 0
+        var r0c2 = 0
+        var r0c3 = 0
+        var r0c4 = 0
+        var r0c5 = 0
+        var r0c6 = 0
+        var r0c7 = 0
+        var r1c0 = 0
+        var r1c1 = 0
+        var r1c2 = 0
+        var r1c3 = 0
+        var r1c4 = 0
+        var r1c5 = 0
+        var r1c6 = 0
+        var r1c7 = 0
+        var r2c0 = 0
+        var r2c1 = 0
+        var r2c2 = 0
+        var r2c3 = 0
+        var r2c4 = 0
+        var r2c5 = 0
+        var r2c6 = 0
+        var r2c7 = 0
+        var r3c0 = 0
+        var r3c1 = 0
+        var r3c2 = 0
+        var r3c3 = 0
+        var r3c4 = 0
+        var r3c5 = 0
+        var r3c6 = 0
+        var r3c7 = 0
+        var r4c0 = 0
+        var r4c1 = 0
+        var r4c2 = 0
+        var r4c3 = 0
+        var r4c4 = 0
+        var r4c5 = 0
+        var r4c6 = 0
+        var r4c7 = 0
+        var r5c0 = 0
+        var r5c1 = 0
+        var r5c2 = 0
+        var r5c3 = 0
+        var r5c4 = 0
+        var r5c5 = 0
+        var r5c6 = 0
+        var r5c7 = 0
+        var r6c0 = 0
+        var r6c1 = 0
+        var r6c2 = 0
+        var r6c3 = 0
+        var r6c4 = 0
+        var r6c5 = 0
+        var r6c6 = 0
+        var r6c7 = 0
+        var r7c0 = 0
+        var r7c1 = 0
+        var r7c2 = 0
+        var r7c3 = 0
+        var r7c4 = 0
+        var r7c5 = 0
+        var r7c6 = 0
+        var r7c7 = 0
+        if true {
+            let x0 = blk[s]
+            let x1 = blk[s + 1]
+            let x2 = blk[s + 2]
+            let x3 = blk[s + 3]
+            let x4 = blk[s + 4]
+            let x5 = blk[s + 5]
+            let x6 = blk[s + 6]
+            let x7 = blk[s + 7]
+            blk[s] = 0
+            blk[s + 1] = 0
+            blk[s + 2] = 0
+            blk[s + 3] = 0
+            blk[s + 4] = 0
+            blk[s + 5] = 0
+            blk[s + 6] = 0
+            blk[s + 7] = 0
+            if (x1 | x2 | x3 | x4 | x5 | x6 | x7) == 0 {
+                let v = ((((x0 + 1) >> 1) + 32768) & 65535) - 32768
+                r0c0 = v
+                r0c1 = v
+                r0c2 = v
+                r0c3 = v
+                r0c4 = v
+                r0c5 = v
+                r0c6 = v
+                r0c7 = v
+            } else {
+                var a0 = 32767 * x0 + 32768
+                var a1 = a0
+                var a2 = a0
+                var a3 = a0
+                a0 += 42813 * x2
+                a1 += 17734 * x2
+                a2 -= 17734 * x2
+                a3 -= 42813 * x2
+                var b0 = 45451 * x1 + 38531 * x3
+                var b1 = 38531 * x1 - 9041 * x3
+                var b2 = 25746 * x1 - 45451 * x3
+                var b3 = 9041 * x1 - 25746 * x3
+                if (x4 | x5 | x6 | x7) != 0 {
+                    a0 += 32767 * x4 + 17734 * x6
+                    a1 += -32767 * x4 - 42813 * x6
+                    a2 += -32767 * x4 + 42813 * x6
+                    a3 += 32767 * x4 - 17734 * x6
+                    b0 += 25746 * x5 + 9041 * x7
+                    b1 += -45451 * x5 - 25746 * x7
+                    b2 += 9041 * x5 + 38531 * x7
+                    b3 += 38531 * x5 - 45451 * x7
+                }
+                r0c0 = ((((a0 + b0) >> 16) + 32768) & 65535) - 32768
+                r0c1 = ((((a1 + b1) >> 16) + 32768) & 65535) - 32768
+                r0c2 = ((((a2 + b2) >> 16) + 32768) & 65535) - 32768
+                r0c3 = ((((a3 + b3) >> 16) + 32768) & 65535) - 32768
+                r0c4 = ((((a3 - b3) >> 16) + 32768) & 65535) - 32768
+                r0c5 = ((((a2 - b2) >> 16) + 32768) & 65535) - 32768
+                r0c6 = ((((a1 - b1) >> 16) + 32768) & 65535) - 32768
+                r0c7 = ((((a0 - b0) >> 16) + 32768) & 65535) - 32768
+            }
+        }
+        if (m & 2) != 0 {
+            let x0 = blk[s + 8]
+            let x1 = blk[s + 8 + 1]
+            let x2 = blk[s + 8 + 2]
+            let x3 = blk[s + 8 + 3]
+            let x4 = blk[s + 8 + 4]
+            let x5 = blk[s + 8 + 5]
+            let x6 = blk[s + 8 + 6]
+            let x7 = blk[s + 8 + 7]
+            blk[s + 8] = 0
+            blk[s + 8 + 1] = 0
+            blk[s + 8 + 2] = 0
+            blk[s + 8 + 3] = 0
+            blk[s + 8 + 4] = 0
+            blk[s + 8 + 5] = 0
+            blk[s + 8 + 6] = 0
+            blk[s + 8 + 7] = 0
+            if (x1 | x2 | x3 | x4 | x5 | x6 | x7) == 0 {
+                let v = ((((x0 + 1) >> 1) + 32768) & 65535) - 32768
+                r1c0 = v
+                r1c1 = v
+                r1c2 = v
+                r1c3 = v
+                r1c4 = v
+                r1c5 = v
+                r1c6 = v
+                r1c7 = v
+            } else {
+                var a0 = 32767 * x0 + 32768
+                var a1 = a0
+                var a2 = a0
+                var a3 = a0
+                a0 += 42813 * x2
+                a1 += 17734 * x2
+                a2 -= 17734 * x2
+                a3 -= 42813 * x2
+                var b0 = 45451 * x1 + 38531 * x3
+                var b1 = 38531 * x1 - 9041 * x3
+                var b2 = 25746 * x1 - 45451 * x3
+                var b3 = 9041 * x1 - 25746 * x3
+                if (x4 | x5 | x6 | x7) != 0 {
+                    a0 += 32767 * x4 + 17734 * x6
+                    a1 += -32767 * x4 - 42813 * x6
+                    a2 += -32767 * x4 + 42813 * x6
+                    a3 += 32767 * x4 - 17734 * x6
+                    b0 += 25746 * x5 + 9041 * x7
+                    b1 += -45451 * x5 - 25746 * x7
+                    b2 += 9041 * x5 + 38531 * x7
+                    b3 += 38531 * x5 - 45451 * x7
+                }
+                r1c0 = ((((a0 + b0) >> 16) + 32768) & 65535) - 32768
+                r1c1 = ((((a1 + b1) >> 16) + 32768) & 65535) - 32768
+                r1c2 = ((((a2 + b2) >> 16) + 32768) & 65535) - 32768
+                r1c3 = ((((a3 + b3) >> 16) + 32768) & 65535) - 32768
+                r1c4 = ((((a3 - b3) >> 16) + 32768) & 65535) - 32768
+                r1c5 = ((((a2 - b2) >> 16) + 32768) & 65535) - 32768
+                r1c6 = ((((a1 - b1) >> 16) + 32768) & 65535) - 32768
+                r1c7 = ((((a0 - b0) >> 16) + 32768) & 65535) - 32768
+            }
+        }
+        if (m & 4) != 0 {
+            let x0 = blk[s + 16]
+            let x1 = blk[s + 16 + 1]
+            let x2 = blk[s + 16 + 2]
+            let x3 = blk[s + 16 + 3]
+            let x4 = blk[s + 16 + 4]
+            let x5 = blk[s + 16 + 5]
+            let x6 = blk[s + 16 + 6]
+            let x7 = blk[s + 16 + 7]
+            blk[s + 16] = 0
+            blk[s + 16 + 1] = 0
+            blk[s + 16 + 2] = 0
+            blk[s + 16 + 3] = 0
+            blk[s + 16 + 4] = 0
+            blk[s + 16 + 5] = 0
+            blk[s + 16 + 6] = 0
+            blk[s + 16 + 7] = 0
+            if (x1 | x2 | x3 | x4 | x5 | x6 | x7) == 0 {
+                let v = ((((x0 + 1) >> 1) + 32768) & 65535) - 32768
+                r2c0 = v
+                r2c1 = v
+                r2c2 = v
+                r2c3 = v
+                r2c4 = v
+                r2c5 = v
+                r2c6 = v
+                r2c7 = v
+            } else {
+                var a0 = 32767 * x0 + 32768
+                var a1 = a0
+                var a2 = a0
+                var a3 = a0
+                a0 += 42813 * x2
+                a1 += 17734 * x2
+                a2 -= 17734 * x2
+                a3 -= 42813 * x2
+                var b0 = 45451 * x1 + 38531 * x3
+                var b1 = 38531 * x1 - 9041 * x3
+                var b2 = 25746 * x1 - 45451 * x3
+                var b3 = 9041 * x1 - 25746 * x3
+                if (x4 | x5 | x6 | x7) != 0 {
+                    a0 += 32767 * x4 + 17734 * x6
+                    a1 += -32767 * x4 - 42813 * x6
+                    a2 += -32767 * x4 + 42813 * x6
+                    a3 += 32767 * x4 - 17734 * x6
+                    b0 += 25746 * x5 + 9041 * x7
+                    b1 += -45451 * x5 - 25746 * x7
+                    b2 += 9041 * x5 + 38531 * x7
+                    b3 += 38531 * x5 - 45451 * x7
+                }
+                r2c0 = ((((a0 + b0) >> 16) + 32768) & 65535) - 32768
+                r2c1 = ((((a1 + b1) >> 16) + 32768) & 65535) - 32768
+                r2c2 = ((((a2 + b2) >> 16) + 32768) & 65535) - 32768
+                r2c3 = ((((a3 + b3) >> 16) + 32768) & 65535) - 32768
+                r2c4 = ((((a3 - b3) >> 16) + 32768) & 65535) - 32768
+                r2c5 = ((((a2 - b2) >> 16) + 32768) & 65535) - 32768
+                r2c6 = ((((a1 - b1) >> 16) + 32768) & 65535) - 32768
+                r2c7 = ((((a0 - b0) >> 16) + 32768) & 65535) - 32768
+            }
+        }
+        if (m & 8) != 0 {
+            let x0 = blk[s + 24]
+            let x1 = blk[s + 24 + 1]
+            let x2 = blk[s + 24 + 2]
+            let x3 = blk[s + 24 + 3]
+            let x4 = blk[s + 24 + 4]
+            let x5 = blk[s + 24 + 5]
+            let x6 = blk[s + 24 + 6]
+            let x7 = blk[s + 24 + 7]
+            blk[s + 24] = 0
+            blk[s + 24 + 1] = 0
+            blk[s + 24 + 2] = 0
+            blk[s + 24 + 3] = 0
+            blk[s + 24 + 4] = 0
+            blk[s + 24 + 5] = 0
+            blk[s + 24 + 6] = 0
+            blk[s + 24 + 7] = 0
+            if (x1 | x2 | x3 | x4 | x5 | x6 | x7) == 0 {
+                let v = ((((x0 + 1) >> 1) + 32768) & 65535) - 32768
+                r3c0 = v
+                r3c1 = v
+                r3c2 = v
+                r3c3 = v
+                r3c4 = v
+                r3c5 = v
+                r3c6 = v
+                r3c7 = v
+            } else {
+                var a0 = 32767 * x0 + 32768
+                var a1 = a0
+                var a2 = a0
+                var a3 = a0
+                a0 += 42813 * x2
+                a1 += 17734 * x2
+                a2 -= 17734 * x2
+                a3 -= 42813 * x2
+                var b0 = 45451 * x1 + 38531 * x3
+                var b1 = 38531 * x1 - 9041 * x3
+                var b2 = 25746 * x1 - 45451 * x3
+                var b3 = 9041 * x1 - 25746 * x3
+                if (x4 | x5 | x6 | x7) != 0 {
+                    a0 += 32767 * x4 + 17734 * x6
+                    a1 += -32767 * x4 - 42813 * x6
+                    a2 += -32767 * x4 + 42813 * x6
+                    a3 += 32767 * x4 - 17734 * x6
+                    b0 += 25746 * x5 + 9041 * x7
+                    b1 += -45451 * x5 - 25746 * x7
+                    b2 += 9041 * x5 + 38531 * x7
+                    b3 += 38531 * x5 - 45451 * x7
+                }
+                r3c0 = ((((a0 + b0) >> 16) + 32768) & 65535) - 32768
+                r3c1 = ((((a1 + b1) >> 16) + 32768) & 65535) - 32768
+                r3c2 = ((((a2 + b2) >> 16) + 32768) & 65535) - 32768
+                r3c3 = ((((a3 + b3) >> 16) + 32768) & 65535) - 32768
+                r3c4 = ((((a3 - b3) >> 16) + 32768) & 65535) - 32768
+                r3c5 = ((((a2 - b2) >> 16) + 32768) & 65535) - 32768
+                r3c6 = ((((a1 - b1) >> 16) + 32768) & 65535) - 32768
+                r3c7 = ((((a0 - b0) >> 16) + 32768) & 65535) - 32768
+            }
+        }
+        if (m & 16) != 0 {
+            let x0 = blk[s + 32]
+            let x1 = blk[s + 32 + 1]
+            let x2 = blk[s + 32 + 2]
+            let x3 = blk[s + 32 + 3]
+            let x4 = blk[s + 32 + 4]
+            let x5 = blk[s + 32 + 5]
+            let x6 = blk[s + 32 + 6]
+            let x7 = blk[s + 32 + 7]
+            blk[s + 32] = 0
+            blk[s + 32 + 1] = 0
+            blk[s + 32 + 2] = 0
+            blk[s + 32 + 3] = 0
+            blk[s + 32 + 4] = 0
+            blk[s + 32 + 5] = 0
+            blk[s + 32 + 6] = 0
+            blk[s + 32 + 7] = 0
+            if (x1 | x2 | x3 | x4 | x5 | x6 | x7) == 0 {
+                let v = ((((x0 + 1) >> 1) + 32768) & 65535) - 32768
+                r4c0 = v
+                r4c1 = v
+                r4c2 = v
+                r4c3 = v
+                r4c4 = v
+                r4c5 = v
+                r4c6 = v
+                r4c7 = v
+            } else {
+                var a0 = 32767 * x0 + 32768
+                var a1 = a0
+                var a2 = a0
+                var a3 = a0
+                a0 += 42813 * x2
+                a1 += 17734 * x2
+                a2 -= 17734 * x2
+                a3 -= 42813 * x2
+                var b0 = 45451 * x1 + 38531 * x3
+                var b1 = 38531 * x1 - 9041 * x3
+                var b2 = 25746 * x1 - 45451 * x3
+                var b3 = 9041 * x1 - 25746 * x3
+                if (x4 | x5 | x6 | x7) != 0 {
+                    a0 += 32767 * x4 + 17734 * x6
+                    a1 += -32767 * x4 - 42813 * x6
+                    a2 += -32767 * x4 + 42813 * x6
+                    a3 += 32767 * x4 - 17734 * x6
+                    b0 += 25746 * x5 + 9041 * x7
+                    b1 += -45451 * x5 - 25746 * x7
+                    b2 += 9041 * x5 + 38531 * x7
+                    b3 += 38531 * x5 - 45451 * x7
+                }
+                r4c0 = ((((a0 + b0) >> 16) + 32768) & 65535) - 32768
+                r4c1 = ((((a1 + b1) >> 16) + 32768) & 65535) - 32768
+                r4c2 = ((((a2 + b2) >> 16) + 32768) & 65535) - 32768
+                r4c3 = ((((a3 + b3) >> 16) + 32768) & 65535) - 32768
+                r4c4 = ((((a3 - b3) >> 16) + 32768) & 65535) - 32768
+                r4c5 = ((((a2 - b2) >> 16) + 32768) & 65535) - 32768
+                r4c6 = ((((a1 - b1) >> 16) + 32768) & 65535) - 32768
+                r4c7 = ((((a0 - b0) >> 16) + 32768) & 65535) - 32768
+            }
+        }
+        if (m & 32) != 0 {
+            let x0 = blk[s + 40]
+            let x1 = blk[s + 40 + 1]
+            let x2 = blk[s + 40 + 2]
+            let x3 = blk[s + 40 + 3]
+            let x4 = blk[s + 40 + 4]
+            let x5 = blk[s + 40 + 5]
+            let x6 = blk[s + 40 + 6]
+            let x7 = blk[s + 40 + 7]
+            blk[s + 40] = 0
+            blk[s + 40 + 1] = 0
+            blk[s + 40 + 2] = 0
+            blk[s + 40 + 3] = 0
+            blk[s + 40 + 4] = 0
+            blk[s + 40 + 5] = 0
+            blk[s + 40 + 6] = 0
+            blk[s + 40 + 7] = 0
+            if (x1 | x2 | x3 | x4 | x5 | x6 | x7) == 0 {
+                let v = ((((x0 + 1) >> 1) + 32768) & 65535) - 32768
+                r5c0 = v
+                r5c1 = v
+                r5c2 = v
+                r5c3 = v
+                r5c4 = v
+                r5c5 = v
+                r5c6 = v
+                r5c7 = v
+            } else {
+                var a0 = 32767 * x0 + 32768
+                var a1 = a0
+                var a2 = a0
+                var a3 = a0
+                a0 += 42813 * x2
+                a1 += 17734 * x2
+                a2 -= 17734 * x2
+                a3 -= 42813 * x2
+                var b0 = 45451 * x1 + 38531 * x3
+                var b1 = 38531 * x1 - 9041 * x3
+                var b2 = 25746 * x1 - 45451 * x3
+                var b3 = 9041 * x1 - 25746 * x3
+                if (x4 | x5 | x6 | x7) != 0 {
+                    a0 += 32767 * x4 + 17734 * x6
+                    a1 += -32767 * x4 - 42813 * x6
+                    a2 += -32767 * x4 + 42813 * x6
+                    a3 += 32767 * x4 - 17734 * x6
+                    b0 += 25746 * x5 + 9041 * x7
+                    b1 += -45451 * x5 - 25746 * x7
+                    b2 += 9041 * x5 + 38531 * x7
+                    b3 += 38531 * x5 - 45451 * x7
+                }
+                r5c0 = ((((a0 + b0) >> 16) + 32768) & 65535) - 32768
+                r5c1 = ((((a1 + b1) >> 16) + 32768) & 65535) - 32768
+                r5c2 = ((((a2 + b2) >> 16) + 32768) & 65535) - 32768
+                r5c3 = ((((a3 + b3) >> 16) + 32768) & 65535) - 32768
+                r5c4 = ((((a3 - b3) >> 16) + 32768) & 65535) - 32768
+                r5c5 = ((((a2 - b2) >> 16) + 32768) & 65535) - 32768
+                r5c6 = ((((a1 - b1) >> 16) + 32768) & 65535) - 32768
+                r5c7 = ((((a0 - b0) >> 16) + 32768) & 65535) - 32768
+            }
+        }
+        if (m & 64) != 0 {
+            let x0 = blk[s + 48]
+            let x1 = blk[s + 48 + 1]
+            let x2 = blk[s + 48 + 2]
+            let x3 = blk[s + 48 + 3]
+            let x4 = blk[s + 48 + 4]
+            let x5 = blk[s + 48 + 5]
+            let x6 = blk[s + 48 + 6]
+            let x7 = blk[s + 48 + 7]
+            blk[s + 48] = 0
+            blk[s + 48 + 1] = 0
+            blk[s + 48 + 2] = 0
+            blk[s + 48 + 3] = 0
+            blk[s + 48 + 4] = 0
+            blk[s + 48 + 5] = 0
+            blk[s + 48 + 6] = 0
+            blk[s + 48 + 7] = 0
+            if (x1 | x2 | x3 | x4 | x5 | x6 | x7) == 0 {
+                let v = ((((x0 + 1) >> 1) + 32768) & 65535) - 32768
+                r6c0 = v
+                r6c1 = v
+                r6c2 = v
+                r6c3 = v
+                r6c4 = v
+                r6c5 = v
+                r6c6 = v
+                r6c7 = v
+            } else {
+                var a0 = 32767 * x0 + 32768
+                var a1 = a0
+                var a2 = a0
+                var a3 = a0
+                a0 += 42813 * x2
+                a1 += 17734 * x2
+                a2 -= 17734 * x2
+                a3 -= 42813 * x2
+                var b0 = 45451 * x1 + 38531 * x3
+                var b1 = 38531 * x1 - 9041 * x3
+                var b2 = 25746 * x1 - 45451 * x3
+                var b3 = 9041 * x1 - 25746 * x3
+                if (x4 | x5 | x6 | x7) != 0 {
+                    a0 += 32767 * x4 + 17734 * x6
+                    a1 += -32767 * x4 - 42813 * x6
+                    a2 += -32767 * x4 + 42813 * x6
+                    a3 += 32767 * x4 - 17734 * x6
+                    b0 += 25746 * x5 + 9041 * x7
+                    b1 += -45451 * x5 - 25746 * x7
+                    b2 += 9041 * x5 + 38531 * x7
+                    b3 += 38531 * x5 - 45451 * x7
+                }
+                r6c0 = ((((a0 + b0) >> 16) + 32768) & 65535) - 32768
+                r6c1 = ((((a1 + b1) >> 16) + 32768) & 65535) - 32768
+                r6c2 = ((((a2 + b2) >> 16) + 32768) & 65535) - 32768
+                r6c3 = ((((a3 + b3) >> 16) + 32768) & 65535) - 32768
+                r6c4 = ((((a3 - b3) >> 16) + 32768) & 65535) - 32768
+                r6c5 = ((((a2 - b2) >> 16) + 32768) & 65535) - 32768
+                r6c6 = ((((a1 - b1) >> 16) + 32768) & 65535) - 32768
+                r6c7 = ((((a0 - b0) >> 16) + 32768) & 65535) - 32768
+            }
+        }
+        if (m & 128) != 0 {
+            let x0 = blk[s + 56]
+            let x1 = blk[s + 56 + 1]
+            let x2 = blk[s + 56 + 2]
+            let x3 = blk[s + 56 + 3]
+            let x4 = blk[s + 56 + 4]
+            let x5 = blk[s + 56 + 5]
+            let x6 = blk[s + 56 + 6]
+            let x7 = blk[s + 56 + 7]
+            blk[s + 56] = 0
+            blk[s + 56 + 1] = 0
+            blk[s + 56 + 2] = 0
+            blk[s + 56 + 3] = 0
+            blk[s + 56 + 4] = 0
+            blk[s + 56 + 5] = 0
+            blk[s + 56 + 6] = 0
+            blk[s + 56 + 7] = 0
+            if (x1 | x2 | x3 | x4 | x5 | x6 | x7) == 0 {
+                let v = ((((x0 + 1) >> 1) + 32768) & 65535) - 32768
+                r7c0 = v
+                r7c1 = v
+                r7c2 = v
+                r7c3 = v
+                r7c4 = v
+                r7c5 = v
+                r7c6 = v
+                r7c7 = v
+            } else {
+                var a0 = 32767 * x0 + 32768
+                var a1 = a0
+                var a2 = a0
+                var a3 = a0
+                a0 += 42813 * x2
+                a1 += 17734 * x2
+                a2 -= 17734 * x2
+                a3 -= 42813 * x2
+                var b0 = 45451 * x1 + 38531 * x3
+                var b1 = 38531 * x1 - 9041 * x3
+                var b2 = 25746 * x1 - 45451 * x3
+                var b3 = 9041 * x1 - 25746 * x3
+                if (x4 | x5 | x6 | x7) != 0 {
+                    a0 += 32767 * x4 + 17734 * x6
+                    a1 += -32767 * x4 - 42813 * x6
+                    a2 += -32767 * x4 + 42813 * x6
+                    a3 += 32767 * x4 - 17734 * x6
+                    b0 += 25746 * x5 + 9041 * x7
+                    b1 += -45451 * x5 - 25746 * x7
+                    b2 += 9041 * x5 + 38531 * x7
+                    b3 += 38531 * x5 - 45451 * x7
+                }
+                r7c0 = ((((a0 + b0) >> 16) + 32768) & 65535) - 32768
+                r7c1 = ((((a1 + b1) >> 16) + 32768) & 65535) - 32768
+                r7c2 = ((((a2 + b2) >> 16) + 32768) & 65535) - 32768
+                r7c3 = ((((a3 + b3) >> 16) + 32768) & 65535) - 32768
+                r7c4 = ((((a3 - b3) >> 16) + 32768) & 65535) - 32768
+                r7c5 = ((((a2 - b2) >> 16) + 32768) & 65535) - 32768
+                r7c6 = ((((a1 - b1) >> 16) + 32768) & 65535) - 32768
+                r7c7 = ((((a0 - b0) >> 16) + 32768) & 65535) - 32768
+            }
+        }
+        if m == 1 {
+            let v0 = max(0, min(4095, (32767 * (r0c0 + 2)) >> 17))
+            let v1 = max(0, min(4095, (32767 * (r0c1 + 2)) >> 17))
+            let v2 = max(0, min(4095, (32767 * (r0c2 + 2)) >> 17))
+            let v3 = max(0, min(4095, (32767 * (r0c3 + 2)) >> 17))
+            let v4 = max(0, min(4095, (32767 * (r0c4 + 2)) >> 17))
+            let v5 = max(0, min(4095, (32767 * (r0c5 + 2)) >> 17))
+            let v6 = max(0, min(4095, (32767 * (r0c6 + 2)) >> 17))
+            let v7 = max(0, min(4095, (32767 * (r0c7 + 2)) >> 17))
+            var o = off
+            for _ in 0..8 {
+                pl[o] = v0
+                pl[o + 1] = v1
+                pl[o + 2] = v2
+                pl[o + 3] = v3
+                pl[o + 4] = v4
+                pl[o + 5] = v5
+                pl[o + 6] = v6
+                pl[o + 7] = v7
+                o += stride
+            }
+            return
+        }
+        let hiRows = m > 15
+        if true {
+            var a0 = 32767 * (r0c0 + 2)
+            var a1 = a0
+            var a2 = a0
+            var a3 = a0
+            a0 += 42813 * r2c0
+            a1 += 17734 * r2c0
+            a2 -= 17734 * r2c0
+            a3 -= 42813 * r2c0
+            var b0 = 45451 * r1c0 + 38531 * r3c0
+            var b1 = 38531 * r1c0 - 9041 * r3c0
+            var b2 = 25746 * r1c0 - 45451 * r3c0
+            var b3 = 9041 * r1c0 - 25746 * r3c0
+            if hiRows {
+                a0 += 32767 * r4c0 + 17734 * r6c0
+                a1 += -32767 * r4c0 - 42813 * r6c0
+                a2 += -32767 * r4c0 + 42813 * r6c0
+                a3 += 32767 * r4c0 - 17734 * r6c0
+                b0 += 25746 * r5c0 + 9041 * r7c0
+                b1 += -45451 * r5c0 - 25746 * r7c0
+                b2 += 9041 * r5c0 + 38531 * r7c0
+                b3 += 38531 * r5c0 - 45451 * r7c0
+            }
+            let o = off + 0
+            pl[o] = max(0, min(4095, (a0 + b0) >> 17))
+            pl[o + stride] = max(0, min(4095, (a1 + b1) >> 17))
+            pl[o + 2 * stride] = max(0, min(4095, (a2 + b2) >> 17))
+            pl[o + 3 * stride] = max(0, min(4095, (a3 + b3) >> 17))
+            pl[o + 4 * stride] = max(0, min(4095, (a3 - b3) >> 17))
+            pl[o + 5 * stride] = max(0, min(4095, (a2 - b2) >> 17))
+            pl[o + 6 * stride] = max(0, min(4095, (a1 - b1) >> 17))
+            pl[o + 7 * stride] = max(0, min(4095, (a0 - b0) >> 17))
+        }
+        if true {
+            var a0 = 32767 * (r0c1 + 2)
+            var a1 = a0
+            var a2 = a0
+            var a3 = a0
+            a0 += 42813 * r2c1
+            a1 += 17734 * r2c1
+            a2 -= 17734 * r2c1
+            a3 -= 42813 * r2c1
+            var b0 = 45451 * r1c1 + 38531 * r3c1
+            var b1 = 38531 * r1c1 - 9041 * r3c1
+            var b2 = 25746 * r1c1 - 45451 * r3c1
+            var b3 = 9041 * r1c1 - 25746 * r3c1
+            if hiRows {
+                a0 += 32767 * r4c1 + 17734 * r6c1
+                a1 += -32767 * r4c1 - 42813 * r6c1
+                a2 += -32767 * r4c1 + 42813 * r6c1
+                a3 += 32767 * r4c1 - 17734 * r6c1
+                b0 += 25746 * r5c1 + 9041 * r7c1
+                b1 += -45451 * r5c1 - 25746 * r7c1
+                b2 += 9041 * r5c1 + 38531 * r7c1
+                b3 += 38531 * r5c1 - 45451 * r7c1
+            }
+            let o = off + 1
+            pl[o] = max(0, min(4095, (a0 + b0) >> 17))
+            pl[o + stride] = max(0, min(4095, (a1 + b1) >> 17))
+            pl[o + 2 * stride] = max(0, min(4095, (a2 + b2) >> 17))
+            pl[o + 3 * stride] = max(0, min(4095, (a3 + b3) >> 17))
+            pl[o + 4 * stride] = max(0, min(4095, (a3 - b3) >> 17))
+            pl[o + 5 * stride] = max(0, min(4095, (a2 - b2) >> 17))
+            pl[o + 6 * stride] = max(0, min(4095, (a1 - b1) >> 17))
+            pl[o + 7 * stride] = max(0, min(4095, (a0 - b0) >> 17))
+        }
+        if true {
+            var a0 = 32767 * (r0c2 + 2)
+            var a1 = a0
+            var a2 = a0
+            var a3 = a0
+            a0 += 42813 * r2c2
+            a1 += 17734 * r2c2
+            a2 -= 17734 * r2c2
+            a3 -= 42813 * r2c2
+            var b0 = 45451 * r1c2 + 38531 * r3c2
+            var b1 = 38531 * r1c2 - 9041 * r3c2
+            var b2 = 25746 * r1c2 - 45451 * r3c2
+            var b3 = 9041 * r1c2 - 25746 * r3c2
+            if hiRows {
+                a0 += 32767 * r4c2 + 17734 * r6c2
+                a1 += -32767 * r4c2 - 42813 * r6c2
+                a2 += -32767 * r4c2 + 42813 * r6c2
+                a3 += 32767 * r4c2 - 17734 * r6c2
+                b0 += 25746 * r5c2 + 9041 * r7c2
+                b1 += -45451 * r5c2 - 25746 * r7c2
+                b2 += 9041 * r5c2 + 38531 * r7c2
+                b3 += 38531 * r5c2 - 45451 * r7c2
+            }
+            let o = off + 2
+            pl[o] = max(0, min(4095, (a0 + b0) >> 17))
+            pl[o + stride] = max(0, min(4095, (a1 + b1) >> 17))
+            pl[o + 2 * stride] = max(0, min(4095, (a2 + b2) >> 17))
+            pl[o + 3 * stride] = max(0, min(4095, (a3 + b3) >> 17))
+            pl[o + 4 * stride] = max(0, min(4095, (a3 - b3) >> 17))
+            pl[o + 5 * stride] = max(0, min(4095, (a2 - b2) >> 17))
+            pl[o + 6 * stride] = max(0, min(4095, (a1 - b1) >> 17))
+            pl[o + 7 * stride] = max(0, min(4095, (a0 - b0) >> 17))
+        }
+        if true {
+            var a0 = 32767 * (r0c3 + 2)
+            var a1 = a0
+            var a2 = a0
+            var a3 = a0
+            a0 += 42813 * r2c3
+            a1 += 17734 * r2c3
+            a2 -= 17734 * r2c3
+            a3 -= 42813 * r2c3
+            var b0 = 45451 * r1c3 + 38531 * r3c3
+            var b1 = 38531 * r1c3 - 9041 * r3c3
+            var b2 = 25746 * r1c3 - 45451 * r3c3
+            var b3 = 9041 * r1c3 - 25746 * r3c3
+            if hiRows {
+                a0 += 32767 * r4c3 + 17734 * r6c3
+                a1 += -32767 * r4c3 - 42813 * r6c3
+                a2 += -32767 * r4c3 + 42813 * r6c3
+                a3 += 32767 * r4c3 - 17734 * r6c3
+                b0 += 25746 * r5c3 + 9041 * r7c3
+                b1 += -45451 * r5c3 - 25746 * r7c3
+                b2 += 9041 * r5c3 + 38531 * r7c3
+                b3 += 38531 * r5c3 - 45451 * r7c3
+            }
+            let o = off + 3
+            pl[o] = max(0, min(4095, (a0 + b0) >> 17))
+            pl[o + stride] = max(0, min(4095, (a1 + b1) >> 17))
+            pl[o + 2 * stride] = max(0, min(4095, (a2 + b2) >> 17))
+            pl[o + 3 * stride] = max(0, min(4095, (a3 + b3) >> 17))
+            pl[o + 4 * stride] = max(0, min(4095, (a3 - b3) >> 17))
+            pl[o + 5 * stride] = max(0, min(4095, (a2 - b2) >> 17))
+            pl[o + 6 * stride] = max(0, min(4095, (a1 - b1) >> 17))
+            pl[o + 7 * stride] = max(0, min(4095, (a0 - b0) >> 17))
+        }
+        if true {
+            var a0 = 32767 * (r0c4 + 2)
+            var a1 = a0
+            var a2 = a0
+            var a3 = a0
+            a0 += 42813 * r2c4
+            a1 += 17734 * r2c4
+            a2 -= 17734 * r2c4
+            a3 -= 42813 * r2c4
+            var b0 = 45451 * r1c4 + 38531 * r3c4
+            var b1 = 38531 * r1c4 - 9041 * r3c4
+            var b2 = 25746 * r1c4 - 45451 * r3c4
+            var b3 = 9041 * r1c4 - 25746 * r3c4
+            if hiRows {
+                a0 += 32767 * r4c4 + 17734 * r6c4
+                a1 += -32767 * r4c4 - 42813 * r6c4
+                a2 += -32767 * r4c4 + 42813 * r6c4
+                a3 += 32767 * r4c4 - 17734 * r6c4
+                b0 += 25746 * r5c4 + 9041 * r7c4
+                b1 += -45451 * r5c4 - 25746 * r7c4
+                b2 += 9041 * r5c4 + 38531 * r7c4
+                b3 += 38531 * r5c4 - 45451 * r7c4
+            }
+            let o = off + 4
+            pl[o] = max(0, min(4095, (a0 + b0) >> 17))
+            pl[o + stride] = max(0, min(4095, (a1 + b1) >> 17))
+            pl[o + 2 * stride] = max(0, min(4095, (a2 + b2) >> 17))
+            pl[o + 3 * stride] = max(0, min(4095, (a3 + b3) >> 17))
+            pl[o + 4 * stride] = max(0, min(4095, (a3 - b3) >> 17))
+            pl[o + 5 * stride] = max(0, min(4095, (a2 - b2) >> 17))
+            pl[o + 6 * stride] = max(0, min(4095, (a1 - b1) >> 17))
+            pl[o + 7 * stride] = max(0, min(4095, (a0 - b0) >> 17))
+        }
+        if true {
+            var a0 = 32767 * (r0c5 + 2)
+            var a1 = a0
+            var a2 = a0
+            var a3 = a0
+            a0 += 42813 * r2c5
+            a1 += 17734 * r2c5
+            a2 -= 17734 * r2c5
+            a3 -= 42813 * r2c5
+            var b0 = 45451 * r1c5 + 38531 * r3c5
+            var b1 = 38531 * r1c5 - 9041 * r3c5
+            var b2 = 25746 * r1c5 - 45451 * r3c5
+            var b3 = 9041 * r1c5 - 25746 * r3c5
+            if hiRows {
+                a0 += 32767 * r4c5 + 17734 * r6c5
+                a1 += -32767 * r4c5 - 42813 * r6c5
+                a2 += -32767 * r4c5 + 42813 * r6c5
+                a3 += 32767 * r4c5 - 17734 * r6c5
+                b0 += 25746 * r5c5 + 9041 * r7c5
+                b1 += -45451 * r5c5 - 25746 * r7c5
+                b2 += 9041 * r5c5 + 38531 * r7c5
+                b3 += 38531 * r5c5 - 45451 * r7c5
+            }
+            let o = off + 5
+            pl[o] = max(0, min(4095, (a0 + b0) >> 17))
+            pl[o + stride] = max(0, min(4095, (a1 + b1) >> 17))
+            pl[o + 2 * stride] = max(0, min(4095, (a2 + b2) >> 17))
+            pl[o + 3 * stride] = max(0, min(4095, (a3 + b3) >> 17))
+            pl[o + 4 * stride] = max(0, min(4095, (a3 - b3) >> 17))
+            pl[o + 5 * stride] = max(0, min(4095, (a2 - b2) >> 17))
+            pl[o + 6 * stride] = max(0, min(4095, (a1 - b1) >> 17))
+            pl[o + 7 * stride] = max(0, min(4095, (a0 - b0) >> 17))
+        }
+        if true {
+            var a0 = 32767 * (r0c6 + 2)
+            var a1 = a0
+            var a2 = a0
+            var a3 = a0
+            a0 += 42813 * r2c6
+            a1 += 17734 * r2c6
+            a2 -= 17734 * r2c6
+            a3 -= 42813 * r2c6
+            var b0 = 45451 * r1c6 + 38531 * r3c6
+            var b1 = 38531 * r1c6 - 9041 * r3c6
+            var b2 = 25746 * r1c6 - 45451 * r3c6
+            var b3 = 9041 * r1c6 - 25746 * r3c6
+            if hiRows {
+                a0 += 32767 * r4c6 + 17734 * r6c6
+                a1 += -32767 * r4c6 - 42813 * r6c6
+                a2 += -32767 * r4c6 + 42813 * r6c6
+                a3 += 32767 * r4c6 - 17734 * r6c6
+                b0 += 25746 * r5c6 + 9041 * r7c6
+                b1 += -45451 * r5c6 - 25746 * r7c6
+                b2 += 9041 * r5c6 + 38531 * r7c6
+                b3 += 38531 * r5c6 - 45451 * r7c6
+            }
+            let o = off + 6
+            pl[o] = max(0, min(4095, (a0 + b0) >> 17))
+            pl[o + stride] = max(0, min(4095, (a1 + b1) >> 17))
+            pl[o + 2 * stride] = max(0, min(4095, (a2 + b2) >> 17))
+            pl[o + 3 * stride] = max(0, min(4095, (a3 + b3) >> 17))
+            pl[o + 4 * stride] = max(0, min(4095, (a3 - b3) >> 17))
+            pl[o + 5 * stride] = max(0, min(4095, (a2 - b2) >> 17))
+            pl[o + 6 * stride] = max(0, min(4095, (a1 - b1) >> 17))
+            pl[o + 7 * stride] = max(0, min(4095, (a0 - b0) >> 17))
+        }
+        if true {
+            var a0 = 32767 * (r0c7 + 2)
+            var a1 = a0
+            var a2 = a0
+            var a3 = a0
+            a0 += 42813 * r2c7
+            a1 += 17734 * r2c7
+            a2 -= 17734 * r2c7
+            a3 -= 42813 * r2c7
+            var b0 = 45451 * r1c7 + 38531 * r3c7
+            var b1 = 38531 * r1c7 - 9041 * r3c7
+            var b2 = 25746 * r1c7 - 45451 * r3c7
+            var b3 = 9041 * r1c7 - 25746 * r3c7
+            if hiRows {
+                a0 += 32767 * r4c7 + 17734 * r6c7
+                a1 += -32767 * r4c7 - 42813 * r6c7
+                a2 += -32767 * r4c7 + 42813 * r6c7
+                a3 += 32767 * r4c7 - 17734 * r6c7
+                b0 += 25746 * r5c7 + 9041 * r7c7
+                b1 += -45451 * r5c7 - 25746 * r7c7
+                b2 += 9041 * r5c7 + 38531 * r7c7
+                b3 += 38531 * r5c7 - 45451 * r7c7
+            }
+            let o = off + 7
+            pl[o] = max(0, min(4095, (a0 + b0) >> 17))
+            pl[o + stride] = max(0, min(4095, (a1 + b1) >> 17))
+            pl[o + 2 * stride] = max(0, min(4095, (a2 + b2) >> 17))
+            pl[o + 3 * stride] = max(0, min(4095, (a3 + b3) >> 17))
+            pl[o + 4 * stride] = max(0, min(4095, (a3 - b3) >> 17))
+            pl[o + 5 * stride] = max(0, min(4095, (a2 - b2) >> 17))
+            pl[o + 6 * stride] = max(0, min(4095, (a1 - b1) >> 17))
+            pl[o + 7 * stride] = max(0, min(4095, (a0 - b0) >> 17))
+        }
+    }
+}
+
+fn dxFilled(_ n: Int, _ v: Int) -> [Int] {
+    var out: [Int] = []
+    for _ in 0..n {
+        out.append(v)
+    }
+    out
+}

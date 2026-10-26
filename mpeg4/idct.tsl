@@ -1,0 +1,60 @@
+// The inverse DCT for MPEG-4 Part 2 (ISO/IEC 14496-2 7.4.4.3 and Annex A),
+// written as the integer "simple IDCT" ffmpeg uses for streams from its own
+// encoder and from DivX/Xvid when no special IDCT is asked for: rows first
+// with 11 bits of rounding, then columns with 20. It meets IEEE 1180
+// accuracy. Its arithmetic is that of ffmpeg's ARM64 (NEON) version, the
+// one ffmpeg runs on Apple silicon, so pictures come out the same bit for
+// bit (ffmpeg's plain C version differs only in rows holding just a DC
+// of 1024 or more, by one in the last bit).
+//
+// The block is 64 coefficients in raster order (row * 8 + column). The
+// result is either written (intra blocks, clipped to 0…255) or added to the
+// prediction already in the plane (inter blocks). The transforms are
+// methods of M4Pics (pics.tsl), next to the pictures they write; this file
+// holds their constants.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+// cos(k·π/16)·√2·2^14, rounded.
+let m4W1 = 22725
+let m4W2 = 21407
+let m4W3 = 19266
+let m4W4 = 16383
+let m4W5 = 12873
+let m4W6 = 8867
+let m4W7 = 4520
+
+fn m4Clip255(_ v: Int) -> Int {
+    if v < 0 {
+        return 0
+    }
+    if v > 255 {
+        return 255
+    }
+    v
+}
+
+// --- The Xvid IDCT (ffmpeg's xvididct.c, which ffmpeg uses for streams
+// whose user data says Xvid): rows with per-row tables and rounding, then
+// columns by the "AAN"-style butterflies with 16-bit fixed point
+// tangents. Results differ from the simple IDCT in the last bit now and
+// then, so streams Xvid made come out exactly as ffmpeg shows them. ---
+
+let m4XTab04 = [22725, 21407, 19266, 16384, 12873, 8867, 4520]
+let m4XTab17 = [31521, 29692, 26722, 22725, 17855, 12299, 6270]
+let m4XTab26 = [29692, 27969, 25172, 21407, 16819, 11585, 5906]
+let m4XTab35 = [26722, 25172, 22654, 19266, 15137, 10426, 5315]
+// Row tables and rounding, rows 0…7.
+let m4XRowTab = m4XTab04 + m4XTab17 + m4XTab26 + m4XTab35 + m4XTab04 + m4XTab35 + m4XTab26 + m4XTab17
+let m4XRowRnd = [65536, 3597, 2260, 1203, 0, 120, 512, 512]
+
+// c·x >> 16 on the 32-bit product.
+fn m4XMul(_ c: Int, _ x: Int) -> Int {
+    (c * x) >> 16
+}
+
+// Wraps to a 16-bit signed value (the int16 stores of the C code).
+fn m4I16(_ v: Int) -> Int {
+    ((v + 32768) & 65535) - 32768
+}

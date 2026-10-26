@@ -1,0 +1,278 @@
+// Constant tables of the HEVC (H.265) decoder: CABAC state machine and
+// context initialisation values (ITU-T H.265 9.3.2.2, Tables 9-5 to 9-37),
+// coefficient scan orders (6.5.3 to 6.5.5), the transform matrix (8.6.4.2),
+// intra prediction angles (8.4.4.2.6), interpolation filters (8.5.3.3.3),
+// default scaling lists (Tables 7-5 and 7-6), chroma QP mapping (Table
+// 8-10) and the deblocking tC / beta tables (Table 8-12).
+//
+// Reading a module-level list costs more than reading a field, so the
+// decoder copies the tables it uses in hot loops into its own structs once.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+// rangeTabLps (Table 9-46) by pStateIdx * 4 + qRangeIdx. HEVC uses the same
+// arithmetic coder tables as H.264.
+let hevcRangeLps: [Int] = [
+    128, 176, 208, 240, 128, 167, 197, 227, 128, 158, 187, 216, 123, 150, 178, 205,
+    116, 142, 169, 195, 111, 135, 160, 185, 105, 128, 152, 175, 100, 122, 144, 166,
+    95, 116, 137, 158, 90, 110, 130, 150, 85, 104, 123, 142, 81, 99, 117, 135,
+    77, 94, 111, 128, 73, 89, 105, 122, 69, 85, 100, 116, 66, 80, 95, 110,
+    62, 76, 90, 104, 59, 72, 86, 99, 56, 69, 81, 94, 53, 65, 77, 89,
+    51, 62, 73, 85, 48, 59, 69, 80, 46, 56, 66, 76, 43, 53, 63, 72,
+    41, 50, 59, 69, 39, 48, 56, 65, 37, 45, 54, 62, 35, 43, 51, 59,
+    33, 41, 48, 56, 32, 39, 46, 53, 30, 37, 43, 50, 29, 35, 41, 48,
+    27, 33, 39, 45, 26, 31, 37, 43, 24, 30, 35, 41, 23, 28, 33, 39,
+    22, 27, 32, 37, 21, 26, 30, 35, 20, 24, 29, 33, 19, 23, 27, 31,
+    18, 22, 26, 30, 17, 21, 25, 28, 16, 20, 23, 27, 15, 19, 22, 25,
+    14, 18, 21, 24, 14, 17, 20, 23, 13, 16, 19, 22, 12, 15, 18, 21,
+    12, 14, 17, 20, 11, 14, 16, 19, 11, 13, 15, 18, 10, 12, 15, 17,
+    10, 12, 14, 16, 9, 11, 13, 15, 9, 11, 12, 14, 8, 10, 12, 14,
+    8, 9, 11, 13, 7, 9, 11, 12, 7, 9, 10, 12, 7, 8, 10, 11,
+    6, 8, 9, 11, 6, 7, 9, 10, 6, 7, 8, 9, 2, 2, 2, 2,
+]
+
+// transIdxLps (Table 9-47): the state after a least probable symbol.
+let hevcTransLps: [Int] = [
+    0, 0, 1, 2, 2, 4, 4, 5, 6, 7, 8, 9, 9, 11, 11, 12,
+    13, 13, 15, 15, 16, 16, 18, 18, 19, 19, 21, 21, 22, 22, 23, 24,
+    24, 25, 26, 26, 27, 27, 28, 29, 29, 30, 30, 30, 31, 32, 32, 33,
+    33, 33, 34, 34, 35, 35, 35, 36, 36, 36, 37, 37, 37, 38, 38, 63,
+]
+
+// Context index offsets: where each syntax element's contexts start in
+// the decoder's list of context states (the counts follow each name).
+let ctxSaoMerge = 0           // 1  sao_merge_left_flag, sao_merge_up_flag
+let ctxSaoType = 1            // 1  sao_type_idx_luma / chroma
+let ctxSplitCu = 2            // 3  split_cu_flag
+let ctxTqBypass = 5           // 1  cu_transquant_bypass_flag
+let ctxSkip = 6               // 3  cu_skip_flag
+let ctxQpDelta = 9            // 3  cu_qp_delta_abs
+let ctxPredMode = 12          // 1  pred_mode_flag
+let ctxPartMode = 13          // 4  part_mode
+let ctxPrevIntra = 17         // 1  prev_intra_luma_pred_flag
+let ctxChromaMode = 18        // 2  intra_chroma_pred_mode
+let ctxMergeFlag = 20         // 1  merge_flag
+let ctxMergeIdx = 21          // 1  merge_idx
+let ctxInterPred = 22         // 5  inter_pred_idc
+let ctxRefIdx = 27            // 2  ref_idx_l0 / ref_idx_l1 (2 more unused)
+let ctxMvdGt0 = 31            // 2  abs_mvd_greater0_flag (first used)
+let ctxMvdGt1 = 33            // 2  abs_mvd_greater1_flag (second used)
+let ctxMvpFlag = 35           // 1  mvp_l0_flag / mvp_l1_flag
+let ctxRootCbf = 36           // 1  rqt_root_cbf
+let ctxSplitTu = 37           // 3  split_transform_flag
+let ctxCbfLuma = 40           // 2  cbf_luma
+let ctxCbfChroma = 42         // 5  cbf_cb / cbf_cr
+let ctxTSkip = 47             // 2  transform_skip_flag (luma, chroma)
+let ctxLastX = 53             // 18 last_sig_coeff_x_prefix
+let ctxLastY = 71             // 18 last_sig_coeff_y_prefix
+let ctxSigCg = 89             // 4  coded_sub_block_flag
+let ctxSig = 93               // 44 sig_coeff_flag
+let ctxGt1 = 137              // 24 coeff_abs_level_greater1_flag
+let ctxGt2 = 161              // 6  coeff_abs_level_greater2_flag
+let ctxCount = 179
+
+// initValue of every context for initType 0 (I slices), 1 and 2 (P / B,
+// swapped by cabac_init_flag), in the order of the offsets above
+// (Tables 9-5 to 9-37). 154 is the neutral value used where a context
+// isn't used by a slice type.
+let hevcInitValues: [Int] = [
+    // initType 0
+    153, 200, 139, 141, 157, 154, 154, 154, 154, 154, 154, 154, 154,
+    184, 154, 154, 154, 184, 63, 139, 154, 154, 154, 154, 154, 154, 154,
+    154, 154, 154, 154, 154, 154, 154, 154, 154, 154,
+    153, 138, 138, 111, 141, 94, 138, 182, 154, 154, 139, 139, 139, 139, 139, 139,
+    110, 110, 124, 125, 140, 153, 125, 127, 140, 109, 111, 143, 127, 111, 79, 108, 123, 63,
+    110, 110, 124, 125, 140, 153, 125, 127, 140, 109, 111, 143, 127, 111, 79, 108, 123, 63,
+    91, 171, 134, 141,
+    111, 111, 125, 110, 110, 94, 124, 108, 124, 107, 125, 141, 179, 153,
+    125, 107, 125, 141, 179, 153, 125, 107, 125, 141, 179, 153, 125, 140,
+    139, 182, 182, 152, 136, 152, 136, 153, 136, 139, 111, 136, 139, 111,
+    141, 111,
+    140, 92, 137, 138, 140, 152, 138, 139, 153, 74, 149, 92, 139, 107,
+    122, 152, 140, 179, 166, 182, 140, 227, 122, 197,
+    138, 153, 136, 167, 152, 152,
+    154, 154, 154, 154, 154, 154, 154, 154, 154, 154, 154, 154,
+    // initType 1
+    153, 185, 107, 139, 126, 154, 197, 185, 201, 154, 154, 154, 149,
+    154, 139, 154, 154, 154, 152, 139, 110, 122, 95, 79, 63, 31, 31,
+    153, 153, 153, 153, 140, 198, 140, 198, 168, 79,
+    124, 138, 94, 153, 111, 149, 107, 167, 154, 154, 139, 139, 139, 139, 139, 139,
+    125, 110, 94, 110, 95, 79, 125, 111, 110, 78, 110, 111, 111, 95, 94, 108, 123, 108,
+    125, 110, 94, 110, 95, 79, 125, 111, 110, 78, 110, 111, 111, 95, 94, 108, 123, 108,
+    121, 140, 61, 154,
+    155, 154, 139, 153, 139, 123, 123, 63, 153, 166, 183, 140, 136, 153,
+    154, 166, 183, 140, 136, 153, 154, 166, 183, 140, 136, 153, 154, 170,
+    153, 123, 123, 107, 121, 107, 121, 167, 151, 183, 140, 151, 183, 140,
+    140, 140,
+    154, 196, 196, 167, 154, 152, 167, 182, 182, 134, 149, 136, 153, 121,
+    136, 137, 169, 194, 166, 167, 154, 167, 137, 182,
+    107, 167, 91, 122, 107, 167,
+    154, 154, 154, 154, 154, 154, 154, 154, 154, 154, 154, 154,
+    // initType 2
+    153, 160, 107, 139, 126, 154, 197, 185, 201, 154, 154, 154, 134,
+    154, 139, 154, 154, 183, 152, 139, 154, 137, 95, 79, 63, 31, 31,
+    153, 153, 153, 153, 169, 198, 169, 198, 168, 79,
+    224, 167, 122, 153, 111, 149, 92, 167, 154, 154, 139, 139, 139, 139, 139, 139,
+    125, 110, 124, 110, 95, 94, 125, 111, 111, 79, 125, 126, 111, 111, 79, 108, 123, 93,
+    125, 110, 124, 110, 95, 94, 125, 111, 111, 79, 125, 126, 111, 111, 79, 108, 123, 93,
+    121, 140, 61, 154,
+    170, 154, 139, 153, 139, 123, 123, 63, 124, 166, 183, 140, 136, 153,
+    154, 166, 183, 140, 136, 153, 154, 166, 183, 140, 136, 153, 154, 170,
+    153, 138, 138, 122, 121, 122, 121, 167, 151, 183, 140, 151, 183, 140,
+    140, 140,
+    154, 196, 167, 167, 154, 152, 167, 182, 182, 134, 149, 136, 153, 121,
+    136, 122, 169, 208, 166, 167, 154, 152, 167, 182,
+    107, 167, 91, 107, 107, 167,
+    154, 154, 154, 154, 154, 154, 154, 154, 154, 154, 154, 154,
+]
+
+// ctxIdxMap of sig_coeff_flag for 4x4 blocks (9.3.4.2.5), by yC * 4 + xC.
+let hevcSigCtx4x4: [Int] = [0, 1, 4, 5, 2, 3, 4, 5, 6, 6, 8, 8, 7, 7, 8, 8]
+
+// intraPredAngle by mode 2..34 (Table 8-5), and invAngle by mode 11..25
+// (Table 8-6).
+let hevcIntraAngle: [Int] = [
+    0, 0, 32, 26, 21, 17, 13, 9, 5, 2, 0, -2, -5, -9, -13, -17, -21, -26,
+    -32, -26, -21, -17, -13, -9, -5, -2, 0, 2, 5, 9, 13, 17, 21, 26, 32,
+]
+let hevcInvAngle: [Int] = [
+    -4096, -1638, -910, -630, -482, -390, -315, -256, -315, -390, -482, -630, -910, -1638, -4096,
+]
+
+// Luma interpolation filters fL (Table 8-11) for 1/4, 1/2, 3/4 positions
+// (index frac * 8 + tap), and chroma filters fC (Table 8-12), frac * 4 + tap.
+let hevcLumaFilter: [Int] = [
+    0, 0, 0, 64, 0, 0, 0, 0,
+    -1, 4, -10, 58, 17, -5, 1, 0,
+    -1, 4, -11, 40, 40, -11, 4, -1,
+    0, 1, -5, 17, 58, -10, 4, -1,
+]
+let hevcChromaFilter: [Int] = [
+    0, 64, 0, 0,
+    -2, 58, 10, -2,
+    -4, 54, 16, -2,
+    -6, 46, 28, -4,
+    -4, 36, 36, -4,
+    -4, 28, 46, -6,
+    -2, 16, 54, -4,
+    -2, 10, 58, -2,
+]
+
+// Default 8x8 scaling lists for intra and inter blocks (Table 7-6), in
+// raster order (y * 8 + x); 4x4 lists default to flat 16.
+let hevcDefaultIntra8: [Int] = [
+    16, 16, 16, 16, 17, 18, 21, 24,
+    16, 16, 16, 16, 17, 19, 22, 25,
+    16, 16, 17, 18, 20, 22, 25, 29,
+    16, 16, 18, 21, 24, 27, 31, 36,
+    17, 17, 20, 24, 30, 35, 41, 47,
+    18, 19, 22, 27, 35, 44, 54, 65,
+    21, 22, 25, 31, 41, 54, 70, 88,
+    24, 25, 29, 36, 47, 65, 88, 115,
+]
+let hevcDefaultInter8: [Int] = [
+    16, 16, 16, 16, 17, 18, 20, 24,
+    16, 16, 16, 17, 18, 20, 24, 25,
+    16, 16, 17, 18, 20, 24, 25, 28,
+    16, 17, 18, 20, 24, 25, 28, 33,
+    17, 18, 20, 24, 25, 28, 33, 41,
+    18, 20, 24, 25, 28, 33, 41, 54,
+    20, 24, 25, 28, 33, 41, 54, 71,
+    24, 25, 28, 33, 41, 54, 71, 91,
+]
+
+// QpC from qPi for 4:2:0 (Table 8-10), for qPi 30..43.
+let hevcQpcTable: [Int] = [29, 30, 31, 32, 33, 33, 34, 34, 35, 35, 36, 36, 37, 37]
+
+// levelScale (8.6.3) by qP % 6.
+let hevcLevelScale: [Int] = [40, 45, 51, 57, 64, 72]
+
+// Deblocking tC' by Q 0..53 and beta' by Q 0..51 (Table 8-12).
+let hevcTcTable: [Int] = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+    1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4,
+    5, 5, 6, 6, 7, 8, 9, 10, 11, 13, 14, 16, 18, 20, 22, 24,
+]
+let hevcBetaTable: [Int] = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 6, 7, 8,
+    9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 20, 22, 24, 26, 28, 30, 32, 34, 36,
+    38, 40, 42, 44, 46, 48, 50, 52, 54, 56, 58, 60, 62, 64,
+]
+
+// Sample aspect ratios by aspect_ratio_idc (Table E-1), num, den pairs.
+let hevcSarTable: [Int] = [
+    0, 1, 1, 1, 12, 11, 10, 11, 16, 11, 40, 33, 24, 11, 20, 11, 32, 11,
+    80, 33, 18, 11, 15, 11, 64, 33, 160, 99, 4, 3, 3, 2, 2, 1,
+]
+
+// cos(m * pi / 64) as the integers of the HEVC transform matrix, for m
+// 0..32 (8.6.4.2): every entry of the 32x32 matrix is one of these with a
+// sign, and smaller transforms use every 2nd, 4th or 8th row.
+let hevcCosTable: [Int] = [
+    64, 90, 90, 90, 89, 88, 87, 85, 83, 82, 80, 78, 75, 73, 70, 67,
+    64, 61, 57, 54, 50, 46, 43, 38, 36, 31, 25, 22, 18, 13, 9, 4, 0,
+]
+
+// The 32x32 transform matrix transMatrix[k][n] (k the frequency row),
+// flattened k * 32 + n.
+fn hevcMakeTransMatrix() -> [Int] {
+    var m: [Int] = []
+    let t = hevcCosTable
+    for k in 0..32 {
+        for n in 0..32 {
+            var a = ((2 * n + 1) * k) % 128
+            if a > 64 {
+                a = 128 - a
+            }
+            var sign = 1
+            if a > 32 {
+                a = 64 - a
+                sign = -1
+            }
+            m.append(sign * t[a])
+        }
+    }
+    m
+}
+
+// Up-right diagonal scan of a blkSize x blkSize block (6.5.3): positions
+// as x + y * blkSize in scan order.
+fn hevcDiagScan(_ blkSize: Int) -> [Int] {
+    var out: [Int] = []
+    var x = 0
+    var y = 0
+    while out.count < blkSize * blkSize {
+        while y >= 0 {
+            if x < blkSize && y < blkSize {
+                out.append(x + y * blkSize)
+            }
+            y -= 1
+            x += 1
+        }
+        y = x
+        x = 0
+    }
+    out
+}
+
+// Horizontal (6.5.4) and vertical (6.5.5) scans.
+fn hevcHorScan(_ blkSize: Int) -> [Int] {
+    var out: [Int] = []
+    for y in 0..blkSize {
+        for x in 0..blkSize {
+            out.append(x + y * blkSize)
+        }
+    }
+    out
+}
+
+fn hevcVerScan(_ blkSize: Int) -> [Int] {
+    var out: [Int] = []
+    for x in 0..blkSize {
+        for y in 0..blkSize {
+            out.append(x + y * blkSize)
+        }
+    }
+    out
+}

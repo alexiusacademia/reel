@@ -1,0 +1,1249 @@
+// AV1 inter prediction (spec section 7.11.3): the reconstructor calls
+// Av1Inter.predictInter for every opInter record (av1/frame.tsl). It
+// covers the rounding variables (7.11.3.2), motion vector scaling with
+// reference scaling and intra block copy (7.11.3.3), block inter
+// prediction with the 8-tap / 4-tap sub-sample filters (7.11.3.4), the
+// block warp for local and global warped motion with setup shear and the
+// divisor lookup (7.11.3.5-7.11.3.7), the wedge, difference weight and
+// interintra masks (7.11.3.11-7.11.3.13), mask blend (7.11.3.14), the
+// distance weights (7.11.3.15), compound averaging and overlapped block
+// motion compensation (7.11.3.9-7.11.3.10).
+//
+// The plane being predicted is the field `pl` (the reconstructor swaps it
+// in), so writes are in place; reference planes come from `refs`. The
+// common case (no reference scaling, the filter footprint inside the
+// reference) runs without clamping each sample position, and a single
+// prediction is written straight into the plane.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+let mcPredSize = 16384
+
+struct Av1Inter {
+    pl: [Int] = []
+    ops: [Int] = []
+    gInfo: [Int] = []
+    gMv: [Int] = []
+    miStride: Int = 0
+    hdr: Av1Hdr = Av1Hdr()
+    refs: [Av1Ref] = []
+
+    ready: Bool = false
+    // Table copies (module tables are slow to read in loops).
+    filt: [Int] = []
+    warpF: [Int] = []
+    divLut: [Int] = []
+    obmcMask: [Int] = []
+    iiW: [Int] = []
+    qdw: [Int] = []
+    qdl: [Int] = []
+    subSize: [Int] = []
+    bw4: [Int] = []
+    bh4: [Int] = []
+    wLog2: [Int] = []
+    hLog2: [Int] = []
+    // WedgeMasks: the mask of (bsize, flipSign, wedge) starts at
+    // wedge[wedgeOff[bsize * 32 + sign * 16 + wedge]], Block_Width wide.
+    wedge: [Int] = []
+    wedgeOff: [Int] = []
+
+    // Scratch: the intermediate array of the two-pass filters, the two
+    // predictions (preds[0] at 0, preds[1] at mcPredSize, row stride w),
+    // the blend mask, the warp intermediate and the OBMC prediction.
+    tmp: [Int] = []
+    pr: [Int] = []
+    mask: [Int] = []
+    maskW: Int = 0
+    wtmp: [Int] = []
+    emu: [Int] = []
+    wp: [Int] = [0, 0, 0, 0, 0, 0]
+
+    // Per frame.
+    bitDepth: Int = 8
+    maxV: Int = 255
+    subX: Int = 1
+    subY: Int = 1
+    // Per reference frame type 0..7: scale factors, is_scaled, and whether
+    // its global motion parameters give a valid shear.
+    // 1 when the reference meets the size limits of 7.11.3.3 (a damaged
+    // stream can break them; such references predict mid-grey).
+    scaleOk: [Int] = [1, 1, 1, 1, 1, 1, 1, 1]
+    xScale: [Int] = [0, 0, 0, 0, 0, 0, 0, 0]
+    yScale: [Int] = [0, 0, 0, 0, 0, 0, 0, 0]
+    scaled: [Int] = [0, 0, 0, 0, 0, 0, 0, 0]
+    globalValid: [Int] = [0, 0, 0, 0, 0, 0, 0, 0]
+    // Rounding variables of the current prediction (7.11.3.2).
+    round0: Int = 3
+    round1: Int = 11
+    postRound: Int = 0
+    // Setup shear outputs.
+    shAlpha: Int = 0
+    shBeta: Int = 0
+    shGamma: Int = 0
+    shDelta: Int = 0
+    // Tests only: always take the spec-literal (clamping) path.
+    slow: Bool = false
+    // FwdWeight / BckWeight of COMPOUND_DISTANCE.
+    blendFwd: Int = 8
+    blendBck: Int = 8
+
+    fn setup() {
+        if ready {
+            return
+        }
+        ready = true
+        filt = av1SubpelFilters
+        warpF = av1WarpedFilters
+        divLut = av1DivLut
+        obmcMask = av1ObmcMask2 + av1ObmcMask4 + av1ObmcMask8 + av1ObmcMask16 + av1ObmcMask32
+        iiW = av1IiWeights1d
+        qdw = av1QuantDistWeight
+        qdl = av1QuantDistLookup
+        subSize = av1SubsampledSize
+        bw4 = av1Num4x4BlocksWide
+        bh4 = av1Num4x4BlocksHigh
+        wLog2 = av1MiWidthLog2
+        hLog2 = av1MiHeightLog2
+        tmp = mcZeros(264 * 128)
+        pr = mcZeros(2 * mcPredSize)
+        mask = mcZeros(mcPredSize)
+        wtmp = mcZeros(15 * 8)
+        emu = mcZeros(136 * 136)
+        buildWedges()
+    }
+
+    // initialise_wedge_mask_table (7.11.3.11).
+    fn buildWedges() {
+        let ms = 64
+        // MasterMask[dir][i][j] at dir * 4096 + i * 64 + j.
+        var master = mcZeros(6 * 4096)
+        let odd = av1WedgeMasterObliqueOdd
+        let even = av1WedgeMasterObliqueEven
+        let vert = av1WedgeMasterVertical
+        for j in 0..ms {
+            var shift = ms / 4
+            var i = 0
+            while i < ms {
+                master[3 * 4096 + i * 64 + j] = even[mcClip3(0, ms - 1, j - shift)]
+                shift -= 1
+                master[3 * 4096 + (i + 1) * 64 + j] = odd[mcClip3(0, ms - 1, j - shift)]
+                master[1 * 4096 + i * 64 + j] = vert[j]
+                master[1 * 4096 + (i + 1) * 64 + j] = vert[j]
+                i += 2
+            }
+        }
+        for i in 0..ms {
+            for j in 0..ms {
+                let msk = master[3 * 4096 + i * 64 + j]
+                master[2 * 4096 + j * 64 + i] = msk
+                master[4 * 4096 + i * 64 + (ms - 1 - j)] = 64 - msk
+                master[5 * 4096 + (ms - 1 - j) * 64 + i] = 64 - msk
+                master[0 * 4096 + j * 64 + i] = master[1 * 4096 + i * 64 + j]
+            }
+        }
+        let cb = av1WedgeCodebook
+        let bits = av1WedgeBits
+        wedgeOff = mcZeros(22 * 32)
+        var out: [Int] = []
+        for bsize in 3..22 {
+            if bits[bsize] == 0 {
+                continue
+            }
+            let w = bw4[bsize] * 4
+            let h = bh4[bsize] * 4
+            let shape = if bh4[bsize] > bw4[bsize] { 0 } else if bh4[bsize] < bw4[bsize] { 1 } else { 2 }
+            for wd in 0..16 {
+                let e = (shape * 16 + wd) * 3
+                let dir = cb[e]
+                let xoff = ms / 2 - ((cb[e + 1] * w) >> 3)
+                let yoff = ms / 2 - ((cb[e + 2] * h) >> 3)
+                var sum = 0
+                for i in 0..w {
+                    sum += master[dir * 4096 + yoff * 64 + xoff + i]
+                }
+                for i in 1..h {
+                    sum += master[dir * 4096 + (yoff + i) * 64 + xoff]
+                }
+                let avg = (sum + (w + h - 1) / 2) / (w + h - 1)
+                let flipSign = if avg < 32 { 1 } else { 0 }
+                let a = out.count
+                let b = a + w * h
+                for _ in 0..(2 * w * h) {
+                    out.append(0)
+                }
+                for i in 0..h {
+                    for j in 0..w {
+                        let m = master[dir * 4096 + (yoff + i) * 64 + xoff + j]
+                        out[(if flipSign == 0 { a } else { b }) + i * w + j] = m
+                        out[(if flipSign == 0 { b } else { a }) + i * w + j] = 64 - m
+                    }
+                }
+                wedgeOff[bsize * 32 + wd] = a
+                wedgeOff[bsize * 32 + 16 + wd] = b
+            }
+        }
+        wedge = out
+    }
+
+    // Per-frame values; call after hdr and refs are set.
+    fn beginFrame() {
+        setup()
+
+        bitDepth = hdr.bitDepth
+        maxV = (1 << bitDepth) - 1
+        subX = hdr.subX
+        subY = hdr.subY
+        let fw = max(hdr.frameWidth, 1)
+        let fh = max(hdr.frameHeight, 1)
+        for rf in 1..8 {
+            var rw = fw
+            var rh = fh
+            let idx = hdr.refFrameIdx[rf - 1]
+            if idx >= 0 && idx < refs.count && refs[idx].ok {
+                rw = refs[idx].upscaledWidth
+                rh = refs[idx].frameHeight
+            }
+            let xs = ((rw << 14) + fw / 2) / fw
+            let ys = ((rh << 14) + fh / 2) / fh
+            xScale[rf] = xs
+            yScale[rf] = ys
+            scaleOk[rf] = if 2 * fw >= rw && 2 * fh >= rh && fw <= 16 * rw && fh <= 16 * rh { 1 } else { 0 }
+            scaled[rf] = if xs != 16384 || ys != 16384 { 1 } else { 0 }
+            globalValid[rf] = 0
+            if hdr.gmParams.count >= 48 && hdr.gmType[rf] > 1 {
+                for i in 0..6 {
+                    wp[i] = hdr.gmParams[rf * 6 + i]
+                }
+                globalValid[rf] = if setupShear() { 1 } else { 0 }
+            }
+        }
+    }
+
+    // Rounding variables derivation (7.11.3.2).
+    fn setRound(_ isCompound: Bool) {
+        round0 = 3
+        round1 = if isCompound { 7 } else { 11 }
+        if bitDepth == 12 {
+            round0 = 5
+            if !isCompound {
+                round1 = 9
+            }
+        }
+        postRound = 14 - (round0 + round1)
+    }
+
+    // Setup shear (7.11.3.6) on wp; sets shAlpha … shDelta, returns
+    // warpValid.
+    fn setupShear() -> Bool {
+        let alpha0 = mcClip3(-32768, 32767, wp[2] - 65536)
+        let beta0 = mcClip3(-32768, 32767, wp[3])
+        let (divShift, divFactor) = resolveDivisor(wp[2])
+        let v = wp[4] << 16
+        let gamma0 = mcClip3(-32768, 32767, mcRound2Signed(v * divFactor, divShift))
+        let w = wp[3] * wp[4]
+        let delta0 = mcClip3(-32768, 32767, wp[5] - mcRound2Signed(w * divFactor, divShift) - 65536)
+        shAlpha = mcRound2Signed(alpha0, 6) << 6
+        shBeta = mcRound2Signed(beta0, 6) << 6
+        shGamma = mcRound2Signed(gamma0, 6) << 6
+        shDelta = mcRound2Signed(delta0, 6) << 6
+        if 4 * mcAbs(shAlpha) + 7 * mcAbs(shBeta) >= 65536 {
+            return false
+        }
+        if 4 * mcAbs(shGamma) + 4 * mcAbs(shDelta) >= 65536 {
+            return false
+        }
+        true
+    }
+
+    // Resolve divisor (7.11.3.7).
+    fn resolveDivisor(_ d: Int) -> (Int, Int) {
+        let a = mcAbs(d)
+        if a == 0 {
+            return (14, 0)
+        }
+        let n = mcFloorLog2(a)
+        let e = a - (1 << n)
+        var f = 0
+        if n > 8 {
+            f = (e + (1 << (n - 9))) >> (n - 8)
+        } else {
+            f = e << (8 - n)
+        }
+        let divShift = n + 14
+        let divFactor = if d < 0 { -divLut[f] } else { divLut[f] }
+        (divShift, divFactor)
+    }
+
+    // get_relative_dist (5.9.24).
+    fn relDist(_ a: Int, _ b: Int) -> Int {
+        if !hdr.enableOrderHint {
+            return 0
+        }
+        let diff = a - b
+        let m = 1 << (hdr.orderHintBits - 1)
+        (diff & (m - 1)) - (diff & m)
+    }
+
+    // The opInter record at ops[at] for the opBlock record at ops[blockAt].
+    fn predictInter(_ at: Int, _ blockAt: Int, _ stride: Int) {
+        let plane = ops[at + 1]
+        let x = ops[at + 2]
+        let y = ops[at + 3]
+        let w = ops[at + 4]
+        let h = ops[at + 5]
+        let candRow = ops[at + 6]
+        let candCol = ops[at + 7]
+        let b = blockAt
+        let gi = candRow * miStride + candCol
+        let g = gInfo[gi]
+        let mvp = gMv[gi]
+        let ref0 = ((g >> 5) & 15) - 1
+        let ref1 = ((g >> 9) & 15) - 1
+        let isCompound = ref1 > 0
+        setRound(isCompound)
+        let sx = if plane == 0 { 0 } else { subX }
+        let sy = if plane == 0 { 0 } else { subY }
+        let useIntrabc = ops[b + 5] == 1
+        let yMode = ops[b + 6]
+        let motionMode = ops[b + 8]
+        let compoundType = ops[b + 9]
+        let isII = ops[b + 13] == 1
+        let globalMode = yMode == 16 || yMode == 24
+        let fv0 = (g >> 23) & 3
+        let fh0 = (g >> 25) & 3
+        var fv = fv0
+        var fh = fh0
+        if w <= 4 {
+            if fh == 0 || fh == 2 {
+                fh = 4
+            } else if fh == 1 {
+                fh = 5
+            }
+        }
+        if h <= 4 {
+            if fv == 0 || fv == 2 {
+                fv = 4
+            } else if fv == 1 {
+                fv = 5
+            }
+        }
+        let direct = !isCompound && !isII && !useIntrabc
+        let numRefs = if isCompound { 2 } else { 1 }
+        if isCompound && compoundType == 4 {
+            distanceWeights(ref0, ref1)
+        }
+        // Compound average / distance blends straight into the plane while
+        // the second prediction is made (unless it is warped).
+        var blended = false
+        for refList in 0..numRefs {
+            let refFrame = if refList == 0 { ref0 } else { ref1 }
+            let mvRow = mcMvPart(mvp, 2 * refList)
+            let mvCol = mcMvPart(mvp, 2 * refList + 1)
+            var useWarp = 0
+            if w >= 8 && h >= 8 && !hdr.forceIntegerMv && refFrame > 0 {
+                if motionMode == 2 && ops[b + 16] == 1 {
+                    useWarp = 1
+                } else if globalMode && hdr.gmType[refFrame] > 1 && scaled[refFrame] == 0 && globalValid[refFrame] == 1 {
+                    useWarp = 2
+                }
+            }
+            let k = refList * mcPredSize
+            let dOff = y * stride + x
+            if useIntrabc {
+                let lastX = ((hdr.miCols * 4 + sx) >> sx) - 1
+                let lastY = ((hdr.miRows * 4 + sy) >> sy) - 1
+                let ox = (x << 4) + ((2 * mvCol) >> sx)
+                let oy = (y << 4) + ((2 * mvRow) >> sy)
+                let src = pl
+                blockPred(src, stride, lastX, lastY, ox * 64 + 32, oy * 64 + 32, 1024, 1024, w, h, fv, fh, k, 0, 0, 0)
+                continue
+            }
+            let idx = if refFrame > 0 && refFrame < 8 { hdr.refFrameIdx[refFrame - 1] } else { -1 }
+            if idx < 0 || idx >= refs.count || !refs[idx].ok || scaleOk[refFrame] == 0 {
+                fillConst(k, w, h, direct, dOff, stride)
+                continue
+            }
+            let r = refs[idx]
+            let rp = if plane == 0 { r.y } else if plane == 1 { r.u } else { r.v }
+            let rs = if plane == 0 { r.yStride } else { r.cStride }
+            if rp.isEmpty {
+                fillConst(k, w, h, direct, dOff, stride)
+                continue
+            }
+            let lastX = ((r.upscaledWidth + sx) >> sx) - 1
+            let lastY = ((r.frameHeight + sy) >> sy) - 1
+            if useWarp != 0 {
+                if useWarp == 1 {
+                    for i in 0..6 {
+                        wp[i] = ops[b + 17 + i]
+                    }
+                } else {
+                    for i in 0..6 {
+                        wp[i] = hdr.gmParams[refFrame * 6 + i]
+                    }
+                }
+                blockWarp(rp, rs, lastX, lastY, x, y, w, h, sx, sy, k, direct, dOff, stride)
+                continue
+            }
+            // Motion vector scaling (7.11.3.3).
+            let xs = xScale[refFrame]
+            let ys = yScale[refFrame]
+            let origX = (x << 4) + ((2 * mvCol) >> sx) + 8
+            let origY = (y << 4) + ((2 * mvRow) >> sy) + 8
+            var startX = 0
+            var startY = 0
+            var stepX = 1024
+            var stepY = 1024
+            if xs == 16384 && ys == 16384 {
+                startX = (origX - 8) * 64 + 32
+                startY = (origY - 8) * 64 + 32
+            } else {
+                let baseX = origX * xs - (8 << 14)
+                let baseY = origY * ys - (8 << 14)
+                startX = mcRound2Signed(baseX, 8) + 32
+                startY = mcRound2Signed(baseY, 8) + 32
+                stepX = mcRound2Signed(xs, 4)
+                stepY = mcRound2Signed(ys, 4)
+            }
+            var mode = if direct { 1 } else { 0 }
+            if refList == 1 && (compoundType == 2 || compoundType == 4) {
+                mode = if compoundType == 2 { 2 } else { 3 }
+                blended = true
+            }
+            blockPred(rp, rs, lastX, lastY, startX, startY, stepX, stepY, w, h, fv, fh, k, mode, dOff, stride)
+        }
+        if direct || blended {
+            if motionMode == 1 {
+                obmc(plane, x, y, w, h, b, stride)
+            }
+            return
+        }
+        let post = postRound
+        let mv = maxV
+        if !isCompound && !isII {
+            // Intra block copy: the prediction is final, clip it in.
+            for i in 0..h {
+                let d = (y + i) * stride + x
+                let s = i * w
+                for j in 0..w {
+                    pl[d + j] = mcClip(pr[s + j], mv)
+                }
+            }
+        } else if compoundType == 2 {
+            let rnd = 1 << post
+            let sh = post + 1
+            for i in 0..h {
+                let d = (y + i) * stride + x
+                let s = i * w
+                for j in 0..w {
+                    pl[d + j] = mcClip((pr[s + j] + pr[mcPredSize + s + j] + rnd) >> sh, mv)
+                }
+            }
+        } else if compoundType == 4 {
+            let fwd = blendFwd
+            let bck = blendBck
+            let sh = 4 + post
+            let rnd = 1 << (sh - 1)
+            for i in 0..h {
+                let d = (y + i) * stride + x
+                let s = i * w
+                for j in 0..w {
+                    pl[d + j] = mcClip((fwd * pr[s + j] + bck * pr[mcPredSize + s + j] + rnd) >> sh, mv)
+                }
+            }
+        } else {
+            // Masks (7.11.3.11-13) and mask blend (7.11.3.14).
+            let wedgeII = ops[b + 15] == 1
+            if compoundType == 0 && plane == 0 {
+                let miSize = ops[b + 3]
+                let off = wedgeOff[miSize * 32 + ops[b + 11] * 16 + ops[b + 10]]
+                for i in 0..(w * h) {
+                    mask[i] = wedge[off + i]
+                }
+                maskW = w
+            } else if compoundType == 3 {
+                let mode = ops[b + 14]
+                let scale = 128 / max(h, w)
+                for i in 0..h {
+                    for j in 0..w {
+                        var m = 32
+                        if mode == 1 {
+                            m = iiW[i * scale]
+                        } else if mode == 2 {
+                            m = iiW[j * scale]
+                        } else if mode == 3 {
+                            m = iiW[min(i, j) * scale]
+                        }
+                        mask[i * w + j] = m
+                    }
+                }
+                maskW = w
+            } else if compoundType == 1 && plane == 0 {
+                let sh = (bitDepth - 8) + post
+                let rnd = if sh > 0 { 1 << (sh - 1) } else { 0 }
+                let inv = ops[b + 12] == 1
+                for i in 0..(w * h) {
+                    let diff = (mcAbs(pr[i] - pr[mcPredSize + i]) + rnd) >> sh
+                    let m = mcClip3(0, 64, 38 + diff / 16)
+                    mask[i] = if inv { 64 - m } else { m }
+                }
+                maskW = w
+            }
+            let full = (sx == 0 && sy == 0) || (isII && !wedgeII)
+            let mw = maskW
+            for i in 0..h {
+                let d = (y + i) * stride + x
+                let s = i * w
+                for j in 0..w {
+                    var m = 0
+                    if full {
+                        m = mask[i * mw + j]
+                    } else if sx == 1 && sy == 0 {
+                        m = (mask[i * mw + 2 * j] + mask[i * mw + 2 * j + 1] + 1) >> 1
+                    } else {
+                        let q = 2 * i * mw + 2 * j
+                        m = (mask[q] + mask[q + 1] + mask[q + mw] + mask[q + mw + 1] + 2) >> 2
+                    }
+                    if isII {
+                        let p0 = mcClip(mcRound2(pr[s + j], post), mv)
+                        let p1 = pl[d + j]
+                        pl[d + j] = (m * p1 + (64 - m) * p0 + 32) >> 6
+                    } else {
+                        pl[d + j] = mcClip(mcRound2(m * pr[s + j] + (64 - m) * pr[mcPredSize + s + j], 6 + post), mv)
+                    }
+                }
+            }
+        }
+        if motionMode == 1 {
+            obmc(plane, x, y, w, h, b, stride)
+        }
+    }
+
+    // Distance weights (7.11.3.15) into blendFwd / blendBck.
+    fn distanceWeights(_ ref0: Int, _ ref1: Int) {
+        let dist0 = mcClip3(0, 31, mcAbs(relDist(hdr.orderHints[ref0], hdr.orderHint)))
+        let dist1 = mcClip3(0, 31, mcAbs(relDist(hdr.orderHints[ref1], hdr.orderHint)))
+        let d0 = dist1
+        let d1 = dist0
+        let order = if d0 <= d1 { 1 } else { 0 }
+        if d0 == 0 || d1 == 0 {
+            blendFwd = qdl[3 * 2 + order]
+            blendBck = qdl[3 * 2 + 1 - order]
+            return
+        }
+        var i = 0
+        while i < 3 {
+            let c0 = qdw[i * 2 + order]
+            let c1 = qdw[i * 2 + 1 - order]
+            if order == 1 {
+                if d0 * c0 > d1 * c1 {
+                    break
+                }
+            } else {
+                if d0 * c0 < d1 * c1 {
+                    break
+                }
+            }
+            i += 1
+        }
+        blendFwd = qdl[i * 2 + order]
+        blendBck = qdl[i * 2 + 1 - order]
+    }
+
+    // A prediction from a missing reference: mid grey.
+    fn fillConst(_ k: Int, _ w: Int, _ h: Int, _ direct: Bool, _ dOff: Int, _ dStride: Int) {
+        let mid = 1 << (bitDepth - 1)
+        let v = mid << postRound
+        for i in 0..h {
+            for j in 0..w {
+                if direct {
+                    pl[dOff + i * dStride + j] = mid
+                } else {
+                    pr[k + i * w + j] = v
+                }
+            }
+        }
+    }
+
+    // Block inter prediction (7.11.3.4) from plane rp (stride rs) at
+    // (sx, sy) in 1/1024 sample units with steps xStep / yStep. fv / fh:
+    // filter types for the vertical and horizontal passes, with the 4-tap
+    // substitution already made. Each predicted value (pred[ r ][ c ] of
+    // the spec) is put by `mode`:
+    //   0  into pr[k + r * w + c]
+    //   1  clipped into pl at dOff (row stride dStride): a single prediction
+    //   2  averaged with preds[0] (pr[r * w + c]) into pl (COMPOUND_AVERAGE)
+    //   3  weighted with preds[0] by blendFwd / blendBck into pl
+    //      (COMPOUND_DISTANCE)
+    fn blockPred(_ rp: [Int], _ rs: Int, _ lastX: Int, _ lastY: Int, _ sx: Int, _ sy: Int,
+                 _ xStep: Int, _ yStep: Int, _ w: Int, _ h: Int, _ fv: Int, _ fh: Int,
+                 _ k: Int, _ mode: Int, _ dOff: Int, _ dStride: Int) {
+        let r0 = round0
+        let r1 = round1
+        let rnd0 = 1 << (r0 - 1)
+        let rnd1 = 1 << (r1 - 1)
+        let x0 = sx >> 10
+        let y0 = sy >> 10
+        let f = filt
+        if !slow && xStep == 1024 && yStep == 1024 && x0 >= 3 && x0 + w + 4 <= lastX && y0 >= 3 && y0 + h + 3 <= lastY {
+            // Unscaled, inside the reference: the filter phases are the
+            // same for every sample. Two horizontally neighbouring samples
+            // are worked on at once, packed in one Int (sample 2c in the
+            // low 32 bits, 2c + 1 above; every sum stays far inside 31
+            // bits, so the halves only need a sign fix-up when split).
+            let fx = (sx >> 6) & 15
+            let fy = (sy >> 6) & 15
+            let wp2 = w >> 1
+            if fx == 0 && fy == 0 {
+                // Whole-sample motion: Round2(Round2(128 v, r0) 128, r1)
+                // is exactly v << postRound.
+                let post = postRound
+                if mode == 1 {
+                    for r in 0..h {
+                        let s = (y0 + r) * rs + x0
+                        let d = dOff + r * dStride
+                        for c in 0..w {
+                            pl[d + c] = rp[s + c]
+                        }
+                    }
+                } else if mode == 0 {
+                    for r in 0..h {
+                        let s = (y0 + r) * rs + x0
+                        let d = k + r * w
+                        for c in 0..w {
+                            pr[d + c] = rp[s + c] << post
+                        }
+                    }
+                } else {
+                    for r in 0..h {
+                        let s = (y0 + r) * rs + x0
+                        for c in 0..w {
+                            putBlend(mode, r * w + c, dOff + r * dStride + c, rp[s + c] << post)
+                        }
+                    }
+                }
+                return
+            }
+            let rStart = if fy == 0 { 3 } else { 0 }
+            let rEnd = if fy == 0 { 3 + h } else { h + 7 }
+            let one = 1 + (1 << 32)
+            if fx == 0 {
+                let sh = 7 - r0
+                for r in rStart..rEnd {
+                    let s = (y0 + r - 3) * rs + x0
+                    let t = r * wp2
+                    var c = 0
+                    while c < wp2 {
+                        tmp[t + c] = (rp[s + 2 * c] << sh) + (rp[s + 2 * c + 1] << (sh + 32))
+                        c += 1
+                    }
+                }
+            } else {
+                let hb = (fh * 16 + fx) * 8
+                let h0 = f[hb + 0]
+                let h1 = f[hb + 1]
+                let h2 = f[hb + 2]
+                let h3 = f[hb + 3]
+                let h4 = f[hb + 4]
+                let h5 = f[hb + 5]
+                let h6 = f[hb + 6]
+                let h7 = f[hb + 7]
+                let rnd = rnd0 * one
+                // Taps 0 and 7 are zero in the regular and smooth filters,
+                // taps 1 and 6 too in the 4-tap and bilinear ones.
+                let taps = if h0 != 0 || h7 != 0 { 8 } else if h1 != 0 || h6 != 0 { 6 } else { 4 }
+                for r in rStart..rEnd {
+                    if taps == 8 {
+                        let s = (y0 + r - 3) * rs + x0 - 3
+                        let t = r * wp2
+                        let a0 = rp[s + 0]
+                        let a1 = rp[s + 1]
+                        let a2 = rp[s + 2]
+                        let a3 = rp[s + 3]
+                        let a4 = rp[s + 4]
+                        let a5 = rp[s + 5]
+                        let a6 = rp[s + 6]
+                        var a7 = rp[s + 7]
+                        var p0 = a0 + (a1 << 32)
+                        var p1 = a1 + (a2 << 32)
+                        var p2 = a2 + (a3 << 32)
+                        var p3 = a3 + (a4 << 32)
+                        var p4 = a4 + (a5 << 32)
+                        var p5 = a5 + (a6 << 32)
+                        var p6 = a6 + (a7 << 32)
+                        var q = s + 8
+                        var c = 0
+                        while c < wp2 {
+                            let b0 = rp[q]
+                            let b1 = rp[q + 1]
+                            let p7 = a7 + (b0 << 32)
+                            let sum = h0 * p0 + h1 * p1 + h2 * p2 + h3 * p3 + h4 * p4 + h5 * p5 + h6 * p6 + h7 * p7 + rnd
+                            let lo = ((sum & 0xffffffff) ^ 0x80000000) - 0x80000000
+                            let hi = (sum - lo) >> 32
+                            tmp[t + c] = (lo >> r0) + ((hi >> r0) << 32)
+                            p0 = p2
+                            p1 = p3
+                            p2 = p4
+                            p3 = p5
+                            p4 = p6
+                            p5 = p7
+                            p6 = b0 + (b1 << 32)
+                            a7 = b1
+                            q += 2
+                            c += 1
+                        }
+                    } else if taps == 6 {
+                        let s = (y0 + r - 3) * rs + x0 - 3
+                        let t = r * wp2
+                        let a1 = rp[s + 1]
+                        let a2 = rp[s + 2]
+                        let a3 = rp[s + 3]
+                        let a4 = rp[s + 4]
+                        let a5 = rp[s + 5]
+                        var a6 = rp[s + 6]
+                        var p1 = a1 + (a2 << 32)
+                        var p2 = a2 + (a3 << 32)
+                        var p3 = a3 + (a4 << 32)
+                        var p4 = a4 + (a5 << 32)
+                        var p5 = a5 + (a6 << 32)
+                        var q = s + 7
+                        var c = 0
+                        while c < wp2 {
+                            let b0 = rp[q]
+                            let b1 = rp[q + 1]
+                            let p6 = a6 + (b0 << 32)
+                            let sum = h1 * p1 + h2 * p2 + h3 * p3 + h4 * p4 + h5 * p5 + h6 * p6 + rnd
+                            let lo = ((sum & 0xffffffff) ^ 0x80000000) - 0x80000000
+                            let hi = (sum - lo) >> 32
+                            tmp[t + c] = (lo >> r0) + ((hi >> r0) << 32)
+                            p1 = p3
+                            p2 = p4
+                            p3 = p5
+                            p4 = p6
+                            p5 = b0 + (b1 << 32)
+                            a6 = b1
+                            q += 2
+                            c += 1
+                        }
+                    } else {
+                        let s = (y0 + r - 3) * rs + x0 - 3
+                        let t = r * wp2
+                        let a2 = rp[s + 2]
+                        let a3 = rp[s + 3]
+                        let a4 = rp[s + 4]
+                        var a5 = rp[s + 5]
+                        var p2 = a2 + (a3 << 32)
+                        var p3 = a3 + (a4 << 32)
+                        var p4 = a4 + (a5 << 32)
+                        var q = s + 6
+                        var c = 0
+                        while c < wp2 {
+                            let b0 = rp[q]
+                            let b1 = rp[q + 1]
+                            let p5 = a5 + (b0 << 32)
+                            let sum = h2 * p2 + h3 * p3 + h4 * p4 + h5 * p5 + rnd
+                            let lo = ((sum & 0xffffffff) ^ 0x80000000) - 0x80000000
+                            let hi = (sum - lo) >> 32
+                            tmp[t + c] = (lo >> r0) + ((hi >> r0) << 32)
+                            p2 = p4
+                            p3 = p5
+                            p4 = b0 + (b1 << 32)
+                            a5 = b1
+                            q += 2
+                            c += 1
+                        }
+                    }
+                }
+            }
+            let rnd = rnd1 * one
+            let mv = maxV
+            let aRnd = 1 << postRound
+            let aSh = postRound + 1
+            if fy == 0 {
+                for r in 0..h {
+                    let t = (r + 3) * wp2
+                    let d = dOff + r * dStride
+                    let e = r * w
+                    for c in 0..wp2 {
+                        let sum = (tmp[t + c] << 7) + rnd
+                        let lo = ((sum & 0xffffffff) ^ 0x80000000) - 0x80000000
+                        let e0 = lo >> r1
+                        let e1 = (sum - lo) >> (32 + r1)
+                        if mode == 1 {
+                            pl[d + 2 * c] = if e0 < 0 { 0 } else if e0 > mv { mv } else { e0 }
+                            pl[d + 2 * c + 1] = if e1 < 0 { 0 } else if e1 > mv { mv } else { e1 }
+                        } else if mode == 0 {
+                            pr[k + e + 2 * c] = e0
+                            pr[k + e + 2 * c + 1] = e1
+                        } else {
+                            putBlend(mode, e + 2 * c, d + 2 * c, e0)
+                            putBlend(mode, e + 2 * c + 1, d + 2 * c + 1, e1)
+                        }
+                    }
+                }
+                return
+            }
+            let vb = (fv * 16 + fy) * 8
+            let v0 = f[vb + 0]
+            let v1 = f[vb + 1]
+            let v2 = f[vb + 2]
+            let v3 = f[vb + 3]
+            let v4 = f[vb + 4]
+            let v5 = f[vb + 5]
+            let v6 = f[vb + 6]
+            let v7 = f[vb + 7]
+            let vtaps = if v0 != 0 || v7 != 0 { 8 } else if v1 != 0 || v6 != 0 { 6 } else { 4 }
+            // Down each pair of columns, the filter's rows kept in locals.
+            for c in 0..wp2 {
+                if vtaps == 8 {
+                    var q0 = tmp[0 * wp2 + c]
+                    var q1 = tmp[1 * wp2 + c]
+                    var q2 = tmp[2 * wp2 + c]
+                    var q3 = tmp[3 * wp2 + c]
+                    var q4 = tmp[4 * wp2 + c]
+                    var q5 = tmp[5 * wp2 + c]
+                    var q6 = tmp[6 * wp2 + c]
+                    var t = 7 * wp2 + c
+                    var d = dOff + 2 * c
+                    var e = 2 * c
+                    for _ in 0..h {
+                        let q7 = tmp[t]
+                        let sum = v0 * q0 + v1 * q1 + v2 * q2 + v3 * q3 + v4 * q4 + v5 * q5 + v6 * q6 + v7 * q7 + rnd
+                        let lo = ((sum & 0xffffffff) ^ 0x80000000) - 0x80000000
+                        let e0 = lo >> r1
+                        let e1 = (sum - lo) >> (32 + r1)
+                        if mode == 1 {
+                            pl[d] = if e0 < 0 { 0 } else if e0 > mv { mv } else { e0 }
+                            pl[d + 1] = if e1 < 0 { 0 } else if e1 > mv { mv } else { e1 }
+                        } else if mode == 0 {
+                            pr[k + e] = e0
+                            pr[k + e + 1] = e1
+                        } else if mode == 2 {
+                            let a0 = (pr[e] + e0 + aRnd) >> aSh
+                            let a1 = (pr[e + 1] + e1 + aRnd) >> aSh
+                            pl[d] = if a0 < 0 { 0 } else if a0 > mv { mv } else { a0 }
+                            pl[d + 1] = if a1 < 0 { 0 } else if a1 > mv { mv } else { a1 }
+                        } else {
+                            putBlend(mode, e, d, e0)
+                            putBlend(mode, e + 1, d + 1, e1)
+                        }
+                        q0 = q1
+                        q1 = q2
+                        q2 = q3
+                        q3 = q4
+                        q4 = q5
+                        q5 = q6
+                        q6 = q7
+                        t += wp2
+                        d += dStride
+                        e += w
+                    }
+                } else if vtaps == 6 {
+                    var q1 = tmp[1 * wp2 + c]
+                    var q2 = tmp[2 * wp2 + c]
+                    var q3 = tmp[3 * wp2 + c]
+                    var q4 = tmp[4 * wp2 + c]
+                    var q5 = tmp[5 * wp2 + c]
+                    var t = 6 * wp2 + c
+                    var d = dOff + 2 * c
+                    var e = 2 * c
+                    for _ in 0..h {
+                        let q6 = tmp[t]
+                        let sum = v1 * q1 + v2 * q2 + v3 * q3 + v4 * q4 + v5 * q5 + v6 * q6 + rnd
+                        let lo = ((sum & 0xffffffff) ^ 0x80000000) - 0x80000000
+                        let e0 = lo >> r1
+                        let e1 = (sum - lo) >> (32 + r1)
+                        if mode == 1 {
+                            pl[d] = if e0 < 0 { 0 } else if e0 > mv { mv } else { e0 }
+                            pl[d + 1] = if e1 < 0 { 0 } else if e1 > mv { mv } else { e1 }
+                        } else if mode == 0 {
+                            pr[k + e] = e0
+                            pr[k + e + 1] = e1
+                        } else if mode == 2 {
+                            let a0 = (pr[e] + e0 + aRnd) >> aSh
+                            let a1 = (pr[e + 1] + e1 + aRnd) >> aSh
+                            pl[d] = if a0 < 0 { 0 } else if a0 > mv { mv } else { a0 }
+                            pl[d + 1] = if a1 < 0 { 0 } else if a1 > mv { mv } else { a1 }
+                        } else {
+                            putBlend(mode, e, d, e0)
+                            putBlend(mode, e + 1, d + 1, e1)
+                        }
+                        q1 = q2
+                        q2 = q3
+                        q3 = q4
+                        q4 = q5
+                        q5 = q6
+                        t += wp2
+                        d += dStride
+                        e += w
+                    }
+                } else {
+                    var q2 = tmp[2 * wp2 + c]
+                    var q3 = tmp[3 * wp2 + c]
+                    var q4 = tmp[4 * wp2 + c]
+                    var t = 5 * wp2 + c
+                    var d = dOff + 2 * c
+                    var e = 2 * c
+                    for _ in 0..h {
+                        let q5 = tmp[t]
+                        let sum = v2 * q2 + v3 * q3 + v4 * q4 + v5 * q5 + rnd
+                        let lo = ((sum & 0xffffffff) ^ 0x80000000) - 0x80000000
+                        let e0 = lo >> r1
+                        let e1 = (sum - lo) >> (32 + r1)
+                        if mode == 1 {
+                            pl[d] = if e0 < 0 { 0 } else if e0 > mv { mv } else { e0 }
+                            pl[d + 1] = if e1 < 0 { 0 } else if e1 > mv { mv } else { e1 }
+                        } else if mode == 0 {
+                            pr[k + e] = e0
+                            pr[k + e + 1] = e1
+                        } else if mode == 2 {
+                            let a0 = (pr[e] + e0 + aRnd) >> aSh
+                            let a1 = (pr[e + 1] + e1 + aRnd) >> aSh
+                            pl[d] = if a0 < 0 { 0 } else if a0 > mv { mv } else { a0 }
+                            pl[d + 1] = if a1 < 0 { 0 } else if a1 > mv { mv } else { a1 }
+                        } else {
+                            putBlend(mode, e, d, e0)
+                            putBlend(mode, e + 1, d + 1, e1)
+                        }
+                        q2 = q3
+                        q3 = q4
+                        q4 = q5
+                        t += wp2
+                        d += dStride
+                        e += w
+                    }
+                }
+            }
+            return
+        }
+        if !slow && xStep == 1024 && yStep == 1024 {
+            // Unscaled near the reference's edges: copy the footprint with
+            // the spec's position clamping into emu, then filter from there
+            // (the same samples, so the same result).
+            let ew = w + 8
+            let eh = h + 8
+            for r in 0..eh {
+                let row = mcClip3(0, lastY, y0 - 3 + r) * rs
+                let t = r * ew
+                for c in 0..ew {
+                    emu[t + c] = rp[row + mcClip3(0, lastX, x0 - 3 + c)]
+                }
+            }
+            let e = emu
+            blockPred(e, ew, ew - 1, eh - 1, (3 << 10) + (sx & 1023), (3 << 10) + (sy & 1023), 1024, 1024,
+                      w, h, fv, fh, k, mode, dOff, dStride)
+            return
+        }
+        // General case, as written in the spec (clamped positions, any step).
+        let ih = (((h - 1) * yStep + 1023) >> 10) + 8
+        for r in 0..ih {
+            let row = mcClip3(0, lastY, y0 + r - 3) * rs
+            let t = r * w
+            for c in 0..w {
+                let p = sx + xStep * c
+                let fb = (fh * 16 + ((p >> 6) & 15)) * 8
+                let px = (p >> 10) - 3
+                var s = 0
+                for tt in 0..8 {
+                    s += f[fb + tt] * rp[row + mcClip3(0, lastX, px + tt)]
+                }
+                tmp[t + c] = (s + rnd0) >> r0
+            }
+        }
+        for r in 0..h {
+            let p = (sy & 1023) + yStep * r
+            let fb = (fv * 16 + ((p >> 6) & 15)) * 8
+            let base = (p >> 10) * w
+            for c in 0..w {
+                var s = 0
+                for tt in 0..8 {
+                    s += f[fb + tt] * tmp[base + tt * w + c]
+                }
+                put(mode, k, r * w + c, dOff + r * dStride + c, (s + rnd1) >> r1)
+            }
+        }
+    }
+
+    // Puts one predicted value v by `mode` (see blockPred); e is the index
+    // in the w-wide prediction, d in the plane.
+    fn put(_ mode: Int, _ k: Int, _ e: Int, _ d: Int, _ v: Int) {
+        if mode == 0 {
+            pr[k + e] = v
+        } else if mode == 1 {
+            pl[d] = mcClip(v, maxV)
+        } else {
+            putBlend(mode, e, d, v)
+        }
+    }
+
+    fn putBlend(_ mode: Int, _ e: Int, _ d: Int, _ v: Int) {
+        if mode == 2 {
+            pl[d] = mcClip((pr[e] + v + (1 << postRound)) >> (postRound + 1), maxV)
+        } else {
+            let sh = 4 + postRound
+            pl[d] = mcClip((blendFwd * pr[e] + blendBck * v + (1 << (sh - 1))) >> sh, maxV)
+        }
+    }
+
+    // Block warp (7.11.3.5) of the whole w x h region, 8x8 at a time, with
+    // the warp parameters in wp.
+    fn blockWarp(_ rp: [Int], _ rs: Int, _ lastX: Int, _ lastY: Int, _ x: Int, _ y: Int, _ w: Int, _ h: Int,
+                 _ sx: Int, _ sy: Int, _ k: Int, _ direct: Bool, _ dOff: Int, _ dStride: Int) {
+        setupShear()
+        let alpha = shAlpha
+        let beta = shBeta
+        let gamma = shGamma
+        let delta = shDelta
+        let r0 = round0
+        let r1 = round1
+        let rnd0 = 1 << (r0 - 1)
+        let rnd1 = 1 << (r1 - 1)
+        let mv = maxV
+        let wf = warpF
+        let p0 = wp[0]
+        let p1 = wp[1]
+        let p2 = wp[2]
+        let p3 = wp[3]
+        let p4 = wp[4]
+        let p5 = wp[5]
+        for i8 in 0..(((h - 1) >> 3) + 1) {
+            for j8 in 0..(((w - 1) >> 3) + 1) {
+                let srcX = (x + j8 * 8 + 4) << sx
+                let srcY = (y + i8 * 8 + 4) << sy
+                let dstX = p2 * srcX + p3 * srcY + p0
+                let dstY = p4 * srcX + p5 * srcY + p1
+                let x4 = dstX >> sx
+                let y4 = dstY >> sy
+                let ix4 = x4 >> 16
+                let sx4 = x4 & 65535
+                let iy4 = y4 >> 16
+                let sy4 = y4 & 65535
+                let inside = !slow && ix4 - 7 >= 0 && ix4 + 7 <= lastX && iy4 - 7 >= 0 && iy4 + 7 <= lastY
+                for i1 in -7..8 {
+                    let row = mcClip3(0, lastY, iy4 + i1) * rs
+                    for i2 in -4..4 {
+                        let sxx = sx4 + alpha * i2 + beta * i1
+                        let offs = ((sxx + 512) >> 10) + 64
+                        let fb = offs * 8
+                        var s = 0
+                        if inside {
+                            let q = row + ix4 + i2 - 3
+                            s = wf[fb] * rp[q] + wf[fb + 1] * rp[q + 1] + wf[fb + 2] * rp[q + 2] + wf[fb + 3] * rp[q + 3] + wf[fb + 4] * rp[q + 4] + wf[fb + 5] * rp[q + 5] + wf[fb + 6] * rp[q + 6] + wf[fb + 7] * rp[q + 7]
+                        } else {
+                            for i3 in 0..8 {
+                                s += wf[fb + i3] * rp[row + mcClip3(0, lastX, ix4 + i2 - 3 + i3)]
+                            }
+                        }
+                        wtmp[(i1 + 7) * 8 + i2 + 4] = (s + rnd0) >> r0
+                    }
+                }
+                let iEnd = min(4, h - i8 * 8 - 4)
+                let jEnd = min(4, w - j8 * 8 - 4)
+                for i1 in -4..iEnd {
+                    for i2 in -4..jEnd {
+                        let syy = sy4 + gamma * i2 + delta * i1
+                        let offs = ((syy + 512) >> 10) + 64
+                        let fb = offs * 8
+                        var s = 0
+                        for i3 in 0..8 {
+                            s += wf[fb + i3] * wtmp[(i1 + i3 + 4) * 8 + i2 + 4]
+                        }
+                        let v = (s + rnd1) >> r1
+                        let rr = i8 * 8 + i1 + 4
+                        let cc = j8 * 8 + i2 + 4
+                        if direct {
+                            pl[dOff + rr * dStride + cc] = mcClip(v, mv)
+                        } else {
+                            pr[k + rr * w + cc] = v
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Overlapped motion compensation (7.11.3.9) for the block at ops[b].
+    fn obmc(_ plane: Int, _ px0: Int, _ py0: Int, _ w: Int, _ h: Int, _ b: Int, _ stride: Int) {
+        let miRow = ops[b + 1]
+        let miCol = ops[b + 2]
+        let miSize = ops[b + 3]
+        let sx = if plane == 0 { 0 } else { subX }
+        let sy = if plane == 0 { 0 } else { subY }
+        let miCols = hdr.miCols
+        let miRows = hdr.miRows
+        if ops[b + 23] == 1 {
+            if subSize[miSize * 4 + sx * 2 + sy] >= 3 {
+                let w4 = bw4[miSize]
+                var x4 = miCol
+                var nCount = 0
+                let nLimit = min(4, wLog2[miSize])
+                while nCount < nLimit && x4 < min(miCols, miCol + w4) {
+                    let candRow = miRow - 1
+                    let candCol = x4 | 1
+                    let g = gInfo[candRow * miStride + candCol]
+                    let step4 = mcClip3(2, 16, bw4[g & 31])
+                    if ((g >> 5) & 15) - 1 > 0 {
+                        nCount += 1
+                        let predW = min(w, (step4 * 4) >> sx)
+                        let predH = min(h >> 1, 32 >> sy)
+                        overlap(plane, candRow, candCol, (x4 * 4) >> sx, (miRow * 4) >> sy, predW, predH, 0, predH, stride)
+                    }
+                    x4 += step4
+                }
+            }
+        }
+        if ops[b + 24] == 1 {
+            let h4 = bh4[miSize]
+            var y4 = miRow
+            var nCount = 0
+            let nLimit = min(4, hLog2[miSize])
+            while nCount < nLimit && y4 < min(miRows, miRow + h4) {
+                let candCol = miCol - 1
+                let candRow = y4 | 1
+                let g = gInfo[candRow * miStride + candCol]
+                let step4 = mcClip3(2, 16, bh4[g & 31])
+                if ((g >> 5) & 15) - 1 > 0 {
+                    nCount += 1
+                    let predW = min(w >> 1, 32 >> sx)
+                    let predH = min(h, (step4 * 4) >> sy)
+                    overlap(plane, candRow, candCol, (miCol * 4) >> sx, (y4 * 4) >> sy, predW, predH, 1, predW, stride)
+                }
+                y4 += step4
+            }
+        }
+    }
+
+    // predict_overlap and the overlap blending process (7.11.3.10).
+    fn overlap(_ plane: Int, _ candRow: Int, _ candCol: Int, _ predX: Int, _ predY: Int, _ predW: Int, _ predH: Int,
+               _ pass: Int, _ maskLen: Int, _ stride: Int) {
+        let gi = candRow * miStride + candCol
+        let g = gInfo[gi]
+        let mvp = gMv[gi]
+        let refFrame = ((g >> 5) & 15) - 1
+        let mvRow = mcMvPart(mvp, 0)
+        let mvCol = mcMvPart(mvp, 1)
+        let sx = if plane == 0 { 0 } else { subX }
+        let sy = if plane == 0 { 0 } else { subY }
+        var fv = (g >> 23) & 3
+        var fh = (g >> 25) & 3
+        if predW <= 4 {
+            if fh == 0 || fh == 2 {
+                fh = 4
+            } else if fh == 1 {
+                fh = 5
+            }
+        }
+        if predH <= 4 {
+            if fv == 0 || fv == 2 {
+                fv = 4
+            } else if fv == 1 {
+                fv = 5
+            }
+        }
+        let k = mcPredSize
+        let idx = if refFrame > 0 && refFrame < 8 { hdr.refFrameIdx[refFrame - 1] } else { -1 }
+        if idx < 0 || idx >= refs.count || !refs[idx].ok || scaleOk[refFrame] == 0 {
+            fillConst(k, predW, predH, false, 0, 0)
+        } else {
+            let r = refs[idx]
+            let rp = if plane == 0 { r.y } else if plane == 1 { r.u } else { r.v }
+            let rs = if plane == 0 { r.yStride } else { r.cStride }
+            if rp.isEmpty {
+                fillConst(k, predW, predH, false, 0, 0)
+            } else {
+                let lastX = ((r.upscaledWidth + sx) >> sx) - 1
+                let lastY = ((r.frameHeight + sy) >> sy) - 1
+                let xs = xScale[refFrame]
+                let ys = yScale[refFrame]
+                let origX = (predX << 4) + ((2 * mvCol) >> sx) + 8
+                let origY = (predY << 4) + ((2 * mvRow) >> sy) + 8
+                var startX = 0
+                var startY = 0
+                var stepX = 1024
+                var stepY = 1024
+                if xs == 16384 && ys == 16384 {
+                    startX = (origX - 8) * 64 + 32
+                    startY = (origY - 8) * 64 + 32
+                } else {
+                    startX = mcRound2Signed(origX * xs - (8 << 14), 8) + 32
+                    startY = mcRound2Signed(origY * ys - (8 << 14), 8) + 32
+                    stepX = mcRound2Signed(xs, 4)
+                    stepY = mcRound2Signed(ys, 4)
+                }
+                blockPred(rp, rs, lastX, lastY, startX, startY, stepX, stepY, predW, predH, fv, fh, k, 0, 0, 0)
+            }
+        }
+        let mo = maskLen - 2
+        let mv = maxV
+        for i in 0..predH {
+            let d = (predY + i) * stride + predX
+            let s = k + i * predW
+            for j in 0..predW {
+                let m = if pass == 0 { obmcMask[mo + i] } else { obmcMask[mo + j] }
+                let o = mcClip(pr[s + j], mv)
+                pl[d + j] = (m * pl[d + j] + (64 - m) * o + 32) >> 6
+            }
+        }
+    }
+}
+
+fn mcZeros(_ n: Int) -> [Int] {
+    var out: [Int] = []
+    for _ in 0..n {
+        out.append(0)
+    }
+    out
+}
+
+fn mcClip3(_ lo: Int, _ hi: Int, _ v: Int) -> Int {
+    if v < lo {
+        return lo
+    }
+    if v > hi {
+        return hi
+    }
+    v
+}
+
+fn mcClip(_ v: Int, _ mv: Int) -> Int {
+    if v < 0 {
+        return 0
+    }
+    if v > mv {
+        return mv
+    }
+    v
+}
+
+fn mcAbs(_ v: Int) -> Int {
+    if v < 0 { -v } else { v }
+}
+
+fn mcRound2(_ x: Int, _ n: Int) -> Int {
+    if n == 0 {
+        return x
+    }
+    (x + (1 << (n - 1))) >> n
+}
+
+fn mcRound2Signed(_ x: Int, _ n: Int) -> Int {
+    if x >= 0 {
+        return mcRound2(x, n)
+    }
+    -mcRound2(-x, n)
+}
+
+fn mcFloorLog2(_ x: Int) -> Int {
+    var s = 0
+    var v = x
+    while v > 1 {
+        v = v >> 1
+        s += 1
+    }
+    s
+}
+
+fn mcMvPart(_ m: Int, _ k: Int) -> Int {
+    (((m >> (16 * k)) & 0xffff) ^ 0x8000) - 0x8000
+}

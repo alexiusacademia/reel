@@ -1,0 +1,271 @@
+// Shared pieces of the ui-tools views (find, transcript, OpenSubtitles,
+// encodings, export, disc titles, jump to time, sleep timer, media
+// information): writing and reading times as people type them, the
+// colours of the dark player panels, and small badges.
+//
+// Times are read the way a "jump to" box is usually typed: "1:23:45"
+// (h:m:s), "83:45" (m:s, minutes may pass 59), "45s", "1h30m", "2.5m",
+// a bare number (seconds), "50%" (of the length), and "+30" / "-1:00"
+// for a step from the current position.
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+// ---- times ----
+
+// "1:23:45", "3:05", or with tenths "3:05.2". Negative times show "--:--".
+public fn formatClock(_ seconds: Float, tenths: Bool = false) -> String {
+    if seconds < 0.0 || seconds.isNaN {
+        return "--:--"
+    }
+    let tenthsTotal = Int(seconds * 10.0 + 0.5)
+    let total = if tenths { tenthsTotal / 10 } else { Int(seconds + 0.5) }
+    let h = total / 3600
+    let m = total / 60 % 60
+    let s = total % 60
+    let ss = "{s}".padStart(2, with: "0")
+    let frac = if tenths { ".{tenthsTotal % 10}" } else { "" }
+    if h > 0 {
+        let mm = "{m}".padStart(2, with: "0")
+        return "{h}:{mm}:{ss}{frac}"
+    }
+    "{m}:{ss}{frac}"
+}
+
+// A length in words for labels: "1 h 5 min", "12 min", "45 s".
+public fn formatSpan(_ seconds: Float) -> String {
+    let total = Int(max(0.0, seconds) + 0.5)
+    let h = total / 3600
+    let m = total / 60 % 60
+    let s = total % 60
+    if h > 0 {
+        return if m > 0 { "{h} h {m} min" } else { "{h} h" }
+    }
+    if m > 0 {
+        return if s > 0 && m < 10 { "{m} min {s} s" } else { "{m} min" }
+    }
+    "{s} s"
+}
+
+// A plain non-negative decimal number ("12", "2.5", ".5"), or nil.
+fn toolsNumber(_ t: String) -> Float? {
+    if t.isEmpty {
+        return nil
+    }
+    var dots = 0
+    var digits = 0
+    for c in t.characters {
+        if c == "." {
+            dots += 1
+        } else if c >= "0" && c <= "9" && c.count == 1 {
+            digits += 1
+        } else {
+            return nil
+        }
+    }
+    if dots > 1 || digits == 0 {
+        return nil
+    }
+    let text = if t.hasPrefix(".") { "0" + t } else { t }
+    Float(text)
+}
+
+// A length typed without a sign, in seconds; nil if it can't be read.
+// `duration` is used by percentages (nil without one).
+public fn parseTimeAmount(_ text: String, duration: Float = -1.0) -> Float? {
+    let t = text.trim().lowercase().replace(",", with: ".")
+    if t.isEmpty {
+        return nil
+    }
+    // Percent of the length.
+    if t.hasSuffix("%") {
+        if duration <= 0.0 {
+            return nil
+        }
+        if let p = toolsNumber(t.substring(from: 0, to: t.count - 1).trim()) {
+            return duration * p / 100.0
+        }
+        return nil
+    }
+    // h:m:s or m:s.
+    if t.contains(":") {
+        let parts = t.split(":")
+        if parts.count > 3 {
+            return nil
+        }
+        var values: [Float] = []
+        for (i, p) in parts.enumerated() {
+            let q = p.trim()
+            // Only the last part may have a fraction.
+            if i < parts.count - 1 && q.contains(".") {
+                return nil
+            }
+            if let v = toolsNumber(q) {
+                values.append(v)
+            } else {
+                return nil
+            }
+        }
+        let n = values.count
+        // Seconds (and minutes under hours) must be below 60.
+        if values[n - 1] >= 60.0 {
+            return nil
+        }
+        if n == 3 && values[1] >= 60.0 {
+            return nil
+        }
+        if n == 2 {
+            return values[0] * 60.0 + values[1]
+        }
+        return values[0] * 3600.0 + values[1] * 60.0 + values[2]
+    }
+    // A bare number: seconds.
+    if let v = toolsNumber(t) {
+        return v
+    }
+    // Numbers with units: "1h30m", "45s", "2.5 min", "500ms".
+    var total = 0.0
+    var num = ""
+    var unit = ""
+    var any = false
+    for c in (t + " ").characters {
+        let isNum = (c >= "0" && c <= "9" && c.count == 1) || c == "."
+        if isNum {
+            if !unit.isEmpty {
+                if let add = toolsUnitAmount(num, unit) {
+                    total += add
+                    any = true
+                } else {
+                    return nil
+                }
+                num = ""
+                unit = ""
+            }
+            num += c
+        } else if c == " " {
+            continue
+        } else {
+            if num.isEmpty {
+                return nil
+            }
+            unit += c
+        }
+    }
+    if !num.isEmpty {
+        if unit.isEmpty {
+            return nil
+        }
+        if let add = toolsUnitAmount(num, unit) {
+            total += add
+            any = true
+        } else {
+            return nil
+        }
+    }
+    if !any {
+        return nil
+    }
+    total
+}
+
+fn toolsUnitAmount(_ num: String, _ unit: String) -> Float? {
+    if let v = toolsNumber(num) {
+        let scale = match unit {
+            "h", "hr", "hrs", "hour", "hours" -> 3600.0
+            "m", "min", "mins", "minute", "minutes" -> 60.0
+            "s", "sec", "secs", "second", "seconds" -> 1.0
+            "ms" -> 0.001
+            _ -> -1.0
+        }
+        if scale < 0.0 {
+            return nil
+        }
+        return v * scale
+    }
+    nil
+}
+
+// Where a "jump to time" text goes, in seconds from the start: absolute,
+// or a step from `position` with a leading + or −. Kept inside 0 …
+// duration (when the duration is known). nil if it can't be read.
+public fn parseJumpTime(_ text: String, position: Float = 0.0, duration: Float = -1.0) -> Float? {
+    var t = text.trim().replace("−", with: "-")
+    if t.isEmpty {
+        return nil
+    }
+    var sign = 0.0
+    if t.hasPrefix("+") {
+        sign = 1.0
+    } else if t.hasPrefix("-") {
+        sign = -1.0
+    }
+    if sign != 0.0 {
+        t = t.substring(from: 1, to: t.count)
+    }
+    if let amount = parseTimeAmount(t, duration: duration) {
+        var at = if sign == 0.0 { amount } else { position + sign * amount }
+        if at < 0.0 {
+            at = 0.0
+        }
+        if duration > 0.0 && at > duration {
+            at = duration
+        }
+        return at
+    }
+    nil
+}
+
+// ---- sizes ----
+
+// "1.4 MB", "820 KB", "12 bytes".
+public fn formatBytes(_ bytes: Int) -> String {
+    if bytes >= 1073741824 {
+        return "{(Float(bytes) / 1073741824.0).formatted(decimals: 2)} GB"
+    }
+    if bytes >= 1048576 {
+        return "{(Float(bytes) / 1048576.0).formatted(decimals: 1)} MB"
+    }
+    if bytes >= 1024 {
+        return "{bytes / 1024} KB"
+    }
+    "{bytes} bytes"
+}
+
+// ---- the dark player look ----
+
+// Colours for panels that sit in the dark player window (dark: true) or
+// in a window of their own (system colours).
+fn toolsText(_ dark: Bool) -> Color {
+    if dark { .rgb(217, 217, 217) } else { .primary }
+}
+
+fn toolsDim(_ dark: Bool) -> Color {
+    if dark { .rgb(140, 140, 140) } else { .secondary }
+}
+
+fn toolsPanel(_ dark: Bool) -> Color {
+    if dark { .rgb(23, 23, 23) } else { .background }
+}
+
+fn toolsRowHover(_ dark: Bool) -> Color {
+    if dark { .rgb(45, 45, 45) } else { .lightGray }
+}
+
+// The selected row: a see-through orange on either background.
+fn toolsSelected() -> Color {
+    .rgba(242, 140, 26, 0.28)
+}
+
+let toolsAccent = Color.rgb(242, 140, 26)
+
+// Lucide's check mark (ISC license), as icons.tsl draws its icons.
+fn toolsSvgCheck() -> String { lucide("<path d='M20 6 9 17l-5-5'/>") }
+
+// A small rounded label ("Matches file", "HI", "Main").
+view ToolsBadge(text: String, color: Color = Color.rgb(242, 140, 26)) {
+    Text(text)
+        .font(size: 10, weight: .semibold)
+        .color(.white)
+        .padding(horizontal: 5, vertical: 1)
+        .background(color, radius: 4)
+}

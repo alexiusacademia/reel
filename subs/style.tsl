@@ -1,0 +1,138 @@
+// The viewer's look for text subtitles: size, colours, outline, shadow, a
+// background box, bold, font, vertical margin and top/bottom position, put
+// onto cues before they are drawn (draw itself is unchanged: cues that
+// were never styled keep the default look, white text with a thin dark
+// outline). A second subtitle track shown at the same time uses a style
+// with position "top", so it sits above the picture while the first stays
+// at the bottom.
+//
+// SRT, WebVTT, tx3g and plain text cues are styled; ASS/SSA cues keep the
+// script's own styles unless `overrideAss` is set (then their colours,
+// font, outline and size give way too, but explicit positions (\pos,
+// \move) and layers stay, so signs aren't thrown about). Colours a cue
+// sets itself (SRT <font color>, WebVTT classes, tx3g styles) are kept
+// unless overriding.
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+public struct TextStyle {
+    // Text size, 1 = the default (a line is 16/288 of the video's height).
+    scale: Float = 1.0
+    // Fill colour, rgba packed.
+    color: Int = 0xFFFFFFFF
+    // Outline width as a multiple of the default (1/288 of the video's
+    // height); 0 = no outline.
+    outline: Float = 1.0
+    outlineColor: Int = 0x000000FF
+    // Shadow offset as a multiple of the default outline width; 0 = none.
+    shadow: Float = 0.0
+    shadowColor: Int = 0x00000080
+    // A box behind each line: its colour (rgb; the alpha is ignored) and
+    // opacity 0…1 (0 = no box).
+    background: Int = 0x000000FF
+    backgroundOpacity: Float = 0.0
+    bold: Bool = false
+    // Font family; "" = the cue's own (the system font by default).
+    font: String = ""
+    // Distance from the bottom (or top) edge, fraction of the video's
+    // height; −1 = the cue's own (10/288 by default).
+    marginV: Float = -1.0
+    // "bottom" (the usual) or "top" (for a second track).
+    position: String = "bottom"
+    // Style ASS/SSA subtitles too.
+    overrideAss: Bool = false
+}
+
+// The style for a second track drawn at the same time: at the top,
+// a little smaller.
+public fn secondaryStyle() -> TextStyle {
+    TextStyle(scale: 0.85, position: "top")
+}
+
+// Whether a cue came from an ASS/SSA script: those carry a style name.
+fn styleIsAss(_ c: Cue, format: String) -> Bool {
+    if format == "ass" || format == "ssa" {
+        return true
+    }
+    format.isEmpty && !c.style.isEmpty
+}
+
+// The cues with a style put on (see the file comment). `format` is the
+// track's (SubTrack.format); "" decides by each cue.
+public fn styleCues(_ cues: [Cue], _ style: TextStyle, format: String = "") -> [Cue] {
+    var out = cues
+    let f = format.lowercase()
+    for c in out {
+        if !c.bitmap.pixels.isEmpty {
+            continue
+        }
+        let ass = styleIsAss(c, format: f)
+        let full = !ass || style.overrideAss
+        let positioned = c.x >= 0.0 || c.y >= 0.0
+        if full {
+            c.fontSize = (if ass { defaultFontSize } else { c.fontSize }) * style.scale
+            for sp in c.spans {
+                if sp.text == "\n" {
+                    continue
+                }
+                if sp.color == white || ass {
+                    sp.color = style.color
+                }
+                sp.outline = style.outlineColor
+                sp.border = defaultBorder * style.outline
+                sp.shadow = style.shadowColor
+                sp.shadowDepth = defaultBorder * style.shadow
+                if style.bold {
+                    sp.bold = true
+                }
+                if !style.font.isEmpty {
+                    sp.font = style.font
+                } else if ass {
+                    sp.font = ""
+                }
+                if ass {
+                    sp.scaleX = 1.0
+                    sp.scaleY = 1.0
+                    sp.spacing = 0.0
+                }
+            }
+            if ass {
+                c.borderStyle = 1
+                c.angle = if positioned { c.angle } else { 0.0 }
+            }
+            if style.backgroundOpacity > 0.0 {
+                let a = Int(round(max(0.0, min(1.0, style.backgroundOpacity)) * 255.0))
+                c.boxColor = (style.background & 0xFFFFFF00) | a
+            }
+            if style.marginV >= 0.0 && !positioned {
+                c.marginV = style.marginV
+            }
+        }
+        // A track at the top: bottom-aligned cues go to the top row (cues
+        // an author put at the top, {\an8}, stay there either way).
+        if style.position == "top" && !positioned && c.align >= 1 && c.align <= 3 {
+            c.align = c.align + 6
+            if style.marginV >= 0.0 {
+                c.marginV = style.marginV
+            }
+        }
+    }
+    out
+}
+
+// A whole track with a style put on (do it once when the track or the
+// style changes, not every frame).
+public fn styleTrack(_ track: SubTrack, _ style: TextStyle) -> SubTrack {
+    var out = track
+    out.cues = styleCues(track.cues, style, format: track.format)
+    out
+}
+
+// Draws the cues of two tracks at once: `primary` where its cues say
+// (the bottom, normally) and `secondary` styled to the top (style them
+// with secondaryStyle, or your own with position "top", first). Cues of
+// either at the same place stack instead of overlapping.
+public fn drawTracks(_ g: Graphics, primary: [Cue], secondary: [Cue], at: Float, x: Float, y: Float, width: Float, height: Float, scale: Float = 1.0) {
+    draw(g, primary + secondary, at: at, x: x, y: y, width: width, height: height, scale: scale)
+}

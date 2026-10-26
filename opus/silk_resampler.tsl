@@ -1,0 +1,178 @@
+// SILK's output resampler (libopus silk/resampler.c with
+// resampler_private_IIR_FIR.c and resampler_private_up2_HQ.c): takes the
+// 8, 12 or 16 kHz SILK signal up to 48 kHz. RFC 6716 section 4.2.9 leaves
+// the resampler to the implementation; this is the reference decoder's,
+// so output matches libopus sample for sample.
+//
+// It upsamples 2x with two chains of three all-pass sections, then picks
+// output samples between those with an 8-tap fractional FIR (12 phases).
+// One millisecond of input is held back ("inputDelay") to line the delay up
+// with the CELT layer.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+let silkResamplerOrderFIR12 = 8
+
+// Delay (input samples) per input rate when the output is 48 kHz:
+// delay_matrix_dec[in][48 kHz].
+fn silkResamplerDelay(_ fsInKHz: Int) -> Int {
+    if fsInKHz == 8 { 0 } else if fsInKHz == 12 { 4 } else { 7 }
+}
+
+struct SilkResampler {
+    sIIR: [Int] = [0, 0, 0, 0, 0, 0]
+    sFIR: [Int] = [0, 0, 0, 0, 0, 0, 0, 0]
+    delayBuf: [Int] = []
+    batchSize: Int = 80
+    invRatioQ16: Int = 0
+    fsInKHz: Int = 16
+    fsOutKHz: Int = 48
+    inputDelay: Int = 0
+    // 2 * batchSize + 8 samples of 2x-upsampled signal.
+    buf: [Int] = []
+    // One block of output per call (scratch).
+    work: [Int] = []
+
+    // silk_resampler_init for the decoder (output 48 kHz).
+    fn setup(fsInHz: Int) {
+        sIIR = [0, 0, 0, 0, 0, 0]
+        sFIR = [0, 0, 0, 0, 0, 0, 0, 0]
+        fsInKHz = fsInHz / 1000
+        fsOutKHz = 48
+        delayBuf = silkZeros(48)
+        inputDelay = silkResamplerDelay(fsInKHz)
+        batchSize = fsInKHz * 10
+        buf = silkZeros(2 * batchSize + silkResamplerOrderFIR12)
+        let fsOutHz = 48000
+        // Ratio of input to output samples, Q16, rounded up (2x upsampled).
+        invRatioQ16 = ((fsInHz << 15) / fsOutHz) << 2
+        while silkSMULWW(invRatioQ16, fsOutHz) < (fsInHz << 1) {
+            invRatioQ16 += 1
+        }
+    }
+
+    // silk_resampler_private_up2_HQ: input[inFrom..<inFrom+len] to
+    // 2 * len samples in buf from bufFrom.
+    fn up2HQ(_ input: [Int], _ inFrom: Int, _ len: Int, _ bufFrom: Int) {
+        let a00 = silkResamplerUp2Hq0[0]
+        let a01 = silkResamplerUp2Hq0[1]
+        let a02 = silkResamplerUp2Hq0[2]
+        let a10 = silkResamplerUp2Hq1[0]
+        let a11 = silkResamplerUp2Hq1[1]
+        let a12 = silkResamplerUp2Hq1[2]
+        var s0 = sIIR[0]
+        var s1 = sIIR[1]
+        var s2 = sIIR[2]
+        var s3 = sIIR[3]
+        var s4 = sIIR[4]
+        var s5 = sIIR[5]
+        for k in 0..len {
+            let in32 = input[inFrom + k] << 10
+            // Even output sample: three all-pass sections.
+            var y = in32 - s0
+            var x = (y * a00) >> 16
+            var out1 = s0 + x
+            s0 = in32 + x
+            y = out1 - s1
+            x = (y * a01) >> 16
+            var out2 = s1 + x
+            s1 = out1 + x
+            y = out2 - s2
+            x = y + ((y * a02) >> 16)
+            out1 = s2 + x
+            s2 = out2 + x
+            buf[bufFrom + 2 * k] = silkSat16(silkRshiftRound(out1, 10))
+            // Odd output sample.
+            y = in32 - s3
+            x = (y * a10) >> 16
+            out1 = s3 + x
+            s3 = in32 + x
+            y = out1 - s4
+            x = (y * a11) >> 16
+            out2 = s4 + x
+            s4 = out1 + x
+            y = out2 - s5
+            x = y + ((y * a12) >> 16)
+            out1 = s5 + x
+            s5 = out2 + x
+            buf[bufFrom + 2 * k + 1] = silkSat16(silkRshiftRound(out1, 10))
+        }
+        sIIR[0] = s0
+        sIIR[1] = s1
+        sIIR[2] = s2
+        sIIR[3] = s3
+        sIIR[4] = s4
+        sIIR[5] = s5
+    }
+
+    // silk_resampler_private_IIR_FIR: appends the output to `work`.
+    fn iirFir(_ input: [Int], _ inFromIn: Int, _ inLenIn: Int) {
+        var inFrom = inFromIn
+        var inLen = inLenIn
+        for i in 0..silkResamplerOrderFIR12 {
+            buf[i] = sFIR[i]
+        }
+        let inc = invRatioQ16
+        var nIn = 0
+        while true {
+            nIn = min(inLen, batchSize)
+            up2HQ(input, inFrom, nIn, silkResamplerOrderFIR12)
+            let maxIndex = nIn << 17
+            var index = 0
+            while index < maxIndex {
+                let t = ((index & 65535) * 12) >> 16
+                let p = index >> 16
+                let f = t * 4
+                let g = (11 - t) * 4
+                var res = buf[p] * silkResamplerFracFIR12[f]
+                res += buf[p + 1] * silkResamplerFracFIR12[f + 1]
+                res += buf[p + 2] * silkResamplerFracFIR12[f + 2]
+                res += buf[p + 3] * silkResamplerFracFIR12[f + 3]
+                res += buf[p + 4] * silkResamplerFracFIR12[g + 3]
+                res += buf[p + 5] * silkResamplerFracFIR12[g + 2]
+                res += buf[p + 6] * silkResamplerFracFIR12[g + 1]
+                res += buf[p + 7] * silkResamplerFracFIR12[g]
+                work.append(silkSat16(silkRshiftRound(silkI32(res), 15)))
+                index += inc
+            }
+            inFrom += nIn
+            inLen -= nIn
+            if inLen > 0 {
+                for i in 0..silkResamplerOrderFIR12 {
+                    buf[i] = buf[(nIn << 1) + i]
+                }
+            } else {
+                break
+            }
+        }
+        for i in 0..silkResamplerOrderFIR12 {
+            sFIR[i] = buf[(nIn << 1) + i]
+        }
+    }
+
+    // silk_resampler: input[inFrom..<inFrom+inLen] (at least 1 ms) to
+    // 48 kHz, returned in `work`.
+    fn process(_ input: [Int], _ inFrom: Int, _ inLen: Int) {
+        work = []
+        let nSamples = fsInKHz - inputDelay
+        for i in 0..nSamples {
+            delayBuf[inputDelay + i] = input[inFrom + i]
+        }
+        iirFir(delayBuf, 0, fsInKHz)
+        iirFir(input, inFrom + nSamples, inLen - fsInKHz)
+        for i in 0..inputDelay {
+            delayBuf[i] = input[inFrom + inLen - inputDelay + i]
+        }
+    }
+}
+
+fn silkZeros(_ n: Int) -> [Int] {
+    var out: [Int] = []
+    var i = 0
+    while i < n {
+        out.append(0)
+        i += 1
+    }
+    out
+}

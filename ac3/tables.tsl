@@ -1,0 +1,216 @@
+// AC-3 tables from ATSC A/52 (the AC-3 standard): frame sizes (Table 5.18),
+// channel counts per audio coding mode (Table 5.8), the bit allocation
+// tables of section 7.2 (band edges, log-addition, hearing threshold, bap,
+// decay/gain/floor parameters), rematrixing bands (7.5.2), quantiser sizes
+// (Table 7.18) and the dequantised mantissa values for the grouped
+// quantisers (Tables 7.19 to 7.23).
+//
+// Mantissas are kept as 24-bit fixed point numbers, as FFmpeg's decoder
+// keeps them, so that our output agrees with FFmpeg's to rounding: a
+// value v stands for v / 2^23 (the spec's −1…1 range is ±2^23).
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+// Words (16-bit) per syncframe for each frmsizecod, at 48, 44.1 and 32 kHz
+// (Table 5.18), three to a row.
+let ac3FrameSizeTab: [Int] = [
+    64, 69, 96, 64, 70, 96, 80, 87, 120, 80, 88, 120,
+    96, 104, 144, 96, 105, 144, 112, 121, 168, 112, 122, 168,
+    128, 139, 192, 128, 140, 192, 160, 174, 240, 160, 175, 240,
+    192, 208, 288, 192, 209, 288, 224, 243, 336, 224, 244, 336,
+    256, 278, 384, 256, 279, 384, 320, 348, 480, 320, 349, 480,
+    384, 417, 576, 384, 418, 576, 448, 487, 672, 448, 488, 672,
+    512, 557, 768, 512, 558, 768, 640, 696, 960, 640, 697, 960,
+    768, 835, 1152, 768, 836, 1152, 896, 975, 1344, 896, 976, 1344,
+    1024, 1114, 1536, 1024, 1115, 1536, 1152, 1253, 1728, 1152, 1254, 1728,
+    1280, 1393, 1920, 1280, 1394, 1920,
+]
+
+let ac3SampleRates: [Int] = [48000, 44100, 32000, 0]
+
+// kbit/s for frmsizecod / 2.
+let ac3Bitrates: [Int] = [32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384, 448, 512, 576, 640]
+
+// Full-bandwidth channels for each acmod (Table 5.8).
+let ac3ChannelsTab: [Int] = [2, 1, 2, 3, 3, 4, 4, 5]
+
+// E-AC-3 numblkscod → blocks per frame.
+let eac3Blocks: [Int] = [1, 2, 3, 6]
+
+// First bin of each of the 50 bit allocation bands, and the end (7.2.2.3).
+let ac3BandStart: [Int] = [
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
+    20, 21, 22, 23, 24, 25, 26, 27, 28, 31, 34, 37, 40, 43, 46, 49, 55, 61, 67, 73,
+    79, 85, 97, 109, 121, 133, 157, 181, 205, 229, 253,
+]
+
+// The band each bin is in.
+let ac3BinToBand: [Int] = ac3MakeBinToBand()
+
+fn ac3MakeBinToBand() -> [Int] {
+    var out: [Int] = []
+    var band = 0
+    for bin in 0..256 {
+        while band < 49 && bin >= ac3BandStart[band + 1] {
+            band += 1
+        }
+        out.append(band)
+    }
+    out
+}
+
+// Log-addition table latab (Table 7.14).
+let ac3LogAdd: [Int] = [
+    0x40, 0x3f, 0x3e, 0x3d, 0x3c, 0x3b, 0x3a, 0x39, 0x38, 0x37,
+    0x36, 0x35, 0x34, 0x34, 0x33, 0x32, 0x31, 0x30, 0x2f, 0x2f,
+    0x2e, 0x2d, 0x2c, 0x2c, 0x2b, 0x2a, 0x29, 0x29, 0x28, 0x27,
+    0x26, 0x26, 0x25, 0x24, 0x24, 0x23, 0x23, 0x22, 0x21, 0x21,
+    0x20, 0x20, 0x1f, 0x1e, 0x1e, 0x1d, 0x1d, 0x1c, 0x1c, 0x1b,
+    0x1b, 0x1a, 0x1a, 0x19, 0x19, 0x18, 0x18, 0x17, 0x17, 0x16,
+    0x16, 0x15, 0x15, 0x15, 0x14, 0x14, 0x13, 0x13, 0x13, 0x12,
+    0x12, 0x12, 0x11, 0x11, 0x11, 0x10, 0x10, 0x10, 0x0f, 0x0f,
+    0x0f, 0x0e, 0x0e, 0x0e, 0x0d, 0x0d, 0x0d, 0x0d, 0x0c, 0x0c,
+    0x0c, 0x0c, 0x0b, 0x0b, 0x0b, 0x0b, 0x0a, 0x0a, 0x0a, 0x0a,
+    0x0a, 0x09, 0x09, 0x09, 0x09, 0x09, 0x08, 0x08, 0x08, 0x08,
+    0x08, 0x08, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x06, 0x06,
+    0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x05, 0x05, 0x05, 0x05,
+    0x05, 0x05, 0x05, 0x05, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04,
+    0x04, 0x04, 0x04, 0x04, 0x04, 0x03, 0x03, 0x03, 0x03, 0x03,
+    0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x02,
+    0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02,
+    0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x01, 0x01,
+    0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+    0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+    0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+]
+
+// Hearing threshold hth for each band at fscod 0, 1, 2 (Table 7.15),
+// three to a row.
+let ac3HearingThreshold: [Int] = [
+    0x04d0, 0x04f0, 0x0580, 0x04d0, 0x04f0, 0x0580, 0x0440, 0x0460, 0x04b0,
+    0x0400, 0x0410, 0x0450, 0x03e0, 0x03e0, 0x0420, 0x03c0, 0x03d0, 0x03f0,
+    0x03b0, 0x03c0, 0x03e0, 0x03b0, 0x03b0, 0x03d0, 0x03a0, 0x03b0, 0x03c0,
+    0x03a0, 0x03a0, 0x03b0, 0x03a0, 0x03a0, 0x03b0, 0x03a0, 0x03a0, 0x03b0,
+    0x03a0, 0x03a0, 0x03a0, 0x0390, 0x03a0, 0x03a0, 0x0390, 0x0390, 0x03a0,
+    0x0390, 0x0390, 0x03a0, 0x0380, 0x0390, 0x03a0, 0x0380, 0x0380, 0x03a0,
+    0x0370, 0x0380, 0x03a0, 0x0370, 0x0380, 0x03a0, 0x0360, 0x0370, 0x0390,
+    0x0360, 0x0370, 0x0390, 0x0350, 0x0360, 0x0390, 0x0350, 0x0360, 0x0390,
+    0x0340, 0x0350, 0x0380, 0x0340, 0x0350, 0x0380, 0x0330, 0x0340, 0x0380,
+    0x0320, 0x0340, 0x0370, 0x0310, 0x0320, 0x0360, 0x0300, 0x0310, 0x0350,
+    0x02f0, 0x0300, 0x0340, 0x02f0, 0x02f0, 0x0330, 0x02f0, 0x02f0, 0x0320,
+    0x02f0, 0x02f0, 0x0310, 0x0300, 0x02f0, 0x0300, 0x0310, 0x0300, 0x02f0,
+    0x0340, 0x0320, 0x02f0, 0x0390, 0x0350, 0x02f0, 0x03e0, 0x0390, 0x0300,
+    0x0420, 0x03e0, 0x0310, 0x0460, 0x0420, 0x0330, 0x0490, 0x0450, 0x0350,
+    0x04a0, 0x04a0, 0x03c0, 0x0460, 0x0490, 0x0410, 0x0440, 0x0460, 0x0470,
+    0x0440, 0x0440, 0x04a0, 0x0520, 0x0480, 0x0460, 0x0800, 0x0630, 0x0440,
+    0x0840, 0x0840, 0x0450, 0x0840, 0x0840, 0x04e0,
+]
+
+// Bit allocation pointer for each masked PSD address (Table 7.16).
+let ac3BapTab: [Int] = [
+    0, 1, 1, 1, 1, 1, 2, 2, 3, 3, 3, 4, 4, 5, 5, 6, 6, 6, 6, 7,
+    7, 7, 7, 8, 8, 8, 8, 9, 9, 9, 9, 10, 10, 10, 10, 11, 11, 11, 11, 12,
+    12, 12, 12, 13, 13, 13, 13, 14, 14, 14, 14, 14, 14, 14, 14, 15, 15, 15, 15, 15,
+    15, 15, 15, 15,
+]
+
+// E-AC-3 high-efficiency bap for AHT channels (Table E3.1).
+let eac3HebapTab: [Int] = [
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 8, 8, 8, 9, 9, 9, 10, 10, 10, 10, 11,
+    11, 11, 11, 12, 12, 12, 12, 13, 13, 13, 13, 14, 14, 14, 14, 15, 15, 15, 15, 16,
+    16, 16, 16, 17, 17, 17, 17, 18, 18, 18, 18, 18, 18, 18, 18, 19, 19, 19, 19, 19,
+    19, 19, 19, 19,
+]
+
+// Bit allocation parameters (Tables 7.6 to 7.11).
+let ac3SlowDecayTab: [Int] = [0x0f, 0x11, 0x13, 0x15]
+let ac3FastDecayTab: [Int] = [0x3f, 0x53, 0x67, 0x7b]
+let ac3SlowGainTab: [Int] = [0x540, 0x4d8, 0x478, 0x410]
+let ac3DbPerBitTab: [Int] = [0x000, 0x700, 0x900, 0xb00]
+// The last is 0xf800 as a 16-bit signed number.
+let ac3FloorTab: [Int] = [0x2f0, 0x2b0, 0x270, 0x230, 0x1f0, 0x170, 0x0f0, -2048]
+let ac3FastGainTab: [Int] = [0x080, 0x100, 0x180, 0x200, 0x280, 0x300, 0x380, 0x400]
+
+// Rematrixing band edges in bins (7.5.2).
+let ac3RematBands: [Int] = [13, 25, 37, 61, 253]
+
+// Default band structures: E-AC-3 coupling (Table E2.16) and spectral
+// extension (Table E2.15). AC-3 uses the coupling one for block 0 too.
+let ac3DefaultCplBandStruct: [Int] = [0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 1, 0, 1, 1, 1, 1, 1]
+let eac3DefaultSpxBandStruct: [Int] = [0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1]
+
+// Quantiser for each bap: levels for the symmetric ones (1 to 5), bits
+// for the plain two's complement ones (6 to 15) (Table 7.18).
+let ac3QuantBits: [Int] = [0, 3, 5, 7, 11, 15, 5, 6, 7, 8, 9, 10, 11, 12, 14, 16]
+
+// Symmetric dequantisation (7.3.3): code 0…levels-1 → a 24-bit mantissa.
+fn ac3Dequant(_ code: Int, _ levels: Int) -> Int {
+    ((code - (levels >> 1)) * (1 << 24)) / levels
+}
+
+// bap 1: three 3-level mantissas in 5 bits; 2: three 5-level in 7 bits;
+// 4: two 11-level in 7 bits; 3 and 5 are ungrouped 7- and 15-level.
+let ac3Bap1Mant: [Int] = ac3MakeGrouped(32, 3, 3)
+let ac3Bap2Mant: [Int] = ac3MakeGrouped(128, 5, 3)
+let ac3Bap4Mant: [Int] = ac3MakeGrouped(128, 11, 2)
+// (An extra 0 for the unused last code of bap 3 and 5.)
+let ac3Bap3Mant: [Int] = ac3MakeGrouped(7, 7, 1) + [0]
+let ac3Bap5Mant: [Int] = ac3MakeGrouped(15, 15, 1) + [0]
+
+// For each group code, `count` mantissas, first one first.
+fn ac3MakeGrouped(_ codes: Int, _ levels: Int, _ count: Int) -> [Int] {
+    var out: [Int] = []
+    for code in 0..codes {
+        if count == 3 {
+            let sq = levels * levels
+            out.append(ac3Dequant(code / sq, levels))
+            out.append(ac3Dequant((code % sq) / levels, levels))
+            out.append(ac3Dequant(code % levels, levels))
+        } else if count == 2 {
+            out.append(ac3Dequant(code / levels, levels))
+            out.append(ac3Dequant(code % levels, levels))
+        } else {
+            out.append(ac3Dequant(code, levels))
+        }
+    }
+    out
+}
+
+// Dynamic range gain words (7.7.1.2): dynrng → a linear gain.
+let ac3DynRangeTab: [Float] = ac3MakeDynRange()
+
+fn ac3MakeDynRange() -> [Float] {
+    var out: [Float] = []
+    for i in 0..256 {
+        // Bits 7-5 are a signed shift (+3 … −4 in 6 dB steps), bits 4-0
+        // the fraction 1.xxxxx, normalised as in the spec.
+        let v = (i >> 5) - ((i >> 7) << 3) - 5
+        out.append(pow(2.0, Float(v)) * Float((i & 0x1f) | 0x20))
+    }
+    out
+}
+
+// Channel names in WAV order for each acmod's channels, in the stream's
+// own order (Table 5.8: L C R Ls Rs), and the order they go out in.
+fn ac3StreamNames(_ acmod: Int) -> [String] {
+    match acmod {
+        0 -> ["FL", "FR"]
+        1 -> ["FC"]
+        2 -> ["FL", "FR"]
+        3 -> ["FL", "FC", "FR"]
+        4 -> ["FL", "FR", "BC"]
+        5 -> ["FL", "FC", "FR", "BC"]
+        6 -> ["FL", "FR", "SL", "SR"]
+        _ -> ["FL", "FC", "FR", "SL", "SR"]
+    }
+}
+
+// Position of a channel name in WAV order (core/samples.tsl).
+fn ac3WavRank(_ name: String) -> Int {
+    let order = ["FL", "FR", "FC", "LFE", "BL", "BR", "FLC", "FRC", "BC", "SL", "SR"]
+    order.index(of: name) ?? 99
+}

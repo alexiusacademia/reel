@@ -1,0 +1,264 @@
+// The demux module: opens any media file Reel plays and lists what's in
+// it (core.Media). `open` looks at the first bytes to pick the container,
+// falling back to the file name's extension.
+//
+// Each container lives in its own files, written by its builder:
+//   mp4.tsl   mp4Open    MP4, MOV, M4A, M4V, 3GP, fragmented MP4
+//   wav.tsl   wavOpen    WAV (RIFF, RF64, WAVE_FORMAT_EXTENSIBLE), AIFF/AIFC
+//   raw.tsl   rawOpen    elementary streams: MP3/MP2 (ID3v1/v2, Xing,
+//                        VBRI, LAME), AAC ADTS, FLAC, AC-3, E-AC-3,
+//                        H.264/HEVC Annex B
+//   mkv.tsl   mkvOpen    Matroska and WebM
+//   ogg.tsl   oggOpen    Ogg (Vorbis, Opus, FLAC, Theora)
+//   avi.tsl   aviOpen    AVI and OpenDML
+//   ts.tsl    tsOpen     MPEG transport streams (188- and 192-byte packets)
+//   ps.tsl    psOpen     MPEG program streams (.mpg, .vob)
+//   dts.tsl   dtsOpen    raw DTS streams (.dts), core and DTS-HD
+//   ivf.tsl   ivfOpen    IVF (VP8, VP9, AV1 elementary streams)
+//   asf.tsl   asfOpen    ASF: Windows Media (.wmv, .wma, .asf)
+//   thd.tsl   thdOpen    raw TrueHD / MLP streams (.thd, .mlp)
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../core"
+import "../truehd"
+
+// The container format of a file: "mp4" "mkv" "avi" "ogg" "ts" "ps" "wav"
+// "aiff" "mp3" "aac" "flac" "ac3" "eac3" "h264" "hevc" "dts" "ivf" "asf"
+// "thd", or "" when it isn't one Reel knows.
+public fn sniff(_ file: Data, name: String = "") -> String {
+    let n = file.count
+    if n >= 12 {
+        let t4 = file.slice(from: 4, to: 8).latin1
+        if t4 == "ftyp" || t4 == "moov" || t4 == "mdat" || t4 == "free" || t4 == "wide" || t4 == "skip" || t4 == "styp" || t4 == "moof" {
+            return "mp4"
+        }
+        let t0 = file.slice(from: 0, to: 4).latin1
+        let t8 = file.slice(from: 8, to: 12).latin1
+        if (t0 == "RIFF" || t0 == "RF64") && t8 == "WAVE" {
+            return "wav"
+        }
+        if t0 == "RIFF" && (t8 == "AVI " || t8 == "AVIX") {
+            return "avi"
+        }
+        if t0 == "FORM" && (t8 == "AIFF" || t8 == "AIFC") {
+            return "aiff"
+        }
+        if t0 == "OggS" {
+            return "ogg"
+        }
+        if t0 == "fLaC" {
+            return "flac"
+        }
+        if t0 == "DKIF" {
+            return "ivf"
+        }
+        // ASF header object GUID 75B22630-668E-11CF-A6D9-00AA0062CE6C.
+        if file[0] == 0x30 && file[1] == 0x26 && file[2] == 0xb2 && file[3] == 0x75 && file[4] == 0x8e && file[5] == 0x66 && file[6] == 0xcf && file[7] == 0x11 {
+            return "asf"
+        }
+        // TrueHD / MLP major sync: F8726FBA (TrueHD) or F8726FBB (MLP)
+        // after the 4-byte access unit header.
+        if file[4] == 0xf8 && file[5] == 0x72 && file[6] == 0x6f && (file[7] == 0xba || file[7] == 0xbb) {
+            return "thd"
+        }
+    }
+    if n >= 4 && file[0] == 0x1a && file[1] == 0x45 && file[2] == 0xdf && file[3] == 0xa3 {
+        return "mkv"
+    }
+    if n >= 4 && file[0] == 0 && file[1] == 0 && file[2] == 1 && file[3] == 0xba {
+        return "ps"
+    }
+    if isTransportStream(file, 188, 0) || isTransportStream(file, 192, 4) {
+        return "ts"
+    }
+    let ext = extensionOf(name)
+    if n >= 3 && file.slice(from: 0, to: 3).latin1 == "ID3" {
+        // ID3 tags come before MP3s, and sometimes AAC or FLAC.
+        if ext == "aac" || ext == "flac" {
+            return ext
+        }
+        return "mp3"
+    }
+    // DTS-HD files (.dtshd) and bare DTS-HD substreams.
+    if n >= 8 && file.slice(from: 0, to: 8).latin1 == "DTSHDHDR" {
+        return "dts"
+    }
+    if n >= 4 && file[0] == 0x64 && file[1] == 0x58 && file[2] == 0x20 && file[3] == 0x25 {
+        return "dts"
+    }
+    // DTS: the 0x7FFE8001 sync word (also 14-bit and little-endian forms).
+    if n >= 4 && ((file[0] == 0x7f && file[1] == 0xfe && file[2] == 0x80 && file[3] == 0x01) || (file[0] == 0xfe && file[1] == 0x7f && file[2] == 0x01 && file[3] == 0x80) || (file[0] == 0x1f && file[1] == 0xff && file[2] == 0xe8 && file[3] == 0x00) || (file[0] == 0xff && file[1] == 0x1f && file[2] == 0x00 && file[3] == 0xe8)) {
+        return "dts"
+    }
+    // Blu-ray .thd+ac3 streams start with an AC-3 frame.
+    if ext == "thd" || ext == "mlp" || ext == "thd+ac3" {
+        return "thd"
+    }
+    if n >= 2 && file[0] == 0x0b && file[1] == 0x77 {
+        return if ext == "eac3" || ext == "ec3" { "eac3" } else { "ac3" }
+    }
+    if n >= 2 && file[0] == 0xff && (file[1] & 0xf6) == 0xf0 {
+        return "aac"
+    }
+    if n >= 2 && file[0] == 0xff && (file[1] & 0xe0) == 0xe0 {
+        return "mp3"
+    }
+    if n >= 4 && file[0] == 0 && file[1] == 0 && (file[2] == 1 || (file[2] == 0 && file[3] == 1)) {
+        if ext == "hevc" || ext == "h265" || ext == "265" {
+            return "hevc"
+        }
+        return "h264"
+    }
+    match ext {
+        "mp4" -> "mp4"
+        "m4a" -> "mp4"
+        "m4v" -> "mp4"
+        "mov" -> "mp4"
+        "mkv" -> "mkv"
+        "mka" -> "mkv"
+        "webm" -> "mkv"
+        "avi" -> "avi"
+        "ogg" -> "ogg"
+        "oga" -> "ogg"
+        "ogv" -> "ogg"
+        "opus" -> "ogg"
+        "ts" -> "ts"
+        "m2ts" -> "ts"
+        "mts" -> "ts"
+        "mpg" -> "ps"
+        "mpeg" -> "ps"
+        "vob" -> "ps"
+        "wav" -> "wav"
+        "mp3" -> "mp3"
+        "aac" -> "aac"
+        "flac" -> "flac"
+        "dts" -> "dts"
+        "dtshd" -> "dts"
+        "ivf" -> "ivf"
+        "wmv" -> "asf"
+        "wma" -> "asf"
+        "asf" -> "asf"
+        "thd" -> "thd"
+        "mlp" -> "thd"
+        _ -> if truehd.thdFindMajorSync(file.slice(from: 0, to: min(n, 65536)), 0) >= 0 { "thd" } else { "" }
+    }
+}
+
+// Opens a file whose bytes are `file`; `name` (the file name or URL)
+// helps when the bytes don't say.
+public fn open(_ file: Data, name: String = "") -> Result<core.Media> {
+    match openAs(file, sniff(file, name: name)) {
+        .ok(m) -> {
+            var media = m
+            fillTrueHD(file, media)
+            Result.ok(value: media)
+        }
+        .failure(e) -> Result.failure(error: e)
+    }
+}
+
+// TrueHD in MP4 (mlpa) and MPEG-TS (0x83) comes without rate and
+// channels: read them from the first major sync.
+fn fillTrueHD(_ file: Data, _ m: bind core.Media) {
+    for i in 0..m.tracks.count {
+        let t = m.tracks[i]
+        if (t.codec != "truehd" && t.codec != "mlp") || (t.sampleRate > 0 && t.channels > 0 && !t.layout.isEmpty) {
+            continue
+        }
+        var seen = 0
+        for p in m.packets {
+            if p.track != i {
+                continue
+            }
+            let bytes = core.packetBytes(file, m, p)
+            let at = truehd.thdFindMajorSync(bytes, 0)
+            if at >= 0 {
+                let mh = truehd.thdReadMajorSync(bytes, at + 4)
+                if mh.ok {
+                    m.tracks[i].sampleRate = mh.group1Rate
+                    m.tracks[i].channels = truehd.thdPopCount(mh.mask)
+                    m.tracks[i].layout = truehd.thdLayoutNames(mh.mask)
+                    m.tracks[i].bitsPerSample = mh.group1Bits
+                    break
+                }
+            }
+            seen += 1
+            if seen >= 8 {
+                break
+            }
+        }
+    }
+}
+
+fn openAs(_ file: Data, _ format: String) -> Result<core.Media> {
+    match format {
+        "mp4" -> mp4Open(file)
+        "wav" -> wavOpen(file)
+        "aiff" -> wavOpen(file)
+        "mkv" -> mkvOpen(file)
+        "ogg" -> oggOpen(file)
+        "avi" -> aviOpen(file)
+        "ts" -> tsOpen(file)
+        "ps" -> psOpen(file)
+        "dts" -> dtsOpen(file)
+        "ivf" -> ivfOpen(file)
+        "asf" -> asfOpen(file)
+        "thd" -> thdOpen(file)
+        "" -> Result.failure(error: Error("this isn't a kind of media file Reel knows"))
+        _ -> rawOpen(file, format: format)
+    }
+}
+
+// The index of the last keyframe packet of `track` at or before `seconds`
+// (by pts), or the track's first packet. -1 when the track has none.
+public fn keyBefore(_ media: core.Media, track: Int, seconds: Float) -> Int {
+    let scale = media.tracks[track].timescale
+    let target = core.ticks(seconds, scale)
+    var best = -1
+    var first = -1
+    for (i, p) in media.packets.enumerated() {
+        if p.track != track {
+            continue
+        }
+        if first < 0 {
+            first = i
+        }
+        if p.key && p.pts != core.noTime && p.pts <= target {
+            best = i
+        }
+    }
+    if best < 0 { first } else { best }
+}
+
+fn extensionOf(_ name: String) -> String {
+    let base = name.split("?")[0]
+    if let dot = base.findLast(".") {
+        return base.substring(from: dot + 1, to: base.count).lowercase()
+    }
+    ""
+}
+
+fn isTransportStream(_ file: Data, _ size: Int, _ skip: Int) -> Bool {
+    if file.count < size * 3 {
+        // One or two whole packets (a short segment).
+        if file.count < size || file.count % size != 0 {
+            return false
+        }
+        var at = skip
+        while at < file.count {
+            if file[at] != 0x47 {
+                return false
+            }
+            at += size
+        }
+        return true
+    }
+    for k in 0..3 {
+        if file[skip + k * size] != 0x47 {
+            return false
+        }
+    }
+    true
+}

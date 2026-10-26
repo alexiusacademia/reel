@@ -1,0 +1,186 @@
+// The public face of the H.264 decoder: Decoder (decode, flush, reset),
+// newDecoder for a core.Track, parseAvcC for the avcC box body
+// (AVCDecoderConfigurationRecord, ISO/IEC 14496-15 5.3.3.1) and spsInfo
+// for the media info window.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../core"
+
+// The contents of an avcC: NAL length size and parameter sets (each a
+// whole NAL unit, header byte included).
+public struct AvcC {
+    valid: Bool = false
+    profile: Int = 0
+    compatibility: Int = 0
+    level: Int = 0
+    lengthSize: Int = 4
+    sps: [Data] = []
+    pps: [Data] = []
+}
+
+public fn parseAvcC(_ extra: Data) -> AvcC {
+    var a = AvcC()
+    if extra.count < 7 || extra[0] != 1 {
+        return a
+    }
+    a.profile = extra[1]
+    a.compatibility = extra[2]
+    a.level = extra[3]
+    a.lengthSize = (extra[4] & 3) + 1
+    var p = 5
+    let nSps = extra[p] & 31
+    p += 1
+    for _ in 0..nSps {
+        if p + 2 > extra.count {
+            return a
+        }
+        let len = (extra[p] << 8) | extra[p + 1]
+        p += 2
+        if p + len > extra.count {
+            return a
+        }
+        a.sps.append(extra.slice(from: p, to: p + len))
+        p += len
+    }
+    if p >= extra.count {
+        return a
+    }
+    let nPps = extra[p]
+    p += 1
+    for _ in 0..nPps {
+        if p + 2 > extra.count {
+            return a
+        }
+        let len = (extra[p] << 8) | extra[p + 1]
+        p += 2
+        if p + len > extra.count {
+            return a
+        }
+        a.pps.append(extra.slice(from: p, to: p + len))
+        p += len
+    }
+    a.valid = true
+    a
+}
+
+// Both stages one after the other (see pipeline.tsl).
+public struct Decoder {
+    // When true, pictures nothing refers to (nal_ref_idc 0) are skipped.
+    skipNonReference: Bool = false
+    warnings: [String] = []
+    parser: Parser = Parser()
+    reconstructor: Reconstructor = Reconstructor()
+    // Development switch H264_SPLIT: luma and chroma by two reconstructors
+    // (one after the other here), to check that path.
+    split: Bool = false
+    chromaRecon: Reconstructor = Reconstructor()
+
+    // Decodes one packet (an access unit); returns the pictures now ready,
+    // in display order.
+    fn decode(_ packet: Data, pts: Int, dts: Int, key: Bool) -> [core.Picture] {
+        parser.skipNonReference = skipNonReference
+        let parsed = parser.parse(packet, pts: pts, dts: dts, key: key)
+        return run(parsed)
+    }
+
+    // End of stream: every picture still held.
+    fn flush() -> [core.Picture] {
+        return run(parser.flush())
+    }
+
+    // After a seek: drop references and held pictures, wait for a key.
+    fn reset() {
+        parser.reset()
+        reconstructor.reset()
+        chromaRecon.reset()
+    }
+
+    fn run(_ parsed: [ParsedPicture]) -> [core.Picture] {
+        var out: [core.Picture] = []
+        for p in parsed {
+            if split {
+                let l = reconstructor.reconstruct(p)
+                out += mergePlanes(l, chromaRecon.reconstruct(p))
+            } else {
+                out += reconstructor.reconstruct(p)
+            }
+        }
+        chromaRecon.warnings = []
+        for list in [parser.warnings, reconstructor.warnings] {
+            for w in list {
+                if warnings.count < 200 {
+                    warnings.append(w)
+                }
+            }
+        }
+        parser.warnings = []
+        reconstructor.warnings = []
+        out
+    }
+}
+
+// A decoder for an "h264" track. track.extra is the avcC (length prefixed
+// NAL units follow) or empty / Annex B parameter sets (start codes).
+public fn newDecoder(_ track: core.Track) -> Result<Decoder> {
+    let p = try newPipeline(track)
+    var d = Decoder(parser: p.parser, reconstructor: p.reconstructor)
+    if environment(name: "H264_SPLIT") != nil {
+        d.split = true
+        d.reconstructor = newReconstructor(.luma)
+        d.chromaRecon = newReconstructor(.chroma)
+    }
+    Result.ok(value: d)
+}
+
+fn h264ProfileName(_ s: Sps) -> String {
+    let p = s.profileIdc
+    if p == 66 {
+        return if (s.constraintFlags & 0x40) != 0 { "Constrained Baseline" } else { "Baseline" }
+    }
+    if p == 77 { return "Main" }
+    if p == 88 { return "Extended" }
+    if p == 100 { return "High" }
+    if p == 110 { return "High 10" }
+    if p == 122 { return "High 4:2:2" }
+    if p == 244 { return "High 4:4:4" }
+    "Profile {p}"
+}
+
+// "High 4.0, 1920×1080, 4:2:0 8-bit" for a track's first SPS.
+public fn spsInfo(_ track: core.Track) -> String {
+    var nal = Data()
+    let x = track.extra
+    if h264LooksAnnexB(x) {
+        let nals = h264SplitNals(x, 0)
+        var i = 0
+        while i + 1 < nals.count {
+            if (x[nals[i]] & 31) == 7 {
+                nal = x.slice(from: nals[i], to: nals[i + 1])
+                break
+            }
+            i += 2
+        }
+    } else {
+        let a = parseAvcC(x)
+        if a.sps.count > 0 {
+            nal = a.sps[0]
+        }
+    }
+    if nal.count < 2 {
+        return "H.264"
+    }
+    let s = parseSps(core.unescapeRbsp(nal, from: 1, to: nal.count))
+    if !s.valid {
+        return "H.264"
+    }
+    let lv = s.levelIdc
+    let level = if lv == 9 { "1b" } else { "{lv / 10}.{lv % 10}" }
+    let chroma = if s.chromaFormatIdc == 0 { "4:0:0" } else if s.chromaFormatIdc == 1 { "4:2:0" } else if s.chromaFormatIdc == 2 { "4:2:2" } else { "4:4:4" }
+    var info = "{h264ProfileName(s)} {level}, {s.width}×{s.height}, {chroma} {s.bitDepthLuma}-bit"
+    if !s.frameMbsOnly {
+        info += ", interlaced"
+    }
+    info
+}

@@ -1,0 +1,84 @@
+// Tests for the library module: text decoding and folding, natural order,
+// locations; M3U/M3U8, PLS, XSPF, WPL and CUE reading, writing and round
+// trips; episode names and next-episode; the keymap; preferences; the
+// SQLite media library (scan, groups, search, rescans, reports), history
+// and per-file memory (positions, finished, moved files, settings,
+// bookmarks, A-B), the legacy recent.json/positions.json import, track
+// choice by language; and the thumbnail cache.
+//
+// Everything is written under build/scratch/library/t (made fresh each
+// run); the user's Reel data folder is never touched.
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+import "../../library"
+
+struct Checker {
+    passed: Int = 0
+    total: Int = 0
+
+    fn check(_ ok: Bool, _ what: String) {
+        total += 1
+        if ok {
+            passed += 1
+        } else {
+            print("FAIL: {what}")
+        }
+    }
+
+    fn same(_ got: String, _ want: String, _ what: String) {
+        check(got == want, "{what}: got \"{got}\", want \"{want}\"")
+    }
+
+    fn sameInt(_ got: Int, _ want: Int, _ what: String) {
+        check(got == want, "{what}: got {got}, want {want}")
+    }
+
+    fn near(_ got: Float, _ want: Float, _ what: String, tol: Float = 0.001) {
+        check(abs(got - want) <= tol, "{what}: got {got}, want {want}")
+    }
+}
+
+// A fresh scratch folder for this run.
+fn scratchRoot() -> String {
+    let root = joinPath(currentFolder(), "build/scratch/library/t")
+    removeTree(root)
+    createFolder(root)
+    root
+}
+
+// Deletes a folder's files and subfolders (only used on our scratch tree).
+fn removeTree(_ folder: String) {
+    if !folder.contains("build/scratch/library") {
+        return
+    }
+    for name in listFolder(folder) ?? [] {
+        let p = joinPath(folder, name)
+        if isFolder(p) {
+            removeTree(p)
+        } else {
+            deleteFile(path: p)
+        }
+    }
+    // (Tessel can't delete folders; empty ones stay.)
+}
+
+fn main() {
+    var c = Checker()
+    let root = scratchRoot()
+    let t0 = now()
+    testText(c)
+    testPlaylists(c, root)
+    testCue(c, root)
+    testXml(c, root)
+    print("time text and playlists: {Int((now() - t0) * 1000.0)} ms")
+    let t1 = now()
+    testEpisodes(c)
+    testKeymap(c)
+    testPrefs(c, root)
+    print("time episodes, keys, preferences: {Int((now() - t1) * 1000.0)} ms")
+    testLibrary(c, root)
+    testThumbs(c, root)
+    print("library: {c.passed} of {c.total} passed")
+}

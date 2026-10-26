@@ -1,0 +1,1185 @@
+// The TrueHD / MLP decoder (codecs "truehd" and "mlp"), bit-exact with
+// FFmpeg's mlpdec.c, which it follows step by step (the MLP and TrueHD
+// specifications aren't public; FFmpeg's decoder is the reference
+// everyone checks against).
+//
+// How an access unit (header.tsl) is decoded:
+// 1. A major sync, when present, (re)sets the stream format.
+// 2. The substream directory says where each substream's data ends.
+//    TrueHD streams carry the same audio several times over: substream 0
+//    a stereo presentation, 1 a 5.1 (or 6-channel) one, 2 an 8-channel
+//    one, and in Atmos streams a fourth with the 16-channel spatial
+//    objects. Like FFmpeg we decode the biggest of the first three
+//    (Atmos: the 7.1 bed) and skip substreams it doesn't need. MLP
+//    streams split channels between substreams, decoded together.
+// 3. Each substream is a run of blocks. A block may start with a restart
+//    header (channel range, noise generator seed, channel assignment) and
+//    decoding parameters (block size, matrices, output shifts, quantiser
+//    steps, per channel: FIR and IIR prediction filters, Huffman offset,
+//    codebook and LSB count), then the samples: per channel an optional
+//    Huffman-coded MSB part and plain LSBs, added to the prediction of
+//    the channel's filters.
+// 4. After all blocks, the primitive matrices are applied in turn (each
+//    rebuilds one channel from all the others, plus dither noise and the
+//    "bypassed" LSBs sent alongside), and channels are shifted and put in
+//    output order by the channel assignment.
+// Check bytes (restart header CRC, substream parity and CRC, the
+// lossless check XOR of all output) give warnings when they disagree.
+//
+// Integers: FFmpeg keeps samples in int32 and sums in int64; we keep
+// everything in Int and wrap to 32 bits (thdWrap32) where C would.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../core"
+
+let thdMaxCh = 8
+let thdMaxBlock = 160
+let thdNoCheck = 0xffffffff
+
+// FFmpeg's ff_mlp_huffman_tables: (code, length) for each symbol of the
+// three codebooks.
+let thdHuffCodes: [Int] = [
+    0x01, 9, 0x01, 8, 0x01, 7, 0x01, 6, 0x01, 5, 0x01, 4, 0x01, 3, 0x04, 3, 0x05, 3, 0x06, 3, 0x07, 3, 0x03, 3, 0x05, 4, 0x09, 5, 0x11, 6, 0x21, 7, 0x41, 8, 0x81, 9,
+    0x01, 9, 0x01, 8, 0x01, 7, 0x01, 6, 0x01, 5, 0x01, 4, 0x01, 3, 0x02, 2, 0x03, 2, 0x03, 3, 0x05, 4, 0x09, 5, 0x11, 6, 0x21, 7, 0x41, 8, 0x81, 9, 0, 0, 0, 0,
+    0x01, 9, 0x01, 8, 0x01, 7, 0x01, 6, 0x01, 5, 0x01, 4, 0x01, 3, 0x01, 1, 0x03, 3, 0x05, 4, 0x09, 5, 0x11, 6, 0x21, 7, 0x41, 8, 0x81, 9, 0, 0, 0, 0, 0, 0
+]
+
+// TrueHD's noise table (mlpdec.c noise_table), for 0x31EB substreams.
+let thdNoiseTable: [Int] = [
+    30, 51, 22, 54, 3, 7, -4, 38, 14, 55, 46, 81, 22, 58, -3, 2,
+    52, 31, -7, 51, 15, 44, 74, 30, 85, -17, 10, 33, 18, 80, 28, 62,
+    10, 32, 23, 69, 72, 26, 35, 17, 73, 60, 8, 56, 2, 6, -2, -5,
+    51, 4, 11, 50, 66, 76, 21, 44, 33, 47, 1, 26, 64, 48, 57, 40,
+    38, 16, -10, -28, 92, 22, -18, 29, -10, 5, -13, 49, 19, 24, 70, 34,
+    61, 48, 30, 14, -6, 25, 58, 33, 42, 60, 67, 17, 54, 17, 22, 30,
+    67, 44, -9, 50, -11, 43, 40, 32, 59, 82, 13, 49, -14, 55, 60, 36,
+    48, 49, 31, 47, 15, 12, 4, 65, 1, 23, 29, 39, 45, -2, 84, 69,
+    0, 72, 37, 57, 27, 41, -15, -16, 35, 31, 14, 61, 24, 0, 27, 24,
+    16, 41, 55, 34, 53, 9, 56, 12, 25, 29, 53, 5, 20, -20, -8, 20,
+    13, 28, -3, 78, 38, 16, 11, 62, 46, 29, 21, 24, 46, 65, 43, -23,
+    89, 18, 74, 21, 38, -12, 19, 12, -19, 8, 15, 33, 4, 57, 9, -8,
+    36, 35, 26, 28, 7, 83, 63, 79, 75, 11, 3, 87, 37, 47, 34, 40,
+    39, 19, 20, 42, 27, 34, 39, 77, 13, 42, 59, 64, 45, -1, 32, 37,
+    45, -5, 53, -6, 7, 36, 50, 23, 6, 32, 9, -21, 18, 71, 27, 52,
+    -25, 31, 35, 42, -1, 68, 63, 52, 26, 43, 66, 37, 41, 25, 40, 70
+]
+
+// The low 32 bits as a signed number (C's int32_t).
+fn thdWrap32(_ v: Int) -> Int {
+    (v << 32) >> 32
+}
+
+// XOR of a 32-bit value's four bytes.
+fn thdXor32to8(_ v: Int) -> Int {
+    var x = v & 0xffffffff
+    x = x ^ (x >> 16)
+    x = x ^ (x >> 8)
+    x & 0xff
+}
+
+// The 512-entry lookup tables of the three codebooks: entry symbol × 16 +
+// length for each 9-bit prefix, 0 for no code.
+fn thdHuffLookup() -> [Int] {
+    var t = core.zeros(3 * 512)
+    let codes = thdHuffCodes
+    for book in 0..3 {
+        for sym in 0..18 {
+            let code = codes[(book * 18 + sym) * 2]
+            let len = codes[(book * 18 + sym) * 2 + 1]
+            if len == 0 {
+                continue
+            }
+            let first = code << (9 - len)
+            for k in 0..(1 << (9 - len)) {
+                t[book * 512 + first + k] = sym * 16 + len
+            }
+        }
+    }
+    t
+}
+
+public struct Decoder {
+    // Output format: from the track, then from each access unit.
+    rate: Int = 0
+    channels: Int = 0
+    layout: [String] = []
+    // TrueHD needs no priming dropped.
+    delay: Int = 0
+    warnings: [String] = []
+    // Bits per sample of the source: 24 for TrueHD, 16/20/24 for MLP.
+    bits: Int = 0
+    // An Atmos stream (its 7.1 bed is decoded).
+    atmos: Bool = false
+    // "TrueHD" or "MLP", from the last major sync.
+    kind: String = ""
+    // Access units decoded, and those that gave no output (damaged, or
+    // before the first major sync).
+    units: Int = 0
+    damaged: Int = 0
+    // Check byte mismatches seen (restart header CRC, substream parity and
+    // CRC, lossless check), also listed in warnings (the first few).
+    checkErrors: Int = 0
+
+    codec: String = "truehd"
+    br: core.BitReader = core.bitReader(Data())
+    huff: [Int] = []
+    noiseTable: [Int] = []
+    pending: Data = Data()
+    outBuf: [Float] = []
+    warned: [String] = []
+
+    // --- Stream parameters (major sync). ---
+    paramsValid: Bool = false
+    mlp: Bool = false
+    numSubstreams: Int = 0
+    substreamInfo: Int = 0
+    maxDecoded: Int = 0
+    auSize: Int = 0
+    auSizePow2: Int = 0
+    needsReordering: Bool = false
+    is32: Bool = true
+    // The output layout (FFmpeg's avctx->ch_layout): channel bits and
+    // count; -1 until known.
+    outMask: Int = -1
+    outChannels: Int = 0
+    // The mask `layout` was made from.
+    layoutMask: Int = -2
+
+    // --- Per substream (4), and per substream × channel/matrix (4 × 8). ---
+    restartSeen: [Int] = core.zeros(4)
+    endOfStream: [Int] = core.zeros(4)
+    noiseType: [Int] = core.zeros(4)
+    minChannel: [Int] = core.zeros(4)
+    maxChannel: [Int] = core.zeros(4)
+    codedChannels: [Int] = core.zeros(4)
+    maxMatrixChannel: [Int] = core.zeros(4)
+    chAssign: [Int] = core.zeros(32)
+    subMask: [Int] = core.zeros(4)
+    noiseShift: [Int] = core.zeros(4)
+    noiseSeed: [Int] = core.zeros(4)
+    dataCheckPresent: [Int] = core.zeros(4)
+    paramPresence: [Int] = core.zeros(4)
+    numMatrices: [Int] = core.zeros(4)
+    matrixOutCh: [Int] = core.zeros(32)
+    lsbBypass: [Int] = core.zeros(32)
+    // (substream × 8 + matrix) × 8 + channel, 2.14 fixed point.
+    matrixCoeff: [Int] = core.zeros(256)
+    matrixNoiseShift: [Int] = core.zeros(32)
+    quantStep: [Int] = core.zeros(32)
+    blocksize: [Int] = core.zeros(4)
+    blockpos: [Int] = core.zeros(4)
+    outputShift: [Int] = core.zeros(32)
+    losslessCheck: [Int] = [0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff]
+    parityPresent: [Int] = core.zeros(4)
+    dataLen: [Int] = core.zeros(4)
+
+    // Channel coding parameters, by substream × 8 + channel.
+    firOrder: [Int] = core.zeros(32)
+    firShift: [Int] = core.zeros(32)
+    iirOrder: [Int] = core.zeros(32)
+    iirShift: [Int] = core.zeros(32)
+    firState: [Int] = core.zeros(256)
+    iirState: [Int] = core.zeros(128)
+    firCoeff: [Int] = core.zeros(256)
+    iirCoeff: [Int] = core.zeros(128)
+    huffOffset: [Int] = core.zeros(32)
+    signHuffOffset: [Int] = core.zeros(32)
+    codebook: [Int] = core.zeros(32)
+    huffLsbs: [Int] = core.zeros(32)
+
+    // --- Shared work buffers. ---
+    // sample × 8 + channel.
+    sampleBuf: [Int] = core.zeros(160 * 8)
+    // sample × 8 + matrix.
+    bypassed: [Int] = core.zeros(160 * 8)
+    noiseBuf: [Int] = core.zeros(256)
+    firBuf: [Int] = core.zeros(176)
+    iirBuf: [Int] = core.zeros(176)
+    matrixChanged: Int = 0
+    // channel × 2 + filter.
+    filterChanged: [Int] = core.zeros(16)
+
+    fn warn(_ text: String) {
+        if warnings.count < 100 {
+            warnings.append(text)
+        }
+    }
+
+    fn warnOnce(_ text: String) {
+        if !warned.contains(text) {
+            warned.append(text)
+            warn(text)
+        }
+    }
+
+    fn checkError(_ text: String) {
+        checkErrors += 1
+        if checkErrors <= 10 {
+            warn(text)
+        }
+    }
+
+    // Decodes a packet: any number of whole access units (and AC-3 frames
+    // interleaved with them, which are skipped). An access unit cut off at
+    // the end is kept for the next packet (MPEG-TS PES packets don't follow
+    // access units).
+    fn decode(_ packet: Data, pts: Int) -> core.Samples {
+        outBuf = []
+        var data = packet
+        if !pending.isEmpty {
+            data = pending + packet
+            pending = Data()
+        }
+        var at = 0
+        var skipped = 0
+        while at + 4 <= data.count {
+            let ac3 = thdAc3FrameSize(data, at)
+            if ac3 > 0 && !thdIsMajorSync(data, at + 4) {
+                if at + ac3 > data.count {
+                    pending = data.slice(from: at, to: data.count)
+                    break
+                }
+                warnOnce("skipped AC-3 frames interleaved with the TrueHD stream")
+                at += ac3
+                continue
+            }
+            let len = thdAccessUnitLength(data, at)
+            if len == 0 {
+                // Lost: look for the next major sync.
+                let next = thdFindMajorSync(data, at + 1)
+                if next < 0 {
+                    skipped += data.count - at
+                    break
+                }
+                skipped += next - at
+                at = next
+                continue
+            }
+            if !paramsValid && !thdIsMajorSync(data, at + 4) {
+                // Waiting for a major sync (at the start, after a seek or
+                // damage): nothing before one can be decoded, and lengths
+                // read here may be anything.
+                let next = thdFindMajorSync(data, at + 1)
+                let ac3Next = thdFindAc3(data, at + 1)
+                var to = if next < 0 { ac3Next } else if ac3Next < 0 { next } else { min(next, ac3Next) }
+                if to < 0 {
+                    // Keep a tail that may hold the start of the next one.
+                    let keep = max(at, data.count - 40)
+                    pending = data.slice(from: keep, to: data.count)
+                    to = keep
+                    if to > at {
+                        skipped += to - at
+                    }
+                    break
+                }
+                skipped += to - at
+                at = to
+                continue
+            }
+            if at + len > data.count {
+                pending = data.slice(from: at, to: data.count)
+                break
+            }
+            units += 1
+            if !decodeUnit(data, at, len) {
+                damaged += 1
+            }
+            at += len
+        }
+        if skipped > 0 {
+            warn("skipped {skipped} bytes that are not TrueHD access units")
+        }
+        var s = core.Samples(rate: rate, channels: channels, layout: layout, pts: pts)
+        s.data = outBuf
+        outBuf = []
+        s
+    }
+
+    // Nothing is held back (an access unit cut off at the end is dropped).
+    fn flush() -> core.Samples {
+        if !pending.isEmpty {
+            warn("dropped an incomplete access unit of {pending.count} bytes at the end")
+            pending = Data()
+        }
+        core.Samples(rate: rate, channels: channels, layout: layout)
+    }
+
+    // After a seek: wait for the next major sync (mlp_decode_flush).
+    fn reset() {
+        pending = Data()
+        paramsValid = false
+        for s in 0..4 {
+            losslessCheck[s] = thdNoCheck
+        }
+    }
+
+    // --- Access units (read_access_unit). ---
+
+    // Decodes the access unit data[at…at+length]; false when it gave no
+    // output.
+    fn decodeUnit(_ data: Data, _ at: Int, _ length: Int) -> Bool {
+        var headerSize = 4
+        var isMajor = false
+        if length >= 8 && data[at + 4] == 0xf8 && data[at + 5] == 0x72 && data[at + 6] == 0x6f && (data[at + 7] & 0xfe) == 0xba {
+            let mh = thdReadMajorSync(data.slice(from: at + 4, to: at + length), 0)
+            if !mh.ok {
+                warn(mh.problem)
+                paramsValid = false
+                return false
+            }
+            if !applyMajorSync(mh) {
+                paramsValid = false
+                return false
+            }
+            isMajor = true
+            headerSize += mh.headerSize
+        }
+        if !paramsValid {
+            warnOnce("stream parameters not seen yet; skipped access units")
+            return false
+        }
+        br = core.bitReaderRange(data, from: at + headerSize, to: at + length)
+        var substreamStart = 0
+        var subHeader = 0
+        for s in 0..numSubstreams {
+            let extraword = br.bits(1)
+            let nonrestart = br.bits(1)
+            let checkdata = br.bits(1)
+            br.skip(1)
+            var end = br.bits(12) * 2
+            subHeader += 2
+            if extraword == 1 {
+                if mlp {
+                    warn("an MLP substream with an extra word")
+                    paramsValid = false
+                    return false
+                }
+                br.skip(16)
+                subHeader += 2
+            }
+            if length < headerSize + subHeader {
+                warn("access unit too short for its headers")
+                paramsValid = false
+                return false
+            }
+            if (nonrestart == 1) == isMajor {
+                warn("invalid nonrestart_substr")
+                paramsValid = false
+                return false
+            }
+            if end + headerSize + subHeader > length {
+                warn("substream {s} data goes past the end of the access unit")
+                end = length - headerSize - subHeader
+            }
+            if end < substreamStart {
+                warn("substream {s} ends before it starts")
+                paramsValid = false
+                return false
+            }
+            if s > maxDecoded {
+                continue
+            }
+            parityPresent[s] = checkdata
+            dataLen[s] = end - substreamStart
+            substreamStart = end
+        }
+        let parity = thdParity(data, at, 4) ^ thdParity(data, at + headerSize, subHeader)
+        if (((parity >> 4) ^ parity) & 0xf) != 0xf {
+            warn("access unit parity check failed")
+            paramsValid = false
+            return false
+        }
+        var p = at + headerSize + subHeader
+        for s in 0..(maxDecoded + 1) {
+            if decodeSubstream(s, data, p, dataLen[s]) < 0 {
+                return false
+            }
+            if restartSeen[s] == 0 {
+                warnOnce("no restart header in substream {s}")
+            }
+            p += dataLen[s]
+        }
+        let ok = outputData(maxDecoded)
+        for s in 0..(maxDecoded + 1) {
+            if endOfStream[s] != 0 {
+                losslessCheck[s] = thdNoCheck
+                endOfStream[s] = 0
+                paramsValid = false
+            }
+        }
+        ok
+    }
+
+    // read_major_sync: checks the format and sets up the substreams.
+    fn applyMajorSync(_ mh: ThdMajorSync) -> Bool {
+        var problem = ""
+        if mh.group1Bits == 0 {
+            problem = "invalid or unknown bits per sample"
+        } else if mh.group2Bits > mh.group1Bits {
+            problem = "channel group 2 has more bits per sample than group 1"
+        } else if mh.group2Rate != 0 && mh.group2Rate != mh.group1Rate {
+            problem = "channel groups with differing sample rates"
+        } else if mh.group1Rate == 0 {
+            problem = "invalid or unknown sampling rate"
+        } else if mh.group1Rate > 192000 {
+            problem = "sampling rate above 192 kHz"
+        } else if mh.auSize > 160 || mh.auSizePow2 > 256 {
+            problem = "access unit size too big"
+        } else if mh.substreams == 0 {
+            problem = "no substreams"
+        } else if mh.streamType == thdSyncMlp && mh.substreams > 2 {
+            problem = "MLP with more than 2 substreams"
+        } else if mh.substreams > 4 {
+            problem = "more than 4 substreams"
+        }
+        if !problem.isEmpty {
+            warn(problem)
+            return false
+        }
+        mlp = mh.streamType == thdSyncMlp
+        kind = if mlp { "MLP" } else { "TrueHD" }
+        auSize = mh.auSize
+        auSizePow2 = mh.auSizePow2
+        numSubstreams = mh.substreams
+        substreamInfo = mh.substreamInfo
+        atmos = mh.atmos
+        maxDecoded = min(numSubstreams - 1, 2)
+        bits = mh.group1Bits
+        is32 = mh.group1Bits > 16
+        paramsValid = true
+        for s in 0..4 {
+            restartSeen[s] = 0
+        }
+        if mlp {
+            var sub = 0
+            if mh.substreams > 1 {
+                sub = 1
+                subMask[0] = thdMlpStereo
+            }
+            subMask[sub] = mh.mlpMask
+        } else {
+            subMask[1] = mh.mask1
+            if mh.channels1 == 2 && mh.channels2 == 2 {
+                subMask[0] = thdMlpStereo
+            }
+            if mh.substreams > 1 {
+                subMask[0] = thdMlpStereo
+            }
+            if mh.substreams == 1 && mh.channels1 == 1 && mh.channels2 == 1 {
+                subMask[0] = thdChFC
+            }
+            if mh.substreams > 2 {
+                subMask[2] = if mh.mask2 != 0 { mh.mask2 } else { mh.mask1 }
+            }
+            if mh.substreams == 2 {
+                subMask[1] = mh.mask2
+            }
+        }
+        needsReordering = mh.channelArrangement >= 18 && mh.channelArrangement <= 20
+        if outMask < 0 {
+            setOutMask(mh.mask)
+        }
+        if rate != mh.group1Rate {
+            rate = mh.group1Rate
+        }
+        true
+    }
+
+    fn setOutMask(_ mask: Int) {
+        outMask = mask
+        outChannels = thdPopCount(mask)
+    }
+
+    // --- Substreams. ---
+
+    // Decodes substream s from data[start…start+len]. −1: the whole access
+    // unit fails; 0: done or skipped.
+    fn decodeSubstream(_ s: Int, _ data: Data, _ start: Int, _ len: Int) -> Int {
+        br = core.bitReaderRange(data, from: start, to: start + len)
+        let base = start * 8
+        let total = len * 8
+        matrixChanged = 0
+        for i in 0..16 {
+            filterChanged[i] = 0
+        }
+        blockpos[s] = 0
+        while true {
+            if br.bits(1) == 1 {
+                if br.bits(1) == 1 {
+                    if !readRestartHeader(s, data, start) {
+                        return 0
+                    }
+                    restartSeen[s] = 1
+                }
+                if restartSeen[s] == 0 {
+                    return 0
+                }
+                if !readDecodingParams(s) {
+                    return 0
+                }
+            }
+            if restartSeen[s] == 0 {
+                return 0
+            }
+            if overlapSkip(s) {
+                return 0
+            }
+            if !readBlockData(s) {
+                return -1
+            }
+            if br.position - base >= total {
+                warn("substream {s} length mismatch")
+                return -1
+            }
+            if br.bits(1) == 1 {
+                break
+            }
+        }
+        let pos = br.position - base
+        br.skip((16 - (pos & 15)) & 15)
+        if total - (br.position - base) >= 32 {
+            if br.bits(16) != 0xd234 {
+                warn("substream {s}: bad end of stream marker")
+                return -1
+            }
+            let shortenBy = br.bits(16)
+            if !mlp && (shortenBy & 0x2000) != 0 {
+                blockpos[s] -= min(shortenBy & 0x1fff, blockpos[s])
+            } else if mlp && shortenBy != 0xd234 {
+                warn("substream {s}: bad end of stream marker")
+                return -1
+            }
+            endOfStream[s] = 1
+        }
+        if parityPresent[s] == 1 {
+            if total - (br.position - base) != 16 {
+                warn("substream {s} length mismatch")
+                return -1
+            }
+            let parity = thdParity(data, start, len - 2)
+            let checksum = thdChecksum8(data, start, len - 2)
+            if (br.bits(8) ^ parity) != 0xa9 {
+                checkError("substream {s} parity check failed")
+            }
+            if br.bits(8) != checksum {
+                checkError("substream {s} checksum failed")
+            }
+        }
+        if total != br.position - base {
+            warn("substream {s} length mismatch")
+            return -1
+        }
+        0
+    }
+
+    // FFmpeg skips a substream whose channels the final one decodes again.
+    fn overlapSkip(_ s: Int) -> Bool {
+        let si = substreamInfo
+        let six = outChannels == 6 && ((si >> 2) & 3) != 3
+        let i8 = (si >> 4) & 7
+        let eight = outChannels == 8 && i8 != 7 && i8 != 6 && i8 != 3
+        if (six || eight) && s > 0 && s < maxDecoded && minChannel[s] <= maxChannel[s - 1] {
+            return true
+        }
+        if s != maxDecoded && (codedChannels[s] & codedChannels[maxDecoded]) != 0 {
+            return true
+        }
+        false
+    }
+
+    // read_restart_header.
+    fn readRestartHeader(_ s: Int, _ data: Data, _ subStart: Int) -> Bool {
+        let startCount = br.position
+        let sync = br.bits(13)
+        if sync != (0x31ea >> 1) {
+            warn("restart header sync incorrect")
+            return false
+        }
+        let nt = br.bits(1)
+        if mlp && nt == 1 {
+            warn("MLP must have the 0x31EA restart sync word")
+            return false
+        }
+        br.skip(16)
+        let minCh = br.bits(4)
+        let maxCh = br.bits(4)
+        let maxMat = br.bits(4)
+        let stdMax = if mlp { 5 } else { 7 }
+        if maxMat > stdMax {
+            warn("max matrix channel above {stdMax}")
+            return false
+        }
+        if maxMat > 5 && nt == 0 {
+            warn("more than 6 channels with 0x31EA noise")
+            return false
+        }
+        if maxCh + 1 > thdMaxCh || maxCh + 1 < minCh {
+            warn("invalid channel range in the restart header")
+            return false
+        }
+        minChannel[s] = minCh
+        maxChannel[s] = maxCh
+        codedChannels[s] = ((1 << (maxCh - minCh + 1)) - 1) << minCh
+        maxMatrixChannel[s] = maxMat
+        noiseType[s] = nt
+        noiseShift[s] = br.bits(4)
+        noiseSeed[s] = br.bits(23)
+        br.skip(19)
+        dataCheckPresent[s] = br.bits(1)
+        let losslessByte = br.bits(8)
+        if s == maxDecoded && losslessCheck[s] != thdNoCheck {
+            let got = thdXor32to8(losslessCheck[s])
+            if got != losslessByte {
+                checkError("lossless check failed")
+            }
+        }
+        br.skip(16)
+        for ch in 0..8 {
+            chAssign[s * 8 + ch] = 0
+        }
+        let mask = subMask[s]
+        for ch in 0..(maxMat + 1) {
+            var assign = br.bits(6)
+            if !mlp {
+                let channel = thdExtractChannel(mask, assign)
+                assign = if channel < 0 || (mask >> channel) & 1 == 0 { -1 } else { thdPopCount(mask & ((1 << channel) - 1)) }
+            }
+            if assign < 0 || assign > maxMat {
+                warn("matrix channel {ch} assigned to invalid output channel")
+                return false
+            }
+            chAssign[s * 8 + assign] = ch
+        }
+        let checksum = thdRestartChecksum(data, subStart, br.position - startCount)
+        if checksum != br.bits(8) {
+            checkError("restart header checksum error")
+        }
+        // Default decoding parameters.
+        paramPresence[s] = 0xff
+        numMatrices[s] = 0
+        blocksize[s] = 8
+        losslessCheck[s] = 0
+        for ch in 0..8 {
+            outputShift[s * 8 + ch] = 0
+            quantStep[s * 8 + ch] = 0
+        }
+        for ch in minCh..(maxCh + 1) {
+            let c = s * 8 + ch
+            firOrder[c] = 0
+            iirOrder[c] = 0
+            firShift[c] = 0
+            iirShift[c] = 0
+            // Default audio coding is 24-bit raw PCM.
+            huffOffset[c] = 0
+            signHuffOffset[c] = -(1 << 23)
+            codebook[c] = 0
+            huffLsbs[c] = 24
+        }
+        if s == maxDecoded {
+            setOutMask(mask)
+            if mlp && needsReordering {
+                let b = s * 8
+                if mask == (thdMlpQuad | thdChLFE) || mask == thdMlp50Back {
+                    let i = chAssign[b + 4]
+                    chAssign[b + 4] = chAssign[b + 3]
+                    chAssign[b + 3] = chAssign[b + 2]
+                    chAssign[b + 2] = i
+                } else if mask == (thdMlp50Back | thdChLFE) {
+                    var t = chAssign[b + 2]
+                    chAssign[b + 2] = chAssign[b + 4]
+                    chAssign[b + 4] = t
+                    t = chAssign[b + 3]
+                    chAssign[b + 3] = chAssign[b + 5]
+                    chAssign[b + 5] = t
+                }
+            }
+        }
+        true
+    }
+
+    // read_filter_params; filter 0 is the FIR, 1 the IIR.
+    fn readFilterParams(_ s: Int, _ ch: Int, _ filter: Int) -> Bool {
+        let fc = ch * 2 + filter
+        filterChanged[fc] += 1
+        if filterChanged[fc] > 2 {
+            warn("filters may change only once per access unit")
+            return false
+        }
+        let maxOrder = if filter == 1 { 4 } else { 8 }
+        let order = br.bits(4)
+        if order > maxOrder {
+            warn("filter order {order} above {maxOrder}")
+            return false
+        }
+        let c = s * 8 + ch
+        if filter == 0 {
+            firOrder[c] = order
+        } else {
+            iirOrder[c] = order
+        }
+        if order > 0 {
+            let shift = br.bits(4)
+            if filter == 0 {
+                firShift[c] = shift
+            } else {
+                iirShift[c] = shift
+            }
+            let coeffBits = br.bits(5)
+            let coeffShift = br.bits(3)
+            if coeffBits < 1 || coeffBits > 16 || coeffBits + coeffShift > 16 {
+                warn("invalid filter coefficient size")
+                return false
+            }
+            for i in 0..order {
+                let v = br.signed(coeffBits) << coeffShift
+                if filter == 0 {
+                    firCoeff[c * 8 + i] = v
+                } else {
+                    iirCoeff[c * 4 + i] = v
+                }
+            }
+            if br.bits(1) == 1 {
+                if filter == 0 {
+                    warn("FIR filter with state data")
+                    return false
+                }
+                let stateBits = br.bits(4)
+                let stateShift = br.bits(4)
+                for i in 0..order {
+                    iirState[c * 4 + i] = if stateBits > 0 { br.signed(stateBits) << stateShift } else { 0 }
+                }
+            }
+        }
+        true
+    }
+
+    // read_matrix_params.
+    fn readMatrixParams(_ s: Int) -> Bool {
+        matrixChanged += 1
+        if matrixChanged > 2 {
+            warn("matrices may change only once per access unit")
+            return false
+        }
+        let n = br.bits(4)
+        numMatrices[s] = n
+        let maxMats = if mlp { 6 } else { 8 }
+        if n > maxMats {
+            warn("too many primitive matrices")
+            numMatrices[s] = 0
+            return false
+        }
+        for mat in 0..n {
+            let m = s * 8 + mat
+            matrixOutCh[m] = br.bits(4)
+            let fracBits = br.bits(4)
+            lsbBypass[m] = br.bits(1)
+            if matrixOutCh[m] > maxMatrixChannel[s] || fracBits > 14 {
+                warn("invalid matrix parameters")
+                numMatrices[s] = 0
+                for k in 0..8 {
+                    matrixOutCh[s * 8 + k] = 0
+                }
+                return false
+            }
+            var maxChan = maxMatrixChannel[s]
+            if noiseType[s] == 0 {
+                maxChan += 2
+            }
+            for ch in 0..(maxChan + 1) {
+                var v = 0
+                if br.bits(1) == 1 {
+                    v = br.signed(fracBits + 2)
+                }
+                matrixCoeff[m * 8 + ch] = v << (14 - fracBits)
+            }
+            matrixNoiseShift[m] = if noiseType[s] == 1 { br.bits(4) } else { 0 }
+        }
+        true
+    }
+
+    // read_channel_params.
+    fn readChannelParams(_ s: Int, _ ch: Int) -> Bool {
+        let c = s * 8 + ch
+        let flags = paramPresence[s]
+        if (flags & 8) != 0 && br.bits(1) == 1 {
+            if !readFilterParams(s, ch, 0) {
+                return false
+            }
+        }
+        if (flags & 4) != 0 && br.bits(1) == 1 {
+            if !readFilterParams(s, ch, 1) {
+                return false
+            }
+        }
+        if firOrder[c] + iirOrder[c] > 8 {
+            warn("total filter orders too high")
+            return false
+        }
+        if firOrder[c] > 0 && iirOrder[c] > 0 && firShift[c] != iirShift[c] {
+            warn("FIR and IIR filters with different precision")
+            return false
+        }
+        if firOrder[c] == 0 && iirOrder[c] > 0 {
+            firShift[c] = iirShift[c]
+        }
+        if (flags & 2) != 0 && br.bits(1) == 1 {
+            huffOffset[c] = br.signed(15)
+        }
+        codebook[c] = br.bits(2)
+        huffLsbs[c] = br.bits(5)
+        if codebook[c] > 0 && huffLsbs[c] > 24 {
+            warn("invalid huff_lsbs")
+            huffLsbs[c] = 0
+            return false
+        }
+        true
+    }
+
+    // read_decoding_params.
+    fn readDecodingParams(_ s: Int) -> Bool {
+        var ok = true
+        var recompute = 0
+        if (paramPresence[s] & 1) != 0 && br.bits(1) == 1 {
+            paramPresence[s] = br.bits(8)
+        }
+        let flags = paramPresence[s]
+        if (flags & 0x80) != 0 && br.bits(1) == 1 {
+            blocksize[s] = br.bits(9)
+            if blocksize[s] < 8 || blocksize[s] > auSize {
+                warn("invalid block size")
+                blocksize[s] = 0
+                return false
+            }
+        }
+        if (flags & 0x40) != 0 && br.bits(1) == 1 {
+            if !readMatrixParams(s) {
+                return false
+            }
+        }
+        if (flags & 0x20) != 0 && br.bits(1) == 1 {
+            for ch in 0..(maxMatrixChannel[s] + 1) {
+                var v = br.signed(4)
+                if v < 0 {
+                    warnOnce("negative output shift")
+                    v = 0
+                }
+                outputShift[s * 8 + ch] = v
+            }
+        }
+        if (flags & 0x10) != 0 && br.bits(1) == 1 {
+            for ch in 0..(maxChannel[s] + 1) {
+                quantStep[s * 8 + ch] = br.bits(4)
+                recompute = recompute | (1 << ch)
+            }
+        }
+        for ch in minChannel[s]..(maxChannel[s] + 1) {
+            if br.bits(1) == 1 {
+                recompute = recompute | (1 << ch)
+                if !readChannelParams(s, ch) {
+                    ok = false
+                    break
+                }
+            }
+        }
+        for ch in 0..(maxChannel[s] + 1) {
+            if (recompute & (1 << ch)) != 0 {
+                let c = s * 8 + ch
+                if codebook[c] > 0 && huffLsbs[c] < quantStep[c] {
+                    if ok {
+                        warn("quant_step_size larger than huff_lsbs")
+                        ok = false
+                    }
+                    quantStep[c] = 0
+                }
+                signHuffOffset[c] = calcSignHuff(c)
+            }
+        }
+        ok
+    }
+
+    fn calcSignHuff(_ c: Int) -> Int {
+        let lsbBits = huffLsbs[c] - quantStep[c]
+        let cb = codebook[c]
+        let signShift = lsbBits + (if cb > 0 { 2 - cb } else { -1 })
+        var v = huffOffset[c]
+        if cb > 0 {
+            v -= 7 << lsbBits
+        }
+        if signShift >= 0 {
+            v -= 1 << signShift
+        }
+        v
+    }
+
+    // read_block_data: a block's samples, then its prediction filters.
+    fn readBlockData(_ s: Int) -> Bool {
+        var expected = 0
+        if dataCheckPresent[s] == 1 {
+            expected = br.position
+            expected += br.bits(16)
+            warnOnce("substreams with VLC block size check info")
+        }
+        let bs = blocksize[s]
+        let bp = blockpos[s]
+        if bp + bs > auSize {
+            warn("too many audio samples in an access unit")
+            return false
+        }
+        for i in (bp * 8)..((bp + bs) * 8) {
+            bypassed[i] = 0
+        }
+        let nmat = numMatrices[s]
+        let minCh = minChannel[s]
+        let maxCh = maxChannel[s]
+        for i in 0..bs {
+            let row = (bp + i) * 8
+            for mat in 0..nmat {
+                if lsbBypass[s * 8 + mat] == 1 {
+                    bypassed[row + mat] = br.bits(1)
+                }
+            }
+            for ch in minCh..(maxCh + 1) {
+                let c = s * 8 + ch
+                let cb = codebook[c]
+                let q = quantStep[c]
+                let lsbBits = huffLsbs[c] - q
+                var result = 0
+                if cb > 0 {
+                    let e = huff[(cb - 1) * 512 + br.peek(9)]
+                    if e == 0 {
+                        warn("invalid Huffman code")
+                        return false
+                    }
+                    br.skip(e & 15)
+                    result = e >> 4
+                }
+                if lsbBits > 0 {
+                    result = (result << lsbBits) + br.bits(lsbBits)
+                }
+                result += signHuffOffset[c]
+                sampleBuf[row + ch] = thdWrap32(result << q)
+            }
+        }
+        for ch in minCh..(maxCh + 1) {
+            filterChannel(s, ch)
+        }
+        blockpos[s] = bp + bs
+        if dataCheckPresent[s] == 1 {
+            if br.position != expected {
+                warn("block data length mismatch")
+            }
+            br.skip(8)
+        }
+        true
+    }
+
+    // filter_channel / mlp_filter_channel: adds the FIR + IIR prediction
+    // to each residual of the block and keeps the filters' history.
+    fn filterChannel(_ s: Int, _ ch: Int) {
+        let c = s * 8 + ch
+        let fo = firOrder[c]
+        let io = iirOrder[c]
+        let shift = firShift[c]
+        let mask = -(1 << quantStep[c])
+        let bs = blocksize[s]
+        let bp = blockpos[s]
+        for i in 0..8 {
+            firBuf[bs + i] = firState[c * 8 + i]
+        }
+        for i in 0..4 {
+            iirBuf[bs + i] = iirState[c * 4 + i]
+        }
+        let fb = c * 8
+        let ib = c * 4
+        var p = bs
+        for i in 0..bs {
+            let idx = (bp + i) * 8 + ch
+            var acc = 0
+            for o in 0..fo {
+                acc += firBuf[p + o] * firCoeff[fb + o]
+            }
+            for o in 0..io {
+                acc += iirBuf[p + o] * iirCoeff[ib + o]
+            }
+            acc = acc >> shift
+            let result = thdWrap32((acc + sampleBuf[idx]) & mask)
+            p -= 1
+            firBuf[p] = result
+            iirBuf[p] = thdWrap32(result - acc)
+            sampleBuf[idx] = result
+        }
+        for i in 0..8 {
+            firState[c * 8 + i] = firBuf[i]
+        }
+        for i in 0..4 {
+            iirState[c * 4 + i] = iirBuf[i]
+        }
+    }
+
+    // --- Output (output_data). ---
+
+    fn outputData(_ s: Int) -> Bool {
+        let maxMat = maxMatrixChannel[s]
+        if outChannels != maxMat + 1 {
+            warn("channel count mismatch")
+            return false
+        }
+        let n = blockpos[s]
+        if n == 0 {
+            warn("no samples to output")
+            return false
+        }
+        var maxChan = maxMat
+        if noiseType[s] == 0 {
+            generate2NoiseChannels(s)
+            maxChan += 2
+        } else {
+            fillNoiseBuffer(s)
+        }
+        let nmat = numMatrices[s]
+        for mat in 0..nmat {
+            rematrix(s, mat, maxChan, n)
+        }
+        // Pack: channel assignment, output shift, the lossless check.
+        var check = losslessCheck[s]
+        let nc = maxMat + 1
+        let b = s * 8
+        for i in 0..n {
+            let row = i * 8
+            for oc in 0..nc {
+                let matCh = chAssign[b + oc]
+                let sample = thdWrap32(sampleBuf[row + matCh] << outputShift[b + matCh])
+                check = check ^ ((sample & 0xffffff) << matCh)
+                if is32 {
+                    outBuf.append(Float(thdWrap32(sample << 8)) / 2147483648.0)
+                } else {
+                    let v16 = ((sample >> 8) << 48) >> 48
+                    outBuf.append(Float(v16) / 32768.0)
+                }
+            }
+        }
+        losslessCheck[s] = check & 0xffffffff
+        if channels != nc || layout.count != nc || outMask != layoutMask {
+            channels = nc
+            layoutMask = outMask
+            let names = thdLayoutNames(outMask)
+            layout = if names.count == nc { names } else { core.defaultLayout(nc) }
+        }
+        true
+    }
+
+    // ff_mlp_rematrix_channel: rebuilds one channel from all the others.
+    fn rematrix(_ s: Int, _ mat: Int, _ maxChan: Int, _ n: Int) {
+        let m = s * 8 + mat
+        let dest = matrixOutCh[m]
+        let cb = m * 8
+        let mns = matrixNoiseShift[m]
+        let mask = -(1 << quantStep[s * 8 + dest])
+        var index = numMatrices[s] - mat
+        let index2 = 2 * index + 1
+        let pow2 = auSizePow2 - 1
+        let noiseMul = 1 << (mns + 7)
+        for i in 0..n {
+            let row = i * 8
+            var acc = 0
+            for src in 0..(maxChan + 1) {
+                acc += sampleBuf[row + src] * matrixCoeff[cb + src]
+            }
+            if mns != 0 {
+                index = index & pow2
+                acc += noiseBuf[index] * noiseMul
+                index += index2
+            }
+            sampleBuf[row + dest] = thdWrap32(((acc >> 14) & mask) + bypassed[row + mat])
+        }
+    }
+
+    // generate_2_noise_channels (0x31EA substreams).
+    fn generate2NoiseChannels(_ s: Int) {
+        var seed = noiseSeed[s]
+        let maxChan = maxMatrixChannel[s]
+        let shift = noiseShift[s]
+        for i in 0..blockpos[s] {
+            let shr7 = (seed >> 7) & 0xffff
+            let a = ((((seed >> 15) & 0xff) << 56) >> 56) << shift
+            let b = (((shr7 & 0xff) << 56) >> 56) << shift
+            sampleBuf[i * 8 + maxChan + 1] = thdWrap32(a)
+            sampleBuf[i * 8 + maxChan + 2] = thdWrap32(b)
+            seed = ((seed << 16) ^ shr7 ^ (shr7 << 5)) & 0xffffffff
+        }
+        noiseSeed[s] = seed
+    }
+
+    // fill_noise_buffer (0x31EB substreams).
+    fn fillNoiseBuffer(_ s: Int) {
+        var seed = noiseSeed[s]
+        for i in 0..auSizePow2 {
+            let shr15 = (seed >> 15) & 0xff
+            noiseBuf[i] = noiseTable[shr15]
+            seed = ((seed << 8) ^ shr15 ^ (shr15 << 5)) & 0xffffffff
+        }
+        noiseSeed[s] = seed
+    }
+}
+
+// thd_channel_layout_extract_channel: the index-th channel of the mask
+// in TrueHD's channel order, or −1.
+fn thdExtractChannel(_ mask: Int, _ index: Int) -> Int {
+    if thdPopCount(mask) <= index {
+        return -1
+    }
+    var k = index
+    let order = thdChannelOrder
+    for ch in order {
+        if (mask >> ch) & 1 == 1 {
+            if k == 0 {
+                return ch
+            }
+            k -= 1
+        }
+    }
+    -1
+}
+
+// The next access unit with a major sync at or after `from` (the major
+// sync sits 4 bytes in), or −1.
+public fn thdFindMajorSync(_ data: Data, _ from: Int) -> Int {
+    var i = max(from, 0)
+    while i + 8 <= data.count {
+        if data[i + 4] == 0xf8 && thdIsMajorSync(data, i + 4) {
+            return i
+        }
+        i += 1
+    }
+    -1
+}
+
+// The next AC-3 syncframe at or after `from`, or −1.
+fn thdFindAc3(_ data: Data, _ from: Int) -> Int {
+    var i = max(from, 0)
+    while i + 6 <= data.count {
+        if data[i] == 0x0b && thdAc3FrameSize(data, i) > 0 {
+            return i
+        }
+        i += 1
+    }
+    -1
+}
+
+public fn newDecoder(_ track: core.Track) -> Result<Decoder> {
+    if track.codec != "truehd" && track.codec != "mlp" {
+        return Result.failure(error: Error("the truehd decoder can't decode \"{track.codec}\""))
+    }
+    var d = Decoder()
+    d.codec = track.codec
+    d.huff = thdHuffLookup()
+    d.noiseTable = thdNoiseTable
+    if track.sampleRate > 0 && track.channels > 0 {
+        d.rate = track.sampleRate
+        d.channels = track.channels
+        d.layout = if track.layout.count == track.channels { track.layout } else { core.defaultLayout(track.channels) }
+    }
+    Result.ok(value: d)
+}

@@ -1,0 +1,107 @@
+// parseText: a subtitle file's text (or a whole text track) as a
+// SubTrack, by format name, or by looking at the text when the format is
+// "" or "auto".
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+// The format of subtitle text by its look: "webvtt", "ass", "srt" or "".
+public fn sniffText(_ text: String) -> String {
+    let head = text.substring(from: 0, to: 4000)
+    let t = head.trimStart()
+    if t.hasPrefix("WEBVTT") {
+        return "webvtt"
+    }
+    if t.hasPrefix("[Script Info]") || head.contains("[V4+ Styles]") || head.contains("[V4 Styles]") || head.contains("[Events]") {
+        return "ass"
+    }
+    for line in head.lines() {
+        if srtTiming(line) != nil {
+            return "srt"
+        }
+    }
+    ""
+}
+
+// Parses a subtitle file's text: format "srt", "webvtt" (or "vtt"), "ass"
+// (or "ssa"), "text" (each line one cue, untimed: shown from 0 for ever)
+// or "" / "auto" to detect it.
+public fn parseText(_ text: String, format: String) -> Result<SubTrack> {
+    var body = text
+    if body.hasPrefix(charOf(0xFEFF)) {
+        body = body.substring(from: 1, to: body.count)
+    }
+    var f = format.lowercase()
+    if f == "" || f == "auto" {
+        f = sniffText(body)
+        if f.isEmpty {
+            return .failure(error: Error("this doesn't look like SRT, WebVTT or ASS subtitles"))
+        }
+    }
+    match f {
+        "srt", "subrip" -> .ok(value: parseSrt(body))
+        "webvtt", "vtt" -> parseVtt(body)
+        "ass", "ssa" -> .ok(value: parseAss(body))
+        "text" -> {
+            var track = SubTrack(format: "text")
+            var b = subsPlainBuilder(start: 0.0, end: openEnd)
+            for (i, line) in subsSplitLines(body).enumerated() {
+                if i > 0 {
+                    b.lineBreak()
+                }
+                b.addText(line)
+            }
+            let cue = b.finish()
+            if !cue.spans.isEmpty {
+                track.cues.append(cue)
+            }
+            Result.ok(value: track)
+        }
+        _ -> .failure(error: Error("unknown subtitle format \"{format}\""))
+    }
+}
+
+// Reads a subtitle file by its extension (.srt .vtt .ass .ssa, .sup for
+// PGS, .idx with its .sub for VobSub), or by its look. Text is decoded
+// in `encoding` ("auto": detected, see decodeText; or any name
+// encodingName knows); `language` (e.g. from siblingFiles) helps the
+// detection. The track's `encoding` and `encodingConfidence` say what was
+// used.
+public fn loadFile(_ path: String, encoding: String = "auto", language: String = "") -> Result<SubTrack> {
+    let data = try readBytes(path)
+    let ext = path.fileExtension.lowercase()
+    if ext == "sup" {
+        return parseSup(data)
+    }
+    if ext == "idx" || ext == "sub" {
+        let base = path.substring(from: 0, to: path.count - 3)
+        let idx = if ext == "idx" { data } else { readData(base + "idx") ?? Data() }
+        let sub = if ext == "sub" { data } else { readData(base + "sub") ?? Data() }
+        if !idx.isEmpty && !sub.isEmpty {
+            return parseVobSub(idx: decodeText(idx), sub: sub)
+        }
+        if ext == "idx" {
+            return .failure(error: Error("the VobSub .sub file beside {path.fileName} is missing"))
+        }
+    }
+    let f = if ext == "srt" || ext == "vtt" || ext == "ass" || ext == "ssa" { ext } else { "" }
+    parseBytes(data, format: f, encoding: encoding, language: language)
+}
+
+// Parses subtitle file bytes (see loadFile and parseText).
+public fn parseBytes(_ data: Data, format: String, encoding: String = "auto", language: String = "") -> Result<SubTrack> {
+    var name = encodingName(encoding)
+    var conf = 1.0
+    if name == "" {
+        return .failure(error: Error("unknown text encoding \"{encoding}\""))
+    }
+    if name == "auto" {
+        let g = detectEncoding(data, language: language)
+        name = g.name
+        conf = g.confidence
+    }
+    var track = try parseText(decodeAs(data, encoding: name), format: format)
+    track.encoding = name
+    track.encodingConfidence = conf
+    Result.ok(value: track)
+}

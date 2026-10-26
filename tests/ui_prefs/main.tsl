@@ -1,0 +1,223 @@
+// Tests for the Preferences window's helpers (ui/prefs_model.tsl): tab
+// names, the subtitle style as subs.TextStyle and its preview cues, hex
+// colours, the language list editor, shortcut recording, conflicts and
+// search, and number formatting. The views themselves are checked with
+// the headless demo in build/scratch/ui-prefs/demo.
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+import "../../ui"
+import "../../library"
+import "../../subs"
+
+struct Checker {
+    passed: Int = 0
+    total: Int = 0
+
+    fn check(_ ok: Bool, _ what: String) {
+        total += 1
+        if ok {
+            passed += 1
+        } else {
+            print("FAIL: {what}")
+        }
+    }
+
+    fn same(_ got: String, _ want: String, _ what: String) {
+        check(got == want, "{what}: got \"{got}\", want \"{want}\"")
+    }
+
+    fn sameInt(_ got: Int, _ want: Int, _ what: String) {
+        check(got == want, "{what}: got {got}, want {want}")
+    }
+
+    fn near(_ got: Float, _ want: Float, _ what: String) {
+        check(abs(got - want) <= 0.0001, "{what}: got {got}, want {want}")
+    }
+}
+
+fn testTabs(_ c: bind Checker) {
+    c.sameInt(ui.prefsTabs.count, 9, "nine pages")
+    c.same(ui.prefsTabTag("Subtitles"), "subtitles", "tab by title")
+    c.same(ui.prefsTabTag("opensubtitles"), "opensubtitles", "tab by tag")
+    c.same(ui.prefsTabTag("keys"), "shortcuts", "keys alias")
+    c.same(ui.prefsTabTag("nonsense"), "general", "unknown tab")
+}
+
+fn testStyle(_ c: bind Checker) {
+    let d = ui.prefsTextStyle(library.SubtitleStyle())
+    c.near(d.scale, 1.0, "default scale")
+    c.near(d.outline, 1.0, "default outline is subs' default")
+    c.near(d.shadow, 1.0, "shadow on by default")
+    c.near(d.backgroundOpacity, 0.0, "no box by default")
+    c.same(d.position, "bottom", "bottom")
+    var s = library.SubtitleStyle()
+    s.fontScale = 1.5
+    s.color = 0xFFE140FF
+    s.outlineWidth = 4.0
+    s.shadow = false
+    s.background = true
+    s.backgroundColor = 0x102030FF
+    s.backgroundOpacity = 0.6
+    s.bold = true
+    s.font = "Georgia"
+    s.marginV = 0.1
+    s.position = "top"
+    s.overrideAss = true
+    let t = ui.prefsTextStyle(s)
+    c.near(t.scale, 1.5, "scale")
+    c.sameInt(t.color, 0xFFE140FF, "colour")
+    c.near(t.outline, 2.0, "outline 4 px at 576 lines")
+    c.near(t.shadow, 0.0, "shadow off")
+    c.near(t.backgroundOpacity, 0.6, "box opacity")
+    c.sameInt(t.background, 0x102030FF, "box colour")
+    c.check(t.bold && t.font == "Georgia" && t.overrideAss, "bold, font, override")
+    c.near(t.marginV, 0.1, "margin")
+    c.same(t.position, "top", "top")
+    var odd = library.SubtitleStyle()
+    odd.position = "middle"
+    c.same(ui.prefsTextStyle(odd).position, "bottom", "unknown position is bottom")
+    // The preview cues carry the style.
+    let (p1, p2) = ui.prefsPreviewCues(s, library.SubtitleStyle(), secondary: false)
+    c.sameInt(p1.count, 1, "one primary cue")
+    c.sameInt(p2.count, 0, "no secondary cue")
+    c.sameInt(p1[0].spans[0].color, 0xFFE140FF, "primary cue colour")
+    c.check(p1[0].spans[0].bold, "primary cue bold")
+    c.sameInt(p1[0].boxColor & 255, 153, "box alpha from opacity")
+    let (q1, q2) = ui.prefsPreviewCues(library.SubtitleStyle(), ui.PrefsExtra().secondaryStyle, secondary: true)
+    c.sameInt(q2.count, 1, "secondary cue")
+    c.check(q2[0].align >= 7, "secondary cue at the top (align {q2[0].align})")
+    c.check(q1[0].align <= 3, "primary cue at the bottom")
+    c.near(q2[0].fontSize, subs.defaultFontSize * 0.85, "secondary smaller")
+}
+
+fn testColors(_ c: bind Checker) {
+    c.same(ui.prefsHex(0xFFE140FF), "#FFE140", "hex")
+    c.same(ui.prefsHex(0x00000080), "#000000", "hex of black")
+    c.sameInt(ui.prefsParseHex("#ffe140") ?? -1, 0xFFE140FF, "parse #rrggbb")
+    c.sameInt(ui.prefsParseHex("FFE140", alpha: 0x80) ?? -1, 0xFFE14080, "parse keeps alpha")
+    c.sameInt(ui.prefsParseHex("#fff") ?? -1, 0xFFFFFFFF, "parse #rgb")
+    c.sameInt(ui.prefsParseHex(" #11223344 ") ?? -1, 0x11223344, "parse #rrggbbaa")
+    c.check(ui.prefsParseHex("#12345") == nil, "five digits")
+    c.check(ui.prefsParseHex("#ggg") == nil, "not hex")
+    c.check(ui.prefsParseHex("") == nil, "empty")
+    c.same(ui.prefsColorName(0xFFFFFFFF), "White", "palette name")
+    c.same(ui.prefsColorName(0x00000080), "Black", "palette ignores alpha")
+    c.same(ui.prefsColorName(0x12345678), "Custom", "custom")
+    c.sameInt(ui.prefsWithAlpha(0xFFE14000, alphaOf: 0x00000080), 0xFFE14080, "with alpha")
+}
+
+fn testLanguages(_ c: bind Checker) {
+    c.check(ui.prefsKnownLanguage("English"), "English known")
+    c.check(ui.prefsKnownLanguage("ja"), "ja known")
+    c.check(ui.prefsKnownLanguage("pt-BR"), "pt-BR known")
+    c.check(!ui.prefsKnownLanguage("klingonese"), "unknown")
+    c.check(!ui.prefsKnownLanguage(""), "empty unknown")
+    c.same(ui.prefsLanguageLabel("eng"), "English (eng)", "label")
+    c.same(ui.prefsLanguageLabel("xyz"), "xyz", "label of unknown")
+    let (l1, m1) = ui.prefsAddLanguage([], "English")
+    c.check(l1 == ["eng"] && m1.isEmpty, "add English")
+    let (l2, _) = ui.prefsAddLanguage(l1, "fr")
+    c.check(l2 == ["eng", "fre"], "add fr as fre")
+    let (l3, m3) = ui.prefsAddLanguage(l2, "en-GB")
+    c.check(l3.count == 2 && m3.contains("already"), "duplicate refused: {m3}")
+    let (l4, m4) = ui.prefsAddLanguage(l2, "qqq")
+    c.check(l4.count == 2 && m4.contains("isn't a language"), "unknown refused")
+    let (l5, m5) = ui.prefsAddLanguage(l2, "   ")
+    c.check(l5.count == 2 && m5.isEmpty, "blank ignored")
+    let three = ["eng", "fre", "jpn"]
+    c.check(ui.prefsMoved(three, 2, by: -1) == ["eng", "jpn", "fre"], "move up")
+    c.check(ui.prefsMoved(three, 0, by: 1) == ["fre", "eng", "jpn"], "move down")
+    c.check(ui.prefsMoved(three, 0, by: -1) == three, "top can't go up")
+    c.check(ui.prefsMoved(three, 2, by: 1) == three, "bottom can't go down")
+    c.check(ui.prefsMoved(three, 5, by: 1) == three, "out of range")
+}
+
+fn testKeys(_ c: bind Checker) {
+    c.check(ui.prefsKeyGroups() == ["Playback", "Audio", "Video", "Subtitles", "Media", "View"], "groups in order")
+    c.same(ui.prefsComboFromKey(key: "s", command: true, shift: true), "cmd+shift+s", "cmd+shift+s")
+    c.same(ui.prefsComboFromKey(key: ".", shift: true), "shift+.", "shift+.")
+    c.same(ui.prefsComboFromKey(key: "space"), "space", "space")
+    c.same(ui.prefsComboFromKey(key: "A"), "a", "letters lower-case")
+    c.same(ui.prefsComboFromKey(key: "left", control: true, alt: true), "ctrl+alt+left", "ctrl+alt+left")
+    c.same(ui.prefsComboFromKey(key: "shift", shift: true), "", "modifier alone")
+    c.same(ui.prefsComboFromKey(key: "command", command: true), "", "command alone")
+    c.same(ui.prefsComboFromKey(key: ""), "", "no key")
+    var m = library.defaultKeymap()
+    c.check(!ui.prefsKeyChanged(m, action: "stop"), "stop unchanged")
+    c.sameInt(m.conflicts().count, 0, "defaults have no conflicts")
+    m.set("stop", combos: m.combos("stop") + ["n", "cmd+q"])
+    c.check(ui.prefsKeyChanged(m, action: "stop"), "stop changed")
+    let cs = m.conflicts()
+    let mine = ui.prefsConflictsOf(cs, action: "stop")
+    c.sameInt(mine.count, 2, "stop in two conflicts")
+    c.sameInt(ui.prefsConflictsOf(cs, action: "next").count, 1, "next in one")
+    c.sameInt(ui.prefsConflictsOf(cs, action: "mute").count, 0, "mute in none")
+    c.same(ui.prefsConflictText(mine[0], action: "stop", os: "macos"), "N also runs Next", "conflict text")
+    c.same(ui.prefsConflictText(mine[0], action: "next", os: "macos"), "N also runs Stop", "conflict text other side")
+    c.same(ui.prefsConflictText(mine[1], action: "stop", os: "macos"), "⌘Q is used by the system, so it may never reach Reel", "reserved text")
+    c.same(ui.prefsConflictText(mine[1], action: "stop", os: "windows"), "Ctrl+Q is used by the system, so it may never reach Reel", "reserved text on Windows")
+    // Taking the key for one action only.
+    m.assign("stop", combo: "n")
+    c.check(m.combos("next").isEmpty, "next lost n")
+    c.sameInt(ui.prefsConflictsOf(m.conflicts(), action: "stop").count, 1, "only the reserved one left")
+    let open = library.keyActions.first(where: { a in a.id == "open-file" }) ?? library.keyActions[0]
+    let d = library.defaultKeymap()
+    c.check(ui.prefsKeyMatches(open, d, query: ""), "empty query matches")
+    c.check(ui.prefsKeyMatches(open, d, query: "open"), "title")
+    c.check(ui.prefsKeyMatches(open, d, query: "media"), "group")
+    c.check(ui.prefsKeyMatches(open, d, query: "cmd+o"), "written combo")
+    c.check(ui.prefsKeyMatches(open, d, query: "⌘o", os: "macos"), "shown combo")
+    c.check(ui.prefsKeyMatches(open, d, query: "ctrl+o", os: "windows"), "shown combo on Windows")
+    c.check(!ui.prefsKeyMatches(open, d, query: "volume"), "no match")
+}
+
+fn testNumbers(_ c: bind Checker) {
+    c.same(ui.prefsSeconds(10.0), "10 s", "10 s")
+    c.same(ui.prefsSeconds(1.5), "1.5 s", "1.5 s")
+    c.same(ui.prefsSeconds(60.0), "1 min", "1 min")
+    c.same(ui.prefsSeconds(150.0), "2 min 30 s", "2 min 30 s")
+    c.same(ui.prefsBytes(512), "512 bytes", "bytes")
+    c.same(ui.prefsBytes(840000), "820 KB", "KB")
+    c.same(ui.prefsBytes(13002342), "12.4 MB", "MB")
+    c.same(ui.prefsBytes(1288490188), "1.2 GB", "GB")
+    c.same(ui.prefsPercent(0.85), "85 %", "percent")
+    c.same(ui.prefsPercent(2.0), "200 %", "percent above 100")
+    c.same(ui.prefsHeightTitle(0), "No limit", "no limit")
+    c.same(ui.prefsHeightTitle(2160), "4K (2160p)", "4K")
+    c.same(ui.prefsHeightTitle(720), "720p", "720p")
+    c.same(ui.prefsSleepTitle(0), "Off", "sleep off")
+    c.same(ui.prefsSleepTitle(-1), "At the end of the current item", "sleep end")
+    c.same(ui.prefsSleepTitle(45), "45 minutes", "sleep 45")
+    c.same(ui.prefsMaskedKey(""), "", "no key")
+    c.same(ui.prefsMaskedKey("abc"), "•••", "short key")
+    c.same(ui.prefsMaskedKey("0123456789abcdef3f9a"), "••••••••3f9a", "masked key")
+    c.check(ui.prefsClearHistoryQuestion(3).contains("3 items"), "question with count")
+    c.check(ui.prefsClearHistoryQuestion(1).contains("1 item "), "question for one")
+    c.check(ui.prefsClearHistoryQuestion(-1).contains("whole"), "question without count")
+}
+
+fn testExtra(_ c: bind Checker) {
+    // PrefsExtra round-trips through JSON (the app may save it), and an
+    // older file without new fields takes their defaults.
+    var e = ui.PrefsExtra()
+    e.speedStep = 0.25
+    e.secondaryStyle.color = 0xFFE140FF
+    let back: ui.PrefsExtra? = fromJson(toJson(e))
+    c.check(back != nil && back?.speedStep == 0.25 && back?.secondaryStyle.color == 0xFFE140FF, "extra round trip")
+    let old: ui.PrefsExtra? = fromJson("\{\"speedStep\": 0.2\}")
+    c.check(old != nil && old?.volumeLimit == 1.0 && old?.secondaryStyle.position == "top", "missing fields take defaults")
+}
+
+fn main() {
+    var c = Checker()
+    testTabs(c)
+    testStyle(c)
+    testColors(c)
+    testLanguages(c)
+    testKeys(c)
+    testNumbers(c)
+    testExtra(c)
+    print("ui_prefs: {c.passed} of {c.total} passed")
+}

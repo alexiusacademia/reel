@@ -1,0 +1,751 @@
+// Tests for the subs module: text decoding, SRT / WebVTT / ASS / SSA
+// parsing (the fixtures made by tools/make_fixtures.sh, ffmpeg's FATE
+// capability testers with ffmpeg's own timings as the reference, and small
+// hand-written cases), the container decoders (Matroska SRT/ASS, MP4
+// tx3g, PGS, DVD subtitles), the timing helpers, and drawing into PNGs
+// whose pixels are checked.
+//
+// Bitmap references: tests/subs/fixtures/pgs_sub_ref.png and
+// vobsub_133s_ref.png are ffmpeg's own rendering of pgs_sub.sup and
+// vobsub.idx/.sub (FATE samples) overlaid on black; vobsub.frames.csv is
+// ffprobe's list of the VobSub display times.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../../subs"
+import "../../core"
+import "../../testkit"
+
+let fx = "tests/subs/fixtures"
+let out = "build/scratch/subs"
+
+fn near(_ a: Float, _ b: Float, _ tol: Float = 0.0005) -> Bool {
+    abs(a - b) <= tol
+}
+
+fn fixtureText(_ name: String) -> String {
+    subs.decodeText(readData(joinPath(fx, name)) ?? Data())
+}
+
+// The (start, end) pairs of a .times file (ffmpeg's ASS output of a
+// sample, rounded to centiseconds), without zero-length events.
+fn refTimes(_ name: String) -> [(Float, Float)] {
+    var outList: [(Float, Float)] = []
+    for line in (readFile(joinPath(fx, name)) ?? "").lines() {
+        let p = line.words()
+        if p.count == 2 {
+            let s = Float(p[0]) ?? 0.0
+            let e = Float(p[1]) ?? 0.0
+            if e > s {
+                outList.append((s, e))
+            }
+        }
+    }
+    outList
+}
+
+// Whether the cues' times match a reference to the centisecond (ffmpeg
+// rounds to it), in any order.
+fn timesMatch(_ cues: [subs.Cue], _ want: [(Float, Float)]) -> Bool {
+    if cues.count != want.count {
+        print("  {cues.count} cues, want {want.count}")
+        return false
+    }
+    var used: [Bool] = []
+    for _ in want {
+        used.append(false)
+    }
+    for c in cues {
+        var found = false
+        for (i, w) in want.enumerated() {
+            if !used[i] && abs(c.start - w.0) < 0.0101 && abs(c.end - w.1) < 0.0101 {
+                used[i] = true
+                found = true
+                break
+            }
+        }
+        if !found {
+            print("  no reference for {c.start} → {c.end}: {subs.plainText(c)}")
+            return false
+        }
+    }
+    true
+}
+
+fn spanIs(_ c: subs.Cue, _ text: String) -> subs.Span {
+    for s in c.spans {
+        if s.text == text {
+            return s
+        }
+    }
+    subs.Span(text: "<none>")
+}
+
+fn spanWith(_ c: subs.Cue, _ text: String) -> subs.Span {
+    for s in c.spans {
+        if s.text.contains(text) {
+            return s
+        }
+    }
+    subs.Span(text: "<none>")
+}
+
+// Count and bounding box [count, x0, y0, x1, y1] of the pixels that pass.
+fn box(_ px: [Int], _ w: Int, _ h: Int, _ test: fn(Int, Int, Int, Int) -> Bool) -> [Int] {
+    var n = 0
+    var x0 = w
+    var y0 = h
+    var x1 = -1
+    var y1 = -1
+    for y in 0..h {
+        for x in 0..w {
+            let p = px[y * w + x]
+            if test(p >> 24 & 255, p >> 16 & 255, p >> 8 & 255, p & 255) {
+                n += 1
+                x0 = min(x0, x)
+                y0 = min(y0, y)
+                x1 = max(x1, x)
+                y1 = max(y1, y)
+            }
+        }
+    }
+    [n, x0, y0, x1, y1]
+}
+
+fn isWhite(_ r: Int, _ g: Int, _ b: Int, _ a: Int) -> Bool {
+    r > 220 && g > 220 && b > 220
+}
+
+fn isRed(_ r: Int, _ g: Int, _ b: Int, _ a: Int) -> Bool {
+    r > 180 && g < 80 && b < 80
+}
+
+// Draws cues over a mid-grey "video" of w × h points into a PNG and
+// reads its pixels back.
+fn render(_ name: String, _ cues: [subs.Cue], at: Float, w: Int, h: Int) -> [Int] {
+    let path = joinPath(out, name)
+    let ok = renderImage(path: path, width: Float(w), height: Float(h)) { g in
+        g.fillRect(x: 0, y: 0, width: g.width, height: g.height, color: .rgb(100, 100, 100))
+        subs.draw(g, cues, at: at, x: 0, y: 0, width: g.width, height: g.height)
+    }
+    if !ok {
+        return []
+    }
+    if let (_, _, px) = readImage(path) {
+        return px
+    }
+    []
+}
+
+// A Media from the reference with Matroska block payload offsets: ffprobe
+// gives the position of the Block (track number, timecode, flags), the
+// payload starts 4 bytes later for track numbers below 127.
+fn mkvMedia(_ name: String) -> (Data, core.Media) {
+    let file = testkit.fixture(name)
+    var m = testkit.mediaFromRef(file, testkit.loadRef(name))
+    for p in m.packets {
+        if m.tracks[p.track].kind == .subtitle {
+            p.offset += 4
+        }
+    }
+    (file, m)
+}
+
+fn subtitleTrack(_ m: core.Media) -> Int {
+    for t in m.tracks {
+        if t.kind == .subtitle {
+            return t.index
+        }
+    }
+    -1
+}
+
+// Big-endian bytes.
+fn be(_ v: Int, _ n: Int) -> [Int] {
+    v.bytes(count: n, bigEndian: true)
+}
+
+fn main() {
+    var passed = 0
+    var total = 0
+    fn check(_ ok: Bool, _ what: String) {
+        total += 1
+        if ok { passed += 1 } else { print("FAIL: {what}") }
+    }
+    createFolder(path: out)
+
+    // ---- Text decoding ----
+    check(subs.decodeText(Data(bytes: [0xEF, 0xBB, 0xBF, 0x41, 0xC3, 0xA9])) == "Aé", "UTF-8 with BOM")
+    check(subs.decodeText(Data(bytes: [0xFF, 0xFE, 0x41, 0, 0xE9, 0, 0x3D, 0xD8, 0x00, 0xDE])) == "Aé" + subs.charOf(0x1F600), "UTF-16LE with BOM and a surrogate pair")
+    check(subs.decodeText(Data(bytes: [0xFE, 0xFF, 0, 0x41, 0x65, 0xE5])) == "A日", "UTF-16BE with BOM")
+    check(subs.decodeText(Data(bytes: [0x48, 0, 0x69, 0, 0x21, 0, 0x0A, 0])) == "Hi!\n", "UTF-16LE without BOM")
+    check(subs.decodeText(Data(bytes: [0x93, 0x63, 0x61, 0x66, 0xE9, 0x94, 0x20, 0x80])) == "“café” €", "Windows-1252")
+    check(subs.decodeText(Data(text: "plain ü")) == "plain ü", "UTF-8")
+
+    // ---- SRT fixture ----
+    let srt = try subs.parseText(fixtureText("../../fixtures/subs.srt"), format: "srt")
+    let srtRef = testkit.loadRef("subs.srt")
+    check(srt.cues.count == 3, "subs.srt has 3 cues")
+    if srt.cues.count == 3 {
+        var timesOk = true
+        for (i, p) in srtRef.packets.enumerated() {
+            let s = core.seconds(p.pts, 1000)
+            let e = core.seconds(p.pts + p.duration, 1000)
+            if !near(srt.cues[i].start, s) || !near(srt.cues[i].end, e) {
+                timesOk = false
+            }
+        }
+        check(timesOk, "subs.srt times = ffprobe's")
+        let c0 = srt.cues[0]
+        check(subs.plainText(c0) == "Hello, world!", "srt text 1: {subs.plainText(c0)}")
+        check(spanWith(c0, "world").italic && !spanWith(c0, "Hello").italic, "srt <i>")
+        let c1 = srt.cues[1]
+        check(subs.plainText(c1) == "Two lines\nof text" && spanWith(c1, "text").bold, "srt two lines and <b>")
+        let c2 = srt.cues[2]
+        check(spanWith(c2, "Red").color == 0xFF0000FF && spanWith(c2, "plain").color == subs.white, "srt <font color>")
+        check(subs.plainText(c2) == "Red & plain", "srt entity &amp;")
+        check(c0.align == 2 && c0.x < 0.0 && near(c0.fontSize, 16.0 / 288.0), "srt default placement")
+    }
+
+    // ---- ASS fixture ----
+    let ass = try subs.parseText(fixtureText("../../fixtures/subs.ass"), format: "ass")
+    check(ass.format == "ass" && ass.playResX == 384 && ass.playResY == 288, "ass PlayRes")
+    check(ass.cues.count == 3, "subs.ass has 3 cues")
+    if ass.cues.count == 3 {
+        check(near(ass.cues[0].start, 0.5) && near(ass.cues[0].end, 1.5) && near(ass.cues[2].start, 3.1) && near(ass.cues[2].end, 4.0), "ass times")
+        check(subs.plainText(ass.cues[0]) == "Hello, world!" && spanWith(ass.cues[0], "world").italic, "ass \\i1")
+        check(subs.plainText(ass.cues[1]) == "Two lines\nof text" && spanWith(ass.cues[1], "text").bold, "ass \\N and \\b1")
+        check(spanWith(ass.cues[2], "Red").color == 0xFF0000FF && spanWith(ass.cues[2], "plain").color == subs.white, "ass \\c&HFF& and \\c reset")
+        check(ass.cues[0].style == "Default" && near(ass.cues[0].marginV, 10.0 / 288.0) && ass.cues[0].spans[0].font == "Arial", "ass style")
+    }
+
+    // ---- WebVTT fixture ----
+    let vtt = try subs.parseText(fixtureText("../../fixtures/subs.vtt"), format: "webvtt")
+    check(vtt.cues.count == 3, "subs.vtt has 3 cues")
+    if vtt.cues.count == 3 {
+        check(near(vtt.cues[1].start, 1.6) && near(vtt.cues[1].end, 3.0), "vtt times")
+        check(spanWith(vtt.cues[0], "world").italic && subs.plainText(vtt.cues[2]) == "Red & plain", "vtt tags and entity")
+    }
+    check(subs.sniffText(fixtureText("../../fixtures/subs.vtt")) == "webvtt" && subs.sniffText(fixtureText("../../fixtures/subs.ass")) == "ass" && subs.sniffText(fixtureText("../../fixtures/subs.srt")) == "srt", "sniff formats")
+    let auto = try subs.parseText(fixtureText("../../fixtures/subs.srt"), format: "")
+    check(auto.format == "srt" && auto.cues.count == 3, "auto-detected format")
+
+    // ---- Matroska SRT and ASS tracks ----
+    let (ms, mm) = mkvMedia("subs_srt.mkv")
+    let msTrack = subtitleTrack(mm)
+    check(msTrack >= 0 && mm.tracks[msTrack].codec == "srt", "mkv srt track")
+    let mkvSrt = try subs.decodeTrack(ms, mm, track: msTrack)
+    check(mkvSrt.cues.count == 3, "mkv srt cues")
+    if mkvSrt.cues.count == 3 && srt.cues.count == 3 {
+        var same = true
+        for i in 0..3 {
+            if subs.plainText(mkvSrt.cues[i]) != subs.plainText(srt.cues[i]) || !near(mkvSrt.cues[i].start, srt.cues[i].start) || !near(mkvSrt.cues[i].end, srt.cues[i].end) {
+                same = false
+            }
+        }
+        check(same, "mkv srt = the .srt file")
+        check(spanWith(mkvSrt.cues[2], "Red").color == 0xFF0000FF, "mkv srt colour")
+    }
+    let (ma, am) = mkvMedia("subs_ass.mkv")
+    let maTrack = subtitleTrack(am)
+    let mkvAss = try subs.decodeTrack(ma, am, track: maTrack)
+    check(mkvAss.cues.count == 3 && mkvAss.playResY == 288, "mkv ass cues")
+    if mkvAss.cues.count == 3 {
+        check(subs.plainText(mkvAss.cues[1]) == "Two lines\nof text" && spanWith(mkvAss.cues[1], "text").bold && near(mkvAss.cues[1].start, 1.6) && near(mkvAss.cues[1].end, 3.0), "mkv ass event")
+        check(spanWith(mkvAss.cues[2], "Red").color == 0xFF0000FF && mkvAss.cues[2].style == "Default", "mkv ass style and colour")
+    }
+
+    // ---- MP4 tx3g ----
+    let txFile = testkit.fixture("subs_tx3g.mp4")
+    let txMedia = testkit.mediaFromRef(txFile, testkit.loadRef("subs_tx3g.mp4"))
+    let txTrack = subtitleTrack(txMedia)
+    let tx = try subs.decodeTrack(txFile, txMedia, track: txTrack)
+    check(tx.cues.count == 3, "tx3g: 3 cues (empty samples skipped)")
+    if tx.cues.count == 3 {
+        check(near(tx.cues[0].start, 0.5) && near(tx.cues[0].end, 1.5) && near(tx.cues[2].start, 3.1), "tx3g times")
+        check(subs.plainText(tx.cues[0]) == "Hello, world!" && spanWith(tx.cues[0], "world").italic && !spanWith(tx.cues[0], "Hello").italic, "tx3g styl italic")
+        check(spanWith(tx.cues[1], "text").bold && subs.plainText(tx.cues[1]) == "Two lines\nof text", "tx3g styl bold and line break")
+        check(tx.cues[0].align == 2 && spanWith(tx.cues[0], "Hello").font == "Arial", "tx3g justification and font table")
+    }
+    // A hand-made sample with a highlight box.
+    var txTrackDef = core.Track(index: 0, kind: .subtitle, codec: "tx3g")
+    txTrackDef.extra = testkit.hexToData("00000000" + "0100" + "000000ff" + "0000000000000000" + "000000000001" + "00" + "10" + "ffffffff")
+    var txDec = try subs.newDecoder(txTrackDef)
+    let txBytes = be(5, 2) + Data(text: "ab cd").bytes + be(12, 4) + Data(text: "hlit").bytes + be(3, 2) + be(5, 2) + be(12, 4) + Data(text: "hclr").bytes + [0, 255, 0, 255]
+    let txCues = txDec.decode(Data(bytes: txBytes), start: 2.0, duration: 1.0)
+    check(txCues.count == 1 && spanWith(txCues[0], "cd").color == 0x00FF00FF && spanWith(txCues[0], "ab").color == subs.white, "tx3g highlight colour")
+    check(txCues.count == 1 && txCues[0].align == 8 && near(txCues[0].end, 3.0), "tx3g top justification and duration")
+
+    // ---- SRT edge cases ----
+    let tricky = "1\r\n00:00:01,000 --> 00:00:02,000 X1:10 X2:20\r\n\{\\an8}<font face=\"Times\" size=\"32\">Top</font> &lt;3\r\n2\r\n00:00:02.500 --> 00:00:03.000\r\nno blank line before me\r\n\r\n\r\n00:00:04,000 --> 00:00:05,000\r\nno number\r\n\r\nstill text after a blank line\r\n\r\n4\r\n00:00:06,000 --> 00:00:07,000\r\n<b>unclosed bold\r\n<invalid_tag>hidden tag</invalid_tag> 2<3 \{Y:i}\{\\i1}it\\Nnew\\hline\r\n"
+    let t2 = try subs.parseText(tricky, format: "srt")
+    check(t2.cues.count == 4, "tricky srt: 4 cues (got {t2.cues.count})")
+    if t2.cues.count == 4 {
+        let a = t2.cues[0]
+        check(a.align == 8 && spanWith(a, "Top").font == "Times" && near(spanWith(a, "Top").size, 2.0), "srt \{\\an8} and <font face size>")
+        check(subs.plainText(a) == "Top <3", "srt &lt;")
+        check(near(t2.cues[1].start, 2.5) && subs.plainText(t2.cues[1]) == "no blank line before me", "srt '.' times, no blank line")
+        check(subs.plainText(t2.cues[2]) == "no number\n\nstill text after a blank line", "srt without numbers, blank line inside")
+        let d = t2.cues[3]
+        check(subs.plainText(d) == "unclosed bold\nhidden tag 2<3 it\nnew" + subs.charOf(0xA0) + "line", "srt hidden tags, \\N, \\h: {subs.plainText(d)}")
+        check(spanWith(d, "hidden").bold && spanWith(d, "it").italic, "srt unclosed bold carries on")
+    }
+
+    // ---- FATE capability testers vs ffmpeg's timings ----
+    let rip = try subs.parseText(fixtureText("SubRip_capability_tester.srt"), format: "srt")
+    check(timesMatch(rip.cues, refTimes("SubRip_capability_tester.srt.times")), "SubRip tester times = ffmpeg's")
+    for c in rip.cues {
+        let t = subs.plainText(c)
+        if t.hasPrefix("This text should be at the\ntop and horizontally at the left") {
+            check(c.align == 7, "SubRip tester \{\\an7} at the end of the text")
+        }
+        if t.hasPrefix("This text should be at the\nmiddle and horiz") && t.contains("second position") {
+            check(c.align == 4, "SubRip tester second \{\\an} ignored")
+        }
+        if t.hasPrefix("This could be the") {
+            check(spanIs(c, "o").color == 0x000000FF && spanWith(c, "st").color == 0x00FF00FF && near(spanWith(c, "st").size, 35.0 / 16.0), "SubRip tester nested <font>")
+        }
+        if t.hasPrefix("It would be a good thing") {
+            check(!t.contains("invalid_tag") && t.contains("hide invalid html tags"), "SubRip tester hides invalid tags")
+        }
+        if t.hasPrefix("Hide these tags") {
+            check(t == "Hide these tags: \nalso hide these tags: \nbut show this: \{normal text}", "SubRip tester hides ASS and MicroDVD blocks: {t}")
+        }
+    }
+    for name in ["madness.srt", "badsyntax.srt", "empty-events-2167.srt"] {
+        let tr = try subs.parseText(fixtureText(name), format: "srt")
+        check(timesMatch(tr.cues, refTimes(name + ".times")), "{name} times = ffmpeg's")
+    }
+    for name in ["WebVTT_capability_tester.vtt", "WebVTT_extended_tester.vtt"] {
+        let tr = try subs.parseText(fixtureText(name), format: "webvtt")
+        check(timesMatch(tr.cues, refTimes(name + ".times")), "{name} times = ffmpeg's")
+    }
+    for name in ["1ededcbd7b.ass", "a9-misc.ssa"] {
+        let tr = try subs.parseText(fixtureText(name), format: "")
+        check(timesMatch(tr.cues, refTimes(name + ".times")), "{name} times = ffmpeg's")
+    }
+    let ssa = try subs.parseText(fixtureText("a9-misc.ssa"), format: "")
+    check(ssa.format == "ssa", "a9-misc.ssa is SSA v4")
+
+    // ---- ASS override tags ----
+    let script = "[Script Info]\nScriptType: v4.00+\nPlayResX: 640\nPlayResY: 480\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,Arial,40,&H00FFFFFF,&H000000FF,&H00000000,&H80000000,0,0,0,0,100,100,0,0,1,2,2,2,20,20,30,1\nStyle: Sign,Georgia,20,&H0000FFFF,&H000000FF,&H00FF0000,&H00000000,-1,0,0,0,100,100,0,0,3,1,0,8,10,10,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 1,0:00:01.00,0:00:04.00,Default,,0,0,0,,\{\\pos(320,240)\\an5\\fad(500,250)}Centre \{\\fs60\\bord4\\shad0\\3c&H0000FF&}big\{\\r} back\nDialogue: 0,0:00:02.00,0:00:03.00,Sign,,0,0,50,,\{\\move(0,0,640,480,100,900)\\1a&H80&\\u1\\s1}sign\\nsoft\{\\p1}m 0 0 l 10 10\{\\p0} after \{comment}\{\\rDefault}default\nDialogue: 0,0:00:00.50,0:00:00.90,Default,,0,0,0,,\{\\alpha&HFF&\\a6}\{\\c&H00FF00&\\fnCourier New\\i1}x,y,z\nComment: 0,0:00:00.00,0:00:09.00,Default,,0,0,0,,not shown\n"
+    let st = try subs.parseText(script, format: "ass")
+    check(st.cues.count == 3 && st.playResX == 640, "ass script: 3 dialogues, no comments")
+    if st.cues.count == 3 {
+        let z = st.cues[0]
+        check(near(z.start, 0.5) && subs.plainText(z) == "x,y,z", "ass: commas in text, sorted by start")
+        check(z.align == 8 && z.spans[0].color & 255 == 0 && z.spans[0].color >> 8 == 0x00FF00 && z.spans[0].font == "Courier New" && z.spans[0].italic, "ass \\a6 (SSA top centre), \\alpha, \\c, \\fn with spaces")
+        let a = st.cues[1]
+        check(near(a.x, 0.5) && near(a.y, 0.5) && a.align == 5 && a.layer == 1, "ass \\pos \\an layer")
+        check(near(a.fadeIn, 0.5) && near(a.fadeOut, 0.25), "ass \\fad")
+        let big = spanWith(a, "big")
+        check(near(big.size, 1.5) && near(big.border, 4.0 / 480.0) && big.shadowDepth == 0.0 && big.outline == 0xFF0000FF, "ass \\fs \\bord \\shad \\3c")
+        let back = spanWith(a, "back")
+        check(near(back.size, 1.0) && near(back.border, 2.0 / 480.0) && near(back.shadowDepth, 2.0 / 480.0) && back.shadow == 0x0000007F, "ass \\r resets, style colours with alpha")
+        check(near(a.fontSize, 40.0 / 480.0) && near(a.marginL, 20.0 / 640.0) && near(a.marginV, 30.0 / 480.0), "ass style size and margins")
+        let b = st.cues[2]
+        check(b.style == "Sign" && b.borderStyle == 3 && b.align == 8 && near(b.marginV, 50.0 / 480.0), "ass second style, event MarginV")
+        check(subs.plainText(b) == "sign soft after default", "ass \\n soft break, \\p drawing skipped, comment block: {subs.plainText(b)}")
+        let sg = spanWith(b, "sign")
+        check(sg.bold && sg.underline && sg.strike && sg.color == 0xFFFF007F && sg.font == "Georgia", "ass style bold, \\1a, \\u, \\s")
+        check(spanWith(b, "default").font == "Arial" && !spanWith(b, "default").bold, "ass \\rDefault")
+        let (mx, my) = subs.positionAt(b, at: 2.5)
+        check(near(b.x, 0.0) && near(b.moveX, 1.0) && near(mx, 0.5) && near(my, 0.5), "ass \\move halfway")
+        let (ex, _) = subs.positionAt(b, at: 2.95)
+        check(near(ex, 1.0), "ass \\move done after t2")
+        check(near(subs.fadeAt(a, at: 1.25), 0.5) && near(subs.fadeAt(a, at: 3.875), 0.5) && near(subs.fadeAt(a, at: 2.0), 1.0), "fade in and out")
+    }
+    // SSA v4: legacy alignment and decimal colours.
+    let v4 = "[Script Info]\nScriptType: v4.00\n\n[V4 Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, TertiaryColour, BackColour, Bold, Italic, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, AlphaLevel, Encoding\nStyle: Default,Tahoma,24,65535,255,16711680,0,-1,0,1,2,0,6,10,10,10,0,0\n\n[Events]\nFormat: Marked, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: Marked=0,0:00:01.00,0:00:02.00,Default,,0000,0000,0000,,Top centre\n"
+    let s4 = try subs.parseText(v4, format: "")
+    check(s4.format == "ssa" && s4.cues.count == 1, "ssa v4 parsed")
+    if s4.cues.count == 1 {
+        check(s4.cues[0].align == 8 && spanWith(s4.cues[0], "Top").color == 0xFFFF00FF && spanWith(s4.cues[0], "Top").outline == 0x0000FFFF && spanWith(s4.cues[0], "Top").bold, "ssa legacy alignment 6 = top centre, decimal BGR colours")
+    }
+
+    // ---- WebVTT settings ----
+    let vt = "WEBVTT - with header text\nKind: captions\n\nSTYLE\n::cue \{ color: red }\n\nNOTE a comment\nspanning lines\n\nREGION\nid:fred width:40%\n\ncue-1\n00:01.000 --> 00:02.000 line:10% position:25%,line-left align:start size:50%\n<c.yellow.bg_blue>Yellow</c> <v Bob>talks</v> <00:01.500>later\n\n01:00:00.000 --> 01:00:01.500 line:0 align:end\n&lt;top right&gt;\n\n00:03.000 --> 00:04.000 line:-1\n<b><i>bold italic</i></b> <u>under</u> <ruby>漢<rt>kan</rt></ruby>\n"
+    let vc = try subs.parseText(vt, format: "vtt")
+    check(vc.cues.count == 3, "vtt: STYLE/NOTE/REGION skipped, 3 cues")
+    if vc.cues.count == 3 {
+        let a = vc.cues[0]
+        check(near(a.y, 0.1) && a.align == 7 && near(a.x, 0.25) && near(a.width, 0.5), "vtt line% position align size")
+        check(spanWith(a, "Yellow").color == 0xFFFF00FF && spanWith(a, "talks").color == subs.white && subs.plainText(a) == "Yellow talks later", "vtt <c.yellow>, <v>, timestamp tag")
+        let b = vc.cues[2]
+        check(near(b.start, 3600.0) && b.align == 9 && b.x < 0.0, "vtt hours, line:0 align:end = top right")
+        check(subs.plainText(b) == "<top right>", "vtt entities")
+        let c = vc.cues[1]
+        check(c.align == 2 && spanWith(c, "bold").bold && spanWith(c, "bold").italic && spanWith(c, "under").underline, "vtt line:-1 bottom, nested tags")
+        check(spanWith(c, "kan").size < 1.0 && subs.plainText(c).contains("漢"), "vtt ruby")
+    }
+    check(!subs.parseText("1\n00:00:01,000 --> 00:00:02,000\nx\n", format: "vtt").isOk(), "vtt without header fails")
+    // MP4 wvtt samples.
+    let wv = core.Track(index: 0, kind: .subtitle, codec: "webvtt")
+    var wd = try subs.newDecoder(wv)
+    let payl = Data(text: "boxed <i>cue</i>")
+    let sttg = Data(text: "align:start line:0")
+    let vttc = be(8 + 8 + payl.count + 8 + sttg.count, 4) + Data(text: "vttc").bytes + be(8 + sttg.count, 4) + Data(text: "sttg").bytes + sttg.bytes + be(8 + payl.count, 4) + Data(text: "payl").bytes + payl.bytes
+    let wc = wd.decode(Data(bytes: vttc), start: 1.0, duration: 2.0)
+    check(wc.count == 1 && subs.plainText(wc[0]) == "boxed cue" && spanWith(wc[0], "cue").italic && wc[0].align == 7, "mp4 wvtt vttc/payl/sttg")
+    check(wd.decode(Data(bytes: be(8, 4) + Data(text: "vtte").bytes), start: 3.0, duration: 1.0).isEmpty, "mp4 wvtt vtte is empty")
+
+    // ---- Timing helpers ----
+    let act = subs.activeCues(srt, at: 1.0)
+    check(act.count == 1 && subs.plainText(act[0]) == "Hello, world!", "activeCues at 1.0")
+    check(subs.activeCues(srt, at: 1.55).isEmpty && subs.activeCues(srt, at: 1.5).isEmpty, "activeCues between cues (end excluded)")
+    let later = subs.shifted(srt, by: 2.0)
+    check(near(later.cues[0].start, 2.5) && near(later.cues[0].end, 3.5) && subs.activeCues(later, at: 1.0).isEmpty, "shifted by 2 s")
+    let earlier = subs.shifted(srt, by: -0.5)
+    check(near(earlier.cues[0].start, 0.0), "shifted earlier")
+    let rc = subs.replaceCues([subs.Cue(start: 1.0, end: subs.openEnd, id: 7)], [subs.Cue(start: 1.0, end: 2.0, id: 7), subs.Cue(start: 2.0, end: 3.0, id: 8)])
+    check(rc.count == 2 && near(rc[0].end, 2.0), "replaceCues")
+
+    // ---- PGS: hand-made display sets ----
+    // PCS: 720×480, epoch start, palette 0, one object at (100, 50).
+    let pcs = [0x16] + be(19, 2) + be(720, 2) + be(480, 2) + [0x10] + be(1, 2) + [0x80, 0, 0, 1] + be(0, 2) + [0, 0] + be(100, 2) + be(50, 2)
+    let wds = [0x17] + be(10, 2) + [1, 0] + be(100, 2) + be(50, 2) + be(4, 2) + be(2, 2)
+    // Palette: 1 = white (Y 235), 2 = red-ish (Y 81, Cr 240, Cb 90) half alpha.
+    let pds = [0x14] + be(12, 2) + [0, 0] + [1, 235, 128, 128, 255] + [2, 81, 240, 90, 128]
+    // Object 4×2: row 0 = 1,1,2,2 (two literal pixels then a run of 2 of
+    // colour 2); row 1 = run of 3 of colour 0, then colour 1.
+    let rle = [1, 1, 0, 0x82, 2, 0, 0, 0, 3, 1, 0, 0]
+    let ods = [0x15] + be(11 + rle.count, 2) + be(0, 2) + [0, 0xC0] + be(rle.count + 4, 3) + be(4, 2) + be(2, 2) + rle
+    let end = [0x80, 0, 0]
+    let pgsTrack = core.Track(index: 0, kind: .subtitle, codec: "pgs")
+    var pd = try subs.newDecoder(pgsTrack)
+    let shown = pd.decode(Data(bytes: pcs + wds + pds + ods + end), start: 10.0, duration: 0.0)
+    check(shown.count == 1, "pgs: one cue from a display set")
+    if shown.count == 1 {
+        let bm = shown[0].bitmap
+        check(bm.x == 100 && bm.y == 50 && bm.w == 4 && bm.h == 2 && bm.frameWidth == 720 && bm.frameHeight == 480, "pgs bitmap placement")
+        check(bm.pixels.count == 8 && bm.pixels[0] == 0xFFFFFFFF && bm.pixels[1] == 0xFFFFFFFF && bm.pixels[4] == 0 && bm.pixels[7] == 0xFFFFFFFF, "pgs RLE and white from YCbCr")
+        let r = bm.pixels[2]
+        check(r & 255 == 128 && r >> 24 > 200 && r >> 16 & 255 < 60, "pgs BT.601 red with alpha: {r >> 24} {r >> 16 & 255} {r >> 8 & 255}")
+        check(near(shown[0].start, 10.0) && shown[0].end >= subs.openEnd, "pgs open end")
+    }
+    // An empty composition 2 s later ends it.
+    let clear = [0x16] + be(11, 2) + be(720, 2) + be(480, 2) + [0x10] + be(2, 2) + [0x00, 0, 0, 0]
+    let ended = pd.decode(Data(bytes: clear + end), start: 12.0, duration: 0.0)
+    check(ended.count == 1 && near(ended[0].end, 12.0) && shown.count == 1 && ended[0].id == shown[0].id, "pgs empty composition ends the cue (same id)")
+    let merged = subs.replaceCues(shown, ended)
+    check(merged.count == 1 && near(merged[0].end, 12.0), "pgs replaceCues keeps one cue")
+    // ODS split over two fragments.
+    var pd2 = try subs.newDecoder(pgsTrack)
+    let ods1 = [0x15] + be(11 + 5, 2) + be(0, 2) + [0, 0x80] + be(rle.count + 4, 3) + be(4, 2) + be(2, 2) + rle.prefix(5)
+    let ods2 = [0x15] + be(4 + rle.count - 5, 2) + be(0, 2) + [0, 0x40] + rle.dropFirst(5)
+    let two = pd2.decode(Data(bytes: pcs + pds + ods1 + ods2 + end), start: 1.0, duration: 3.0)
+    check(two.count == 1 && two[0].bitmap.pixels.count == 8 && two[0].bitmap.pixels[7] == 0xFFFFFFFF && near(two[0].end, 4.0), "pgs object in two fragments, known duration")
+
+    // ---- PGS: FATE pgs_sub.sup against ffmpeg's rendering ----
+    let sup = try subs.parseSup(readData(joinPath(fx, "pgs_sub.sup")) ?? Data())
+    check(sup.cues.count == 1 && sup.playResX == 1920, "pgs_sub.sup: one composition")
+    if sup.cues.count == 1 {
+        let c = sup.cues[0]
+        check(near(c.start, 0.067467, 0.00001) && c.end >= subs.openEnd, "pgs_sub.sup time = ffprobe's PCS pts")
+        if let (rw, rh, ref) = readImage(joinPath(fx, "pgs_sub_ref.png")) {
+            let bm = c.bitmap
+            var diff = 0
+            var worst = 0
+            var lit = 0
+            for y in 0..bm.h {
+                for x in 0..bm.w {
+                    let p = bm.pixels[y * bm.w + x]
+                    let a = p & 255
+                    let q = ref[(bm.y + y) * rw + bm.x + x]
+                    for sh in [24, 16, 8] {
+                        let mine = (p >> sh & 255) * a / 255
+                        let d = abs(mine - (q >> sh & 255))
+                        diff += d
+                        worst = max(worst, d)
+                    }
+                    if a > 0 {
+                        lit += 1
+                    }
+                }
+            }
+            let mean = Float(diff) / Float(max(1, bm.w * bm.h * 3))
+            check(mean < 1.0 && worst < 40, "pgs_sub.sup pixels = ffmpeg's (mean diff {mean}, worst {worst})")
+            let refLit = box(ref, rw, rh, { r, g, b, a in r > 128 })
+            let mineLit = box(bm.pixels, bm.w, bm.h, { r, g, b, a in a > 128 && r > 128 })
+            check(abs(refLit[0] - mineLit[0]) * 50 < refLit[0] && refLit[1] >= bm.x && refLit[3] < bm.x + bm.w, "pgs_sub.sup bright pixel count {mineLit[0]} vs {refLit[0]}")
+        } else {
+            check(false, "pgs reference image")
+        }
+    }
+
+    // ---- DVD subtitles: hand-made SPU ----
+    var dvdTrack = core.Track(index: 0, kind: .subtitle, codec: "dvdsub")
+    dvdTrack.extra = Data(text: "# idx\nsize: 720x576\npalette: 000000, ff0000, 00ff00, 0000ff, ffffff, 101010, 202020, 303030, 404040, 505050, 606060, 707070, 808080, 909090, a0a0a0, b0b0b0\n")
+    var dd = try subs.newDecoder(dvdTrack)
+    // 4×2 area at (10, 20): top field (row 0) = 4 pixels of colour 1 (a
+    // 2-nibble run: 0001 0001 = len 4, colour 1); bottom field (row 1) =
+    // fill with colour 2 (0000 0000 0000 0010).
+    let pix = [0x11, 0x00, 0x02]
+    let ctrlAt = 4 + pix.count
+    let ctrl = be(0, 2) + be(ctrlAt, 2) + [0x01] + [0x03, 0x43, 0x21] + [0x04, 0xFF, 0xF0] + [0x05, 0x00, 0xA0, 0x0D, 0x01, 0x40, 0x15] + [0x06] + be(4, 2) + be(5, 2) + [0xFF]
+    let ctrl2At = ctrlAt + ctrl.count
+    let ctrl2 = be(200, 2) + be(ctrl2At, 2) + [0x02, 0xFF]
+    // The first sequence's "next" points at the second.
+    var seq1 = ctrl
+    seq1[2] = ctrl2At >> 8
+    seq1[3] = ctrl2At & 255
+    let spuBody = pix + seq1 + ctrl2
+    let spu = be(4 + spuBody.count, 2) + be(ctrlAt, 2) + spuBody
+    let dc = dd.decode(Data(bytes: spu), start: 5.0, duration: 0.0)
+    check(dc.count == 1, "dvdsub: one cue")
+    if dc.count == 1 {
+        let bm = dc[0].bitmap
+        check(bm.x == 10 && bm.y == 20 && bm.w == 4 && bm.h == 2 && bm.frameWidth == 720 && bm.frameHeight == 576, "dvdsub area and idx size")
+        check(bm.pixels.count == 8 && bm.pixels[0] == 0x00FF00FF && bm.pixels[3] == 0x00FF00FF, "dvdsub top field: colour 1 → palette 2 (green), opaque")
+        check(bm.pixels[4] == 0x0000FFFF && bm.pixels[7] == 0x0000FFFF, "dvdsub bottom field fill: colour 2 → palette 3 (blue)")
+        check(near(dc[0].start, 5.0) && near(dc[0].end, 5.0 + Float(200 * 1024) / 90000.0, 0.001), "dvdsub stop display time")
+    }
+
+    // ---- VobSub: FATE vobsub.idx/.sub against ffprobe and ffmpeg ----
+    let vob = try subs.parseVobSub(idx: readFile(joinPath(fx, "vobsub.idx")) ?? "", sub: readData(joinPath(fx, "vobsub.sub")) ?? Data())
+    var refFrames: [(Float, Float)] = []
+    for line in (readFile(joinPath(fx, "vobsub.frames.csv")) ?? "").lines() {
+        let p = line.split(",")
+        if p.count >= 6 {
+            let s = Float(p[2]) ?? 0.0
+            refFrames.append((s, s + (Float(p[5]) ?? 0.0) / 1000.0))
+        }
+    }
+    check(vob.cues.count == refFrames.count && vob.cues.count == 43, "vobsub: {vob.cues.count} cues, ffprobe {refFrames.count}")
+    var vobTimes = vob.cues.count == refFrames.count
+    if vobTimes {
+        for (i, c) in vob.cues.enumerated() {
+            // Three SPUs start in one pack and end in the next, whose PES
+            // has its own PTS and idx timestamp; ffmpeg dates them by the
+            // second (≤ 17 ms later or earlier), we by the first, where
+            // the SPU starts.
+            if !near(c.start, refFrames[i].0, 0.02) || !near(c.end - c.start, refFrames[i].1 - refFrames[i].0, 0.002) {
+                print("  vobsub cue {i}: {c.start}–{c.end}, ffprobe {refFrames[i].0}–{refFrames[i].1}")
+                vobTimes = false
+            }
+        }
+    }
+    check(vobTimes, "vobsub times = ffprobe's (within 17 ms) and durations")
+    let vobAt = subs.activeCues(vob, at: 133.0)
+    check(vobAt.count == 1, "vobsub: one cue at 133 s")
+    if vobAt.count == 1 {
+        if let (rw, rh, ref) = readImage(joinPath(fx, "vobsub_133s_ref.png")) {
+            let bm = vobAt[0].bitmap
+            // Composite onto black and compare the whole frame.
+            var frame = core.zeros(rw * rh)
+            for y in 0..bm.h {
+                for x in 0..bm.w {
+                    let p = bm.pixels[y * bm.w + x]
+                    let a = p & 255
+                    let fx2 = bm.x + x
+                    let fy = bm.y + y
+                    if fx2 < rw && fy < rh {
+                        frame[fy * rw + fx2] = ((p >> 24 & 255) * a / 255) << 24 | ((p >> 16 & 255) * a / 255) << 16 | ((p >> 8 & 255) * a / 255) << 8 | 255
+                    }
+                }
+            }
+            var diff = 0
+            var worst = 0
+            for i in 0..(rw * rh) {
+                for sh in [24, 16, 8] {
+                    let d = abs((frame[i] >> sh & 255) - (ref[i] >> sh & 255))
+                    diff += d
+                    worst = max(worst, d)
+                }
+            }
+            let mean = Float(diff) / Float(rw * rh * 3)
+            check(mean < 0.5 && worst < 40, "vobsub frame at 133 s = ffmpeg's (mean diff {mean}, worst {worst})")
+            let yellowRef = box(ref, rw, rh, { r, g, b, a in r > 180 && g > 180 && b < 100 })
+            let yellowMine = box(frame, rw, rh, { r, g, b, a in r > 180 && g > 180 && b < 100 })
+            check(yellowRef[0] > 100 && abs(yellowRef[0] - yellowMine[0]) * 20 < yellowRef[0], "vobsub yellow text pixels {yellowMine[0]} vs {yellowRef[0]}")
+        } else {
+            check(false, "vobsub reference image")
+        }
+    }
+
+    // ---- Drawing ----
+    let w = 768
+    let h = 432
+    let px1 = render("srt_bottom.png", srt.cues, at: 1.0, w: w, h: h)
+    check(px1.count == w * h, "rendered a PNG")
+    if px1.count == w * h {
+        let wb = box(px1, w, h, isWhite)
+        check(wb[0] > 80 && wb[2] > h * 3 / 4 && wb[4] < h - 2, "srt text drawn at the bottom (white rows {wb[2]}–{wb[4]})")
+        let mid = (wb[1] + wb[3]) / 2
+        check(abs(mid - w / 2) < 12, "srt text centred (middle x {mid})")
+        check(near(Float(h - wb[4]), Float(h) * 10.0 / 288.0, 6.0), "bottom margin about MarginV")
+        // The outline: dark pixels right next to the white text.
+        let dark = box(px1, w, h, { r, g, b, a in r < 40 && g < 40 && b < 40 })
+        check(dark[0] > 50 && dark[2] >= wb[2] - 3 && dark[4] <= wb[4] + 3, "dark outline around the text")
+        let line = Float(wb[4] - wb[2])
+        check(line > Float(h) * 16.0 / 288.0 * 0.5 && line < Float(h) * 16.0 / 288.0 * 1.3, "text height follows the font size ({line} px)")
+    }
+    let px2 = render("srt_red.png", srt.cues, at: 3.5, w: w, h: h)
+    if px2.count == w * h {
+        let rb = box(px2, w, h, isRed)
+        let wb = box(px2, w, h, isWhite)
+        check(rb[0] > 20 && wb[0] > 20 && rb[3] < wb[1], "red word left of the white words")
+    }
+    // {\an8} at the top, \pos in the middle, an empty frame between cues.
+    let t2c = try subs.parseText("1\n00:00:01,000 --> 00:00:02,000\n\{\\an8}TOP\n\n2\n00:00:01,000 --> 00:00:02,000\n\{\\pos(192,108)\\an5}MIDDLE\n", format: "srt")
+    let px3 = render("srt_top_pos.png", t2c.cues, at: 1.5, w: 768, h: 576)
+    if px3.count == 768 * 576 {
+        let top = box(px3.slice(from: 0, to: 768 * 120), 768, 120, isWhite)
+        check(top[0] > 30 && top[2] < 50 && abs((top[1] + top[3]) / 2 - 384) < 10, "\{\\an8} drawn at the top centre")
+        let middle = box(px3.slice(from: 768 * 120, to: 768 * 400), 768, 280, isWhite)
+        check(middle[0] > 30 && abs((middle[2] + middle[4]) / 2 + 120 - 216) < 6 && abs((middle[1] + middle[3]) / 2 - 384) < 8, "\\pos(192,108) centred there with \\an5 ({(middle[1] + middle[3]) / 2}, {(middle[2] + middle[4]) / 2 + 120})")
+    }
+    let px4 = render("srt_none.png", srt.cues, at: 1.55, w: w, h: h)
+    check(px4.count == w * h && box(px4, w, h, isWhite)[0] == 0, "nothing drawn between cues")
+    // Wrapping: a long line breaks into two balanced lines.
+    let long = try subs.parseText("1\n00:00:00,000 --> 00:00:05,000\nThis is a rather long subtitle line that cannot possibly fit on one line, not even on a wide screen, because it simply goes on and on\n", format: "srt")
+    let px5 = render("srt_wrap.png", long.cues, at: 1.0, w: w, h: h)
+    if px5.count == w * h {
+        let wb = box(px5, w, h, isWhite)
+        let rows = Float(wb[4] - wb[2])
+        check(rows > Float(h) * 16.0 / 288.0 * 1.5 && wb[1] > 5 && wb[3] < w - 5, "long line wrapped inside the margins (height {rows})")
+    }
+    // Two cues at once stack instead of overlapping.
+    let both = try subs.parseText("1\n00:00:00,000 --> 00:00:05,000\nFIRST\n\n2\n00:00:01,000 --> 00:00:05,000\nSECOND\n", format: "srt")
+    let px6 = render("srt_stack.png", both.cues, at: 2.0, w: w, h: h)
+    if px6.count == w * h {
+        let wb = box(px6, w, h, isWhite)
+        check(Float(wb[4] - wb[2]) > Float(h) * 16.0 / 288.0 * 1.4, "two bottom cues stacked")
+    }
+    // Fading: at half the fade the text is about half as bright.
+    var faded = srt.cues[0]
+    faded.fadeIn = 0.4
+    let px7 = render("fade.png", [faded], at: 0.7, w: w, h: h)
+    if px7.count == w * h && px1.count == w * h {
+        let full = box(px1, w, h, isWhite)
+        let half = box(px7, w, h, isWhite)
+        let mid = box(px7, w, h, { r, g, b, a in r > 150 && r < 200 && g > 150 && g < 200 })
+        check(half[0] == 0 && mid[0] > full[0] / 3, "half-faded text is grey ({mid[0]} px)")
+    }
+    // ASS box style and colours.
+    let pxa = render("ass.png", st.cues, at: 2.5, w: 640, h: 480)
+    if pxa.count == 640 * 480 {
+        let blue = box(pxa, 640, 480, { r, g, b, a in b > 200 && r < 60 && g < 60 })
+        let yellowish = box(pxa, 640, 480, { r, g, b, a in r > 100 && g > 100 && b < 160 && r - b > 40 })
+        check(blue[0] > 200 && yellowish[0] > 20 && blue[1] <= yellowish[1] && blue[3] >= yellowish[3], "ass BorderStyle 3: blue box behind the half-transparent yellow text")
+        check(abs(blue[2] - 240) < 12 && abs((blue[1] + blue[3]) / 2 - 320) < 40, "ass \\move puts the sign (\\an8) mid-screen at mid-move ({blue[1]},{blue[2]})")
+        let centre = box(pxa.slice(from: 640 * 200, to: 640 * 280), 640, 80, isWhite)
+        check(centre[0] > 100 && abs((centre[1] + centre[3]) / 2 - 320) < 40, "ass \\pos(320,240) \\an5 at the centre")
+    }
+    // A bitmap cue scaled from its 720×480 frame to a 360×240 rectangle.
+    if shown.count == 1 {
+        var bc = shown[0]
+        bc.bitmap.w = 40
+        bc.bitmap.h = 20
+        bc.bitmap.pixels = core.filled(800, 0xFF0000FF)
+        let pxb = render("bitmap.png", [bc], at: 11.0, w: 360, h: 240)
+        if pxb.count == 360 * 240 {
+            let rb = box(pxb, 360, 240, isRed)
+            check(abs(rb[1] - 50) <= 1 && abs(rb[2] - 25) <= 1 && abs(rb[3] - 69) <= 1 && abs(rb[4] - 34) <= 1, "bitmap scaled to the video rectangle ({rb[1]},{rb[2]})–({rb[3]},{rb[4]})")
+        }
+    }
+    // The PGS sample drawn over a 960×540 rectangle at an offset.
+    if sup.cues.count == 1 {
+        let path = joinPath(out, "pgs_sub.png")
+        renderImage(path: path, width: 1000, height: 600) { g in
+            g.fillRect(x: 0, y: 0, width: g.width, height: g.height, color: .black)
+            subs.draw(g, sup.cues, at: 1.0, x: 20, y: 30, width: 960, height: 540)
+        }
+        if let (pw, ph, pp) = readImage(path) {
+            let wb = box(pp, pw, ph, isWhite)
+            check(wb[0] > 500 && wb[2] > 30 + 540 * 9 / 10 - 40 && wb[1] > 20 + 30 && wb[3] < 20 + 960 * 3 / 4, "pgs sample drawn bottom-left in the rectangle ({wb[1]},{wb[2]})–({wb[3]},{wb[4]})")
+        }
+    }
+
+    // \\frz: rotated text is taller than wide.
+    let rot = try subs.parseText("1\n00:00:00,000 --> 00:00:05,000\n\{\\an5\\pos(192,144)\\frz90}ROTATED TEXT\n", format: "srt")
+    let pxr = render("rotated.png", rot.cues, at: 1.0, w: 768, h: 576)
+    if pxr.count == 768 * 576 {
+        let wb = box(pxr, 768, 576, isWhite)
+        check(wb[0] > 50 && wb[4] - wb[2] > 3 * (wb[3] - wb[1]) && abs((wb[1] + wb[3]) / 2 - 384) < 10, "\\frz90 turns the text upright ({wb[3] - wb[1]} × {wb[4] - wb[2]})")
+    }
+
+    // ---- decodeTrack over a container track, loadFile, plain text ----
+    var pgsFile = Data(bytes: pcs + wds + pds + ods + end)
+    let firstSize = pgsFile.count
+    pgsFile = pgsFile + Data(bytes: clear + end)
+    var pm = core.Media()
+    var pt = core.Track(index: 0, kind: .subtitle, codec: "pgs", timescale: 90000)
+    pt.width = 720
+    pt.height = 480
+    pm.tracks.append(pt)
+    pm.packets.append(core.PacketRef(track: 0, pts: 90000, key: true, offset: 0, size: firstSize))
+    pm.packets.append(core.PacketRef(track: 0, pts: 270000, key: true, offset: firstSize, size: pgsFile.count - firstSize))
+    let pgsTrackAll = try subs.decodeTrack(pgsFile, pm, track: 0)
+    check(pgsTrackAll.cues.count == 1 && near(pgsTrackAll.cues[0].start, 1.0) && near(pgsTrackAll.cues[0].end, 3.0), "decodeTrack: a PGS cue ended by the next display set")
+    check(!subs.decodeTrack(pgsFile, pm, track: 3).isOk(), "decodeTrack: no such track")
+    let loaded = try subs.loadFile("tests/fixtures/subs.ass")
+    check(loaded.format == "ass" && loaded.cues.count == 3, "loadFile .ass")
+    let loadedSup = try subs.loadFile(joinPath(fx, "pgs_sub.sup"))
+    check(loadedSup.format == "pgs" && loadedSup.cues.count == 1, "loadFile .sup")
+    let plain = try subs.parseText("one\ntwo", format: "text")
+    check(plain.cues.count == 1 && subs.plainText(plain.cues[0]) == "one\ntwo", "plain text track")
+    check(!subs.parseText("hello", format: "").isOk() && !subs.newDecoder(core.Track(index: 0, kind: .subtitle, codec: "dvbsub")).isOk(), "unknown formats fail with a reason")
+    var srtDec = try subs.newDecoder(core.Track(index: 0, kind: .subtitle, codec: "srt"))
+    let sd = srtDec.decode(Data(bytes: [0x93, 0x48, 0x69, 0x94]), start: 1.0, duration: 0.0)
+    check(sd.count == 1 && subs.plainText(sd[0]) == "“Hi”" && near(sd[0].end, 6.0), "srt packet in Windows-1252, unknown duration")
+
+    // ---- Round 5: encodings, styling, OpenSubtitles, search, siblings ----
+    for (ok, what) in round5Checks() {
+        check(ok, what)
+    }
+
+    // ---- Speed ----
+    var big = ""
+    for i in 0..3000 {
+        let s = i * 2
+        let mins = String(s / 60).padStart(2, with: "0")
+        let secs = String(s % 60).padStart(2, with: "0")
+        big += "{i + 1}\n00:{mins}:{secs},000 --> 00:{mins}:{secs},900\nLine <i>number</i> {i}, with <b>some</b> words\nand a second line\n\n"
+    }
+    let t0 = now()
+    let bigTrack = try subs.parseText(big, format: "srt")
+    let parseMs = Int((now() - t0) * 1000.0)
+    check(bigTrack.cues.count == 3000, "3000-cue SRT parsed")
+    print("time parse 3000-cue srt: {parseMs} ms")
+    let tIx = now()
+    var bigIndex = subs.DialogueIndex()
+    let bigSource = bigIndex.add(bigTrack, name: "big")
+    let indexMs = Int((now() - tIx) * 1000.0)
+    let tSearch = now()
+    let found = bigIndex.search("number 2999")
+    let none = bigIndex.search("\"second line and\"")
+    let searchMs = (now() - tSearch) * 1000.0 / 2.0
+    let tTr = now()
+    var tr = subs.Transcript()
+    for k in 0..1000 {
+        tr = bigIndex.transcript(source: bigSource, at: Float(k) * 6.0 + 0.3)
+    }
+    let trUs = (now() - tTr) * 1000.0
+    check(bigIndex.lines.count == 3000 && found.count == 1 && none.isEmpty && tr.current >= 0, "index, search and transcript of 3000 cues")
+    print("time index 3000 cues: {indexMs} ms")
+    print("time search 3000 cues: {Int(searchMs)} ms")
+    print("time 1000 transcript lookups: {Int(trUs)} ms")
+    var bigBytes = Data()
+    for _ in 0..6 {
+        bigBytes.append(readData("tests/subs/fixtures/enc/ru.windows-1251.srt") ?? Data())
+        bigBytes.append(readData("tests/subs/fixtures/enc/fr.windows-1252.srt") ?? Data())
+    }
+    while bigBytes.count < 70000 {
+        bigBytes.append(readData("tests/subs/fixtures/enc/ru.windows-1251.srt") ?? Data())
+    }
+    let tDet = now()
+    let bigGuess = subs.detectEncoding(bigBytes)
+    print("time detect encoding of {bigBytes.count / 1024} KB: {Int((now() - tDet) * 1000.0)} ms")
+    check(bigGuess.name == "windows-1251", "a 70 KB Windows-1251 file (with French lines)")
+    let t1 = now()
+    for k in 0..20 {
+        renderImage(path: joinPath(out, "speed.png"), width: 1280, height: 720) { g in
+            subs.draw(g, bigTrack.cues, at: Float(k) * 2.0 + 0.5, x: 0, y: 0, width: 1280, height: 720)
+        }
+    }
+    print("time draw a cue (with renderImage to PNG): {Int((now() - t1) * 1000.0 / 20.0)} ms")
+
+    print("subs: {passed} of {total} passed")
+}

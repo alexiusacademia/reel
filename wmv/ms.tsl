@@ -1,0 +1,1851 @@
+// The MS-MPEG4 v1/v2/v3, WMV1 (WMV7) and WMV2 (WMV8) video decoder:
+// Microsoft's H.263/MPEG-4-like codecs, decoded exactly as ffmpeg 8.1
+// does (msmpeg4dec.c, msmpeg4.c, wmv2dec.c, h263dec.c, mpegvideo_dec.c),
+// so pictures match its output bit for bit.
+//
+// There's no public specification; the bitstream as ffmpeg reads it:
+//   picture header (msmpeg4_decode_picture_header / wmv2's): picture type
+//     (I or P), quantiser, slice count, the run/level, DC and motion
+//     vector table choices, and for I pictures of v1–v3 an "extension
+//     header" (frame rate, bit rate, flip-flop rounding) after the data;
+//   macroblocks in raster order, in slices of whole rows: P macroblocks
+//     may be skipped (one bit, or WMV2's skip map), carry one half-sample
+//     motion vector (predicted by the median of left, above, above right)
+//     and a coded block pattern; intra macroblocks predict their DC from
+//     the left or above block (the one more alike), optionally the first
+//     row or column of AC levels too, and (I pictures of v3 and later)
+//     their coded block pattern from the neighbours;
+//   blocks: run/level/last codes from one of six tables, with three kinds
+//     of escape; H.263 dequantisation (level·2q ± (q−1 | 1)).
+// Reconstruction is in mspix.tsl; WMV2's IntraX8 ("J-frame") pictures in
+// x8.tsl.
+//
+// The prediction state (DC and AC values per block, coded block flags,
+// which macroblocks are intra) lives in lists laid out like ffmpeg's, which
+// keeps values across pictures exactly where ffmpeg does (the coded block
+// flags of v3/WMV1 I pictures, for instance, are never cleared).
+//
+// Each packet holds one picture; there are no B pictures, so pictures come
+// out right away with their packet's pts.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../core"
+
+struct MsDecoder {
+    skipNonReference: Bool = false
+    warnings: [String] = []
+
+    // 1, 2, 3 (MS-MPEG4 v1–v3), 4 (WMV1), 5 (WMV2): ffmpeg's
+    // msmpeg4_version order.
+    version: Int = 3
+    width: Int = 0
+    height: Int = 0
+    mbw: Int = 0
+    mbh: Int = 0
+    mbStride: Int = 0
+    b8Stride: Int = 0
+    sarNum: Int = 1
+    sarDen: Int = 1
+    matrix: core.ColorMatrix = .unknown
+    ready: Bool = false
+    // After reset(): drop P pictures until an I picture.
+    waitKey: Bool = false
+    warnCount: Int = 0
+    // Pictures decoded so far, and how many were IntraX8 ones.
+    pictures: Int = 0
+    x8Pictures: Int = 0
+    // Intra macroblocks with inter-intra DC prediction (WMV1).
+    interIntraCount: Int = 0
+
+    px: MsPix = MsPix()
+    x8: X8Decoder = X8Decoder()
+    br: core.BitReader = core.bitReader(Data())
+
+    // Picture header.
+    pictI: Bool = true
+    qscale: Int = 1
+    yDcScale: Int = 8
+    cDcScale: Int = 8
+    sliceHeight: Int = 1
+    rlTable: Int = 0
+    rlChromaTable: Int = 0
+    dcTable: Int = 0
+    mvTable: Int = 0
+    useSkipCode: Bool = false
+    perMbRl: Bool = false
+    bitRate: Int = 0
+    flipflop: Bool = false
+    noRounding: Bool = false
+    interIntraPred: Bool = false
+    esc3Level: Int = 0
+    esc3Run: Int = 0
+    // WMV2 (extradata and picture header).
+    mspelBit: Bool = false
+    loopFilter: Bool = false
+    abtFlag: Bool = false
+    jTypeBit: Bool = false
+    topLeftMvFlag: Bool = false
+    perMbRlBit: Bool = false
+    jType: Bool = false
+    mspel: Bool = false
+    cbpTable: Int = 3
+    perMbAbt: Bool = false
+    perBlockAbt: Bool = false
+    abtType: Int = 0
+    abtTypes: [Int] = [0, 0, 0, 0, 0, 0]
+    hshift: Int = 0
+    mbSkipMap: [Int] = []
+
+    // Macroblock state.
+    mbx: Int = 0
+    mby: Int = 0
+    resyncX: Int = 0
+    resyncY: Int = 0
+    firstSliceLine: Bool = true
+    mbIntra: Bool = false
+    acPred: Bool = false
+    aicDir: Int = 0
+    mvx: Int = 0
+    mvy: Int = 0
+    skipped: Bool = false
+    lastIndex: [Int] = [0, 0, 0, 0, 0, 0]
+    blockIndex: [Int] = [0, 0, 0, 0, 0, 0]
+    lastDc: [Int] = [128, 128, 128]
+
+    // Prediction state, as ffmpeg's lists (indexes are ffmpeg's plus
+    // `pOff` = b8Stride + 1).
+    pOff: Int = 0
+    dcVal: [Int] = []
+    acVal: [Int] = []
+    codedBlock: [Int] = []
+    mbIntraTable: [Int] = []
+    motionVal: [Int] = []
+    qscaleTable: [Int] = []
+    skipTable: [Int] = []
+
+    // Tables (copied from mstables.tsl for fast reads).
+    rlLut0: [Int] = []
+    rlLut1: [Int] = []
+    rlLut2: [Int] = []
+    rlLut3: [Int] = []
+    rlLut4: [Int] = []
+    rlLut5: [Int] = []
+    rlRun: [Int] = []
+    rlLevel: [Int] = []
+    rlStart: [Int] = []
+    rlN: [Int] = []
+    rlLast: [Int] = []
+    rlMaxLevel: [Int] = []
+    rlMaxRun: [Int] = []
+    mvLut0: [Int] = []
+    mvLut1: [Int] = []
+    mvSym0: [Int] = []
+    mvSym1: [Int] = []
+    mbNonIntraLut0: [Int] = []
+    mbNonIntraLut1: [Int] = []
+    mbNonIntraLut2: [Int] = []
+    mbNonIntraLut3: [Int] = []
+    mbILut: [Int] = []
+    dcLut00: [Int] = []
+    dcLut01: [Int] = []
+    dcLut10: [Int] = []
+    dcLut11: [Int] = []
+    v2DcLumLut: [Int] = []
+    v2DcChromaLut: [Int] = []
+    v2MbTypeLut: [Int] = []
+    v2IntraCbpcLut: [Int] = []
+    interIntraLut: [Int] = []
+    intraMcbpcLut: [Int] = []
+    interMcbpcLut: [Int] = []
+    cbpyLut: [Int] = []
+    h263MvLut: [Int] = []
+    scanIntra: [Int] = []
+    scanInter: [Int] = []
+    scanH: [Int] = []
+    scanV: [Int] = []
+    scanA: [Int] = []
+    scanB: [Int] = []
+    yDcTable: [Int] = []
+    cDcTable: [Int] = []
+
+    // --- Public API (wmv/api.tsl) ---
+
+    fn decode(_ packet: Data, pts: Int, dts: Int, key: Bool) -> [core.Picture] {
+        if packet.isEmpty || !ready {
+            return []
+        }
+        br = core.bitReader(packet)
+        let ok = if version == 5 { wmv2Header() } else { msHeader() }
+        if ok < 0 {
+            warn("damaged picture header")
+            return []
+        }
+        if ok == 1 {
+            // WMV2: a skipped picture (every macroblock skipped): ffmpeg
+            // shows nothing for it.
+            return []
+        }
+        if waitKey {
+            if !pictI {
+                return []
+            }
+            waitKey = false
+        }
+        px.startPicture()
+        resetMotionVal()
+        var good = true
+        if version == 5 {
+            let r = wmv2SecondaryHeader()
+            if r < 0 {
+                warn("damaged WMV2 picture header")
+                concealFrom(0, 0)
+                good = false
+            } else if r == 1 {
+                // An IntraX8 picture, decoded whole.
+                good = decodeX8()
+            } else {
+                good = decodeSlices(packet.count)
+            }
+        } else {
+            good = decodeSlices(packet.count)
+        }
+        if !good {
+            warn("damaged picture data (concealed)")
+        }
+        px.endPicture()
+        pictures += 1
+        var pic = makePicture()
+        pic.pts = pts
+        [pic]
+    }
+
+    fn flush() -> [core.Picture] {
+        []
+    }
+
+    fn reset() {
+        waitKey = true
+    }
+
+    fn warn(_ s: String) {
+        warnCount += 1
+        if warnings.count < 50 {
+            warnings.append("{msName(version)}: {s}")
+        }
+    }
+
+    fn makePicture() -> core.Picture {
+        var p = core.Picture(width: width, height: height)
+        p.y = px.curY
+        p.u = px.curU
+        p.v = px.curV
+        p.yStride = px.ys
+        p.cStride = px.cs
+        p.key = pictI
+        p.sarNum = sarNum
+        p.sarDen = sarDen
+        p.matrix = matrix
+        p
+    }
+
+    // --- Setup ---
+
+    fn setup(_ track: core.Track) {
+        width = track.width
+        height = track.height
+        mbw = (width + 15) / 16
+        mbh = (height + 15) / 16
+        mbStride = mbw + 1
+        b8Stride = mbw * 2 + 1
+        pOff = b8Stride + 1
+        let ySize = b8Stride * (2 * mbh + 1)
+        let cSize = mbStride * (mbh + 1)
+        dcVal = core.filled(ySize + 2 * cSize, 1024)
+        acVal = core.zeros((ySize + 2 * cSize) * 16)
+        codedBlock = core.zeros(ySize)
+        mbIntraTable = core.zeros(mbh * mbStride + 1)
+        motionVal = core.zeros(2 * (b8Stride * mbh * 2 + 4))
+        qscaleTable = core.zeros(mbh * mbStride + 1)
+        skipTable = core.zeros(mbh * mbStride + 1)
+        mbSkipMap = core.zeros(mbh * mbStride + 1)
+        px.setup(width: width, height: height, mbw: mbw, mbh: mbh)
+        sliceHeight = mbh
+        if track.sarNum > 0 && track.sarDen > 0 {
+            sarNum = track.sarNum
+            sarDen = track.sarDen
+        }
+        matrix = if track.matrix != .unknown { track.matrix } else { core.guessMatrix(width: width, height: height) }
+        buildTables()
+        if version == 5 {
+            wmv2ExtHeader(track.extra)
+            x8.setup(mbWidth: mbw, mbHeight: mbh)
+        }
+        ready = mbw > 0 && mbh > 0
+    }
+
+    fn buildTables() {
+        let rc = msRlCode
+        let rlen = msRlLen
+        rlStart = msRlStart
+        rlN = msRlN
+        rlLast = msRlLast
+        rlRun = msRlRun
+        rlLevel = msRlLevel
+        rlMaxLevel = msRlMaxLevel
+        rlMaxRun = msRlMaxRun
+        var luts: [[Int]] = []
+        for t in 0..6 {
+            let a = rlStart[t]
+            let b = a + rlN[t] + 1
+            luts.append(wmvBuildVlc(rc.slice(from: a, to: b), rlen.slice(from: a, to: b), rootBits: 9))
+        }
+        rlLut0 = luts[0]
+        rlLut1 = luts[1]
+        rlLut2 = luts[2]
+        rlLut3 = luts[3]
+        rlLut4 = luts[4]
+        rlLut5 = luts[5]
+        mvLut0 = wmvBuildVlc(msMv0Code, msMv0Len, rootBits: 9)
+        mvLut1 = wmvBuildVlc(msMv1Code, msMv1Len, rootBits: 9)
+        mvSym0 = msMv0Sym
+        mvSym1 = msMv1Sym
+        let mb = msMbNonIntra
+        var mbl: [[Int]] = []
+        for t in 0..4 {
+            let part = mb.slice(from: t * 256, to: t * 256 + 256)
+            mbl.append(wmvBuildVlc(wmvEvery(part, 0, 2), wmvEvery(part, 1, 2), rootBits: 9))
+        }
+        mbNonIntraLut0 = mbl[0]
+        mbNonIntraLut1 = mbl[1]
+        mbNonIntraLut2 = mbl[2]
+        mbNonIntraLut3 = mbl[3]
+        mbILut = wmvBuildVlc(wmvEvery(msMbI, 0, 2), wmvEvery(msMbI, 1, 2), rootBits: 9)
+        let dc = msDcTables
+        var dl: [[Int]] = []
+        for t in 0..4 {
+            let part = dc.slice(from: t * 240, to: t * 240 + 240)
+            dl.append(wmvBuildVlc(wmvEvery(part, 0, 2), wmvEvery(part, 1, 2), rootBits: 9))
+        }
+        dcLut00 = dl[0]
+        dcLut01 = dl[1]
+        dcLut10 = dl[2]
+        dcLut11 = dl[3]
+        v2DcLumLut = wmvBuildVlc(wmvEvery(msV2DcLum, 0, 2), wmvEvery(msV2DcLum, 1, 2), rootBits: 9)
+        v2DcChromaLut = wmvBuildVlc(wmvEvery(msV2DcChroma, 0, 2), wmvEvery(msV2DcChroma, 1, 2), rootBits: 9)
+        v2MbTypeLut = wmvBuildVlc(wmvEvery(msV2MbType, 0, 2), wmvEvery(msV2MbType, 1, 2), rootBits: 7)
+        v2IntraCbpcLut = wmvBuildVlc(wmvEvery(msV2IntraCbpc, 0, 2), wmvEvery(msV2IntraCbpc, 1, 2), rootBits: 3)
+        interIntraLut = wmvBuildVlc(wmvEvery(msInterIntra, 0, 2), wmvEvery(msInterIntra, 1, 2), rootBits: 3)
+        intraMcbpcLut = wmvBuildVlc(msIntraMcbpcCode, msIntraMcbpcLen, rootBits: 6)
+        interMcbpcLut = wmvBuildVlc(msInterMcbpcCode, msInterMcbpcLen, rootBits: 7)
+        cbpyLut = wmvBuildVlc(wmvEvery(msCbpy, 0, 2), wmvEvery(msCbpy, 1, 2), rootBits: 6)
+        h263MvLut = wmvBuildVlc(wmvEvery(msMvtab, 0, 2), wmvEvery(msMvtab, 1, 2), rootBits: 9)
+        if version >= 4 {
+            let s = msWmv1Scan
+            scanInter = s.slice(from: 0, to: 64)
+            scanIntra = s.slice(from: 64, to: 128)
+            scanH = s.slice(from: 128, to: 192)
+            scanV = s.slice(from: 192, to: 256)
+        } else {
+            scanIntra = msZigzag
+            scanInter = msZigzag
+            scanH = msAltH
+            scanV = msAltV
+        }
+        scanA = msWmv2ScanA
+        scanB = msWmv2ScanB
+        // DC scales (ff_msmpeg4_common_init): v1/v2 MPEG-1's (8), v3 the
+        // "old" tables (workaround_bugs is on by default), WMV1/2 theirs.
+        if version <= 2 {
+            yDcTable = core.filled(32, 8)
+            cDcTable = core.filled(32, 8)
+        } else if version == 3 {
+            yDcTable = msOldYDcScale
+            cDcTable = msWmv1CDcScale
+        } else {
+            yDcTable = msWmv1YDcScale
+            cDcTable = msWmv1CDcScale
+        }
+    }
+
+    // WMV2's settings in the extradata (wmv2dec.c decode_ext_header).
+    fn wmv2ExtHeader(_ x: Data) {
+        if x.count < 4 {
+            warn("no WMV2 extradata")
+            sliceHeight = mbh
+            return
+        }
+        var r = core.bitReader(x)
+        r.bits(5)
+        bitRate = r.bits(11) * 1024
+        mspelBit = r.flag()
+        loopFilter = r.flag()
+        abtFlag = r.flag()
+        jTypeBit = r.flag()
+        topLeftMvFlag = r.flag()
+        perMbRlBit = r.flag()
+        let code = r.bits(3)
+        if code == 0 {
+            warn("bad WMV2 slice count")
+            sliceHeight = mbh
+            return
+        }
+        sliceHeight = mbh / code
+    }
+
+    // --- Bit reading ---
+
+    fn vlc(_ lut: [Int], _ bits: Int) -> Int {
+        var e = lut[br.peek(bits)]
+        if e > 0 {
+            br.bits(e & 63)
+            return (e >> 6) - 1
+        }
+        var nb = bits
+        while e < 0 {
+            br.bits(nb)
+            let p = -e
+            nb = p & 63
+            e = lut[(p >> 6) + br.peek(nb)]
+        }
+        if e == 0 {
+            return -1
+        }
+        br.bits(e & 63)
+        (e >> 6) - 1
+    }
+
+    // 0, 10, 11 → 0, 1, 2 (decode012).
+    fn decode012() -> Int {
+        if br.bit() == 0 {
+            return 0
+        }
+        1 + br.bit()
+    }
+
+    // --- Picture headers ---
+
+    // msmpeg4_decode_picture_header: 0 ok, -1 damaged.
+    fn msHeader() -> Int {
+        if br.left * 8 < mbw * mbh {
+            return -1
+        }
+        if version == 1 {
+            if br.bits(32) != 0x100 {
+                return -1
+            }
+            br.bits(5)
+        }
+        let t = br.bits(2) + 1
+        if t != 1 && t != 2 {
+            return -1
+        }
+        pictI = t == 1
+        qscale = br.bits(5)
+        if qscale == 0 {
+            return -1
+        }
+        if pictI {
+            let code = br.bits(5)
+            if version == 1 {
+                if code == 0 || code > mbh {
+                    return -1
+                }
+                sliceHeight = code
+            } else {
+                if code < 0x17 {
+                    return -1
+                }
+                sliceHeight = mbh / (code - 0x16)
+            }
+            if version <= 2 {
+                rlChromaTable = 2
+                rlTable = 2
+                dcTable = 0
+            } else if version == 3 {
+                rlChromaTable = decode012()
+                rlTable = decode012()
+                dcTable = br.bit()
+            } else {
+                // WMV1: the extension header comes right here.
+                extHeader(4)
+                perMbRl = if bitRate > 50 * 1024 { br.flag() } else { false }
+                if !perMbRl {
+                    rlChromaTable = decode012()
+                    rlTable = decode012()
+                }
+                dcTable = br.bit()
+                interIntraPred = false
+            }
+            noRounding = true
+        } else {
+            if version <= 2 {
+                useSkipCode = if version == 1 { true } else { br.flag() }
+                rlTable = 2
+                rlChromaTable = 2
+                dcTable = 0
+                mvTable = 0
+            } else if version == 3 {
+                useSkipCode = br.flag()
+                rlTable = decode012()
+                rlChromaTable = rlTable
+                dcTable = br.bit()
+                mvTable = br.bit()
+            } else {
+                useSkipCode = br.flag()
+                perMbRl = if bitRate > 50 * 1024 { br.flag() } else { false }
+                if !perMbRl {
+                    rlTable = decode012()
+                    rlChromaTable = rlTable
+                }
+                dcTable = br.bit()
+                mvTable = br.bit()
+                interIntraPred = width * height < 320 * 240 && bitRate <= 128 * 1024
+            }
+            if flipflop {
+                noRounding = !noRounding
+            } else {
+                noRounding = false
+            }
+        }
+        esc3Level = 0
+        esc3Run = 0
+        0
+    }
+
+    // ff_msmpeg4_decode_ext_header: fps, bit rate and (v3+) flip-flop
+    // rounding, when bufSize·8 minus the bits read so far is the right
+    // amount.
+    fn extHeader(_ bufSize: Int) {
+        let left = bufSize * 8 - br.position
+        let length = if version >= 3 { 17 } else { 16 }
+        if left >= length && left < length + 8 {
+            br.bits(5)
+            bitRate = br.bits(11) * 1024
+            flipflop = if version >= 3 { br.flag() } else { false }
+        } else if left < length + 8 {
+            flipflop = false
+        }
+    }
+
+    // wmv2_decode_picture_header: 0 ok, 1 skipped picture, -1 damaged.
+    fn wmv2Header() -> Int {
+        pictI = br.bit() == 0
+        if pictI {
+            br.bits(7)
+        }
+        qscale = br.bits(5)
+        if qscale <= 0 {
+            return -1
+        }
+        if !pictI && br.peek(1) == 1 {
+            // All-skipped picture: the skip map is all ones.
+            var g = br
+            let skipType = g.bits(2)
+            var run = if skipType == 3 { mbw } else { mbh }
+            while run > 0 {
+                let block = min(run, 25)
+                if g.bits(block) + 1 != (1 << block) {
+                    break
+                }
+                run -= block
+            }
+            if run == 0 {
+                return 1
+            }
+        }
+        0
+    }
+
+    // ff_wmv2_decode_secondary_picture_header: 0 ok, 1 IntraX8 picture
+    // (decode it whole), -1 damaged.
+    fn wmv2SecondaryHeader() -> Int {
+        if pictI {
+            for i in 0..skipTable.count {
+                mbSkipMap[i] = 0
+            }
+            jType = if jTypeBit { br.flag() } else { false }
+            if !jType {
+                perMbRl = if perMbRlBit { br.flag() } else { false }
+                if !perMbRl {
+                    rlChromaTable = decode012()
+                    rlTable = decode012()
+                }
+                dcTable = br.bit()
+                if br.left * 8 < mbw * mbh {
+                    return -1
+                }
+            }
+            interIntraPred = false
+            noRounding = true
+        } else {
+            jType = false
+            if parseMbSkip() < 0 {
+                return -1
+            }
+            let cbpIndex = decode012()
+            let row = (if qscale > 10 { 1 } else { 0 }) + (if qscale > 20 { 1 } else { 0 })
+            cbpTable = msWmv2CbpMap[row * 3 + cbpIndex]
+            mspel = if mspelBit { br.flag() } else { false }
+            if abtFlag {
+                perMbAbt = br.bit() == 0
+                if !perMbAbt {
+                    abtType = decode012()
+                }
+            }
+            perMbRl = if perMbRlBit { br.flag() } else { false }
+            if !perMbRl {
+                rlTable = decode012()
+                rlChromaTable = rlTable
+            }
+            if br.left < 2 {
+                return -1
+            }
+            dcTable = br.bit()
+            mvTable = br.bit()
+            interIntraPred = false
+            noRounding = !noRounding
+        }
+        esc3Level = 0
+        esc3Run = 0
+        if jType {
+            return 1
+        }
+        0
+    }
+
+    // parse_mb_skip: the skip map of a WMV2 P picture.
+    fn parseMbSkip() -> Int {
+        let skipType = br.bits(2)
+        for i in 0..mbSkipMap.count {
+            mbSkipMap[i] = 0
+        }
+        if skipType == 1 {
+            if br.left < mbh * mbw {
+                return -1
+            }
+            for y in 0..mbh {
+                for x in 0..mbw {
+                    mbSkipMap[y * mbStride + x] = br.bit()
+                }
+            }
+        } else if skipType == 2 {
+            for y in 0..mbh {
+                if br.left < 1 {
+                    return -1
+                }
+                if br.flag() {
+                    for x in 0..mbw {
+                        mbSkipMap[y * mbStride + x] = 1
+                    }
+                } else {
+                    if br.left < mbw {
+                        return -1
+                    }
+                    for x in 0..mbw {
+                        mbSkipMap[y * mbStride + x] = br.bit()
+                    }
+                }
+            }
+        } else if skipType == 3 {
+            for x in 0..mbw {
+                if br.left < 1 {
+                    return -1
+                }
+                if br.flag() {
+                    for y in 0..mbh {
+                        mbSkipMap[y * mbStride + x] = 1
+                    }
+                } else {
+                    if br.left < mbh {
+                        return -1
+                    }
+                    for y in 0..mbh {
+                        mbSkipMap[y * mbStride + x] = br.bit()
+                    }
+                }
+            }
+        }
+        var coded = 0
+        for y in 0..mbh {
+            for x in 0..mbw {
+                if mbSkipMap[y * mbStride + x] == 0 {
+                    coded += 1
+                }
+            }
+        }
+        if coded > br.left {
+            return -1
+        }
+        0
+    }
+
+    // An IntraX8 picture (WMV2 I pictures with j_type).
+    fn decodeX8() -> Bool {
+        x8Pictures += 1
+        x8.br = br
+        let a = px.curY
+        px.curY = x8.y
+        x8.y = a
+        let b = px.curU
+        px.curU = x8.u
+        x8.u = b
+        let c = px.curV
+        px.curV = x8.v
+        x8.v = c
+        x8.ys = px.ys
+        x8.cs = px.cs
+        let ok = x8.decodePicture(dquant: 2 * qscale, quantOffset: (qscale - 1) | 1, loopFilter: loopFilter)
+        let a2 = x8.y
+        x8.y = px.curY
+        px.curY = a2
+        let b2 = x8.u
+        x8.u = px.curU
+        px.curU = b2
+        let c2 = x8.v
+        x8.v = px.curV
+        px.curV = c2
+        br = x8.br
+        for i in 0..qscaleTable.count {
+            qscaleTable[i] = qscale
+        }
+        ok
+    }
+
+    // --- Slices (h263dec.c ff_h263_decode_frame / decode_slice) ---
+
+    fn decodeSlices(_ bufSize: Int) -> Bool {
+        mbx = 0
+        mby = 0
+        var good = decodeSlice()
+        while mby < mbh {
+            if sliceHeight == 0 || mbx != 0 || !good || (mby % sliceHeight) != 0 || br.left < 0 {
+                break
+            }
+            if version < 4 {
+                cleanBuffers()
+            }
+            if !decodeSlice() {
+                good = false
+            }
+        }
+        if mby < mbh || mbx != 0 {
+            concealFrom(mbx, mby)
+            good = false
+        }
+        if version < 4 && pictI {
+            extHeader(bufSize)
+        }
+        good
+    }
+
+    fn decodeSlice() -> Bool {
+        firstSliceLine = true
+        resyncX = mbx
+        resyncY = mby
+        yDcScale = yDcTable[qscale]
+        cDcScale = cDcTable[qscale]
+        while mby < mbh {
+            if resyncY + sliceHeight == mby {
+                return true
+            }
+            if version == 1 {
+                lastDc[0] = 128
+                lastDc[1] = 128
+                lastDc[2] = 128
+            }
+            while mbx < mbw {
+                if resyncX == mbx && resyncY + 1 == mby {
+                    firstSliceLine = false
+                }
+                setBlockIndex()
+                let ok = if version <= 2 { mbV12() } else if version == 5 { mbWmv2() } else { mbV34() }
+                let xy = mby * mbStride + mbx
+                if !mbIntra {
+                    if mbIntraTable[xy] != 0 {
+                        mbIntraTable[xy] = 0
+                        cleanIntraTableEntries()
+                    }
+                } else {
+                    mbIntraTable[xy] = 1
+                }
+                updateMotionVal()
+                if !ok {
+                    return false
+                }
+                reconstructMb()
+                if loopFilter {
+                    h263LoopFilter()
+                }
+                mbx += 1
+            }
+            mbx = 0
+            mby += 1
+        }
+        true
+    }
+
+    fn setBlockIndex() {
+        let b0 = b8Stride * (2 * mby) + 2 * mbx
+        blockIndex[0] = b0
+        blockIndex[1] = b0 + 1
+        blockIndex[2] = b0 + b8Stride
+        blockIndex[3] = b0 + b8Stride + 1
+        blockIndex[4] = mbStride * (mby + 1) + b8Stride * mbh * 2 + mbx
+        blockIndex[5] = mbStride * (mby + mbh + 2) + b8Stride * mbh * 2 + mbx
+    }
+
+    // ff_mpeg4_clean_buffers (start of each slice after the first, v1–v3):
+    // clears the AC values above and left of the slice start.
+    fn cleanBuffers() {
+        let lw = b8Stride
+        let lxy = (2 * mby - 1) * lw + mbx * 2 - 1
+        let cw = mbStride
+        let uxy = 2 * mbh * lw + mby * cw + mbx - 1
+        let vxy = uxy + cw * (mbh + 1)
+        clearAc(lxy, lw * 2 + 1)
+        clearAc(uxy, cw + 1)
+        clearAc(vxy, cw + 1)
+    }
+
+    fn clearAc(_ from: Int, _ count: Int) {
+        let a = (pOff + from) * 16
+        let n = count * 16
+        if a < 0 {
+            return
+        }
+        for i in 0..n {
+            if a + i < acVal.count {
+                acVal[a + i] = 0
+            }
+        }
+    }
+
+    // ff_clean_intra_table_entries: an inter macroblock where an intra one
+    // was: DC values back to 1024, AC values (but block 0's) to 0.
+    fn cleanIntraTableEntries() {
+        let w = b8Stride
+        let xy = pOff + blockIndex[0]
+        dcVal[xy] = 1024
+        dcVal[xy + 1] = 1024
+        dcVal[xy + w] = 1024
+        dcVal[xy + w + 1] = 1024
+        let uxy = pOff + blockIndex[4]
+        let vxy = pOff + blockIndex[5]
+        dcVal[uxy] = 1024
+        dcVal[vxy] = 1024
+        for i in 0..16 {
+            acVal[(xy + 1) * 16 + i] = 0
+            acVal[(xy + w) * 16 + i] = 0
+            acVal[(xy + w + 1) * 16 + i] = 0
+            acVal[uxy * 16 + i] = 0
+            acVal[vxy * 16 + i] = 0
+        }
+    }
+
+    fn resetMotionVal() {
+        for i in 0..motionVal.count {
+            motionVal[i] = 0
+        }
+    }
+
+    // ff_h263_update_motion_val: the macroblock's vector (0 for intra) for
+    // its four 8×8 positions.
+    fn updateMotionVal() {
+        let mx = if mbIntra { 0 } else { mvx }
+        let my = if mbIntra { 0 } else { mvy }
+        let xy = blockIndex[0] + 4
+        let w = b8Stride
+        motionVal[2 * xy] = mx
+        motionVal[2 * xy + 1] = my
+        motionVal[2 * xy + 2] = mx
+        motionVal[2 * xy + 3] = my
+        motionVal[2 * (xy + w)] = mx
+        motionVal[2 * (xy + w) + 1] = my
+        motionVal[2 * (xy + w) + 2] = mx
+        motionVal[2 * (xy + w) + 3] = my
+    }
+
+    // A vector of motion_val (ffmpeg's index i); 0 above the picture
+    // (only read where it isn't used).
+    fn mvAt(_ i: Int, _ c: Int) -> Int {
+        let k = 2 * (i + 4) + c
+        if k < 0 {
+            return 0
+        }
+        motionVal[k]
+    }
+
+    // ff_h263_pred_motion for a 16×16 vector (block 0).
+    fn predMotion() {
+        let xy = blockIndex[0]
+        let w = b8Stride
+        if firstSliceLine {
+            if mbx == resyncX {
+                mvx = 0
+                mvy = 0
+            } else if mbx + 1 == resyncX {
+                if mbx == 0 {
+                    mvx = mvAt(xy + 2 - w, 0)
+                    mvy = mvAt(xy + 2 - w, 1)
+                } else {
+                    mvx = msMid(mvAt(xy - 1, 0), 0, mvAt(xy + 2 - w, 0))
+                    mvy = msMid(mvAt(xy - 1, 1), 0, mvAt(xy + 2 - w, 1))
+                }
+            } else {
+                mvx = mvAt(xy - 1, 0)
+                mvy = mvAt(xy - 1, 1)
+            }
+            return
+        }
+        mvx = msMid(mvAt(xy - 1, 0), mvAt(xy - w, 0), mvAt(xy + 2 - w, 0))
+        mvy = msMid(mvAt(xy - 1, 1), mvAt(xy - w, 1), mvAt(xy + 2 - w, 1))
+    }
+
+    // --- Macroblocks ---
+
+    fn setSkipped() {
+        mbIntra = false
+        for i in 0..6 {
+            lastIndex[i] = -1
+        }
+        mvx = 0
+        mvy = 0
+        skipped = true
+        hshift = 0
+    }
+
+    // msmpeg4v12_decode_mb.
+    fn mbV12() -> Bool {
+        skipped = false
+        var cbp = 0
+        if !pictI {
+            if useSkipCode && br.flag() {
+                setSkipped()
+                return true
+            }
+            let code = if version == 2 { vlc(v2MbTypeLut, 7) } else { vlc(interMcbpcLut, 7) }
+            if code < 0 || code > 7 {
+                return false
+            }
+            mbIntra = (code >> 2) == 1
+            cbp = code & 3
+        } else {
+            mbIntra = true
+            cbp = if version == 2 { vlc(v2IntraCbpcLut, 3) } else { vlc(intraMcbpcLut, 6) }
+            if cbp < 0 || cbp > 3 {
+                return false
+            }
+        }
+        if !mbIntra {
+            let cbpy = vlc(cbpyLut, 6)
+            if cbpy < 0 {
+                return false
+            }
+            cbp = cbp | (cbpy << 2)
+            if version == 1 || (cbp & 3) != 3 {
+                cbp = cbp ^ 0x3C
+            }
+            predMotion()
+            mvx = v2Motion(mvx)
+            mvy = v2Motion(mvy)
+        } else {
+            if version == 2 {
+                acPred = br.flag()
+                let v = vlc(cbpyLut, 6)
+                if v < 0 {
+                    return false
+                }
+                cbp = cbp | (v << 2)
+            } else {
+                acPred = false
+                let v = vlc(cbpyLut, 6)
+                if v < 0 {
+                    return false
+                }
+                cbp = cbp | (v << 2)
+                if !pictI {
+                    cbp = cbp ^ 0x3C
+                }
+            }
+        }
+        for i in 0..6 {
+            if !decodeBlock(i, ((cbp >> (5 - i)) & 1) == 1, 0, false) {
+                return false
+            }
+        }
+        true
+    }
+
+    // msmpeg4v2_decode_motion with f_code 1.
+    fn v2Motion(_ pred: Int) -> Int {
+        let code = vlc(h263MvLut, 9)
+        if code < 0 {
+            return 0xffff
+        }
+        if code == 0 {
+            return pred
+        }
+        let sign = br.bit()
+        var val = code
+        if sign == 1 {
+            val = -val
+        }
+        val += pred
+        if val <= -64 {
+            val += 64
+        } else if val >= 64 {
+            val -= 64
+        }
+        val
+    }
+
+    // Coded block pattern of an I macroblock, bits of `code` XORed with
+    // the prediction from the neighbours (ff_msmpeg4_coded_block_pred).
+    fn intraCbp(_ code: Int) -> Int {
+        var cbp = 0
+        for i in 0..6 {
+            var v = (code >> (5 - i)) & 1
+            if i < 4 {
+                let xy = pOff + blockIndex[i]
+                let w = b8Stride
+                let a = codedBlock[xy - 1]
+                let b = codedBlock[xy - 1 - w]
+                let c = codedBlock[xy - w]
+                let pred = if b == c { a } else { c }
+                v = v ^ pred
+                codedBlock[xy] = v
+            }
+            cbp = cbp | (v << (5 - i))
+        }
+        cbp
+    }
+
+    // msmpeg4v34_decode_mb (v3 and WMV1).
+    fn mbV34() -> Bool {
+        skipped = false
+        if br.left <= 0 {
+            return false
+        }
+        var cbp = 0
+        if !pictI {
+            if useSkipCode && br.flag() {
+                setSkipped()
+                return true
+            }
+            let code = vlc(mbNonIntraLut3, 9)
+            if code < 0 {
+                return false
+            }
+            mbIntra = (code & 0x40) == 0
+            cbp = code & 0x3f
+        } else {
+            mbIntra = true
+            let code = vlc(mbILut, 9)
+            if code < 0 {
+                return false
+            }
+            cbp = intraCbp(code)
+        }
+        if !mbIntra {
+            if perMbRl && cbp != 0 {
+                rlTable = decode012()
+                rlChromaTable = rlTable
+            }
+            predMotion()
+            msMotion()
+        } else {
+            acPred = br.flag()
+            if interIntraPred {
+                aicDir = vlc(interIntraLut, 3)
+                interIntraCount += 1
+            }
+            if perMbRl && cbp != 0 {
+                rlTable = decode012()
+                rlChromaTable = rlTable
+            }
+        }
+        for i in 0..6 {
+            if !decodeBlock(i, ((cbp >> (5 - i)) & 1) == 1, 0, false) {
+                return false
+            }
+        }
+        true
+    }
+
+    // ff_msmpeg4_decode_motion: (mx, my) from the vector table, added to
+    // the prediction with MS's not-quite-modulo wrap.
+    fn msMotion() {
+        let sym = if mvTable == 0 { mvSymAt0(vlc(mvLut0, 9)) } else { mvSymAt1(vlc(mvLut1, 9)) }
+        var mx = 0
+        var my = 0
+        if sym > 0 {
+            mx = sym >> 8
+            my = sym & 0xFF
+        } else {
+            mx = br.bits(6)
+            my = br.bits(6)
+        }
+        mx += mvx - 32
+        my += mvy - 32
+        if mx <= -64 {
+            mx += 64
+        } else if mx >= 64 {
+            mx -= 64
+        }
+        if my <= -64 {
+            my += 64
+        } else if my >= 64 {
+            my -= 64
+        }
+        mvx = mx
+        mvy = my
+    }
+
+    fn mvSymAt0(_ i: Int) -> Int {
+        if i < 0 {
+            return 0
+        }
+        mvSym0[i]
+    }
+
+    fn mvSymAt1(_ i: Int) -> Int {
+        if i < 0 {
+            return 0
+        }
+        mvSym1[i]
+    }
+
+    // wmv2_decode_mb.
+    fn mbWmv2() -> Bool {
+        skipped = false
+        var cbp = 0
+        if !pictI {
+            if mbSkipMap[mby * mbStride + mbx] != 0 {
+                setSkipped()
+                return true
+            }
+            if br.left <= 0 {
+                return false
+            }
+            let lut = if cbpTable == 0 { mbNonIntraLut0 } else if cbpTable == 1 { mbNonIntraLut1 } else if cbpTable == 2 { mbNonIntraLut2 } else { mbNonIntraLut3 }
+            let code = vlc(lut, 9)
+            if code < 0 {
+                return false
+            }
+            mbIntra = (code & 0x40) == 0
+            cbp = code & 0x3f
+        } else {
+            mbIntra = true
+            if br.left <= 0 {
+                return false
+            }
+            let code = vlc(mbILut, 9)
+            if code < 0 {
+                return false
+            }
+            cbp = intraCbp(code)
+        }
+        if !mbIntra {
+            wmv2PredMotion()
+            if cbp != 0 {
+                if perMbRl {
+                    rlTable = decode012()
+                    rlChromaTable = rlTable
+                }
+                if abtFlag && perMbAbt {
+                    perBlockAbt = br.flag()
+                    if !perBlockAbt {
+                        abtType = decode012()
+                    }
+                } else {
+                    perBlockAbt = false
+                }
+            }
+            msMotion()
+            if ((mvx | mvy) & 1) != 0 && mspel {
+                hshift = br.bit()
+            } else {
+                hshift = 0
+            }
+            for i in 0..6 {
+                if !wmv2InterBlock(i, ((cbp >> (5 - i)) & 1) == 1) {
+                    return false
+                }
+            }
+        } else {
+            acPred = br.flag()
+            if interIntraPred {
+                aicDir = vlc(interIntraLut, 3)
+                interIntraCount += 1
+            }
+            if perMbRl && cbp != 0 {
+                rlTable = decode012()
+                rlChromaTable = rlTable
+            }
+            for i in 0..6 {
+                if !decodeBlock(i, ((cbp >> (5 - i)) & 1) == 1, 0, false) {
+                    return false
+                }
+            }
+        }
+        true
+    }
+
+    // wmv2_pred_motion: median, or (top_left_mv_flag) left or top when
+    // they differ a lot and a bit says which.
+    fn wmv2PredMotion() {
+        let xy = blockIndex[0]
+        let w = b8Stride
+        let ax = mvAt(xy - 1, 0)
+        let ay = mvAt(xy - 1, 1)
+        let bx = mvAt(xy - w, 0)
+        let by = mvAt(xy - w, 1)
+        let cx = mvAt(xy + 2 - w, 0)
+        let cy = mvAt(xy + 2 - w, 1)
+        var diff = 0
+        if mbx != 0 && !firstSliceLine && !mspel && topLeftMvFlag {
+            diff = max(abs(ax - bx), abs(ay - by))
+        }
+        let type = if diff >= 8 { br.bit() } else { 2 }
+        if type == 0 {
+            mvx = ax
+            mvy = ay
+        } else if type == 1 {
+            mvx = bx
+            mvy = by
+        } else if firstSliceLine {
+            mvx = ax
+            mvy = ay
+        } else {
+            mvx = msMid(ax, bx, cx)
+            mvy = msMid(ay, by, cy)
+        }
+    }
+
+    // wmv2_decode_inter_block: a whole 8×8 block, or (ABT) one or two
+    // 8×4 / 4×8 halves.
+    fn wmv2InterBlock(_ n: Int, _ coded: Bool) -> Bool {
+        if !coded {
+            lastIndex[n] = -1
+            return true
+        }
+        if perBlockAbt {
+            abtType = decode012()
+        }
+        abtTypes[n] = abtType
+        if abtType != 0 {
+            let which = decode012()
+            let sub = if which == 0 { 2 } else if which == 1 { 3 } else { 1 }
+            let scan = abtType
+            if (sub & 1) != 0 {
+                if !decodeBlock(n, true, scan, false) {
+                    return false
+                }
+            }
+            if (sub & 2) != 0 {
+                if !decodeBlock(n, true, scan, true) {
+                    return false
+                }
+            }
+            lastIndex[n] = 63
+            return true
+        }
+        decodeBlock(n, true, 0, false)
+    }
+
+    // --- Blocks (ff_msmpeg4_decode_block) ---
+
+    // The DC of an intra block (msmpeg4_decode_dc), predicted; -1000000
+    // for a damaged code. Sets dcDir.
+    fn decodeDc(_ n: Int) -> Int {
+        var level = 0
+        if version <= 2 {
+            level = if n < 4 { vlc(v2DcLumLut, 9) } else { vlc(v2DcChromaLut, 9) }
+            if level < 0 {
+                dcDir = 0
+                return -1000000
+            }
+            level -= 256
+        } else {
+            let lut = if dcTable == 0 {
+                if n < 4 { dcLut00 } else { dcLut01 }
+            } else {
+                if n < 4 { dcLut10 } else { dcLut11 }
+            }
+            level = vlc(lut, 9)
+            if level < 0 {
+                dcDir = 0
+                return -1000000
+            }
+            if level == 119 {
+                level = br.bits(8)
+                if br.flag() {
+                    level = -level
+                }
+            } else if level != 0 {
+                if br.flag() {
+                    level = -level
+                }
+            }
+        }
+        if version == 1 {
+            let i = if n < 4 { 0 } else { n - 3 }
+            level += lastDc[i]
+            lastDc[i] = level
+            dcDir = -1
+            return level
+        }
+        let pred = predDc(n)
+        level += pred
+        let xy = pOff + blockIndex[n]
+        dcVal[xy] = level * (if n < 4 { yDcScale } else { cDcScale })
+        level
+    }
+
+    // ff_msmpeg4_pred_dc: the predicted DC (quantised) and direction
+    // (dcDir 0 left, 1 top).
+    fn predDc(_ n: Int) -> Int {
+        let scale = if n < 4 { yDcScale } else { cDcScale }
+        let wrap = if n < 4 { b8Stride } else { mbStride }
+        let xy = pOff + blockIndex[n]
+        var a = dcVal[xy - 1]
+        var b = dcVal[xy - 1 - wrap]
+        var c = dcVal[xy - wrap]
+        if firstSliceLine && (n & 2) == 0 && version < 4 {
+            b = 1024
+            c = 1024
+        }
+        a = (a + (scale >> 1)) / scale
+        b = (b + (scale >> 1)) / scale
+        c = (c + (scale >> 1)) / scale
+        var pred = 0
+        if version > 3 {
+            if interIntraPred {
+                if n == 1 {
+                    pred = a
+                    dcDir = 0
+                } else if n == 2 {
+                    pred = c
+                    dcDir = 1
+                } else if n == 3 {
+                    if abs(a - b) < abs(b - c) {
+                        pred = c
+                        dcDir = 1
+                    } else {
+                        pred = a
+                        dcDir = 0
+                    }
+                } else {
+                    // From the neighbouring pixels (get_dc).
+                    if mbx == 0 {
+                        a = (1024 + (scale >> 1)) / scale
+                    } else {
+                        a = pixelDc(n, -1, 0, scale * 8)
+                    }
+                    if mby == 0 {
+                        c = (1024 + (scale >> 1)) / scale
+                    } else {
+                        c = pixelDc(n, 0, -1, scale * 8)
+                    }
+                    if aicDir == 0 {
+                        pred = a
+                        dcDir = 0
+                    } else if aicDir == 1 {
+                        if n == 0 {
+                            pred = c
+                            dcDir = 1
+                        } else {
+                            pred = a
+                            dcDir = 0
+                        }
+                    } else if aicDir == 2 {
+                        if n == 0 {
+                            pred = a
+                            dcDir = 0
+                        } else {
+                            pred = c
+                            dcDir = 1
+                        }
+                    } else {
+                        pred = c
+                        dcDir = 1
+                    }
+                }
+            } else {
+                if abs(a - b) < abs(b - c) {
+                    pred = c
+                    dcDir = 1
+                } else {
+                    pred = a
+                    dcDir = 0
+                }
+            }
+        } else {
+            if abs(a - b) <= abs(b - c) {
+                pred = c
+                dcDir = 1
+            } else {
+                pred = a
+                dcDir = 0
+            }
+        }
+        pred
+    }
+
+    // get_dc: the rounded mean of the 8×8 block one block left (dx −1) or
+    // above (dy −1) of block n's position in the current picture.
+    fn pixelDc(_ n: Int, _ dx: Int, _ dy: Int, _ scale: Int) -> Int {
+        var sum = 0
+        if n < 4 {
+            let s = px.ys
+            var o = ((n >> 1) + 2 * mby) * 8 * s + ((n & 1) + 2 * mbx) * 8 + dx * 8 + dy * 8 * s
+            for _ in 0..8 {
+                for c in 0..8 {
+                    sum += px.curY[o + c]
+                }
+                o += s
+            }
+        } else {
+            let s = px.cs
+            var o = mby * 8 * s + mbx * 8 + dx * 8 + dy * 8 * s
+            for _ in 0..8 {
+                for c in 0..8 {
+                    sum += if n == 4 { px.curU[o + c] } else { px.curV[o + c] }
+                }
+                o += s
+            }
+        }
+        (sum + (scale >> 1)) / scale
+    }
+
+    // Decodes block n (coded or not). scanSel: 0 the usual scan, 1 WMV2
+    // ABT 8×4, 2 ABT 4×8; second: the ABT block's second half.
+    fn decodeBlock(_ n: Int, _ coded: Bool, _ scanSel: Int, _ second: Bool) -> Bool {
+        let bo = if second { (6 + n) * 64 } else { n * 64 }
+        var qmul = 1
+        var qadd = 0
+        var i = 0
+        var runDiff = 0
+        var scan = scanIntra
+        var table = 0
+        if mbIntra {
+            var level = decodeDc(n)
+            if level == -1000000 {
+                return false
+            }
+            if level < 0 {
+                if interIntraPred {
+                    level = 0
+                }
+            }
+            if n < 4 {
+                table = rlTable
+                if level > 256 * yDcScale && !interIntraPred {
+                    return false
+                }
+            } else {
+                table = 3 + rlChromaTable
+                if level > 256 * cDcScale && !interIntraPred {
+                    return false
+                }
+            }
+            px.blk[bo] = level
+            runDiff = if version >= 4 { 1 } else { 0 }
+            i = 0
+            if !coded {
+                predAc(n, bo)
+                lastIndex[n] = 0
+                return true
+            }
+            if acPred {
+                scan = if dcDir == 0 { scanV } else { scanH }
+            }
+        } else {
+            qmul = qscale << 1
+            qadd = (qscale - 1) | 1
+            i = -1
+            table = 3 + rlTable
+            runDiff = if version == 2 { 0 } else { 1 }
+            if !coded {
+                lastIndex[n] = -1
+                return true
+            }
+            scan = if scanSel == 1 { scanA } else if scanSel == 2 { scanB } else { scanInter }
+        }
+        let lut = if table == 0 { rlLut0 } else if table == 1 { rlLut1 } else if table == 2 { rlLut2 } else if table == 3 { rlLut3 } else if table == 4 { rlLut4 } else { rlLut5 }
+        let start = rlStart[table]
+        let esc = rlN[table]
+        let lastFrom = rlLast[table]
+        let ml = table * 130
+        let scanLen = scan.count
+        while true {
+            var run = 0
+            var level = 0
+            let sym = vlc(lut, 9)
+            if sym < 0 {
+                return false
+            }
+            if sym == esc {
+                // Escapes: v1 always the third kind; otherwise 1 → first,
+                // 01 → second, 00 → third.
+                if version == 1 || br.peek(1) == 0 {
+                    if version == 1 || br.peek(2) == 0 {
+                        // Third escape: last, run, level coded directly.
+                        if version != 1 {
+                            br.bits(2)
+                        }
+                        var last = 0
+                        if version <= 3 {
+                            last = br.bit()
+                            run = br.bits(6)
+                            level = br.signed(8)
+                        } else {
+                            last = br.bit()
+                            if esc3Level == 0 {
+                                var ll = 0
+                                if qscale < 8 {
+                                    ll = br.bits(3)
+                                    if ll == 0 {
+                                        ll = 8 + br.bit()
+                                    }
+                                } else {
+                                    ll = 2
+                                    while ll < 8 && br.peek(1) == 0 {
+                                        ll += 1
+                                        br.bits(1)
+                                    }
+                                    if ll < 8 {
+                                        br.bits(1)
+                                    }
+                                }
+                                esc3Level = ll
+                                esc3Run = br.bits(2) + 3
+                            }
+                            run = br.bits(esc3Run)
+                            let sign = br.bit()
+                            level = br.bits(esc3Level)
+                            if sign == 1 {
+                                level = -level
+                            }
+                        }
+                        if level > 0 {
+                            level = level * qmul + qadd
+                        } else {
+                            level = level * qmul - qadd
+                        }
+                        i += run + 1
+                        if last == 1 {
+                            i += 192
+                        }
+                    } else {
+                        // Second escape: a code whose run is extended by
+                        // the table's max_run for its level.
+                        br.bits(2)
+                        let s2 = vlc(lut, 9)
+                        if s2 < 0 || s2 == esc {
+                            return false
+                        }
+                        let last = if s2 >= lastFrom { 1 } else { 0 }
+                        let lv = rlLevel[start + s2]
+                        run = rlRun[start + s2] + 1 + 192 * last
+                        i += run + rlMaxRun[ml + last * 65 + lv] + runDiff
+                        level = lv * qmul + qadd
+                        if br.bit() == 1 {
+                            level = -level
+                        }
+                    }
+                } else {
+                    // First escape: a code whose level is extended by the
+                    // table's max_level for its run.
+                    br.bits(1)
+                    let s2 = vlc(lut, 9)
+                    if s2 < 0 || s2 == esc {
+                        return false
+                    }
+                    let last = if s2 >= lastFrom { 1 } else { 0 }
+                    let r0 = rlRun[start + s2]
+                    run = r0 + 1 + 192 * last
+                    i += run
+                    level = rlLevel[start + s2] * qmul + qadd + rlMaxLevel[ml + last * 65 + r0] * qmul
+                    if br.bit() == 1 {
+                        level = -level
+                    }
+                }
+            } else {
+                let last = if sym >= lastFrom { 1 } else { 0 }
+                run = rlRun[start + sym] + 1 + 192 * last
+                i += run
+                level = rlLevel[start + sym] * qmul + qadd
+                if br.bit() == 1 {
+                    level = -level
+                }
+            }
+            if i > 62 {
+                i -= 192
+                if (i & ~63) != 0 {
+                    if br.left >= 0 {
+                        // ffmpeg: "ignoring overflow".
+                        i = 63
+                        break
+                    }
+                    return false
+                }
+                if i < scanLen {
+                    px.blk[bo + scan[i]] = level
+                }
+                break
+            }
+            if i < scanLen {
+                px.blk[bo + scan[i]] = level
+            }
+        }
+        if mbIntra {
+            predAc(n, bo)
+        }
+        lastIndex[n] = i
+        true
+    }
+
+    // ff_mpeg4_pred_ac: adds the left column (dcDir 0) or top row of the
+    // neighbour's levels when acPred, then stores this block's for the
+    // next ones. (msmpeg4 has one quantiser per picture, so no rescaling.)
+    fn predAc(_ n: Int, _ bo: Int) {
+        let xy = pOff + blockIndex[n]
+        let a = xy * 16
+        if acPred {
+            if dcDir == 0 {
+                let l = a - 16
+                for k in 1..8 {
+                    px.blk[bo + k * 8] = px.blk[bo + k * 8] + acVal[l + k]
+                }
+            } else {
+                let wrap = if n < 4 { b8Stride } else { mbStride }
+                let t = a - 16 * wrap
+                for k in 1..8 {
+                    px.blk[bo + k] = px.blk[bo + k] + acVal[t + k + 8]
+                }
+            }
+        }
+        for k in 1..8 {
+            acVal[a + k] = px.blk[bo + k * 8]
+            acVal[a + 8 + k] = px.blk[bo + k]
+        }
+    }
+
+    // --- Reconstruction (ff_mpv_reconstruct_mb) ---
+
+    fn reconstructMb() {
+        let xy = mby * mbStride + mbx
+        qscaleTable[xy] = qscale
+        skipTable[xy] = if skipped { 1 } else { 0 }
+        let yo = mby * 16 * px.ys + mbx * 16
+        let co = mby * 8 * px.cs + mbx * 8
+        let ys = px.ys
+        if !mbIntra {
+            if skipped && (mvx | mvy) == 0 {
+                px.copyMb(mbx, mby)
+                return
+            }
+            if mspel && version == 5 {
+                px.mspelMotion(mbx, mby, mvx, mvy, hshift, noRound: noRounding)
+            } else {
+                px.motion(mbx, mby, mvx, mvy, noRound: noRounding)
+            }
+            if version == 5 {
+                wmv2AddBlock(0, 0, yo)
+                wmv2AddBlock(1, 0, yo + 8)
+                wmv2AddBlock(2, 0, yo + 8 * ys)
+                wmv2AddBlock(3, 0, yo + 8 * ys + 8)
+                wmv2AddBlock(4, 1, co)
+                wmv2AddBlock(5, 2, co)
+            } else {
+                addBlock(0, 0, yo)
+                addBlock(1, 0, yo + 8)
+                addBlock(2, 0, yo + 8 * ys)
+                addBlock(3, 0, yo + 8 * ys + 8)
+                addBlock(4, 1, co)
+                addBlock(5, 2, co)
+            }
+            return
+        }
+        putBlock(0, 0, yo)
+        putBlock(1, 0, yo + 8)
+        putBlock(2, 0, yo + 8 * ys)
+        putBlock(3, 0, yo + 8 * ys + 8)
+        putBlock(4, 1, co)
+        putBlock(5, 2, co)
+    }
+
+    // An inter block, already dequantised, added.
+    fn addBlock(_ n: Int, _ plane: Int, _ off: Int) {
+        if lastIndex[n] >= 0 {
+            px.simpleIdct(n, plane, off, add: true)
+        }
+    }
+
+    // wmv2_add_block.
+    fn wmv2AddBlock(_ n: Int, _ plane: Int, _ off: Int) {
+        if lastIndex[n] < 0 {
+            return
+        }
+        let t = abtTypes[n]
+        if t == 0 {
+            px.wmv2Idct(n, plane, off, add: true)
+        } else if t == 1 {
+            let stride = if plane == 0 { px.ys } else { px.cs }
+            px.idct84Add(n, plane, off)
+            px.idct84Add(6 + n, plane, off + 4 * stride)
+        } else {
+            px.idct48Add(n, plane, off)
+            px.idct48Add(6 + n, plane, off + 4)
+        }
+    }
+
+    // An intra block: H.263 dequantisation (dct_unquantize_h263_intra),
+    // then the IDCT written.
+    fn putBlock(_ n: Int, _ plane: Int, _ off: Int) {
+        let bo = n * 64
+        let qmul = qscale << 1
+        let qadd = (qscale - 1) | 1
+        px.blk[bo] = px.blk[bo] * (if n < 4 { yDcScale } else { cDcScale })
+        for i in 1..64 {
+            let level = px.blk[bo + i]
+            if level != 0 {
+                px.blk[bo + i] = if level < 0 { level * qmul - qadd } else { level * qmul + qadd }
+            }
+        }
+        if version == 5 {
+            px.wmv2Idct(n, plane, off, add: false)
+        } else {
+            px.simpleIdct(n, plane, off, add: false)
+        }
+    }
+
+    // ff_h263_loop_filter after each macroblock (WMV2 with loop_filter).
+    fn h263LoopFilter() {
+        let ys = px.ys
+        let cs = px.cs
+        let xy = mby * mbStride + mbx
+        let dy = mby * 16 * ys + mbx * 16
+        let dc = mby * 8 * cs + mbx * 8
+        var qpc = 0
+        if skipTable[xy] == 0 {
+            qpc = qscale
+            px.vFilter(0, dy + 8 * ys, qpc)
+            px.vFilter(0, dy + 8 * ys + 8, qpc)
+        }
+        if mby > 0 {
+            let qptt = if skipTable[xy - mbStride] != 0 { 0 } else { qscaleTable[xy - mbStride] }
+            let qptc = if qpc != 0 { qpc } else { qptt }
+            if qptc != 0 {
+                px.vFilter(0, dy, qptc)
+                px.vFilter(0, dy + 8, qptc)
+                px.vFilter(1, dc, qptc)
+                px.vFilter(2, dc, qptc)
+            }
+            if qptt != 0 {
+                px.hFilter(0, dy - 8 * ys + 8, qptt)
+            }
+            if mbx > 0 {
+                let qpdt = if qptt != 0 || skipTable[xy - 1 - mbStride] != 0 { qptt } else { qscaleTable[xy - 1 - mbStride] }
+                if qpdt != 0 {
+                    px.hFilter(0, dy - 8 * ys, qpdt)
+                    px.hFilter(1, dc - 8 * cs, qpdt)
+                    px.hFilter(2, dc - 8 * cs, qpdt)
+                }
+            }
+        }
+        if qpc != 0 {
+            px.hFilter(0, dy + 8, qpc)
+            if mby + 1 == mbh {
+                px.hFilter(0, dy + 8 * ys + 8, qpc)
+            }
+        }
+        if mbx > 0 {
+            let qplc = if qpc != 0 || skipTable[xy - 1] != 0 { qpc } else { qscaleTable[xy - 1] }
+            if qplc != 0 {
+                px.hFilter(0, dy, qplc)
+                if mby + 1 == mbh {
+                    px.hFilter(0, dy + 8 * ys, qplc)
+                    px.hFilter(1, dc, qplc)
+                    px.hFilter(2, dc, qplc)
+                }
+            }
+        }
+    }
+
+    // Damage: the rest of the picture from (x, y) on copies the reference.
+    fn concealFrom(_ x: Int, _ y: Int) {
+        var cx = x
+        var cy = y
+        while cy < mbh {
+            while cx < mbw {
+                px.copyMb(cx, cy)
+                for b in 0..6 {
+                    px.clearBlock(b)
+                    px.clearBlock(6 + b)
+                }
+                cx += 1
+            }
+            cx = 0
+            cy += 1
+        }
+    }
+
+    dcDir: Int = 0
+}
+
+// A decoder for a "msmpeg4v1/2/3", "wmv1" or "wmv2" track.
+fn msNewDecoder(_ track: core.Track) -> Result<MsDecoder> {
+    var d = MsDecoder()
+    d.version = match track.codec {
+        "msmpeg4v1" -> 1
+        "msmpeg4v2" -> 2
+        "msmpeg4v3" -> 3
+        "wmv1" -> 4
+        "wmv2" -> 5
+        _ -> 0
+    }
+    if d.version == 0 {
+        return .failure(error: Error("wmv: {track.codec} isn't an MS-MPEG4/WMV1/WMV2 track"))
+    }
+    if track.width <= 0 || track.height <= 0 || track.width > 8192 || track.height > 8192 {
+        return .failure(error: Error("wmv: the track has no picture size"))
+    }
+    d.setup(track)
+    Result.ok(value: d)
+}
+
+fn msName(_ v: Int) -> String {
+    match v {
+        1 -> "msmpeg4v1"
+        2 -> "msmpeg4v2"
+        3 -> "msmpeg4v3"
+        4 -> "wmv1"
+        _ -> "wmv2"
+    }
+}
+
+fn msMid(_ a: Int, _ b: Int, _ c: Int) -> Int {
+    if a > b {
+        if b > c {
+            return b
+        }
+        if a > c {
+            return c
+        }
+        return a
+    }
+    if b > c {
+        if a > c {
+            return a
+        }
+        return c
+    }
+    b
+}
+
+// wmv2_get_cbp_table_index's map[(q > 10) + (q > 20)][cbp_index].
+let msWmv2CbpMap: [Int] = [0, 2, 1, 1, 0, 2, 2, 1, 0]

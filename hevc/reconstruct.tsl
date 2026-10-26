@@ -1,0 +1,542 @@
+// The second stage of the HEVC decoder: Reconstructor turns ParsedPictures
+// into decoded pictures. It runs the operation stream (intra prediction,
+// residuals, inter prediction, PCM; ITU-T H.265 8.4, 8.5, 8.6) on the
+// picture's planes, the in-loop filters (8.7), keeps the decoded pictures
+// that are referenced or wait for output, and outputs them in the order
+// the parser's DPB decisions give.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../core"
+
+// A decoded picture held for reference or output.
+struct HevcFrame {
+    slot: Int = 0
+    y: [Int] = []
+    u: [Int] = []
+    v: [Int] = []
+    pts: Int = -9223372036854775807
+    key: Bool = false
+    width: Int = 0
+    height: Int = 0
+    chromaIdc: Int = 1
+    bitDepth: Int = 8
+    cropLeft: Int = 0
+    cropRight: Int = 0
+    cropTop: Int = 0
+    cropBottom: Int = 0
+    sarNum: Int = 1
+    sarDen: Int = 1
+    matrix: core.ColorMatrix = .unknown
+    fullRange: Bool = false
+}
+
+public struct Reconstructor {
+    warnings: [String] = []
+    rc: HevcRecon = HevcRecon()
+    frames: [HevcFrame] = []
+    // Planes of freed pictures, reused for new ones (y, u, v each).
+    poolY: [[Int]] = []
+    poolU: [[Int]] = []
+    poolV: [[Int]] = []
+    geomW: Int = -1
+    geomH: Int = -1
+    geomC: Int = -1
+    out: [core.Picture] = []
+    // Development timing (seconds) of the stages, when `timing` is set.
+    timing: Bool = false
+    tOps: Float = 0.0
+    tDeblock: Float = 0.0
+    tSao: Float = 0.0
+    tAlloc: Float = 0.0
+    tByOp: [Float] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    nByOp: [Int] = [0, 0, 0, 0, 0, 0]
+
+    fn setup() {
+        rc.setup()
+    }
+
+    // Reconstructs one parsed picture; returns the pictures now ready, in
+    // display order.
+    public fn reconstruct(_ p: ParsedPicture) -> [core.Picture] {
+        setup()
+        for w in p.warnings {
+            if warnings.count < 200 {
+                warnings.append(w)
+            }
+        }
+        doActions(p.before)
+        if p.hasPicture {
+            decodePicture(p)
+        }
+        doActions(p.after)
+        let o = out
+        out = []
+        o
+    }
+
+    // After a seek: drops every held picture.
+    public fn reset() {
+        for f in frames {
+            recycle(f)
+        }
+        frames = []
+        out = []
+    }
+
+    fn doActions(_ acts: [Int]) {
+        var i = 0
+        while i + 1 < acts.count {
+            let a = acts[i]
+            let slot = acts[i + 1]
+            let k = frameIndex(slot)
+            if k >= 0 {
+                if a == actOutput {
+                    out.append(toPicture(frames[k]))
+                } else {
+                    let f = frames.remove(at: k)
+                    recycle(f)
+                }
+            }
+            i += 2
+        }
+    }
+
+    // A held picture of the current geometry, or -1.
+    fn sameSize() -> Int {
+        for k in 0..frames.count {
+            if frames[k].width == geomW && frames[k].height == geomH && frames[k].chromaIdc == geomC && frames[k].y.count > 0 {
+                return k
+            }
+        }
+        -1
+    }
+
+    fn frameIndex(_ slot: Int) -> Int {
+        for k in 0..frames.count {
+            if frames[k].slot == slot {
+                return k
+            }
+        }
+        -1
+    }
+
+    fn recycle(_ f: HevcFrame) {
+        if f.width == geomW && f.height == geomH && f.chromaIdc == geomC && poolY.count < 3 && f.y.count > 0 {
+            poolY.append(f.y)
+            poolU.append(f.u)
+            poolV.append(f.v)
+        }
+    }
+
+    fn toPicture(_ f: HevcFrame) -> core.Picture {
+        var pic = core.Picture(width: f.width - f.cropLeft - f.cropRight, height: f.height - f.cropTop - f.cropBottom)
+        pic.depth = f.bitDepth
+        pic.y = f.y
+        pic.yStride = f.width
+        pic.yOffset = f.cropTop * f.width + f.cropLeft
+        if f.chromaIdc == 0 {
+            pic.chroma = .gray
+        } else {
+            let cw = (f.width + 1) >> 1
+            pic.u = f.u
+            pic.v = f.v
+            pic.cStride = cw
+            pic.cOffset = (f.cropTop >> 1) * cw + (f.cropLeft >> 1)
+        }
+        pic.pts = f.pts
+        pic.key = f.key
+        pic.sarNum = f.sarNum
+        pic.sarDen = f.sarDen
+        pic.matrix = f.matrix
+        pic.fullRange = f.fullRange
+        pic
+    }
+
+    fn decodePicture(_ p: ParsedPicture) {
+        let w = p.width
+        let h = p.height
+        let hasC = p.chromaIdc != 0
+        let cw = if hasC { (w + 1) >> 1 } else { 0 }
+        let ch = if hasC { (h + 1) >> 1 } else { 0 }
+        if w != geomW || h != geomH || p.chromaIdc != geomC {
+            geomW = w
+            geomH = h
+            geomC = p.chromaIdc
+            poolY = []
+            poolU = []
+            poolV = []
+        }
+        rc.width = w
+        rc.height = h
+        rc.cw = cw
+        rc.ch = ch
+        rc.setDepth(p.bitDepth)
+        var t0 = 0.0
+        if timing {
+            t0 = now()
+        }
+        let k = sameSize()
+        if !poolY.isEmpty {
+            rc.y = poolY.removeLast()
+            rc.u = poolU.removeLast()
+            rc.v = poolV.removeLast()
+        } else if k >= 0 {
+            // A held picture's planes, shared: the first write makes a fast
+            // copy (every sample is then overwritten).
+            rc.y = frames[k].y
+            rc.u = frames[k].u
+            rc.v = frames[k].v
+        } else {
+            rc.y = hevcFilled(w * h, 0)
+            rc.u = hevcFilled(cw * ch, 0)
+            rc.v = hevcFilled(cw * ch, 0)
+        }
+        var t1 = 0.0
+        if timing {
+            t1 = now()
+            tAlloc += t1 - t0
+        }
+        runOps(p)
+        if timing {
+            let t2 = now()
+            tOps += t2 - t1
+            t1 = t2
+        }
+        // In-loop filters on the whole picture.
+        var flt = p.filter
+        flt.y = rc.y
+        flt.u = rc.u
+        flt.v = rc.v
+        rc.y = []
+        rc.u = []
+        rc.v = []
+        flt.deblock()
+        if timing {
+            let t2 = now()
+            tDeblock += t2 - t1
+            t1 = t2
+        }
+        if flt.anySao {
+            // SAO writes into spare planes.
+            if !poolY.isEmpty {
+                flt.outY = poolY.removeLast()
+                flt.outU = poolU.removeLast()
+                flt.outV = poolV.removeLast()
+            } else {
+                // Shared with the deblocked planes: SAO's first write makes
+                // the copy, which keeps its input intact.
+                flt.outY = flt.y
+                flt.outU = flt.u
+                flt.outV = flt.v
+            }
+        }
+        flt.sao()
+        if flt.anySao && poolY.count < 3 {
+            poolY.append(flt.outY)
+            poolU.append(flt.outU)
+            poolV.append(flt.outV)
+        }
+        if timing {
+            tSao += now() - t1
+        }
+        var f = HevcFrame()
+        f.slot = p.slot
+        f.y = flt.y
+        f.u = flt.u
+        f.v = flt.v
+        flt.y = []
+        flt.u = []
+        flt.v = []
+        f.pts = p.pts
+        f.key = p.key
+        f.width = w
+        f.height = h
+        f.chromaIdc = p.chromaIdc
+        f.bitDepth = p.bitDepth
+        f.cropLeft = p.cropLeft
+        f.cropRight = p.cropRight
+        f.cropTop = p.cropTop
+        f.cropBottom = p.cropBottom
+        f.sarNum = p.sarNum
+        f.sarDen = p.sarDen
+        f.matrix = p.matrix
+        f.fullRange = p.fullRange
+        frames.append(f)
+        // The parser frees every picture; should actions ever go missing,
+        // don't hold more than a DPB can (16) plus the reorder slack.
+        while frames.count > 20 {
+            let old = frames.remove(at: 0)
+            recycle(old)
+            if warnings.count < 200 {
+                warnings.append("hevc: too many pictures held; dropped the oldest")
+            }
+        }
+    }
+
+    // The planes of a reference by slot, or of the latest picture when it
+    // is missing (concealment). -1 when there is none at all.
+    fn refIndex(_ slot: Int) -> Int {
+        let k = frameIndex(slot)
+        if k >= 0 && frames[k].width == rc.width && frames[k].height == rc.height {
+            return k
+        }
+        var best = -1
+        for i in 0..frames.count {
+            if frames[i].width == rc.width && frames[i].height == rc.height && (best < 0 || frames[i].slot > frames[best].slot) {
+                best = i
+            }
+        }
+        best
+    }
+
+    fn runOps(_ p: ParsedPicture) {
+        let ops = p.ops
+        let n = ops.count
+        let hasC = p.chromaIdc != 0
+        var i = 0
+        var tPrev = 0.0
+        var opPrev = 0
+        while i < n {
+            let op = ops[i]
+            if timing {
+                let t = now()
+                if opPrev > 0 && opPrev < 6 {
+                    tByOp[opPrev] += t - tPrev
+                    nByOp[opPrev] += 1
+                }
+                tPrev = t
+                opPrev = op
+            }
+            if op == opIntra {
+                let cIdx = ops[i + 1]
+                let x0 = ops[i + 2]
+                let y0 = ops[i + 3]
+                let log2 = ops[i + 4]
+                let mode = ops[i + 5]
+                let mask = ops[i + 6]
+                i += 7
+                if !validBlock(cIdx, x0, y0, log2) || mode < 0 || mode > 34 {
+                    bad()
+                    continue
+                }
+                let size = 1 << log2
+                let unit = if cIdx == 0 { 4 } else { 2 }
+                let units = 2 * size / unit
+                for k in 0..(2 * units + 1) {
+                    rc.avail[k] = (mask >> k) & 1
+                }
+                rc.usePlane(cIdx)
+                rc.gatherRefs(x0, y0, size, unit)
+                rc.predictIntra(cIdx == 0, x0, y0, log2, mode, strong: p.strongSmoothing)
+            } else if op == opResidual {
+                let cIdx = ops[i + 1]
+                let x0 = ops[i + 2]
+                let y0 = ops[i + 3]
+                let log2 = ops[i + 4]
+                i += 5
+                if !validBlock(cIdx, x0, y0, log2) {
+                    bad()
+                    continue
+                }
+                rc.usePlane(cIdx)
+                if cIdx == 0 {
+                    rc.addPlane(p.resY, x0, y0, log2)
+                } else if cIdx == 1 {
+                    rc.addPlane(p.resU, x0, y0, log2)
+                } else {
+                    rc.addPlane(p.resV, x0, y0, log2)
+                }
+            } else if op == opResDc {
+                let cIdx = ops[i + 1]
+                let x0 = ops[i + 2]
+                let y0 = ops[i + 3]
+                let log2 = ops[i + 4]
+                let dc = ops[i + 5]
+                i += 6
+                if !validBlock(cIdx, x0, y0, log2) {
+                    bad()
+                    continue
+                }
+                rc.usePlane(cIdx)
+                rc.addConstant(x0, y0, 1 << log2, dc)
+            } else if op == opInter {
+                let x0 = ops[i + 1]
+                let y0 = ops[i + 2]
+                let w = ops[i + 3]
+                let h = ops[i + 4]
+                let flags = ops[i + 5]
+                let use0 = (flags & 1) != 0
+                let use1 = (flags & 2) != 0
+                let weighted = (flags & 4) != 0
+                let k0 = if use0 { refIndex(ops[i + 6]) } else { -1 }
+                let k1 = if use1 { refIndex(ops[i + 8]) } else { -1 }
+                let mv0 = ops[i + 7]
+                let mv1 = ops[i + 9]
+                let wi = i + 10
+                i += 10
+                if weighted {
+                    i += 14
+                }
+                if w < 4 || h < 4 || w > 64 || h > 64 || (w & 1) != 0 || (h & 1) != 0 || x0 < 0 || y0 < 0 || x0 + w > rc.width || y0 + h > rc.height {
+                    bad()
+                    continue
+                }
+                if (use0 && k0 < 0) || (use1 && k1 < 0) {
+                    concealGray(x0, y0, w, h)
+                    continue
+                }
+                let m0x = hevcMvX(mv0)
+                let m0y = hevcMvY(mv0)
+                let m1x = hevcMvX(mv1)
+                let m1y = hevcMvY(mv1)
+                for c in 0..3 {
+                    if c > 0 && !hasC {
+                        break
+                    }
+                    rc.usePlane(c)
+                    let bx = if c == 0 { x0 } else { x0 >> 1 }
+                    let by = if c == 0 { y0 } else { y0 >> 1 }
+                    let bw = if c == 0 { w } else { w >> 1 }
+                    let bh = if c == 0 { h } else { h >> 1 }
+                    if weighted {
+                        if use0 {
+                            interOne(c, k0, bx, by, bw, bh, m0x, m0y, 0)
+                        }
+                        if use1 {
+                            interOne(c, k1, bx, by, bw, bh, m1x, m1y, 1)
+                        }
+                        let denom = if c == 0 { ops[wi] } else { ops[wi + 1] }
+                        let b0 = wi + 2 + c * 2
+                        let b1 = wi + 8 + c * 2
+                        rc.putPredWeighted(bx, by, bw, bh, use0, use1, denom, ops[b0], ops[b0 + 1], ops[b1], ops[b1 + 1])
+                    } else if use0 && use1 {
+                        interOne(c, k0, bx, by, bw, bh, m0x, m0y, 0)
+                        interOne(c, k1, bx, by, bw, bh, m1x, m1y, 3)
+                    } else if use0 {
+                        interOne(c, k0, bx, by, bw, bh, m0x, m0y, 2)
+                    } else {
+                        interOne(c, k1, bx, by, bw, bh, m1x, m1y, 2)
+                    }
+                }
+            } else if op == opPcm {
+                let x0 = ops[i + 1]
+                let y0 = ops[i + 2]
+                let size = 1 << ops[i + 3]
+                if !validBlock(0, x0, y0, ops[i + 3]) || ops[i + 3] < 3 || i + 4 + size * size * (if hasC { 3 } else { 2 }) / 2 > n {
+                    bad()
+                    break
+                }
+                var j = i + 4
+                rc.usePlane(0)
+                for yy in 0..size {
+                    for xx in 0..size {
+                        rc.setSample(x0 + xx, y0 + yy, ops[j])
+                        j += 1
+                    }
+                }
+                if hasC {
+                    let hs = size >> 1
+                    for c in 1..3 {
+                        rc.usePlane(c)
+                        for yy in 0..hs {
+                            for xx in 0..hs {
+                                rc.setSample((x0 >> 1) + xx, (y0 >> 1) + yy, ops[j])
+                                j += 1
+                            }
+                        }
+                    }
+                }
+                i = j
+            } else if op == opConceal {
+                conceal(ops[i + 1], ops[i + 2], ops[i + 3], ops[i + 4])
+                i += 5
+            } else {
+                // Unknown op: the stream is broken; stop here.
+                if warnings.count < 200 {
+                    warnings.append("hevc: bad reconstruction data")
+                }
+                break
+            }
+        }
+        rc.usePlane(-1)
+    }
+
+    // Whether a (1 << log2) block at (x0, y0) of colour c lies in the picture.
+    fn validBlock(_ c: Int, _ x0: Int, _ y0: Int, _ log2: Int) -> Bool {
+        if log2 < 2 || log2 > 6 || x0 < 0 || y0 < 0 {
+            return false
+        }
+        let size = 1 << log2
+        if c == 0 {
+            return x0 + size <= rc.width && y0 + size <= rc.height
+        }
+        rc.cw > 0 && x0 + size <= rc.cw && y0 + size <= rc.ch
+    }
+
+    fn bad() {
+        if warnings.count < 200 {
+            warnings.append("hevc: bad reconstruction data")
+        }
+    }
+
+    // Interpolation of one colour of one list (see HevcRecon's modes).
+    fn interOne(_ c: Int, _ k: Int, _ x: Int, _ y: Int, _ w: Int, _ h: Int, _ mvx: Int, _ mvy: Int, _ mode: Int) {
+        if c == 0 {
+            rc.mcLuma(frames[k].y, x, y, w, h, mvx, mvy, mode)
+        } else if c == 1 {
+            rc.mcChroma(frames[k].u, x, y, w, h, mvx, mvy, mode)
+        } else {
+            rc.mcChroma(frames[k].v, x, y, w, h, mvx, mvy, mode)
+        }
+    }
+
+    // Copies an area from the latest held picture (or mid-grey).
+    fn conceal(_ x0: Int, _ y0: Int, _ w: Int, _ h: Int) {
+        let k = refIndex(-1)
+        if k < 0 {
+            concealGray(x0, y0, w, h)
+            return
+        }
+        for c in 0..3 {
+            if c > 0 && rc.cw == 0 {
+                break
+            }
+            let s = if c == 0 { 0 } else { 1 }
+            let pw = if c == 0 { rc.width } else { rc.cw }
+            let ph = if c == 0 { rc.height } else { rc.ch }
+            let src = if c == 0 { frames[k].y } else if c == 1 { frames[k].u } else { frames[k].v }
+            rc.usePlane(c)
+            for yy in (y0 >> s)..min(ph, (y0 + h) >> s) {
+                for xx in (x0 >> s)..min(pw, (x0 + w) >> s) {
+                    rc.setSample(xx, yy, src[yy * pw + xx])
+                }
+            }
+        }
+    }
+
+    fn concealGray(_ x0: Int, _ y0: Int, _ w: Int, _ h: Int) {
+        let mid = 1 << (rc.bitDepth - 1)
+        for c in 0..3 {
+            if c > 0 && rc.cw == 0 {
+                break
+            }
+            let s = if c == 0 { 0 } else { 1 }
+            let pw = if c == 0 { rc.width } else { rc.cw }
+            let ph = if c == 0 { rc.height } else { rc.ch }
+            rc.usePlane(c)
+            for yy in (y0 >> s)..min(ph, (y0 + h) >> s) {
+                for xx in (x0 >> s)..min(pw, (x0 + w) >> s) {
+                    rc.setSample(xx, yy, mid)
+                }
+            }
+        }
+    }
+}
+
+public fn newReconstructor() -> Reconstructor {
+    var r = Reconstructor()
+    r.setup()
+    r
+}

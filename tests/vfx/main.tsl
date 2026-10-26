@@ -1,0 +1,516 @@
+// Tests for the vfx module: deinterlacing (every mode, single and double
+// rate, PSNR against the progressive source of clips interlaced like
+// ffmpeg's tinterlace; field timing; 10-bit 4:2:2 and gray), sharpening,
+// noise reduction, black bar detection, scene detection and thumbnails,
+// with speed lines for 1080i/1080p. Fixtures: tests/vfx/make_fixtures.sh.
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+import "../../vfx"
+import "../../render"
+import "../../core"
+
+fn main() {
+    var tally = Tally()
+    let testsrc = loadClip("testsrc_p", 256, 192)
+    let testsrcI = loadClip("testsrc_i", 256, 192)
+    let mandel = loadClip("mandel_p", 128, 96)
+    let still = loadClip("still_p", 256, 192)
+    tally.check(testsrc.count == 12 && testsrcI.count == 6 && mandel.count == 12 && still.count == 12, "fixture clips load ({testsrc.count}, {testsrcI.count}, {mandel.count}, {still.count})")
+    if testsrc.count == 12 && testsrcI.count == 6 && mandel.count == 12 && still.count == 12 {
+        deinterlaceTests(tally, testsrc, testsrcI, mandel, still)
+        filterTests(tally, testsrc, still)
+        cropTests(tally)
+        sceneTests(tally)
+        thumbTests(tally, testsrc)
+        chainTests(tally, testsrc)
+        speedTests(tally, testsrc)
+    }
+    print("vfx: {tally.passed} of {tally.total} passed")
+}
+
+// Mean luma PSNR of a deinterlacer's output against the progressive
+// pictures each output stands for (single rate: picture 2k; double rate:
+// 2k and 2k + 1), and the outputs.
+fn runDeint(_ inter: [core.Picture], _ prog: [core.Picture], _ mode: vfx.DeinterlaceMode, _ double: Bool) -> (Float, [vfx.Field]) {
+    var d = vfx.newDeinterlacer(mode: mode, doubleRate: double)
+    var out: [vfx.Field] = []
+    for i in 0..inter.count {
+        out.appendAll(d.push(inter[i], time: Float(i) * 0.04))
+    }
+    out.appendAll(d.flush())
+    var sum = 0.0
+    for i in 0..out.count {
+        let k = if double { i } else { 2 * i }
+        if k < prog.count {
+            sum += lumaPsnr(out[i].picture, prog[k])
+        }
+    }
+    (sum / Float(max(out.count, 1)), out)
+}
+
+fn deinterlaceTests(_ t: bind Tally, _ testsrc: [core.Picture], _ testsrcI: [core.Picture], _ mandel: [core.Picture], _ still: [core.Picture]) {
+    // Our weave is ffmpeg's tinterlace=interleave_top.
+    let woven = interlaceClip(testsrc)
+    var same = woven.count == testsrcI.count
+    for i in 0..min(woven.count, testsrcI.count) {
+        if woven[i].y != testsrcI[i].y || woven[i].u != testsrcI[i].u || woven[i].v != testsrcI[i].v {
+            same = false
+        }
+    }
+    t.check(same, "weaving pairs of pictures matches ffmpeg's tinterlace (interleave_top)")
+    let clips: [(String, [core.Picture])] = [("testsrc", testsrc), ("mandel", mandel), ("still", still)]
+    let ffmpegDeint = ((readData("tests/vfx/fixtures/ffmpeg_deint.txt") ?? Data()).text ?? "").lines()
+    for (name, prog) in clips {
+        let inter = interlaceClip(prog)
+        let (weaveDb, _) = runDeint(inter, prog, .off, false)
+        let (blendDb, _) = runDeint(inter, prog, .blend, false)
+        let (bobDb, _) = runDeint(inter, prog, .bob, false)
+        let (adaDb, _) = runDeint(inter, prog, .adaptive, false)
+        let (bob2Db, bob2) = runDeint(inter, prog, .bob, true)
+        let (ada2Db, ada2) = runDeint(inter, prog, .adaptive, true)
+        print("deinterlace {name} PSNR (dB) single rate: weave {f2(weaveDb)}, blend {f2(blendDb)}, bob {f2(bobDb)}, adaptive {f2(adaDb)}; double rate: bob {f2(bob2Db)}, adaptive {f2(ada2Db)}")
+        // ffmpeg's deinterlacers on the same clip (make_fixtures.sh).
+        var theirs = ""
+        var yadif = 0.0
+        for line in ffmpegDeint {
+            let parts = line.split(" ")
+            if parts.count == 3 && parts[0] == name {
+                theirs += " {parts[1]} {parts[2]}"
+                if parts[1] == "yadif" {
+                    yadif = Float(parts[2]) ?? 0.0
+                }
+            }
+        }
+        print("    ffmpeg at double rate:{theirs}")
+        t.check(ada2Db >= yadif - 1.0, "{name}: adaptive double rate within 1 dB of ffmpeg's yadif or better ({f2(ada2Db)} vs {f2(yadif)})")
+        t.check(bob2.count == 2 * inter.count && ada2.count == 2 * inter.count, "{name}: double rate gives two pictures per picture")
+        t.check(ada2Db >= bob2Db + 0.15, "{name}: adaptive beats bob at double rate ({f2(ada2Db)} vs {f2(bob2Db)})")
+        t.check(adaDb >= bobDb + 0.2, "{name}: adaptive beats bob at single rate ({f2(adaDb)} vs {f2(bobDb)})")
+        t.check(ada2Db >= weaveDb - 1.0 || name == "still", "{name}: adaptive double rate not worse than weave")
+        if name == "still" {
+            t.check(ada2Db >= 45.0, "still picture: adaptive restores the full detail ({f2(ada2Db)} dB)")
+        } else {
+            t.check(adaDb > weaveDb + 1.0, "{name}: adaptive single rate beats weave on motion ({f2(adaDb)} vs {f2(weaveDb)})")
+        }
+        // Kept rows are untouched: the first field's even rows.
+        var kept = true
+        for r in 0..prog[0].height {
+            if r % 2 == 0 {
+                for x in 0..prog[0].width {
+                    if ada2[2].picture.luma(x, r) != prog[2].luma(x, r) {
+                        kept = false
+                    }
+                }
+            } else {
+                for x in 0..prog[0].width {
+                    if ada2[3].picture.luma(x, r) != prog[3].luma(x, r) {
+                        kept = false
+                    }
+                }
+            }
+        }
+        t.check(kept, "{name}: each field's own rows are kept")
+        if name == "testsrc" {
+            // Field timing: the second field half-way to the next picture.
+            var timesOk = true
+            for i in 0..ada2.count {
+                let want = Float(i) * 0.02
+                if abs(ada2[i].time - want) > 0.0001 {
+                    timesOk = false
+                }
+            }
+            t.check(timesOk, "double rate field times are the picture times and the mid-points")
+            t.check(ada2[1].picture.pts == 2 && ada2[2].picture.pts == 4 && ada2[1].picture.duration == 2, "double rate pts and durations (pts {ada2[1].picture.pts}, {ada2[2].picture.pts}; duration {ada2[1].picture.duration})")
+            t.check(!ada2[0].picture.interlaced && !bob2[0].picture.interlaced, "outputs are marked progressive")
+        }
+    }
+
+    // Auto mode leaves progressive pictures alone; off returns them as is.
+    var d = vfx.newDeinterlacer()
+    let progOut = d.push(testsrc[0], time: 0.0)
+    t.check(progOut.count == 1 && progOut[0].picture.y == testsrc[0].y, "auto mode passes progressive pictures through")
+    var forced = vfx.newDeinterlacer(mode: .bob)
+    forced.auto = false
+    let forcedOut = forced.push(testsrc[0], time: 0.0)
+    t.check(forcedOut.count == 1 && forcedOut[0].picture.y != testsrc[0].y, "auto off deinterlaces every picture")
+    // A seek: reset, then the first picture is spatial only (no ghost of
+    // the old position).
+    let inter = interlaceClip(testsrc)
+    var dr = vfx.newDeinterlacer(doubleRate: true)
+    var n = 0
+    n += dr.push(inter[0], time: 0.0).count
+    n += dr.push(inter[1], time: 0.04).count
+    dr.reset()
+    let afterSeek = dr.push(inter[4], time: 0.16)
+    let bobOnly = vfx.deinterlaced(inter[4], mode: .bob)
+    t.check(n == 3 && afterSeek.count == 1 && afterSeek[0].picture.y == bobOnly.y, "reset drops the held picture and history")
+    // A progressive picture after an interlaced one (double rate): the
+    // held field comes out first.
+    var mix = vfx.newDeinterlacer(doubleRate: true)
+    mix.push(inter[0], time: 0.0)
+    let mixed = mix.push(testsrc[2], time: 0.04)
+    t.check(mixed.count == 2 && abs(mixed[0].time - 0.02) < 0.0001 && mixed[1].picture.y == testsrc[2].y, "held field before a progressive picture")
+    t.check(vfx.deinterlaceMode("bob") == .bob && vfx.deinterlaceMode("blend") == .blend && vfx.deinterlaceMode("off") == .off && vfx.deinterlaceMode("x") == .adaptive, "mode names")
+
+    // 10-bit 4:2:2: the same quality as 8-bit (in its own scale).
+    var prog10: [core.Picture] = []
+    for p in testsrc {
+        prog10.append(tenBit422(p))
+    }
+    let inter10 = interlaceClip(prog10)
+    let (db10, out10) = runDeint(inter10, prog10, .adaptive, true)
+    let (db8, _) = runDeint(interlaceClip(testsrc), testsrc, .adaptive, true)
+    print("deinterlace 10-bit 4:2:2 adaptive double rate: {f2(db10)} dB (8-bit 4:2:0: {f2(db8)} dB)")
+    t.check(abs(db10 - db8) < 1.5 && out10[0].picture.depth == 10 && out10[0].picture.u.count == prog10[0].u.count, "10-bit 4:2:2 deinterlaces like 8-bit")
+    var chromaOk = true
+    for p in out10 {
+        if p.picture.u.any(where: { v in v < 0 || v > 1023 }) {
+            chromaOk = false
+        }
+    }
+    t.check(chromaOk, "10-bit samples stay in range")
+    // Gray pictures.
+    var grayInter: [core.Picture] = []
+    for p in inter {
+        var g = p
+        g.chroma = .gray
+        g.u = []
+        g.v = []
+        grayInter.append(g)
+    }
+    let (dbGray, outGray) = runDeint(grayInter, testsrc, .adaptive, true)
+    t.check(outGray.count == 2 * grayInter.count && outGray[0].picture.u.isEmpty && abs(dbGray - db8) < 1.0, "gray pictures deinterlace ({f2(dbGray)} dB)")
+    // Strided planes with offsets (a cropped decoder picture).
+    var padded: [core.Picture] = []
+    for p in inter {
+        var q = p
+        q.yStride = p.width + 32
+        q.cStride = p.chromaWidth + 16
+        q.yOffset = 2 * q.yStride + 16
+        q.cOffset = q.cStride + 8
+        q.y = core.zeros(q.yOffset + p.height * q.yStride + 16)
+        q.u = core.zeros(q.cOffset + p.chromaHeight * q.cStride + 8)
+        q.v = core.zeros(q.cOffset + p.chromaHeight * q.cStride + 8)
+        for r in 0..p.height {
+            for x in 0..p.width {
+                q.y[q.yOffset + r * q.yStride + x] = p.luma(x, r)
+            }
+        }
+        for r in 0..p.chromaHeight {
+            for x in 0..p.chromaWidth {
+                q.u[q.cOffset + r * q.cStride + x] = p.cb(x, r)
+                q.v[q.cOffset + r * q.cStride + x] = p.cr(x, r)
+            }
+        }
+        padded.append(q)
+    }
+    let (dbPad, _) = runDeint(padded, testsrc, .adaptive, true)
+    t.check(abs(dbPad - db8) < 0.01, "strided pictures with offsets deinterlace the same ({f2(dbPad)} dB)")
+}
+
+fn filterTests(_ t: bind Tally, _ testsrc: [core.Picture], _ still: [core.Picture]) {
+    // Sharpen: flat stays flat, an edge gets steeper, amount 0 is identity.
+    var flat = core.blankPicture(width: 32, height: 16)
+    flat.y = core.filled(32 * 16, 120)
+    let sh = vfx.newSharpener(amount: 1.0)
+    t.check(sh.apply(flat).y == flat.y, "sharpen leaves a flat picture alone")
+    var edge = core.blankPicture(width: 32, height: 16, chroma: .gray)
+    for y in 0..16 {
+        for x in 0..32 {
+            edge.y[y * 32 + x] = if x < 16 { 60 } else { 180 }
+        }
+    }
+    let se = sh.apply(edge)
+    t.check(se.luma(15, 8) < 60 && se.luma(16, 8) > 180 && se.luma(5, 8) == 60 && se.luma(26, 8) == 180, "sharpen overshoots at an edge and leaves flat parts ({se.luma(15, 8)}, {se.luma(16, 8)})")
+    let s0 = vfx.newSharpener(amount: 0.0)
+    t.check(s0.apply(edge).y == edge.y, "amount 0 does nothing")
+    // Against the exact formula (3×3 binomial unsharp, amount 0.7, no
+    // threshold) on a natural picture.
+    var exact = vfx.Sharpener(amount: 0.7, threshold: 0)
+    let p = testsrc[3]
+    let sp = exact.apply(p)
+    var worst = 0
+    for y in 1..(p.height - 1) {
+        for x in 1..(p.width - 1) {
+            var blur = 0
+            for dy in -1..2 {
+                for dx in -1..2 {
+                    let w = (2 - abs(dx)) * (2 - abs(dy))
+                    blur += w * p.luma(x + dx, y + dy)
+                }
+            }
+            let c = Float(p.luma(x, y))
+            let want = max(0, min(255, Int(floor(c + 0.7 * (c - Float(blur) / 16.0) + 0.5))))
+            worst = max(worst, abs(sp.luma(x, y) - want))
+        }
+    }
+    t.check(worst <= 1, "sharpen matches the unsharp-mask formula (max error {worst})")
+    t.check(sp.u == p.u && sp.v == p.v, "sharpen leaves chroma alone")
+    var sh10 = p
+    sh10.depth = 10
+    for i in 0..sh10.y.count {
+        sh10.y[i] = p.y[i] * 4
+    }
+    let s10 = exact.apply(sh10)
+    t.check(s10.y.all(where: { v in v >= 0 && v <= 1023 }) && abs(s10.luma(100, 100) - 4 * sp.luma(100, 100)) <= 4, "sharpen 10-bit")
+
+    // Denoise: noisy still picture → much closer to the clean one after a
+    // few pictures; a moving clip stays close to the clean motion (no
+    // trails); a cut is followed at once.
+    var noise = Noise()
+    var dn = vfx.newDenoiser(strength: 0.6)
+    var noisyDb = 0.0
+    var cleanDb = 0.0
+    for i in 0..10 {
+        let np = noisy(still[i], 4.0, noise)
+        let out = dn.apply(np)
+        if i == 9 {
+            noisyDb = lumaPsnr(np, still[i])
+            cleanDb = lumaPsnr(out, still[i])
+        }
+    }
+    print("denoise still σ=4: noisy {f2(noisyDb)} dB → {f2(cleanDb)} dB")
+    t.check(cleanDb >= noisyDb + 3.0, "denoise removes noise from a still picture ({f2(noisyDb)} → {f2(cleanDb)} dB)")
+    var dm = vfx.newDenoiser(strength: 0.6)
+    var worstMove = 99.0
+    var worstNoisy = 99.0
+    for i in 0..12 {
+        let np = noisy(testsrc[i], 4.0, noise)
+        let out = dm.apply(np)
+        if i > 0 {
+            worstMove = min(worstMove, lumaPsnr(out, testsrc[i]))
+            worstNoisy = min(worstNoisy, lumaPsnr(np, testsrc[i]))
+        }
+    }
+    print("denoise moving σ=4: worst noisy {f2(worstNoisy)} dB → {f2(worstMove)} dB")
+    t.check(worstMove >= worstNoisy, "denoise doesn't smear a moving clip ({f2(worstNoisy)} → {f2(worstMove)} dB)")
+    var dc = vfx.newDenoiser(strength: 1.0)
+    dc.apply(still[0])
+    let cut = dc.apply(testsrc[5])
+    t.check(lumaPsnr(cut, testsrc[5]) > 30.0, "denoise follows a cut at once ({f2(lumaPsnr(cut, testsrc[5]))} dB)")
+    var d0 = vfx.newDenoiser(strength: 0.0)
+    t.check(d0.apply(testsrc[1]).y == testsrc[1].y, "strength 0 does nothing")
+    var d10 = vfx.newDenoiser()
+    let t10 = tenBit422(testsrc[0])
+    let o10 = d10.apply(d10.apply(t10))
+    t.check(o10.depth == 10 && o10.y.all(where: { v in v >= 0 && v <= 1023 }) && lumaPsnr(o10, t10) > 35.0, "denoise 10-bit 4:2:2")
+}
+
+fn cropTests(_ t: bind Tally) {
+    let bars = loadClip("bars", 256, 192)
+    t.check(bars.count == 3, "bars clip loads")
+    if bars.count < 3 {
+        return
+    }
+    let c = vfx.detectCrop(bars[0])
+    t.check(c.left == 16 && c.right == 16 && c.top == 48 && c.bottom == 48, "detectCrop finds letterbox and pillarbox bars ({c.left}, {c.top}, {c.right}, {c.bottom})")
+    var black = core.blankPicture(width: 64, height: 48)
+    t.check(vfx.detectCrop(black).isEmpty, "a black picture has no crop")
+    var full = bars[0]
+    full.fullRange = true
+    for i in 0..full.y.count {
+        if full.y[i] == 16 {
+            full.y[i] = 0
+        }
+    }
+    let cf = vfx.detectCrop(full)
+    t.check(cf.left == 16 && cf.top == 48, "full range bars")
+    var det = vfx.newCropDetector()
+    det.every = 1
+    det.push(black)
+    det.push(bars[0])
+    // A darker picture with a narrower picture area (bars would grow):
+    // the detector keeps the smaller bars.
+    var dark = bars[1]
+    for r in 48..80 {
+        for x in 0..256 {
+            dark.y[r * 256 + x] = 16
+        }
+    }
+    let dc = det.push(dark)
+    t.check(dc.top == 48 && dc.left == 16, "CropDetector keeps the smallest bars ({dc.top})")
+    // Into a View.
+    var v = render.View()
+    v.cropLeft = c.left
+    v.cropTop = c.top
+    v.cropRight = c.right
+    v.cropBottom = c.bottom
+    let (_, _, ww, wh) = render.viewWindow(bars[0], v)
+    t.check(ww == 224 && wh == 96, "the crop's window is the picture area")
+}
+
+fn sceneTests(_ t: bind Tally) {
+    let cuts = loadClip("cuts", 96, 64)
+    t.check(cuts.count == 30, "cuts clip loads ({cuts.count})")
+    if cuts.count < 30 {
+        return
+    }
+    var sd = vfx.newSceneDetector()
+    var line = ""
+    for i in 0..cuts.count {
+        let s = sd.push(cuts[i], time: Float(i) * 0.04)
+        line += " " + s.formatted(decimals: 2)
+    }
+    print("scene scores:{line}")
+    let found = sd.cuts(minGap: 0.2)
+    t.check(found.count == 2 && abs(found[0] - 0.4) < 0.001 && abs(found[1] - 0.8) < 0.001, "sceneCuts finds the two cuts ({found})")
+    let ch = vfx.sceneChapters(found, duration: 1.2)
+    t.check(ch.count == 3 && ch[1].start == found[0] && ch[2].end == 1.2 && ch[0].title == "Scene 1", "chapters from cuts")
+    // A pan (the same picture moving sideways) is not a cut.
+    var pan = vfx.newSceneDetector()
+    let base = cuts[0]
+    for i in 0..20 {
+        var q = base
+        for r in 0..64 {
+            for x in 0..96 {
+                q.y[r * 96 + x] = base.y[r * 96 + (x + 3 * i) % 96]
+            }
+        }
+        pan.push(q, time: Float(i) * 0.04)
+    }
+    t.check(pan.cuts(minGap: 0.2).isEmpty, "a pan is not a cut")
+    let (tw, th, _) = vfx.lumaThumb(cuts[0])
+    t.check(tw == 64 && th == 43, "luma thumbnail size ({tw}×{th})")
+}
+
+fn thumbTests(_ t: bind Tally, _ testsrc: [core.Picture]) {
+    let p = testsrc[0]
+    let th = vfx.thumbnail(p, width: 64)
+    t.check(th.count == 64 * 48 && vfx.thumbnailHeight(p, width: 64) == 48, "thumbnail size")
+    // Close to the renderer's full area average.
+    let ref = render.toRgba(p, width: 64, height: 48)
+    var sum = 0
+    for i in 0..min(th.count, ref.count) {
+        for c in 0..3 {
+            let d = ((th[i] >> (24 - 8 * c)) & 255) - ((ref[i] >> (24 - 8 * c)) & 255)
+            sum += d * d
+        }
+    }
+    let db = if sum == 0 { 99.0 } else { 10.0 * log10(255.0 * 255.0 * Float(3 * th.count) / Float(sum)) }
+    print("thumbnail 64×48 vs full area average: {f2(db)} dB")
+    t.check(db >= 28.0, "thumbnail is close to a full area average ({f2(db)} dB)")
+    var wide = p
+    wide.sarNum = 4
+    wide.sarDen = 3
+    t.check(vfx.thumbnailHeight(wide, width: 128) == 72, "thumbnail keeps the sample aspect ratio")
+    var flat = core.blankPicture(width: 200, height: 100)
+    flat.y = core.filled(200 * 100, 235)
+    t.check(vfx.thumbnail(flat, width: 50).all(where: { v in v == 0xffffffff }), "a white picture gives a white thumbnail")
+    var broken = p
+    broken.y = []
+    t.check(vfx.thumbnail(broken, width: 32).isEmpty, "a broken picture gives no thumbnail")
+}
+
+fn chainTests(_ t: bind Tally, _ testsrc: [core.Picture]) {
+    let inter = interlaceClip(testsrc)
+    var s = vfx.Settings()
+    s.doubleRate = true
+    s.denoise = 0.4
+    s.sharpen = 0.5
+    s.autoCrop = true
+    var chain = vfx.newChain(s)
+    var out: [vfx.Field] = []
+    for i in 0..inter.count {
+        out.appendAll(chain.process(inter[i], time: Float(i) * 0.04))
+    }
+    out.appendAll(chain.flush())
+    t.check(out.count == 2 * inter.count && abs(out[3].time - 0.06) < 0.0001, "chain: double rate deinterlace + denoise + sharpen")
+    // Settings off: pictures pass through untouched.
+    var plain = vfx.newChain(vfx.Settings(deinterlace: "off"))
+    let one = plain.process(inter[0], time: 0.0)
+    t.check(one.count == 1 && one[0].picture.y == inter[0].y, "chain: everything off passes pictures through")
+    // Settings and views survive JSON (the player saves them per file).
+    let back: vfx.Settings = fromJson(toJson(s)) ?? vfx.Settings()
+    t.check(back.doubleRate && back.denoise == 0.4 && back.deinterlace == "adaptive" && back.autoCrop, "Settings round-trip through JSON")
+    var v = render.View()
+    v.hue = 30.0
+    v.cropTop = 8
+    v.flipH = true
+    let vb: render.View = fromJson(toJson(v)) ?? render.View()
+    t.check(vb.hue == 30.0 && vb.cropTop == 8 && vb.flipH, "View round-trips through JSON")
+    let old: render.View = fromJson("\{\"zoom\": 2.0}") ?? render.View()
+    t.check(old.zoom == 2.0 && old.contrast == 1.0, "a View saved with fewer fields loads with defaults")
+    // Auto crop into a view.
+    let bars = loadClip("bars", 256, 192)
+    var cc = vfx.newChain(vfx.Settings(autoCrop: true))
+    cc.cropper.every = 1
+    cc.process(bars[0], time: 0.0)
+    let cv = cc.applyCrop(render.View())
+    t.check(cv.cropLeft == 16 && cv.cropTop == 48 && cv.cropBottom == 48, "chain auto crop goes into the view")
+}
+
+fn speedTests(_ t: bind Tally, _ testsrc: [core.Picture]) {
+    // 1080i: the clip's pictures woven and enlarged.
+    let inter = interlaceClip(testsrc)
+    var big: [core.Picture] = []
+    for i in 0..4 {
+        big.append(bigPicture(inter[i], 1920, 1080))
+    }
+    var best = 1e9
+    var bestBob = 1e9
+    var bestBlend = 1e9
+    var bestDouble = 1e9
+    var keep = 0
+    for _ in 0..3 {
+        var d = vfx.newDeinterlacer()
+        d.push(big[0], time: 0.0)
+        for i in 1..4 {
+            let t0 = now()
+            keep += d.push(big[i], time: Float(i) * 0.04).count
+            best = min(best, ms(t0))
+        }
+        var b = vfx.newDeinterlacer(mode: .bob)
+        var bl = vfx.newDeinterlacer(mode: .blend)
+        var dd = vfx.newDeinterlacer(doubleRate: true)
+        dd.push(big[0], time: 0.0)
+        for i in 1..4 {
+            var t0 = now()
+            keep += b.push(big[i], time: 0.0).count
+            bestBob = min(bestBob, ms(t0))
+            t0 = now()
+            keep += bl.push(big[i], time: 0.0).count
+            bestBlend = min(bestBlend, ms(t0))
+            t0 = now()
+            keep += dd.push(big[i], time: Float(i) * 0.04).count
+            bestDouble = min(bestDouble, ms(t0) / 2.0)
+        }
+    }
+    print("time deinterlace 1080i adaptive: {f2(best)} ms per picture; double rate: {f2(bestDouble)} ms per field; bob: {f2(bestBob)} ms; blend: {f2(bestBlend)} ms")
+    t.check(keep > 0, "1080i deinterlaces")
+    // Progressive 1080p from the clip.
+    let hd = bigPicture(testsrc[4], 1920, 1080)
+    let hd2 = bigPicture(testsrc[5], 1920, 1080)
+    var sh = vfx.newSharpener()
+    var dn = vfx.newDenoiser()
+    dn.apply(hd)
+    var bs = 1e9
+    var bd = 1e9
+    var bt = 1e9
+    var bsc = 1e9
+    var bc = 1e9
+    var sd = vfx.newSceneDetector()
+    sd.push(hd, time: 0.0)
+    var size = 0
+    for i in 0..6 {
+        var t0 = now()
+        size += sh.apply(hd).y.count
+        bs = min(bs, ms(t0))
+        t0 = now()
+        size += dn.apply(if i % 2 == 0 { hd2 } else { hd }).y.count
+        bd = min(bd, ms(t0))
+        t0 = now()
+        size += vfx.thumbnail(hd, width: 160).count
+        bt = min(bt, ms(t0))
+        t0 = now()
+        sd.push(if i % 2 == 0 { hd2 } else { hd }, time: Float(i))
+        bsc = min(bsc, ms(t0))
+        t0 = now()
+        size += vfx.detectCrop(hd).top
+        bc = min(bc, ms(t0))
+    }
+    print("time sharpen 1080p: {f2(bs)} ms; denoise 1080p: {f2(bd)} ms")
+    print("time thumbnail 1080p → 160×90: {f2(bt)} ms; scene score 1080p: {f2(bsc)} ms; detectCrop 1080p: {f2(bc)} ms")
+    t.check(size > 0, "1080p filters run")
+}

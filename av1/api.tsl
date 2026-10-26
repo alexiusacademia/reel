@@ -1,0 +1,265 @@
+// The public face of the AV1 decoder: Decoder (decode, flush, reset) that
+// chains the two stages, newPipeline for running them side by side in two
+// background jobs (a Parser and a Reconstructor exchanging ParsedFrames),
+// and streamInfo for the media info window.
+//
+// Packets are temporal units of low-overhead OBUs (obu_has_size_field), as
+// MP4, Matroska/WebM and IVF store them; `track.extra` is the av1C box
+// body (its configOBUs hold the sequence header) or empty.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../core"
+
+// Both stages one after the other.
+public struct Decoder {
+    // When true, frames no later frame refers to (refresh_frame_flags 0)
+    // are parsed but not reconstructed.
+    skipNonReference: Bool = false
+    warnings: [String] = []
+    parser: Parser = Parser()
+    reconstructor: Reconstructor = Reconstructor()
+
+    // Decodes one temporal unit; returns the picture it shows (none for a
+    // unit of hidden frames), in display order.
+    fn decode(_ packet: Data, pts: Int, dts: Int, key: Bool) -> [core.Picture] {
+        parser.skipNonReference = skipNonReference
+        let parsed = parser.parse(packet, pts: pts, dts: dts, key: key)
+        run(parsed)
+    }
+
+    // End of stream: AV1 has no reordering in the decoder, nothing is held.
+    fn flush() -> [core.Picture] {
+        run(parser.flush())
+    }
+
+    // After a seek: drop references, wait for a keyframe.
+    fn reset() {
+        parser.reset()
+        reconstructor.reset()
+    }
+
+    fn run(_ parsed: [ParsedFrame]) -> [core.Picture] {
+        var out: [core.Picture] = []
+        for p in parsed {
+            out += reconstructor.reconstruct(p)
+        }
+        out = av1LastOnly(out)
+        for list in [parser.warnings, reconstructor.warnings] {
+            for w in list {
+                if warnings.count < 200 {
+                    warnings.append(w)
+                }
+            }
+        }
+        parser.warnings = []
+        reconstructor.warnings = []
+        out
+    }
+}
+
+// A decoder for an "av1" track.
+public fn newDecoder(_ track: core.Track) -> Result<Decoder> {
+    let p = try newPipeline(track)
+    Result.ok(value: Decoder(parser: p.parser, reconstructor: p.reconstructor))
+}
+
+// Both stages for one "av1" track.
+public struct Pipeline {
+    parser: Parser = Parser()
+    reconstructor: Reconstructor = Reconstructor()
+}
+
+public fn newPipeline(_ track: core.Track) -> Result<Pipeline> {
+    if track.codec != "av1" {
+        return .failure(error: Error("av1: not an AV1 track ({track.codec})"))
+    }
+    var p = Parser()
+    p.setup()
+    p.annexB = track.tag.lowercase().contains("annexb")
+    p.configure(track.extra)
+    var r = Reconstructor()
+    r.setup()
+    if track.sarNum > 0 && track.sarDen > 0 {
+        r.sarNum = track.sarNum
+        r.sarDen = track.sarDen
+    }
+    r.trackMatrix = track.matrix
+    Result.ok(value: Pipeline(parser: p, reconstructor: r))
+}
+
+// For background jobs, which call top-level functions: one parse step and
+// one reconstruct step, each returning the stage's new state.
+public struct ParseStep {
+    parser: Parser = Parser()
+    frames: [ParsedFrame] = []
+}
+
+public fn parseStep(_ parser: Parser, _ packet: Data, pts: Int, dts: Int, key: Bool) -> ParseStep {
+    var p = parser
+    let f = p.parse(packet, pts: pts, dts: dts, key: key)
+    ParseStep(parser: p, frames: f)
+}
+
+public struct ReconstructStep {
+    reconstructor: Reconstructor = Reconstructor()
+    pictures: [core.Picture] = []
+    // With reconstructor.deferGrain: the film grain of each picture.
+    grains: [FilmGrain] = []
+}
+
+public fn reconstructStep(_ reconstructor: Reconstructor, _ frames: [ParsedFrame]) -> ReconstructStep {
+    var r = reconstructor
+    var out: [core.Picture] = []
+    var grains: [FilmGrain] = []
+    for f in frames {
+        out += r.reconstruct(f)
+        grains += r.grains
+    }
+    if out.count > 1 {
+        out = av1LastOnly(out)
+        if grains.count > 1 {
+            grains = [grains[grains.count - 1]]
+        }
+    }
+    ReconstructStep(reconstructor: r, pictures: out, grains: grains)
+}
+
+// Adds film grain (7.18.3) to a picture the reconstructor gave out with
+// deferGrain on; returns the new picture (the input is not changed).
+public fn applyFilmGrain(_ p: core.Picture, _ g: FilmGrain) -> core.Picture {
+    if !g.apply || !g.params.applyGrain {
+        return p
+    }
+    var e = Av1FilmGrain()
+    e.setup()
+    e.y = p.y
+    e.u = p.u
+    e.v = p.v
+    let mono = p.chroma == .gray
+    let subX = if p.chroma == .yuv444 { 0 } else { 1 }
+    let subY = if p.chroma == .yuv420 || p.chroma == .gray { 1 } else { 0 }
+    e.apply(g.params, p.width, p.height, p.yStride, p.cStride, subX, subY, p.depth, mono, g.matrixCoefficients)
+    var q = p
+    q.y = e.y
+    q.u = e.u
+    q.v = e.v
+    q
+}
+
+// A temporal unit shows one picture: with spatial layers, the last (the
+// highest layer), as libaom and dav1d output by default.
+fn av1LastOnly(_ pics: [core.Picture]) -> [core.Picture] {
+    if pics.count <= 1 {
+        return pics
+    }
+    [pics[pics.count - 1]]
+}
+
+// "AV1 Main, 1920×1080, 10-bit" from the track: its size, and the profile,
+// bit depth and chroma format from the av1C box (or its sequence header).
+public fn streamInfo(_ track: core.Track) -> String {
+    var info = "AV1"
+    let x = track.extra
+    var profile = -1
+    var depth = 0
+    var chroma = ""
+    var mono = false
+    if x.count >= 4 && (x[0] & 0x80) != 0 {
+        // av1C: marker/version, seq_profile(3) seq_level_idx_0(5),
+        // seq_tier_0 high_bitdepth twelve_bit monochrome
+        // chroma_subsampling_x chroma_subsampling_y chroma_sample_position(2).
+        profile = x[1] >> 5
+        let b = x[2]
+        let high = (b >> 6) & 1
+        let twelve = (b >> 5) & 1
+        mono = ((b >> 4) & 1) == 1
+        let sx = (b >> 3) & 1
+        let sy = (b >> 2) & 1
+        depth = if twelve == 1 { 12 } else if high == 1 { 10 } else { 8 }
+        if mono {
+            chroma = "monochrome"
+        } else if sx == 1 && sy == 1 {
+            chroma = "4:2:0"
+        } else if sx == 1 {
+            chroma = "4:2:2"
+        } else {
+            chroma = "4:4:4"
+        }
+    }
+    if profile == 0 {
+        info += " Main"
+    } else if profile == 1 {
+        info += " High"
+    } else if profile == 2 {
+        info += " Professional"
+    }
+    if track.width > 0 && track.height > 0 {
+        info += ", {track.width}×{track.height}"
+    }
+    if depth > 0 {
+        info += ", {depth}-bit"
+    }
+    if !chroma.isEmpty && chroma != "4:2:0" {
+        info += " {chroma}"
+    }
+    info
+}
+
+// The profile, size and bit depth from a packet's sequence header OBU
+// (5.5), for streamInfo when the container says nothing.
+public fn frameInfo(_ packet: Data) -> String {
+    let n = packet.count
+    var p = 0
+    while p < n {
+        let h = packet[p]
+        let type = (h >> 3) & 15
+        let ext = (h >> 2) & 1
+        let hasSize = (h >> 1) & 1
+        var q = p + 1 + ext
+        var size = n - q
+        if hasSize == 1 {
+            var v = 0
+            var i = 0
+            while i < 8 && q < n {
+                let b = packet[q]
+                q += 1
+                v |= (b & 0x7f) << (i * 7)
+                i += 1
+                if (b & 0x80) == 0 {
+                    break
+                }
+            }
+            size = v
+        }
+        if q + size > n {
+            break
+        }
+        if type == 1 {
+            let s = av1ParseSequenceHeader(packet, q, q + size)
+            if !s.ok {
+                break
+            }
+            var info = "AV1"
+            if s.profile == 0 {
+                info += " Main"
+            } else if s.profile == 1 {
+                info += " High"
+            } else if s.profile == 2 {
+                info += " Professional"
+            }
+            info += ", {s.maxFrameWidth}×{s.maxFrameHeight}, {s.bitDepth}-bit"
+            if s.monochrome {
+                info += " monochrome"
+            } else if s.subX == 1 && s.subY == 0 {
+                info += " 4:2:2"
+            } else if s.subX == 0 {
+                info += " 4:4:4"
+            }
+            return info
+        }
+        p = q + size
+    }
+    "AV1"
+}

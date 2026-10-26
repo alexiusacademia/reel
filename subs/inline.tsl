@@ -1,0 +1,739 @@
+// Inline formatting inside one subtitle event: the ASS/SSA override tags
+// ("{\b1}", "{\pos(10,20)}", …) and the HTML-like tags of SRT and WebVTT
+// ("<i>", "<font color=…>", "<c.yellow>", …), turned into Spans and the
+// cue-wide settings they change (position, alignment, fades).
+//
+// ASS override tags follow the "ASS tags" list of the Aegisub manual
+// (which documents VSFilter/libass behaviour); SRT tags are what VLC and
+// ffmpeg accept; WebVTT tags are W3C WebVTT §4.2 (cue text).
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+// A V4+/V4 style (ASS "Style:" line). Sizes, margins and outline widths are
+// in script pixels (PlayResX/PlayResY).
+public struct AssStyle {
+    name: String = "Default"
+    font: String = "Arial"
+    size: Float = 16.0
+    primary: Int = 0xFFFFFFFF
+    secondary: Int = 0xFF0000FF
+    outlineColor: Int = 0x000000FF
+    back: Int = 0x00000080
+    bold: Bool = false
+    italic: Bool = false
+    underline: Bool = false
+    strike: Bool = false
+    scaleX: Float = 100.0
+    scaleY: Float = 100.0
+    spacing: Float = 0.0
+    angle: Float = 0.0
+    borderStyle: Int = 1
+    outline: Float = 1.0
+    shadow: Float = 0.0
+    align: Int = 2
+    marginL: Float = 10.0
+    marginR: Float = 10.0
+    marginV: Float = 10.0
+}
+
+// The span a style starts its text with.
+fn assSpanOf(_ st: AssStyle, resY: Float) -> Span {
+    var s = Span(text: "")
+    s.bold = st.bold
+    s.italic = st.italic
+    s.underline = st.underline
+    s.strike = st.strike
+    s.color = st.primary
+    s.outline = st.outlineColor
+    s.shadow = st.back
+    s.font = st.font
+    s.size = 1.0
+    s.border = st.outline / resY
+    s.shadowDepth = st.shadow / resY
+    s.scaleX = st.scaleX / 100.0
+    s.scaleY = st.scaleY / 100.0
+    s.spacing = st.spacing / resY
+    s
+}
+
+// SSA (v4) alignment: 1–3 bottom, +4 top, +8 middle, to numpad.
+fn ssaAlign(_ a: Int) -> Int {
+    if a >= 9 && a <= 11 {
+        return a - 5
+    }
+    if a >= 5 && a <= 7 {
+        return a + 2
+    }
+    if a >= 1 && a <= 3 {
+        return a
+    }
+    2
+}
+
+// An ASS colour: "&HAABBGGRR", "&HBBGGRR&", "&H0", or a decimal number
+// (SSA files), as the raw number AABBGGRR; −1 if it isn't one.
+fn assColorValue(_ text: String) -> Int {
+    var t = text.trim()
+    while t.hasSuffix("&") {
+        t = t.substring(from: 0, to: t.count - 1)
+    }
+    if t.hasPrefix("&H") || t.hasPrefix("&h") {
+        return subsHex(t.substring(from: 2, to: t.count))
+    }
+    if t.hasPrefix("H") || t.hasPrefix("h") || t.hasPrefix("0x") || t.hasPrefix("0X") {
+        let k = if t.hasPrefix("0") { 2 } else { 1 }
+        return subsHex(t.substring(from: k, to: t.count))
+    }
+    if let v = Int(t) {
+        // Negative decimals are 32-bit two's complement.
+        if v < 0 {
+            return v & 0xFFFFFFFF
+        }
+        return v
+    }
+    let v = subsHex(t)
+    v
+}
+
+// The raw ASS colour AABBGGRR as packed rgba (ASS alpha 0 is opaque).
+fn assColor(_ v: Int) -> Int {
+    let r = v & 0xFF
+    let g = v >> 8 & 0xFF
+    let b = v >> 16 & 0xFF
+    let a = 255 - (v >> 24 & 0xFF)
+    rgba(r, g, b, a)
+}
+
+// One alpha argument ("&H80&") as rgba opacity (0…255).
+fn assAlpha(_ text: String) -> Int {
+    let v = assColorValue(text)
+    if v < 0 {
+        return 255
+    }
+    255 - (v & 0xFF)
+}
+
+fn subsWithRgb(_ packed: Int, _ rgb: Int) -> Int {
+    (rgb & 0xFFFFFF00) | (packed & 0xFF)
+}
+
+fn subsWithAlpha(_ packed: Int, _ a: Int) -> Int {
+    (packed & 0xFFFFFF00) | (a & 0xFF)
+}
+
+fn subsIsLetter(_ c: String) -> Bool {
+    (c >= "a" && c <= "z") || (c >= "A" && c <= "Z")
+}
+
+// The numbers in a tag's arguments: "(10,20)" or "120" or "-3.5".
+fn subsNumbers(_ arg: String) -> [Float] {
+    var t = arg.trim()
+    if t.hasPrefix("(") {
+        t = t.substring(from: 1, to: t.count)
+    }
+    if t.hasSuffix(")") {
+        t = t.substring(from: 0, to: t.count - 1)
+    }
+    var out: [Float] = []
+    for p in t.split(",") {
+        if let v = Float(p.trim()) {
+            out.append(v)
+        }
+    }
+    out
+}
+
+// Builds one cue's spans while its text is read.
+struct SubsBuilder {
+    cue: Cue
+    // The style new text is written in.
+    cur: Span
+    // What \r (and closing tags) go back to.
+    base: Span
+    styles: [AssStyle] = []
+    resX: Float = 384.0
+    resY: Float = 288.0
+    // The event's style size, for \fs (span.size is relative to it).
+    styleSize: Float = 16.0
+    pending: String = ""
+    // ASS drawing mode (\p1…): text is a drawing, which we skip.
+    drawing: Int = 0
+    posSet: Bool = false
+    alignSet: Bool = false
+    fadeSet: Bool = false
+    // Open HTML-like tags: their names and the span to go back to.
+    tagNames: [String] = []
+    tagSpans: [Span] = []
+
+    fn flush() {
+        if !pending.isEmpty {
+            var s = cur
+            s.text = pending
+            cue.spans.append(s)
+            pending = ""
+        }
+    }
+
+    fn addText(_ t: String) {
+        if drawing == 0 {
+            pending += t
+        }
+    }
+
+    fn lineBreak() {
+        flush()
+        var s = cur
+        s.text = "\n"
+        cue.spans.append(s)
+    }
+
+    fn finish() -> Cue {
+        flush()
+        // Drop line breaks at the end (SRT files often have them).
+        while !cue.spans.isEmpty && cue.spans[cue.spans.count - 1].text == "\n" {
+            cue.spans.removeLast()
+        }
+        cue
+    }
+
+    // ---- ASS override tags (the text of one "{…}" block) ----
+
+    fn assTags(_ block: String) {
+        let cs = block.characters
+        let n = cs.count
+        var i = 0
+        while i < n {
+            if cs[i] != "\\" {
+                i += 1
+                continue
+            }
+            i += 1
+            var name = ""
+            if i + 1 < n && subsIsDigit(cs[i]) && (cs[i + 1] == "c" || cs[i + 1] == "a") {
+                name = cs[i] + cs[i + 1]
+                i += 2
+            } else {
+                while i < n && subsIsLetter(cs[i]) {
+                    name += cs[i]
+                    i += 1
+                }
+            }
+            var arg = ""
+            if i < n && cs[i] == "(" {
+                var depth = 0
+                while i < n {
+                    let c = cs[i]
+                    arg += c
+                    i += 1
+                    if c == "(" {
+                        depth += 1
+                    } else if c == ")" {
+                        depth -= 1
+                        if depth == 0 {
+                            break
+                        }
+                    }
+                }
+            } else {
+                while i < n && cs[i] != "\\" {
+                    arg += cs[i]
+                    i += 1
+                }
+            }
+            assTag(name, arg)
+        }
+    }
+
+    fn assTag(_ name: String, _ arg: String) {
+        let a = arg.trim()
+        let nums = subsNumbers(a)
+        let num = if nums.isEmpty { -1.0e18 } else { nums[0] }
+        let has = !nums.isEmpty
+        if name.hasPrefix("fn") && name != "fn" || name == "fn" {
+            flush()
+            let f = (name.substring(from: 2, to: name.count) + arg).trim()
+            cur.font = if f.isEmpty || f == "0" { base.font } else { f }
+            return
+        }
+        if name.hasPrefix("r") {
+            flush()
+            let sname = (name.substring(from: 1, to: name.count) + arg).trim()
+            cur = base
+            if !sname.isEmpty {
+                for st in styles {
+                    if st.name == sname {
+                        cur = assSpanOf(st, resY: resY)
+                        cur.size = st.size / styleSize
+                    }
+                }
+            }
+            return
+        }
+        match name {
+            "b" -> {
+                flush()
+                cur.bold = if !has { base.bold } else { num == 1.0 || num >= 600.0 }
+            }
+            "i" -> {
+                flush()
+                cur.italic = if !has { base.italic } else { num == 1.0 }
+            }
+            "u" -> {
+                flush()
+                cur.underline = if !has { base.underline } else { num == 1.0 }
+            }
+            "s" -> {
+                flush()
+                cur.strike = if !has { base.strike } else { num == 1.0 }
+            }
+            "c", "1c" -> {
+                flush()
+                let v = assColorValue(a)
+                cur.color = if v < 0 { base.color } else { subsWithRgb(cur.color, assColor(v)) }
+            }
+            "3c" -> {
+                flush()
+                let v = assColorValue(a)
+                cur.outline = if v < 0 { base.outline } else { subsWithRgb(cur.outline, assColor(v)) }
+            }
+            "4c" -> {
+                flush()
+                let v = assColorValue(a)
+                cur.shadow = if v < 0 { base.shadow } else { subsWithRgb(cur.shadow, assColor(v)) }
+            }
+            "alpha" -> {
+                flush()
+                if a.isEmpty {
+                    cur.color = subsWithAlpha(cur.color, base.color & 0xFF)
+                    cur.outline = subsWithAlpha(cur.outline, base.outline & 0xFF)
+                    cur.shadow = subsWithAlpha(cur.shadow, base.shadow & 0xFF)
+                } else {
+                    let al = assAlpha(a)
+                    cur.color = subsWithAlpha(cur.color, al)
+                    cur.outline = subsWithAlpha(cur.outline, al)
+                    cur.shadow = subsWithAlpha(cur.shadow, al)
+                }
+            }
+            "1a" -> {
+                flush()
+                cur.color = subsWithAlpha(cur.color, if a.isEmpty { base.color & 0xFF } else { assAlpha(a) })
+            }
+            "3a" -> {
+                flush()
+                cur.outline = subsWithAlpha(cur.outline, if a.isEmpty { base.outline & 0xFF } else { assAlpha(a) })
+            }
+            "4a" -> {
+                flush()
+                cur.shadow = subsWithAlpha(cur.shadow, if a.isEmpty { base.shadow & 0xFF } else { assAlpha(a) })
+            }
+            "fs" -> {
+                flush()
+                if !has || num <= 0.0 && !(a.hasPrefix("-")) {
+                    cur.size = base.size
+                } else if a.hasPrefix("+") || a.hasPrefix("-") {
+                    cur.size = max(0.1, cur.size + num / styleSize)
+                } else {
+                    cur.size = num / styleSize
+                }
+            }
+            "fscx" -> {
+                flush()
+                cur.scaleX = if has { num / 100.0 } else { base.scaleX }
+            }
+            "fscy" -> {
+                flush()
+                cur.scaleY = if has { num / 100.0 } else { base.scaleY }
+            }
+            "fsp" -> {
+                flush()
+                cur.spacing = if has { num / resY } else { base.spacing }
+            }
+            "bord" -> {
+                flush()
+                cur.border = if has { max(0.0, num) / resY } else { base.border }
+            }
+            "shad" -> {
+                flush()
+                cur.shadowDepth = if has { max(0.0, num) / resY } else { base.shadowDepth }
+            }
+            "fr", "frz" -> {
+                if has {
+                    cue.angle = num
+                }
+            }
+            "pos" -> {
+                if nums.count >= 2 && !posSet {
+                    cue.x = nums[0] / resX
+                    cue.y = nums[1] / resY
+                    posSet = true
+                }
+            }
+            "move" -> {
+                if nums.count >= 4 && !posSet {
+                    cue.x = nums[0] / resX
+                    cue.y = nums[1] / resY
+                    cue.moveX = nums[2] / resX
+                    cue.moveY = nums[3] / resY
+                    if nums.count >= 6 {
+                        cue.moveT1 = nums[4] / 1000.0
+                        cue.moveT2 = nums[5] / 1000.0
+                    }
+                    posSet = true
+                }
+            }
+            "an" -> {
+                if has && num >= 1.0 && num <= 9.0 && !alignSet {
+                    cue.align = Int(num)
+                    alignSet = true
+                }
+            }
+            "a" -> {
+                if has && !alignSet {
+                    cue.align = ssaAlign(Int(num))
+                    alignSet = true
+                }
+            }
+            "fad" -> {
+                if nums.count >= 2 && !fadeSet {
+                    cue.fadeIn = nums[0] / 1000.0
+                    cue.fadeOut = nums[1] / 1000.0
+                    fadeSet = true
+                }
+            }
+            "fade" -> {
+                // \fade(a1,a2,a3,t1,t2,t3,t4): opacity a1 → a2 from t1 to
+                // t2, a2 → a3 from t3 to t4. Kept as a fade in and out.
+                if nums.count >= 7 && !fadeSet {
+                    if nums[0] > nums[1] {
+                        cue.fadeIn = (nums[4] - nums[3]) / 1000.0
+                    }
+                    if nums[2] > nums[1] {
+                        cue.fadeOut = (nums[6] - nums[5]) / 1000.0
+                    }
+                    fadeSet = true
+                }
+            }
+            "q" -> {
+                if has {
+                    cue.wrapStyle = Int(num)
+                }
+            }
+            "p" -> {
+                flush()
+                drawing = if has { Int(num) } else { 0 }
+            }
+            _ -> {}
+        }
+    }
+
+    // ---- HTML-like tags (SRT, WebVTT) ----
+
+    fn openTag(_ name: String) {
+        flush()
+        tagNames.append(name)
+        tagSpans.append(cur)
+    }
+
+    fn closeTag(_ name: String) {
+        flush()
+        var i = tagNames.count - 1
+        while i >= 0 {
+            if tagNames[i] == name {
+                cur = tagSpans[i]
+                while tagNames.count > i {
+                    tagNames.removeLast()
+                    tagSpans.removeLast()
+                }
+                return
+            }
+            i -= 1
+        }
+        // A closing tag that was never opened: SRT files do this with
+        // </b> etc.; just turn the attribute off.
+        match name {
+            "b" -> { cur.bold = base.bold }
+            "i" -> { cur.italic = base.italic }
+            "u" -> { cur.underline = base.underline }
+            "s" -> { cur.strike = base.strike }
+            "font" -> {
+                cur.color = base.color
+                cur.font = base.font
+                cur.size = base.size
+            }
+            _ -> {}
+        }
+    }
+
+    // One "<…>" tag's inside. Returns false if it isn't a tag we know (the
+    // caller keeps it as text then).
+    fn htmlTag(_ inside: String, vtt: Bool) -> Bool {
+        let t = inside.trim()
+        if t.isEmpty {
+            return false
+        }
+        if t.hasPrefix("/") {
+            let name = subsTagName(t.substring(from: 1, to: t.count))
+            if name.isEmpty {
+                return false
+            }
+            closeTag(name)
+            return true
+        }
+        // WebVTT timestamp tags (<00:01.500>) for karaoke: ignored.
+        if subsIsDigit(t.substring(from: 0, to: 1)) {
+            return vtt
+        }
+        let full = subsTagName(t)
+        // WebVTT: "c.yellow.bg_black", "v.loud Esme".
+        let dot = full.split(".")
+        let name = dot[0].lowercase()
+        match name {
+            "b", "i", "u", "s" -> {
+                openTag(name)
+                if name == "b" { cur.bold = true }
+                if name == "i" { cur.italic = true }
+                if name == "u" { cur.underline = true }
+                if name == "s" { cur.strike = true }
+            }
+            "font" -> {
+                openTag("font")
+                let attrs = subsAttributes(t)
+                for (k, v) in attrs {
+                    if k == "color" {
+                        let c = subsCssColor(v)
+                        if c >= 0 {
+                            cur.color = c
+                        }
+                    } else if k == "face" {
+                        cur.font = v
+                    } else if k == "size" {
+                        if let px = Float(v) {
+                            if px > 0.0 {
+                                cur.size = px / 16.0
+                            }
+                        }
+                    }
+                }
+            }
+            "c" -> {
+                openTag("c")
+                for cls in dot.dropFirst() {
+                    let c = subsCssColor(cls)
+                    if c >= 0 && !cls.hasPrefix("bg_") {
+                        cur.color = c
+                    }
+                }
+            }
+            "v", "lang", "ruby", "span" -> { openTag(name) }
+            "rt" -> {
+                // Ruby text: shown smaller, after the base text.
+                openTag("rt")
+                cur.size = cur.size * 0.5
+            }
+            "br" -> { lineBreak() }
+            _ -> {
+                // Unknown tags that look like tags are hidden, as VLC and
+                // ffmpeg do ("<invalid_tag>"); "2<3,5>1" stays text.
+                return subsIsLetter(name.substring(from: 0, to: 1))
+            }
+        }
+        true
+    }
+}
+
+// The name at the start of a tag: letters, digits and dots, up to a
+// space, '=' or the end.
+fn subsTagName(_ t: String) -> String {
+    var name = ""
+    for c in t.characters {
+        if c == " " || c == "\t" || c == "=" || c == "/" {
+            break
+        }
+        name += c
+    }
+    name.lowercase()
+}
+
+// The attributes of an HTML tag: name="value", name='value' or name=value.
+fn subsAttributes(_ tag: String) -> [(String, String)] {
+    var out: [(String, String)] = []
+    let cs = tag.characters
+    let n = cs.count
+    var i = 0
+    // Skip the tag name.
+    while i < n && cs[i] != " " && cs[i] != "\t" {
+        i += 1
+    }
+    while i < n {
+        while i < n && (cs[i] == " " || cs[i] == "\t") {
+            i += 1
+        }
+        var key = ""
+        while i < n && cs[i] != "=" && cs[i] != " " {
+            key += cs[i]
+            i += 1
+        }
+        if i < n && cs[i] == "=" {
+            i += 1
+            var value = ""
+            if i < n && (cs[i] == "\"" || cs[i] == "'") {
+                let q = cs[i]
+                i += 1
+                while i < n && cs[i] != q {
+                    value += cs[i]
+                    i += 1
+                }
+                i += 1
+            } else {
+                while i < n && cs[i] != " " {
+                    value += cs[i]
+                    i += 1
+                }
+            }
+            out.append((key.lowercase(), value))
+        } else if key.isEmpty {
+            i += 1
+        }
+    }
+    out
+}
+
+// The spans of SRT or WebVTT cue text (and its {\an8}-style ASS tags,
+// which many SRT files carry).
+fn subsHtmlText(_ b: SubsBuilder, _ text: String, vtt: Bool) -> SubsBuilder {
+    var bl = b
+    let cs = text.characters
+    let n = cs.count
+    var i = 0
+    while i < n {
+        let c = cs[i]
+        if c == "\n" {
+            bl.lineBreak()
+            i += 1
+        } else if c == "<" {
+            var j = i + 1
+            var inside = ""
+            while j < n && cs[j] != ">" && cs[j] != "<" && cs[j] != "\n" {
+                inside += cs[j]
+                j += 1
+            }
+            if j < n && cs[j] == ">" && bl.htmlTag(inside, vtt: vtt) {
+                i = j + 1
+            } else {
+                bl.addText("<")
+                i += 1
+            }
+        } else if c == "\{" && !vtt {
+            var j = i + 1
+            var inside = ""
+            while j < n && cs[j] != "}" {
+                inside += cs[j]
+                j += 1
+            }
+            if j < n {
+                if inside.hasPrefix("\\") {
+                    bl.assTags(inside)
+                    i = j + 1
+                    continue
+                }
+                // MicroDVD-style {b} {/i} found in some SRT files.
+                let t = inside.lowercase()
+                if t == "b" || t == "i" || t == "u" || t == "s" {
+                    bl.htmlTag(t, vtt: false)
+                    i = j + 1
+                    continue
+                }
+                if t == "/b" || t == "/i" || t == "/u" || t == "/s" {
+                    bl.htmlTag(t, vtt: false)
+                    i = j + 1
+                    continue
+                }
+                // MicroDVD control codes ({Y:i}, {C:$0000ff}): hidden.
+                if inside.count >= 2 && subsIsLetter(inside.substring(from: 0, to: 1)) && inside.substring(from: 1, to: 2) == ":" {
+                    i = j + 1
+                    continue
+                }
+            }
+            bl.addText("\{")
+            i += 1
+        } else if c == "&" {
+            var j = i + 1
+            var name = ""
+            while j < n && j - i < 12 && cs[j] != ";" && cs[j] != " " && cs[j] != "&" {
+                name += cs[j]
+                j += 1
+            }
+            if j < n && cs[j] == ";" {
+                if let e = subsEntity(name) {
+                    bl.addText(e)
+                    i = j + 1
+                    continue
+                }
+            }
+            bl.addText("&")
+            i += 1
+        } else if c == "\\" && !vtt && i + 1 < n && (cs[i + 1] == "N" || cs[i + 1] == "n") {
+            bl.lineBreak()
+            i += 2
+        } else if c == "\\" && !vtt && i + 1 < n && cs[i + 1] == "h" {
+            bl.addText(charOf(0xA0))
+            i += 2
+        } else {
+            bl.addText(c)
+            i += 1
+        }
+    }
+    bl
+}
+
+// The spans of an ASS event's Text field.
+fn subsAssText(_ b: SubsBuilder, _ text: String) -> SubsBuilder {
+    var bl = b
+    let cs = text.characters
+    let n = cs.count
+    var i = 0
+    while i < n {
+        let c = cs[i]
+        if c == "\{" {
+            var j = i + 1
+            var inside = ""
+            while j < n && cs[j] != "}" {
+                inside += cs[j]
+                j += 1
+            }
+            if j < n {
+                // A block without tags is a comment.
+                bl.assTags(inside)
+                i = j + 1
+            } else {
+                bl.addText(c)
+                i += 1
+            }
+        } else if c == "\\" && i + 1 < n {
+            let d = cs[i + 1]
+            if d == "N" {
+                bl.lineBreak()
+                i += 2
+            } else if d == "n" {
+                // A soft break: a real break only with WrapStyle 2.
+                if bl.cue.wrapStyle == 2 {
+                    bl.lineBreak()
+                } else {
+                    bl.addText(" ")
+                }
+                i += 2
+            } else if d == "h" {
+                bl.addText(charOf(0xA0))
+                i += 2
+            } else {
+                bl.addText(c)
+                i += 1
+            }
+        } else {
+            bl.addText(c)
+            i += 1
+        }
+    }
+    bl
+}

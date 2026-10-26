@@ -1,0 +1,155 @@
+// HEVC NAL units (ITU-T H.265 7.3.1): finding them in a packet (length
+// prefixed as in MP4/MKV, or Annex B start codes), NAL unit types, and
+// turning a NAL unit's payload into its RBSP by removing emulation
+// prevention bytes (7.4.2), remembering where they were so slice entry
+// points (which count payload bytes) can be mapped to RBSP positions.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+// NAL unit types (Table 7-1).
+let nalTrailN = 0
+let nalRadlN = 6
+let nalRaslN = 8
+let nalRaslR = 9
+let nalBlaWLp = 16
+let nalBlaNLp = 18
+let nalIdrWRadl = 19
+let nalIdrNLp = 20
+let nalCra = 21
+let nalVps = 32
+let nalSps = 33
+let nalPps = 34
+let nalAud = 35
+let nalEos = 36
+let nalEob = 37
+
+// Whether the packet bytes look like Annex B (a 00 00 01 or 00 00 00 01
+// start code at the beginning).
+fn hevcLooksAnnexB(_ d: Data) -> Bool {
+    if d.count >= 3 && d[0] == 0 && d[1] == 0 && d[2] == 1 {
+        return true
+    }
+    d.count >= 4 && d[0] == 0 && d[1] == 0 && d[2] == 0 && d[3] == 1
+}
+
+// Start and end offsets (pairs) of the NAL units in d: length prefixed
+// with lengthSize bytes, or Annex B when lengthSize is 0.
+fn hevcSplitNals(_ d: Data, _ lengthSize: Int) -> [Int] {
+    var out: [Int] = []
+    let n = d.count
+    if lengthSize > 0 {
+        var p = 0
+        while p + lengthSize <= n {
+            var len = 0
+            for i in 0..lengthSize {
+                len = (len << 8) | d[p + i]
+            }
+            p += lengthSize
+            if len <= 0 {
+                continue
+            }
+            let e = min(n, p + len)
+            out.append(p)
+            out.append(e)
+            p = e
+        }
+        return out
+    }
+    // Annex B: NAL units start after 00 00 01; trailing zero bytes before
+    // the next start code belong to no NAL unit.
+    var i = 0
+    var start = -1
+    while i + 2 < n {
+        if d[i + 2] > 1 {
+            i += 3
+        } else if d[i] == 0 && d[i + 1] == 0 && d[i + 2] == 1 {
+            if start >= 0 {
+                var e = i
+                while e > start && d[e - 1] == 0 {
+                    e -= 1
+                }
+                out.append(start)
+                out.append(e)
+            }
+            start = i + 3
+            i += 3
+        } else {
+            i += 1
+        }
+    }
+    if start >= 0 && start < n {
+        out.append(start)
+        out.append(n)
+    }
+    out
+}
+
+// The RBSP of d[from..<to] and the payload offsets (relative to `from`) of
+// the bytes removed as emulation prevention.
+struct HevcRbsp {
+    data: Data = Data()
+    removed: [Int] = []
+
+    // The RBSP position of a payload byte offset (relative to `from`).
+    fn rbspOffset(_ payload: Int) -> Int {
+        var k = 0
+        while k < removed.count && removed[k] < payload {
+            k += 1
+        }
+        payload - k
+    }
+}
+
+fn hevcUnescape(_ d: Data, from: Int, to: Int) -> HevcRbsp {
+    var out = HevcRbsp()
+    var zeros = 0
+    var i = from
+    var runStart = from
+    var hasEscape = false
+    while i < to {
+        let b = d[i]
+        if zeros >= 2 && b == 3 {
+            hasEscape = true
+            break
+        }
+        if b == 0 {
+            zeros += 1
+        } else {
+            zeros = 0
+        }
+        i += 1
+    }
+    if !hasEscape {
+        out.data = d.slice(from: from, to: to)
+        return out
+    }
+    var data = Data()
+    zeros = 0
+    i = from
+    while i < to {
+        let b = d[i]
+        if zeros >= 2 && b == 3 {
+            data += d.slice(from: runStart, to: i)
+            out.removed.append(i - from)
+            runStart = i + 1
+            zeros = 0
+        } else if b == 0 {
+            zeros += 1
+        } else {
+            zeros = 0
+        }
+        i += 1
+    }
+    data += d.slice(from: runStart, to: to)
+    out.data = data
+    out
+}
+
+fn hevcCeilLog2(_ n: Int) -> Int {
+    var k = 0
+    while (1 << k) < n {
+        k += 1
+    }
+    k
+}

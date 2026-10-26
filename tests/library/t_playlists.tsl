@@ -1,0 +1,261 @@
+// Library tests: text helpers and the playlist formats.
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+import "../../library"
+
+fn testText(_ c: bind Checker) {
+    // Decoding.
+    c.same(library.decodeText(Data(bytes: [0xef, 0xbb, 0xbf, 0x68, 0xc3, 0xa9])), "hé", "utf-8 with BOM")
+    c.same(library.decodeText(Data(bytes: [0xff, 0xfe, 0x68, 0, 0xe9, 0, 0x3d, 0xd8, 0x00, 0xde])), "hé😀", "utf-16le with BOM and a surrogate pair")
+    c.same(library.decodeText(Data(bytes: [0xfe, 0xff, 0, 0x41, 0x20, 0xac])), "A€", "utf-16be with BOM")
+    c.same(library.decodeText(Data(bytes: [0x43, 0x61, 0x66, 0xe9, 0x20, 0x93, 0x78, 0x94])), "Café “x”", "windows-1252 fallback")
+    c.same(library.decodeTextAs(Data(bytes: [0x93]), encoding: "latin-1"), library.fromCodePoints([0x93]), "latin-1 keeps C1")
+    // Folding and words.
+    c.same(library.fold("Amélie ÉCOLE Łódź Straße Œuvre"), "amelie ecole lodz strasse oeuvre", "fold")
+    c.same(library.fold("Cafe" + library.fromCodePoints([0x301])), "cafe", "fold drops combining marks")
+    c.same(library.searchWords("The.Office_(US) – S01E02 Don't").joined(separator: "|"), "the|office|us|s01e02|dont", "search words")
+    c.check(library.matchesSearch("Amélie (2001).mkv", query: "AMELIE 2001"), "matchesSearch accent/case")
+    c.check(!library.matchesSearch("Amélie (2001).mkv", query: "amelie 2002"), "matchesSearch needs every word")
+    // Natural order.
+    c.same(library.naturalSorted(["Ep 10.mkv", "ep 2.mkv", "Ep 1.mkv", "Ep 02.mkv", "Épisode 3.mkv"]).joined(separator: "|"), "Ep 1.mkv|ep 2.mkv|Ep 02.mkv|Ep 10.mkv|Épisode 3.mkv", "natural sort")
+    c.check(library.naturalLess("track9", "track10"), "track9 < track10")
+    c.check(library.naturalCompare("a", "a") == 0, "equal names")
+    c.same(library.naturalSorted(["x100", "x20", "x3", "x"]).joined(separator: ","), "x,x3,x20,x100", "natural numbers")
+    // Locations.
+    c.same(library.resolveLocation("a/b.mp3", base: "/m/list"), "/m/list/a/b.mp3", "relative")
+    c.same(library.resolveLocation("../x/./b.mp3", base: "/m/list"), "/m/x/b.mp3", "dot-dot")
+    c.same(library.resolveLocation("Music\\Old\\b.mp3", base: "/m"), "/m/Music/Old/b.mp3", "backslashes")
+    c.same(library.resolveLocation("file:///Users/a/b%20c%C3%A9.mp3", base: "/m"), "/Users/a/b cé.mp3", "file URL")
+    c.same(library.resolveLocation("file://localhost/x/y.mp3", base: ""), "/x/y.mp3", "file URL with localhost")
+    c.same(library.resolveLocation("file:///C:/Music/a.mp3", base: ""), "C:/Music/a.mp3", "file URL with a drive")
+    c.same(library.resolveLocation("http://h.example/s.mp3", base: "/m"), "http://h.example/s.mp3", "http URL")
+    c.same(library.resolveLocation("seg/a.mp3", base: "https://h.example/lists/p.m3u"), "https://h.example/lists/seg/a.mp3", "relative to a URL")
+    c.same(library.resolveLocation("/top.mp3", base: "https://h.example/lists/p.m3u"), "https://h.example/top.mp3", "rooted against a URL")
+    c.same(library.resolveLocation("C:\\Music\\a.mp3", base: "/m"), "C:\\Music\\a.mp3", "windows absolute kept")
+    c.same(library.fileURL("/a b/é.mp3"), "file:///a%20b/%C3%A9.mp3", "fileURL")
+    c.same(library.pathFromFileURL(library.fileURL("/a b/é#1.mp3")), "/a b/é#1.mp3", "fileURL round trip")
+    c.same(library.relativeLocation("/m/list/a/b.mp3", base: "/m/list"), "a/b.mp3", "relativeLocation inside")
+    c.same(library.relativeLocation("/other/b.mp3", base: "/m/list"), "/other/b.mp3", "relativeLocation outside")
+    c.check(library.isURL("rtsp://x/y") && !library.isURL("C:/x") && !library.isURL("/a://b"), "isURL")
+}
+
+let m3uText = "#EXTM3U\n#PLAYLIST:Road trip\n#EXTINF:215,Daft Punk - One More Time\n#EXTVLCOPT:network-caching=1000\nMusic/one.mp3\n\n#EXTINF:-1 tvg-name=\"News, live\" artist=\"BBC\",World News\nhttp://radio.example/live.aac\n# a comment\n#EXTALB:Discovery\n#EXTINF:180.5,Plain title\n../other/two.flac\nthree.ogg\n"
+
+fn testPlaylists(_ c: bind Checker, _ root: String) {
+    let base = joinPath(root, "lists")
+    createFolder(base)
+    // M3U.
+    let pl = library.parseM3U(m3uText, base: base)
+    c.same(pl.title, "Road trip", "m3u #PLAYLIST")
+    c.sameInt(pl.entries.count, 4, "m3u entries")
+    if pl.entries.count == 4 {
+        c.same(pl.entries[0].location, base + "/Music/one.mp3", "m3u relative location")
+        c.same(pl.entries[0].artist, "Daft Punk", "m3u artist from 'A - T'")
+        c.same(pl.entries[0].title, "One More Time", "m3u title")
+        c.near(pl.entries[0].duration, 215.0, "m3u duration")
+        c.same(pl.entries[1].location, "http://radio.example/live.aac", "m3u URL")
+        c.same(pl.entries[1].artist, "BBC", "m3u artist attribute (comma inside quotes)")
+        c.same(pl.entries[1].title, "World News", "m3u title after attributes")
+        c.near(pl.entries[1].duration, -1.0, "m3u -1 duration")
+        c.same(pl.entries[2].location, joinPath(root, "other/two.flac"), "m3u ../ location")
+        c.near(pl.entries[2].duration, 180.5, "m3u fractional duration")
+        c.same(pl.entries[2].album, "Discovery", "m3u #EXTALB")
+        c.same(pl.entries[3].title, "", "m3u plain line has no title")
+    }
+    // Latin-1 .m3u, UTF-8 .m3u8.
+    let latin = Data(bytes: [0x23, 0x45, 0x58, 0x54, 0x4d, 0x33, 0x55, 0x0a]) + Data(bytes: [0x43, 0x61, 0x66, 0xe9, 0x2e, 0x6d, 0x70, 0x33, 0x0a])
+    match library.parsePlaylist(latin, name: "x.m3u", base: "/m") {
+        .ok(p) -> c.same(p.entries.first?.location ?? "", "/m/Café.mp3", "latin-1 m3u")
+        .failure(e) -> c.check(false, "latin-1 m3u: {e.message}")
+    }
+    match library.parsePlaylist(Data(text: "#EXTM3U\nCafé.mp3\n"), name: "x.m3u8", base: "/m") {
+        .ok(p) -> {
+            c.same(p.entries.first?.location ?? "", "/m/Café.mp3", "utf-8 m3u8")
+            c.same(p.format, "m3u8", "m3u8 format")
+        }
+        .failure(e) -> c.check(false, "m3u8: {e.message}")
+    }
+    c.same(library.playlistFormat(Data(text: "#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6,\nseg0.ts\n"), name: "index.m3u8"), "hls", "HLS media playlist detected")
+    c.same(library.playlistFormat(Data(text: "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\nlow.m3u8\n"), name: "master.m3u8"), "hls", "HLS master detected")
+    c.check(!library.parsePlaylist(Data(text: "#EXTM3U\n#EXT-X-TARGETDURATION:6\n"), name: "a.m3u8").isOk(), "HLS isn't read as a playlist")
+    c.same(library.playlistFormat(Data(text: "[playlist]\nFile1=a\n"), name: "x.txt"), "pls", "pls sniffed by content")
+    c.same(library.playlistFormat(Data(text: "<?xml version=\"1.0\"?><playlist version=\"1\" xmlns=\"http://xspf.org/ns/0/\"/>"), name: "x"), "xspf", "xspf sniffed")
+    c.same(library.playlistFormat(Data(text: "<?wpl version=\"1.0\"?><smil/>"), name: "x"), "wpl", "wpl sniffed")
+    c.same(library.playlistFormat(Data(text: "hello"), name: "x.txt"), "", "not a playlist")
+    c.check(library.isPlaylistPath("/a/b.XSPF") && library.isPlaylistPath("http://x/y.m3u?z=1") && !library.isPlaylistPath("/a/b.mkv"), "isPlaylistPath")
+    // M3U round trip through a file.
+    let m3uPath = joinPath(base, "trip.m3u8")
+    c.check(library.savePlaylist(pl, path: m3uPath) == nil, "save m3u8")
+    let written = readFile(m3uPath) ?? ""
+    c.check(written.contains("\nMusic/one.mp3\n"), "m3u8 writes entries inside its folder relative")
+    c.check(written.contains("#EXTINF:215,Daft Punk - One More Time\n"), "m3u8 EXTINF written")
+    match library.readPlaylist(m3uPath) {
+        .ok(back) -> {
+            c.check(library.playlistPaths(back) == library.playlistPaths(pl), "m3u round trip locations")
+            c.same(back.title, "Road trip", "m3u round trip title")
+            c.same(back.entries[0].title, "One More Time", "m3u round trip entry title")
+        }
+        .failure(e) -> c.check(false, "read m3u8: {e.message}")
+    }
+
+    // PLS.
+    let plsText = "[playlist]\nFile2=http://stream.example:8000/live\nTitle2=Live radio\nLength2=-1\nfile1=songs/a b.mp3\nTITLE1=Song A\nLength1=201\nNumberOfEntries=2\nVersion=2\n"
+    let pls = library.parsePLS(plsText, base: base)
+    c.sameInt(pls.entries.count, 2, "pls entries")
+    if pls.entries.count == 2 {
+        c.same(pls.entries[0].location, base + "/songs/a b.mp3", "pls entries ordered by number, case-insensitive keys")
+        c.same(pls.entries[0].title, "Song A", "pls title")
+        c.near(pls.entries[0].duration, 201.0, "pls length")
+        c.same(pls.entries[1].location, "http://stream.example:8000/live", "pls URL")
+        c.near(pls.entries[1].duration, -1.0, "pls -1 length")
+    }
+    let plsPath = joinPath(base, "radio.pls")
+    library.savePlaylist(pls, path: plsPath)
+    match library.readPlaylist(plsPath) {
+        .ok(back) -> {
+            c.check(library.playlistPaths(back) == library.playlistPaths(pls), "pls round trip")
+            c.same(back.entries[1].title, "Live radio", "pls round trip title")
+        }
+        .failure(e) -> c.check(false, "read pls: {e.message}")
+    }
+    c.check((readFile(plsPath) ?? "").contains("NumberOfEntries=2\nVersion=2"), "pls footer")
+}
+
+let cueText = "REM GENRE Electronic\nREM DATE 2001\nPERFORMER \"Daft Punk\"\nTITLE \"Discovery\"\nFILE \"Discovery.flac\" WAVE\n  TRACK 01 AUDIO\n    TITLE \"One More Time\"\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    TITLE \"Aerodynamic\"\n    PERFORMER \"Daft Punk feat. Nobody\"\n    INDEX 00 05:20:00\n    INDEX 01 05:20:37\n  TRACK 03 AUDIO\n    TITLE \"Digital Love\"\n    ISRC GBDUW0000059\n    INDEX 01 08:52:74\n"
+
+fn testCue(_ c: bind Checker, _ root: String) {
+    let base = joinPath(root, "album")
+    createFolder(base)
+    c.near(library.cueTime("05:20:37"), 320.0 + 37.0 / 75.0, "cue time")
+    c.near(library.cueTime("5:20:75"), -1.0, "cue time frame out of range")
+    c.same(library.formatCueTime(320.0 + 37.0 / 75.0), "05:20:37", "format cue time")
+    match library.parseCue(cueText, base: base) {
+        .ok(sheet) -> {
+            c.same(sheet.title, "Discovery", "cue title")
+            c.same(sheet.performer, "Daft Punk", "cue performer")
+            c.same(sheet.rems["GENRE"] ?? "", "Electronic", "cue REM GENRE")
+            c.sameInt(sheet.tracks.count, 3, "cue tracks")
+            c.same(sheet.files.first ?? "", base + "/Discovery.flac", "cue FILE resolved")
+            let pl = library.cuePlaylist(sheet)
+            c.sameInt(pl.entries.count, 3, "cue playlist entries")
+            if pl.entries.count == 3 {
+                c.near(pl.entries[1].start, 320.0 + 37.0 / 75.0, "track 2 start (INDEX 01)")
+                c.near(pl.entries[0].end, 320.0, "track 1 ends at track 2's pregap (INDEX 00)")
+                c.same(pl.entries[1].artist, "Daft Punk feat. Nobody", "track performer")
+                c.same(pl.entries[2].artist, "Daft Punk", "sheet performer as fallback")
+                c.near(pl.entries[2].end, -1.0, "last track runs to the end")
+            }
+            let ch = library.cueChapters(sheet, duration: 600.0)
+            c.sameInt(ch.count, 3, "cue chapters")
+            if ch.count == 3 {
+                c.near(ch[0].end, ch[1].start, "chapters are contiguous")
+                c.near(ch[2].end, 600.0, "last chapter ends at the duration")
+                c.same(ch[2].title, "Digital Love", "chapter title")
+            }
+            c.sameInt(library.chaptersFor(pl, file: base + "/Discovery.flac").count, 3, "chaptersFor the file")
+            // Write and read back.
+            let text = library.writeCue(sheet, base: base)
+            c.check(text.contains("FILE \"Discovery.flac\" WAVE"), "cue writes the file relative")
+            c.check(text.contains("INDEX 00 05:20:00\n    INDEX 01 05:20:37"), "cue writes indexes")
+            match library.parseCue(text, base: base) {
+                .ok(back) -> {
+                    c.sameInt(back.tracks.count, 3, "cue round trip tracks")
+                    c.near(back.tracks[2].start, sheet.tracks[2].start, "cue round trip start", tol: 0.0001)
+                    c.same(back.tracks[2].isrc, "GBDUW0000059", "cue round trip ISRC")
+                }
+                .failure(e) -> c.check(false, "cue round trip: {e.message}")
+            }
+            // Finding the sheet beside its file.
+            writeFile(path: joinPath(base, "Discovery.cue"), text: cueText)
+            writeFile(path: joinPath(base, "Discovery.flac"), text: "x")
+            c.same(library.findCueSheet(joinPath(base, "Discovery.flac"), listing: listFolder(base) ?? []), joinPath(base, "Discovery.cue"), "findCueSheet by name")
+            match library.readPlaylist(joinPath(base, "Discovery.cue")) {
+                .ok(p) -> c.same(p.format, "cue", "cue read as a playlist")
+                .failure(e) -> c.check(false, "read cue: {e.message}")
+            }
+        }
+        .failure(e) -> c.check(false, "parse cue: {e.message}")
+    }
+    c.check(!library.parseCue("TITLE \"x\"\n").isOk(), "a cue without tracks fails")
+    // A playlist with starts written as a cue sheet.
+    var tracks = library.Playlist(title: "Mix")
+    tracks.entries.append(library.PlaylistEntry(location: base + "/mix.wav", title: "One", artist: "A"))
+    tracks.entries.append(library.PlaylistEntry(location: base + "/mix.wav", title: "Two", artist: "A", start: 61.5))
+    let cueOut = library.writePlaylist(tracks, format: "cue", base: base)
+    match library.parseCue(cueOut, base: base) {
+        .ok(sh) -> c.check(sh.tracks.count == 2 && sh.files.count == 1 && abs(sh.tracks[1].start - 61.5) < 0.01 && sh.performer == "A", "playlist written as a cue sheet")
+        .failure(e) -> c.check(false, "playlist as cue: {e.message}")
+    }
+}
+
+let xspfText = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<playlist version=\"1\" xmlns=\"http://xspf.org/ns/0/\">\n  <title>Mix &amp; match</title>\n  <trackList>\n    <track><location>file:///Users/a/Music/x%20y.mp3</location><title>X Y</title><creator>Ann</creator><album>Al</album><duration>123456</duration><trackNum>4</trackNum></track>\n    <track><location>sub/b%C3%A9.ogg</location><title>B</title></track>\n    <track><location>http://h.example/s.mp3</location></track>\n    <track><title>No location</title></track>\n  </trackList>\n</playlist>\n"
+
+let wplText = "<?wpl version=\"1.0\"?>\n<smil>\n  <head>\n    <meta name=\"Generator\" content=\"Microsoft Windows Media Player -- 12.0\"/>\n    <title>Party</title>\n  </head>\n  <body>\n    <seq>\n      <media src=\"..\\Music\\Song &amp; Dance.mp3\" albumTitle=\"Hits\" trackTitle=\"Song\"/>\n      <media src=\"C:\\Users\\a\\Videos\\clip.wmv\"/>\n    </seq>\n  </body>\n</smil>\n"
+
+fn testXml(_ c: bind Checker, _ root: String) {
+    let base = joinPath(root, "lists")
+    match library.parsePlaylist(Data(text: xspfText), name: "mix.xspf", base: base) {
+        .ok(pl) -> {
+            c.same(pl.title, "Mix & match", "xspf title")
+            c.sameInt(pl.entries.count, 3, "xspf entries (one without location skipped)")
+            c.sameInt(pl.warnings.count, 1, "xspf warning for the missing location")
+            if pl.entries.count == 3 {
+                c.same(pl.entries[0].location, "/Users/a/Music/x y.mp3", "xspf file URL")
+                c.near(pl.entries[0].duration, 123.456, "xspf duration in ms")
+                c.same(pl.entries[0].artist, "Ann", "xspf creator")
+                c.same(pl.entries[0].album, "Al", "xspf album")
+                c.sameInt(pl.entries[0].trackNumber, 4, "xspf trackNum")
+                c.same(pl.entries[1].location, base + "/sub/bé.ogg", "xspf relative URI")
+                c.same(pl.entries[2].location, "http://h.example/s.mp3", "xspf http")
+            }
+            let path = joinPath(base, "mix.xspf")
+            library.savePlaylist(pl, path: path)
+            let text = readFile(path) ?? ""
+            c.check(text.contains("<location>sub/b%C3%A9.ogg</location>"), "xspf writes relative URIs")
+            c.check(text.contains("<location>file:///Users/a/Music/x%20y.mp3</location>"), "xspf writes file URLs")
+            c.check(text.contains("Mix &amp; match"), "xspf escapes text")
+            match library.readPlaylist(path) {
+                .ok(back) -> {
+                    c.check(library.playlistPaths(back) == library.playlistPaths(pl), "xspf round trip")
+                    c.near(back.entries[0].duration, 123.456, "xspf round trip duration")
+                }
+                .failure(e) -> c.check(false, "xspf round trip: {e.message}")
+            }
+        }
+        .failure(e) -> c.check(false, "xspf: {e.message}")
+    }
+    match library.parsePlaylist(Data(text: wplText), name: "party.wpl", base: base) {
+        .ok(pl) -> {
+            c.same(pl.title, "Party", "wpl title")
+            c.sameInt(pl.entries.count, 2, "wpl entries")
+            if pl.entries.count == 2 {
+                c.same(pl.entries[0].location, joinPath(root, "Music/Song & Dance.mp3"), "wpl relative backslash path")
+                c.same(pl.entries[0].title, "Song", "wpl trackTitle")
+                c.same(pl.entries[0].album, "Hits", "wpl albumTitle")
+                c.same(pl.entries[1].location, "C:\\Users\\a\\Videos\\clip.wmv", "wpl absolute windows path")
+            }
+            let path = joinPath(base, "party.wpl")
+            library.savePlaylist(pl, path: path)
+            match library.readPlaylist(path) {
+                .ok(back) -> {
+                    c.check(library.playlistPaths(back) == library.playlistPaths(pl), "wpl round trip")
+                    c.same(back.title, "Party", "wpl round trip title")
+                }
+                .failure(e) -> c.check(false, "wpl round trip: {e.message}")
+            }
+        }
+        .failure(e) -> c.check(false, "wpl: {e.message}")
+    }
+    c.check(!library.parsePlaylist(Data(text: "<?xml version=\"1.0\"?><playlist><trackList><track></playlist>"), name: "bad.xspf").isOk(), "broken xspf fails cleanly")
+    // Converting between formats keeps the entries.
+    let pl = library.parseM3U(m3uText, base: base)
+    for f in ["m3u", "pls", "xspf", "wpl"] {
+        let text = library.writePlaylist(pl, format: f, base: base)
+        match library.parsePlaylist(Data(text: text), name: "x.{f}", base: base) {
+            .ok(back) -> c.check(library.playlistPaths(back) == library.playlistPaths(pl), "m3u → {f} → back keeps locations")
+            .failure(e) -> c.check(false, "m3u → {f}: {e.message}")
+        }
+    }
+}

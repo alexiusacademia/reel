@@ -1,0 +1,474 @@
+// Fast paths of inter prediction sample interpolation (8.4.2.2): the luma
+// 6-tap filter and chroma bilinear filter written straight into the
+// picture (or averaged into it for the second list of a bi-predicted
+// partition without weights, which is the default (p0 + p1 + 1) >> 1 of
+// 8.4.2.3.1). The filters slide a window along rows or columns so each
+// output sample reads one new reference sample.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../core"
+
+// Luma interpolation of a w x h block: src sample (0, 0) of the block at
+// src[base], rows s apart; output to dst[dOff], rows ds apart. tmp holds
+// at least 21 * 21 intermediate values.
+fn h264Qpel(_ dst: bind [Int], _ dOff: Int, _ ds: Int, _ tmp: bind [Int], _ src: [Int], _ base: Int, _ s: Int, _ fx: Int, _ fy: Int, _ w: Int, _ h: Int, _ avg: Bool) {
+    if fx == 0 && fy == 0 {
+        var y = 0
+        while y < h {
+            let r = base + y * s
+            let d = dOff + y * ds
+            var x = 0
+            while x < w {
+                let sv = src[r + x]
+                if avg {
+                    dst[d + x] = (dst[d + x] + sv + 1) >> 1
+                } else {
+                    dst[d + x] = sv
+                }
+                x += 1
+            }
+            y += 1
+        }
+        return
+    }
+    if fy == 0 {
+        // Horizontal half sample b, averaged with G or H for quarters.
+        var y = 0
+        while y < h {
+            let r = base + y * s
+            let d = dOff + y * ds
+            var a0 = src[r - 2]
+            var a1 = src[r - 1]
+            var a2 = src[r]
+            var a3 = src[r + 1]
+            var a4 = src[r + 2]
+            var x = 0
+            while x < w {
+                let a5 = src[r + x + 3]
+                let b = h264Clip((a0 - 5 * (a1 + a4) + 20 * (a2 + a3) + a5 + 16) >> 5)
+                var v = b
+                if fx == 1 {
+                    v = (a2 + b + 1) >> 1
+                } else if fx == 3 {
+                    v = (a3 + b + 1) >> 1
+                }
+                let sv = v
+                if avg {
+                    dst[d + x] = (dst[d + x] + sv + 1) >> 1
+                } else {
+                    dst[d + x] = sv
+                }
+                a0 = a1
+                a1 = a2
+                a2 = a3
+                a3 = a4
+                a4 = a5
+                x += 1
+            }
+            y += 1
+        }
+        return
+    }
+    if fx == 0 {
+        // Vertical half sample h, averaged with G or M for quarters.
+        var x = 0
+        while x < w {
+            let c = base + x
+            var a0 = src[c - 2 * s]
+            var a1 = src[c - s]
+            var a2 = src[c]
+            var a3 = src[c + s]
+            var a4 = src[c + 2 * s]
+            var y = 0
+            while y < h {
+                let a5 = src[c + (y + 3) * s]
+                let hv = h264Clip((a0 - 5 * (a1 + a4) + 20 * (a2 + a3) + a5 + 16) >> 5)
+                var v = hv
+                if fy == 1 {
+                    v = (a2 + hv + 1) >> 1
+                } else if fy == 3 {
+                    v = (a3 + hv + 1) >> 1
+                }
+                let sv = v
+                if avg {
+                    dst[dOff + y * ds + x] = (dst[dOff + y * ds + x] + sv + 1) >> 1
+                } else {
+                    dst[dOff + y * ds + x] = sv
+                }
+                a0 = a1
+                a1 = a2
+                a2 = a3
+                a3 = a4
+                a4 = a5
+                y += 1
+            }
+            x += 1
+        }
+        return
+    }
+    if fx == 2 || fy == 2 {
+        // Unrounded horizontal sums of rows -2 .. h + 2 (21 wide), then the
+        // centre sample j from them vertically.
+        var y = 0
+        while y < h + 5 {
+            let r = base + (y - 2) * s
+            let t = y * 21
+            var a0 = src[r - 2]
+            var a1 = src[r - 1]
+            var a2 = src[r]
+            var a3 = src[r + 1]
+            var a4 = src[r + 2]
+            var x = 0
+            while x < w {
+                let a5 = src[r + x + 3]
+                tmp[t + x] = a0 - 5 * (a1 + a4) + 20 * (a2 + a3) + a5
+                a0 = a1
+                a1 = a2
+                a2 = a3
+                a3 = a4
+                a4 = a5
+                x += 1
+            }
+            y += 1
+        }
+        var x = 0
+        while x < w {
+            var t0 = tmp[x]
+            var t1 = tmp[21 + x]
+            var t2 = tmp[42 + x]
+            var t3 = tmp[63 + x]
+            var t4 = tmp[84 + x]
+            // For fx 1 or 3 with fy 2: vertical half samples of column x or
+            // x + 1.
+            let vc = base + x + (if fx == 3 { 1 } else { 0 })
+            var v0 = 0
+            var v1 = 0
+            var v2 = 0
+            var v3 = 0
+            var v4 = 0
+            if fx != 2 {
+                v0 = src[vc - 2 * s]
+                v1 = src[vc - s]
+                v2 = src[vc]
+                v3 = src[vc + s]
+                v4 = src[vc + 2 * s]
+            }
+            var y2 = 0
+            while y2 < h {
+                let t5 = tmp[(y2 + 5) * 21 + x]
+                let j = h264Clip((t0 - 5 * (t1 + t4) + 20 * (t2 + t3) + t5 + 512) >> 10)
+                var v = j
+                if fx == 2 {
+                    if fy == 1 {
+                        v = (j + h264Clip((t2 + 16) >> 5) + 1) >> 1
+                    } else if fy == 3 {
+                        v = (j + h264Clip((t3 + 16) >> 5) + 1) >> 1
+                    }
+                } else {
+                    let v5 = src[vc + (y2 + 3) * s]
+                    let hv = h264Clip((v0 - 5 * (v1 + v4) + 20 * (v2 + v3) + v5 + 16) >> 5)
+                    v = (j + hv + 1) >> 1
+                    v0 = v1
+                    v1 = v2
+                    v2 = v3
+                    v3 = v4
+                    v4 = v5
+                }
+                let sv = v
+                if avg {
+                    dst[dOff + y2 * ds + x] = (dst[dOff + y2 * ds + x] + sv + 1) >> 1
+                } else {
+                    dst[dOff + y2 * ds + x] = sv
+                }
+                t0 = t1
+                t1 = t2
+                t2 = t3
+                t3 = t4
+                t4 = t5
+                y2 += 1
+            }
+            x += 1
+        }
+        return
+    }
+    // Diagonal quarter positions: (b + h + 1) >> 1 with b the horizontal
+    // half sample of row y (fy 1) or y + 1 (fy 3) and h the vertical half
+    // sample of column x (fx 1) or x + 1 (fx 3). The b values go to tmp.
+    let ho = if fy == 1 { 0 } else { s }
+    var y = 0
+    while y < h {
+        let r = base + y * s + ho
+        let t = y * 21
+        var a0 = src[r - 2]
+        var a1 = src[r - 1]
+        var a2 = src[r]
+        var a3 = src[r + 1]
+        var a4 = src[r + 2]
+        var x = 0
+        while x < w {
+            let a5 = src[r + x + 3]
+            tmp[t + x] = h264Clip((a0 - 5 * (a1 + a4) + 20 * (a2 + a3) + a5 + 16) >> 5)
+            a0 = a1
+            a1 = a2
+            a2 = a3
+            a3 = a4
+            a4 = a5
+            x += 1
+        }
+        y += 1
+    }
+    let vo = if fx == 1 { 0 } else { 1 }
+    var x = 0
+    while x < w {
+        let c = base + x + vo
+        var a0 = src[c - 2 * s]
+        var a1 = src[c - s]
+        var a2 = src[c]
+        var a3 = src[c + s]
+        var a4 = src[c + 2 * s]
+        var y2 = 0
+        while y2 < h {
+            let a5 = src[c + (y2 + 3) * s]
+            let hv = h264Clip((a0 - 5 * (a1 + a4) + 20 * (a2 + a3) + a5 + 16) >> 5)
+            let sv = (tmp[y2 * 21 + x] + hv + 1) >> 1
+            if avg {
+                dst[dOff + y2 * ds + x] = (dst[dOff + y2 * ds + x] + sv + 1) >> 1
+            } else {
+                dst[dOff + y2 * ds + x] = sv
+            }
+            a0 = a1
+            a1 = a2
+            a2 = a3
+            a3 = a4
+            a4 = a5
+            y2 += 1
+        }
+        x += 1
+    }
+}
+
+// Luma prediction from a reference plane, clamping coordinates through
+// buf when the block reaches outside the picture (8-228, 8-229).
+fn h264McLuma(_ dst: bind [Int], _ dOff: Int, _ ds: Int, _ tmp: bind [Int], _ buf: bind [Int], _ ref: [Int], _ off: Int, _ stride: Int, _ pw: Int, _ ph: Int, _ px: Int, _ py: Int, _ fx: Int, _ fy: Int, _ w: Int, _ h: Int, _ avg: Bool) {
+    let x0 = px - 2
+    let y0 = py - 2
+    let bw = w + 5
+    let bh = h + 5
+    if x0 >= 0 && y0 >= 0 && x0 + bw <= pw && y0 + bh <= ph {
+        h264Qpel(dst, dOff, ds, tmp, ref, off + py * stride + px, stride, fx, fy, w, h, avg)
+        return
+    }
+    for y in 0..bh {
+        let yy = max(0, min(ph - 1, y0 + y))
+        let r = off + yy * stride
+        for x in 0..bw {
+            buf[y * 21 + x] = ref[r + max(0, min(pw - 1, x0 + x))]
+        }
+    }
+    h264Qpel(dst, dOff, ds, tmp, buf, 2 * 21 + 2, 21, fx, fy, w, h, avg)
+}
+
+// Chroma prediction (8.4.2.2.2) of a w x h block.
+fn h264McChroma(_ dst: bind [Int], _ dOff: Int, _ ds: Int, _ buf: bind [Int], _ ref: [Int], _ off: Int, _ stride: Int, _ pw: Int, _ ph: Int, _ px: Int, _ py: Int, _ fx: Int, _ fy: Int, _ w: Int, _ h: Int, _ avg: Bool) {
+    let a = (8 - fx) * (8 - fy)
+    let b = fx * (8 - fy)
+    let c = (8 - fx) * fy
+    let d = fx * fy
+    if px >= 0 && py >= 0 && px + w + 1 <= pw && py + h + 1 <= ph {
+        if fx == 0 && fy == 0 {
+            for y in 0..h {
+                let r = off + (py + y) * stride + px
+                let o = dOff + y * ds
+                for x in 0..w {
+                    let sv = ref[r + x]
+                    if avg {
+                        dst[o + x] = (dst[o + x] + sv + 1) >> 1
+                    } else {
+                        dst[o + x] = sv
+                    }
+                }
+            }
+            return
+        }
+        for y in 0..h {
+            let r = off + (py + y) * stride + px
+            let o = dOff + y * ds
+            var s0 = ref[r]
+            var s1 = ref[r + stride]
+            for x in 0..w {
+                let n0 = ref[r + x + 1]
+                let n1 = ref[r + stride + x + 1]
+                let sv = (a * s0 + b * n0 + c * s1 + d * n1 + 32) >> 6
+                if avg {
+                    dst[o + x] = (dst[o + x] + sv + 1) >> 1
+                } else {
+                    dst[o + x] = sv
+                }
+                s0 = n0
+                s1 = n1
+            }
+        }
+        return
+    }
+    for y in 0..(h + 1) {
+        let yy = max(0, min(ph - 1, py + y))
+        let r = off + yy * stride
+        for x in 0..(w + 1) {
+            buf[y * 21 + x] = ref[r + max(0, min(pw - 1, px + x))]
+        }
+    }
+    for y in 0..h {
+        for x in 0..w {
+            let p = y * 21 + x
+            let sv = (a * buf[p] + b * buf[p + 1] + c * buf[p + 21] + d * buf[p + 22] + 32) >> 6
+            if avg {
+                dst[dOff + y * ds + x] = (dst[dOff + y * ds + x] + sv + 1) >> 1
+            } else {
+                dst[dOff + y * ds + x] = sv
+            }
+        }
+    }
+}
+
+// Chroma prediction of both planes at once (same position and fraction):
+// h264McChroma for Cb into du and Cr into dv.
+fn h264McChroma2(_ du: bind [Int], _ dv: bind [Int], _ dOff: Int, _ ds: Int, _ buf: bind [Int], _ refU: [Int], _ refV: [Int], _ off: Int, _ stride: Int, _ pw: Int, _ ph: Int, _ px: Int, _ py: Int, _ fx: Int, _ fy: Int, _ w: Int, _ h: Int, _ avg: Bool) {
+    if !(px >= 0 && py >= 0 && px + w + 1 <= pw && py + h + 1 <= ph) {
+        h264McChroma(du, dOff, ds, buf, refU, off, stride, pw, ph, px, py, fx, fy, w, h, avg)
+        h264McChroma(dv, dOff, ds, buf, refV, off, stride, pw, ph, px, py, fx, fy, w, h, avg)
+        return
+    }
+    let a = (8 - fx) * (8 - fy)
+    let b = fx * (8 - fy)
+    let c = (8 - fx) * fy
+    let d = fx * fy
+    if fx == 0 && fy == 0 {
+        for y in 0..h {
+            let r = off + (py + y) * stride + px
+            let o = dOff + y * ds
+            for x in 0..w {
+                if avg {
+                    du[o + x] = (du[o + x] + refU[r + x] + 1) >> 1
+                    dv[o + x] = (dv[o + x] + refV[r + x] + 1) >> 1
+                } else {
+                    du[o + x] = refU[r + x]
+                    dv[o + x] = refV[r + x]
+                }
+            }
+        }
+        return
+    }
+    for y in 0..h {
+        let r = off + (py + y) * stride + px
+        let o = dOff + y * ds
+        var u0 = refU[r]
+        var u1 = refU[r + stride]
+        var v0 = refV[r]
+        var v1 = refV[r + stride]
+        for x in 0..w {
+            let un0 = refU[r + x + 1]
+            let un1 = refU[r + stride + x + 1]
+            let vn0 = refV[r + x + 1]
+            let vn1 = refV[r + stride + x + 1]
+            let su = (a * u0 + b * un0 + c * u1 + d * un1 + 32) >> 6
+            let sv = (a * v0 + b * vn0 + c * v1 + d * vn1 + 32) >> 6
+            if avg {
+                du[o + x] = (du[o + x] + su + 1) >> 1
+                dv[o + x] = (dv[o + x] + sv + 1) >> 1
+            } else {
+                du[o + x] = su
+                dv[o + x] = sv
+            }
+            u0 = un0
+            u1 = un1
+            v0 = vn0
+            v1 = vn1
+        }
+    }
+}
+
+// ----------------------------------------------------------------------
+// The prediction buffers used when weights apply (8.4.2.3) or the
+// reference is the frame being decoded.
+
+struct Mc {
+    // Predictions: luma of list 0 at 0 and list 1 at 256 (16x16, stride
+    // 16); chroma Cb list 0, Cb list 1, Cr list 0, Cr list 1 at 64 each
+    // (8x8, stride 8).
+    py: [Int] = []
+    pc: [Int] = []
+    // (w + 5) x (h + 5) reference samples with clamped coordinates.
+    buf: [Int] = []
+    // Unrounded horizontal 6-tap sums for the centre positions.
+    tmp: [Int] = []
+
+    fn setup() {
+        py = core.zeros(512)
+        pc = core.zeros(256)
+        buf = core.zeros(21 * 21)
+        tmp = core.zeros(21 * 21)
+    }
+
+    // Predicts a w x h luma block at full-sample position (px, py0) with
+    // fraction (fx, fy) from plane `ref` (picture pw x ph, rows `stride`
+    // apart starting at `off`) into list `list`'s block at (bx, by).
+    fn luma(_ ref: [Int], off: Int, stride: Int, pw: Int, ph: Int, px: Int, py0: Int, fx: Int, fy: Int, w: Int, h: Int, list: Int, bx: Int, by: Int) {
+        let dst = list * 256 + by * 16 + bx
+        let x0 = px - 2
+        let y0 = py0 - 2
+        let bw = w + 5
+        let bh = h + 5
+        if x0 >= 0 && y0 >= 0 && x0 + bw <= pw && y0 + bh <= ph {
+            h264Qpel(py, dst, 16, tmp, ref, off + py0 * stride + px, stride, fx, fy, w, h, false)
+            return
+        }
+        for y in 0..bh {
+            let yy = max(0, min(ph - 1, y0 + y))
+            let src = off + yy * stride
+            let d = y * 21
+            for x in 0..bw {
+                let xx = max(0, min(pw - 1, x0 + x))
+                buf[d + x] = ref[src + xx]
+            }
+        }
+        h264Qpel(py, dst, 16, tmp, buf, 2 * 21 + 2, 21, fx, fy, w, h, false)
+    }
+
+    // Predicts a w x h chroma block at full-sample (px, py0), eighth
+    // fraction (fx, fy) into slot `slot` (0 Cb l0, 1 Cb l1, 2 Cr l0, 3 Cr
+    // l1) at (bx, by) (8.4.2.2.2).
+    fn chroma(_ ref: [Int], off: Int, stride: Int, pw: Int, ph: Int, px: Int, py0: Int, fx: Int, fy: Int, w: Int, h: Int, slot: Int, bx: Int, by: Int) {
+        let dst = slot * 64 + by * 8 + bx
+        let a = (8 - fx) * (8 - fy)
+        let b = fx * (8 - fy)
+        let c = (8 - fx) * fy
+        let d = fx * fy
+        if px >= 0 && py0 >= 0 && px + w + 1 <= pw && py0 + h + 1 <= ph {
+            for y in 0..h {
+                let r = off + (py0 + y) * stride + px
+                let o = dst + y * 8
+                for x in 0..w {
+                    let p = r + x
+                    pc[o + x] = (a * ref[p] + b * ref[p + 1] + c * ref[p + stride] + d * ref[p + stride + 1] + 32) >> 6
+                }
+            }
+            return
+        }
+        for y in 0..(h + 1) {
+            let yy = max(0, min(ph - 1, py0 + y))
+            let src = off + yy * stride
+            for x in 0..(w + 1) {
+                let xx = max(0, min(pw - 1, px + x))
+                buf[y * 21 + x] = ref[src + xx]
+            }
+        }
+        for y in 0..h {
+            for x in 0..w {
+                let p = y * 21 + x
+                pc[dst + y * 8 + x] = (a * buf[p] + b * buf[p + 1] + c * buf[p + 21] + d * buf[p + 22] + 32) >> 6
+            }
+        }
+    }
+}

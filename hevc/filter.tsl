@@ -1,0 +1,670 @@
+// HEVC in-loop filters, run on the whole picture once all its slices are
+// decoded: the deblocking filter (ITU-T H.265 8.7.2: all vertical edges of
+// the picture, then all horizontal edges, luma strong / normal filtering
+// 8.7.2.5.3 and 8.7.2.5.6, chroma 8.7.2.5.5) and sample adaptive offset
+// (8.7.3: band offset and the four edge offset classes, with the slice and
+// tile boundary rules).
+//
+// The engine fills the per-4x4 tables while it decodes: boundary strengths
+// of the edges to filter (bsV for vertical edges at the left of a 4x4
+// unit, bsH for horizontal edges at its top; 0 means not filtered), QpY,
+// and the units whose samples the filters must not change (PCM with
+// pcm_loop_filter_disabled_flag, cu_transquant_bypass).
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+struct HevcFilter {
+    y: [Int] = []
+    u: [Int] = []
+    v: [Int] = []
+    // Spare planes SAO writes into (see sao()).
+    outY: [Int] = []
+    outU: [Int] = []
+    outV: [Int] = []
+    width: Int = 0
+    height: Int = 0
+    cw: Int = 0
+    ch: Int = 0
+    hasChroma: Bool = true
+    bitDepth: Int = 8
+    maxVal: Int = 255
+    w4: Int = 0
+    h4: Int = 0
+    bsV: [Int] = []
+    bsH: [Int] = []
+    qp4: [Int] = []
+    noFilt: [Int] = []
+    anyNoFilt: Bool = false
+    anyDeblock: Bool = false
+    log2Ctb: Int = 4
+    ctbW: Int = 0
+    ctbH: Int = 0
+    // Per CTB (raster address): deblocking offsets (beta_offset_div2 * 2,
+    // tc_offset_div2 * 2) of its slice, slice address, tile, decoding
+    // order, slice_loop_filter_across_slices_enabled_flag, and SAO.
+    ctbBeta: [Int] = []
+    ctbTc: [Int] = []
+    ctbSlice: [Int] = []
+    ctbTile: [Int] = []
+    ctbTs: [Int] = []
+    ctbLfAcross: [Int] = []
+    lfAcrossTiles: Bool = true
+    cbQpOffset: Int = 0
+    crQpOffset: Int = 0
+    // SAO per CTB and colour: type (0 off, 1 band, 2 edge), band position
+    // or edge class, and four offsets.
+    saoType: [Int] = []
+    saoClass: [Int] = []
+    saoOff: [Int] = []
+    anySao: Bool = false
+    tcTab: [Int] = []
+    betaTab: [Int] = []
+    qpcTab: [Int] = []
+    // SAO scratch: the CTB's neighbours that edge offset must not read
+    // (index (dy + 1) * 3 + dx + 1), and the band table.
+    blocked: [Int] = []
+    bandTab: [Int] = []
+    offTab: [Int] = []
+
+    // Sizes the tables for a picture geometry.
+    fn setup(width: Int, height: Int, chromaIdc: Int, bitDepth: Int, log2Ctb: Int) {
+        self.width = width
+        self.height = height
+        hasChroma = chromaIdc != 0
+        cw = if hasChroma { (width + 1) >> 1 } else { 0 }
+        ch = if hasChroma { (height + 1) >> 1 } else { 0 }
+        self.bitDepth = bitDepth
+        maxVal = (1 << bitDepth) - 1
+        w4 = (width + 3) >> 2
+        h4 = (height + 3) >> 2
+        self.log2Ctb = log2Ctb
+        ctbW = (width + (1 << log2Ctb) - 1) >> log2Ctb
+        ctbH = (height + (1 << log2Ctb) - 1) >> log2Ctb
+        let n4 = w4 * h4
+        bsV = hevcFilled(n4, 0)
+        bsH = hevcFilled(n4, 0)
+        qp4 = hevcFilled(n4, 0)
+        noFilt = hevcFilled(n4, 0)
+        let nc = ctbW * ctbH
+        ctbBeta = hevcFilled(nc, 0)
+        ctbTc = hevcFilled(nc, 0)
+        ctbSlice = hevcFilled(nc, -1)
+        ctbTile = hevcFilled(nc, 0)
+        ctbTs = hevcFilled(nc, 0)
+        ctbLfAcross = hevcFilled(nc, 0)
+        saoType = hevcFilled(nc * 3, 0)
+        saoClass = hevcFilled(nc * 3, 0)
+        saoOff = hevcFilled(nc * 12, 0)
+        tcTab = hevcTcTable
+        betaTab = hevcBetaTable
+        qpcTab = hevcQpcTable
+        blocked = hevcFilled(9, 0)
+        bandTab = hevcFilled(32, 0)
+        offTab = hevcFilled(5, 0)
+    }
+
+    // Clears the per-picture tables.
+    fn startPicture() {
+        for i in 0..bsV.count {
+            bsV[i] = 0
+            bsH[i] = 0
+        }
+        if anyNoFilt {
+            for i in 0..noFilt.count {
+                noFilt[i] = 0
+            }
+        }
+        anyNoFilt = false
+        anyDeblock = false
+        anySao = false
+        for i in 0..ctbSlice.count {
+            ctbSlice[i] = -1
+        }
+        for i in 0..saoType.count {
+            saoType[i] = 0
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Deblocking (8.7.2).
+
+    fn deblock() {
+        if !anyDeblock {
+            return
+        }
+        let bd = bitDepth - 8
+        // Vertical edges, then horizontal edges, of luma.
+        for edgeDir in 0..2 {
+            for y4 in 0..h4 {
+                for x4 in 0..w4 {
+                    let i = y4 * w4 + x4
+                    let bs = if edgeDir == 0 { bsV[i] } else { bsH[i] }
+                    if bs == 0 {
+                        continue
+                    }
+                    let x = x4 << 2
+                    let yy = y4 << 2
+                    // q0 is at (x, yy); p0 left of / above it.
+                    let pi = if edgeDir == 0 { i - 1 } else { i - w4 }
+                    let qpL = (qp4[i] + qp4[pi] + 1) >> 1
+                    let ctb = (yy >> log2Ctb) * ctbW + (x >> log2Ctb)
+                    let qb = max(0, min(51, qpL + ctbBeta[ctb]))
+                    let beta = betaTab[qb] << bd
+                    let qt = max(0, min(53, qpL + 2 * (bs - 1) + ctbTc[ctb]))
+                    let tc = tcTab[qt] << bd
+                    if tc == 0 && beta == 0 {
+                        continue
+                    }
+                    var noP = false
+                    var noQ = false
+                    if anyNoFilt {
+                        noP = noFilt[pi] == 1
+                        noQ = noFilt[i] == 1
+                    }
+                    if edgeDir == 0 {
+                        lumaEdge(yy * width + x, 1, width, beta, tc, noP, noQ)
+                    } else {
+                        lumaEdge(yy * width + x, width, 1, beta, tc, noP, noQ)
+                    }
+                }
+            }
+        }
+        if !hasChroma {
+            return
+        }
+        // Chroma: edges on the 8x8 chroma grid (16 luma samples), bS 2,
+        // segments of 4 chroma lines taking the bS of their first line.
+        for edgeDir in 0..2 {
+            var y4 = 0
+            while y4 < h4 {
+                var x4 = 0
+                while x4 < w4 {
+                    let i = y4 * w4 + x4
+                    let bs = if edgeDir == 0 { bsV[i] } else { bsH[i] }
+                    // Vertical edges at x multiple of 16, horizontal at y
+                    // multiple of 16 (the other coordinate in steps of 8).
+                    let onGrid = if edgeDir == 0 { (x4 & 3) == 0 } else { (y4 & 3) == 0 }
+                    if bs == 2 && onGrid {
+                        let pi = if edgeDir == 0 { i - 1 } else { i - w4 }
+                        let qpAvg = (qp4[i] + qp4[pi] + 1) >> 1
+                        let x = x4 << 2
+                        let yy = y4 << 2
+                        let ctb = (yy >> log2Ctb) * ctbW + (x >> log2Ctb)
+                        var noP = false
+                        var noQ = false
+                        if anyNoFilt {
+                            noP = noFilt[pi] == 1
+                            noQ = noFilt[i] == 1
+                        }
+                        let xc = x >> 1
+                        let yc = yy >> 1
+                        for c in 1..3 {
+                            let off = if c == 1 { cbQpOffset } else { crQpOffset }
+                            let qpi = qpAvg + off
+                            var qpc = qpi
+                            if qpi >= 30 {
+                                qpc = if qpi > 43 { qpi - 6 } else { qpcTab[qpi - 30] }
+                            }
+                            let qt = max(0, min(53, qpc + 2 + ctbTc[ctb]))
+                            let tc = tcTab[qt] << bd
+                            if tc == 0 {
+                                continue
+                            }
+                            // Four chroma lines (two for a picture edge).
+                            let lines = if edgeDir == 0 { min(4, ch - yc) } else { min(4, cw - xc) }
+                            if edgeDir == 0 {
+                                chromaEdge(c, yc * cw + xc, 1, cw, tc, noP, noQ, lines)
+                            } else {
+                                chromaEdge(c, yc * cw + xc, cw, 1, tc, noP, noQ, lines)
+                            }
+                        }
+                    }
+                    x4 += if edgeDir == 0 { 1 } else { 2 }
+                }
+                y4 += if edgeDir == 0 { 2 } else { 1 }
+            }
+        }
+    }
+
+    // One 4-line luma edge segment. q0 of the first line at `at`; `across`
+    // steps from p0 to q0, `along` to the next line.
+    fn lumaEdge(_ at: Int, _ across: Int, _ along: Int, _ beta: Int, _ tc: Int, _ noP: Bool, _ noQ: Bool) {
+        let a = across
+        let l3 = at + 3 * along
+        let dp0 = abs(y[at - 3 * a] - 2 * y[at - 2 * a] + y[at - a])
+        let dp3 = abs(y[l3 - 3 * a] - 2 * y[l3 - 2 * a] + y[l3 - a])
+        let dq0 = abs(y[at + 2 * a] - 2 * y[at + a] + y[at])
+        let dq3 = abs(y[l3 + 2 * a] - 2 * y[l3 + a] + y[l3])
+        let dpq0 = dp0 + dq0
+        let dpq3 = dp3 + dq3
+        let dp = dp0 + dp3
+        let dq = dq0 + dq3
+        let d = dpq0 + dpq3
+        if d >= beta {
+            return
+        }
+        let strong0 = 2 * dpq0 < (beta >> 2) && abs(y[at - 4 * a] - y[at - a]) + abs(y[at] - y[at + 3 * a]) < (beta >> 3) && abs(y[at - a] - y[at]) < ((5 * tc + 1) >> 1)
+        let strong3 = 2 * dpq3 < (beta >> 2) && abs(y[l3 - 4 * a] - y[l3 - a]) + abs(y[l3] - y[l3 + 3 * a]) < (beta >> 3) && abs(y[l3 - a] - y[l3]) < ((5 * tc + 1) >> 1)
+        let side = (beta + (beta >> 1)) >> 3
+        let dEp = dp < side
+        let dEq = dq < side
+        let mv = maxVal
+        var q = at
+        if strong0 && strong3 {
+            let tc2 = 2 * tc
+            for _ in 0..4 {
+                let p3 = y[q - 4 * a]
+                let p2 = y[q - 3 * a]
+                let p1 = y[q - 2 * a]
+                let p0 = y[q - a]
+                let q0 = y[q]
+                let q1 = y[q + a]
+                let q2 = y[q + 2 * a]
+                let q3 = y[q + 3 * a]
+                if !noP {
+                    y[q - a] = max(p0 - tc2, min(p0 + tc2, (p2 + 2 * p1 + 2 * p0 + 2 * q0 + q1 + 4) >> 3))
+                    y[q - 2 * a] = max(p1 - tc2, min(p1 + tc2, (p2 + p1 + p0 + q0 + 2) >> 2))
+                    y[q - 3 * a] = max(p2 - tc2, min(p2 + tc2, (2 * p3 + 3 * p2 + p1 + p0 + q0 + 4) >> 3))
+                }
+                if !noQ {
+                    y[q] = max(q0 - tc2, min(q0 + tc2, (p1 + 2 * p0 + 2 * q0 + 2 * q1 + q2 + 4) >> 3))
+                    y[q + a] = max(q1 - tc2, min(q1 + tc2, (p0 + q0 + q1 + q2 + 2) >> 2))
+                    y[q + 2 * a] = max(q2 - tc2, min(q2 + tc2, (p0 + q0 + q1 + 3 * q2 + 2 * q3 + 4) >> 3))
+                }
+                q += along
+            }
+            return
+        }
+        let tcHalf = tc >> 1
+        for _ in 0..4 {
+            let p2 = y[q - 3 * a]
+            let p1 = y[q - 2 * a]
+            let p0 = y[q - a]
+            let q0 = y[q]
+            let q1 = y[q + a]
+            let q2 = y[q + 2 * a]
+            var delta = (9 * (q0 - p0) - 3 * (q1 - p1) + 8) >> 4
+            if abs(delta) < tc * 10 {
+                delta = max(-tc, min(tc, delta))
+                if !noP {
+                    let s = p0 + delta
+                    y[q - a] = if s < 0 { 0 } else if s > mv { mv } else { s }
+                    if dEp {
+                        let dP = max(-tcHalf, min(tcHalf, (((p2 + p0 + 1) >> 1) - p1 + delta) >> 1))
+                        let s1 = p1 + dP
+                        y[q - 2 * a] = if s1 < 0 { 0 } else if s1 > mv { mv } else { s1 }
+                    }
+                }
+                if !noQ {
+                    let s = q0 - delta
+                    y[q] = if s < 0 { 0 } else if s > mv { mv } else { s }
+                    if dEq {
+                        let dQ = max(-tcHalf, min(tcHalf, (((q2 + q0 + 1) >> 1) - q1 - delta) >> 1))
+                        let s1 = q1 + dQ
+                        y[q + a] = if s1 < 0 { 0 } else if s1 > mv { mv } else { s1 }
+                    }
+                }
+            }
+            q += along
+        }
+    }
+
+    // A chroma edge segment of `lines` lines in plane c (1 Cb, 2 Cr).
+    fn chromaEdge(_ c: Int, _ at: Int, _ across: Int, _ along: Int, _ tc: Int, _ noP: Bool, _ noQ: Bool, _ lines: Int) {
+        let a = across
+        let mv = maxVal
+        var q = at
+        for _ in 0..lines {
+            if c == 1 {
+                let p1 = u[q - 2 * a]
+                let p0 = u[q - a]
+                let q0 = u[q]
+                let q1 = u[q + a]
+                let delta = max(-tc, min(tc, ((((q0 - p0) << 2) + p1 - q1 + 4) >> 3)))
+                if !noP {
+                    let s = p0 + delta
+                    u[q - a] = if s < 0 { 0 } else if s > mv { mv } else { s }
+                }
+                if !noQ {
+                    let s = q0 - delta
+                    u[q] = if s < 0 { 0 } else if s > mv { mv } else { s }
+                }
+            } else {
+                let p1 = v[q - 2 * a]
+                let p0 = v[q - a]
+                let q0 = v[q]
+                let q1 = v[q + a]
+                let delta = max(-tc, min(tc, ((((q0 - p0) << 2) + p1 - q1 + 4) >> 3)))
+                if !noP {
+                    let s = p0 + delta
+                    v[q - a] = if s < 0 { 0 } else if s > mv { mv } else { s }
+                }
+                if !noQ {
+                    let s = q0 - delta
+                    v[q] = if s < 0 { 0 } else if s > mv { mv } else { s }
+                }
+            }
+            q += along
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Sample adaptive offset (8.7.3).
+
+    // SAO into spare planes (outY / outU / outV, which the reconstructor
+    // provides; their content doesn't matter): every sample of the output
+    // is written, from the deblocked planes, which become the spares.
+    // When few CTBs use SAO, the output is instead the deblocked planes
+    // themselves (a copy-on-write copy keeps SAO's input) and only the SAO
+    // CTBs are written.
+    fn sao() {
+        if !anySao {
+            return
+        }
+        var nSao = 0
+        let nCtb = ctbW * ctbH
+        for ctb in 0..nCtb {
+            if saoType[ctb * 3] != 0 || saoType[ctb * 3 + 1] != 0 || saoType[ctb * 3 + 2] != 0 {
+                nSao += 1
+            }
+        }
+        let spare = nSao * 10 >= nCtb * 6 && outY.count == y.count
+        let srcY = y
+        let srcU = u
+        let srcV = v
+        if spare {
+            y = outY
+            u = outU
+            v = outV
+            outY = []
+            outU = []
+            outV = []
+        }
+        for cy in 0..ctbH {
+            for cx in 0..ctbW {
+                let ctb = cy * ctbW + cx
+                let any = saoType[ctb * 3] != 0 || saoType[ctb * 3 + 1] != 0 || saoType[ctb * 3 + 2] != 0
+                if !any && !spare {
+                    continue
+                }
+                if any {
+                    setBlocked(cx, cy)
+                }
+                for c in 0..3 {
+                    if c > 0 && !hasChroma {
+                        break
+                    }
+                    let t = saoType[ctb * 3 + c]
+                    let shift = if c == 0 { 0 } else { 1 }
+                    let x0 = (cx << log2Ctb) >> shift
+                    let y0 = (cy << log2Ctb) >> shift
+                    let pw = if c == 0 { width } else { cw }
+                    let ph = if c == 0 { height } else { ch }
+                    let x1 = min(pw, ((cx + 1) << log2Ctb) >> shift)
+                    let y1 = min(ph, ((cy + 1) << log2Ctb) >> shift)
+                    let src = if c == 0 { srcY } else if c == 1 { srcU } else { srcV }
+                    if t == 0 {
+                        if spare {
+                            copyRegion(c, src, x0, y0, x1, y1, pw)
+                        }
+                    } else if t == 1 {
+                        saoBand(c, src, ctb, x0, y0, x1, y1, pw, shift)
+                    } else {
+                        saoEdge(c, src, ctb, x0, y0, x1, y1, pw, ph, shift)
+                    }
+                }
+            }
+        }
+        if spare {
+            outY = srcY
+            outU = srcU
+            outV = srcV
+        }
+    }
+
+    fn copyRegion(_ c: Int, _ src: [Int], _ x0: Int, _ y0: Int, _ x1: Int, _ y1: Int, _ pw: Int) {
+        for yy in y0..y1 {
+            var at = yy * pw + x0
+            let end = yy * pw + x1
+            if c == 0 {
+                while at < end {
+                    y[at] = src[at]
+                    at += 1
+                }
+            } else if c == 1 {
+                while at < end {
+                    u[at] = src[at]
+                    at += 1
+                }
+            } else {
+                while at < end {
+                    v[at] = src[at]
+                    at += 1
+                }
+            }
+        }
+    }
+
+    // Which neighbouring CTBs edge offset must not read across (outside
+    // the picture, or across a slice / tile boundary that isn't filtered).
+    fn setBlocked(_ cx: Int, _ cy: Int) {
+        let ctb = cy * ctbW + cx
+        for dy in -1..2 {
+            for dx in -1..2 {
+                let nx = cx + dx
+                let ny = cy + dy
+                var b = 0
+                if nx < 0 || ny < 0 || nx >= ctbW || ny >= ctbH {
+                    b = 1
+                } else if dx != 0 || dy != 0 {
+                    let n = ny * ctbW + nx
+                    if ctbSlice[n] != ctbSlice[ctb] {
+                        // The earlier slice in decoding order decides by the
+                        // later one's flag (8.7.3: the slice of the sample
+                        // later in decoding order must allow it).
+                        if ctbTs[n] < ctbTs[ctb] {
+                            if ctbLfAcross[ctb] == 0 {
+                                b = 1
+                            }
+                        } else if ctbLfAcross[n] == 0 {
+                            b = 1
+                        }
+                    }
+                    if !lfAcrossTiles && ctbTile[n] != ctbTile[ctb] {
+                        b = 1
+                    }
+                }
+                blocked[(dy + 1) * 3 + dx + 1] = b
+            }
+        }
+    }
+
+    fn putSao(_ c: Int, _ at: Int, _ s: Int) {
+        if c == 0 {
+            y[at] = s
+        } else if c == 1 {
+            u[at] = s
+        } else {
+            v[at] = s
+        }
+    }
+
+    fn saoBand(_ c: Int, _ src: [Int], _ ctb: Int, _ x0: Int, _ y0: Int, _ x1: Int, _ y1: Int, _ pw: Int, _ shift: Int) {
+        // bandTab: the offset of each of the 32 bands (0 for most).
+        for k in 0..32 {
+            bandTab[k] = 0
+        }
+        let pos = saoClass[ctb * 3 + c]
+        let base = (ctb * 3 + c) * 4
+        for k in 0..4 {
+            bandTab[(k + pos) & 31] = saoOff[base + k]
+        }
+        let bandShift = bitDepth - 5
+        let mv = maxVal
+        for yy in y0..y1 {
+            let row = yy * pw
+            if anyNoFilt {
+                for xx in x0..x1 {
+                    let s = src[row + xx]
+                    if noFilt[((yy << shift) >> 2) * w4 + ((xx << shift) >> 2)] == 1 {
+                        putSao(c, row + xx, s)
+                    } else {
+                        putSao(c, row + xx, max(0, min(mv, s + bandTab[s >> bandShift])))
+                    }
+                }
+                continue
+            }
+            var at = row + x0
+            let end = row + x1
+            if c == 0 {
+                while at < end {
+                    let s = src[at]
+                    y[at] = max(0, min(mv, s + bandTab[s >> bandShift]))
+                    at += 1
+                }
+            } else if c == 1 {
+                while at < end {
+                    let s = src[at]
+                    u[at] = max(0, min(mv, s + bandTab[s >> bandShift]))
+                    at += 1
+                }
+            } else {
+                while at < end {
+                    let s = src[at]
+                    v[at] = max(0, min(mv, s + bandTab[s >> bandShift]))
+                    at += 1
+                }
+            }
+        }
+    }
+
+    fn saoEdge(_ c: Int, _ src: [Int], _ ctb: Int, _ x0: Int, _ y0: Int, _ x1: Int, _ y1: Int, _ pw: Int, _ ph: Int, _ shift: Int) {
+        let cls = saoClass[ctb * 3 + c]
+        // Neighbour offsets a and b (Table 8-14).
+        var ax = -1
+        var ay = 0
+        if cls == 1 {
+            ax = 0
+            ay = -1
+        } else if cls == 2 {
+            ax = -1
+            ay = -1
+        } else if cls == 3 {
+            ax = 1
+            ay = -1
+        }
+        let base = (ctb * 3 + c) * 4
+        let da = ay * pw + ax
+        let db = -da
+        // Rows and columns at the CTB's edges need neighbour checks; the
+        // rest of the CTB runs a tight loop.
+        let ys = if ay != 0 { y0 + 1 } else { y0 }
+        let ye = if ay != 0 { y1 - 1 } else { y1 }
+        let xs = if ax != 0 { x0 + 1 } else { x0 }
+        let xe = if ax != 0 { x1 - 1 } else { x1 }
+        if anyNoFilt {
+            for yy in y0..y1 {
+                for xx in x0..x1 {
+                    saoEdgeChecked(c, src, xx, yy, ax, ay, x0, y0, x1, y1, pw, ph, base, shift)
+                }
+            }
+            return
+        }
+        for yy in y0..y1 {
+            if yy < ys || yy >= ye {
+                for xx in x0..x1 {
+                    saoEdgeChecked(c, src, xx, yy, ax, ay, x0, y0, x1, y1, pw, ph, base, shift)
+                }
+                continue
+            }
+            if xs > x0 {
+                saoEdgeChecked(c, src, x0, yy, ax, ay, x0, y0, x1, y1, pw, ph, base, shift)
+            }
+            if xe > xs {
+                saoEdgeRun(c, src, yy * pw + xs, xe - xs, da, db, base)
+            }
+            if xe < x1 && xe >= xs {
+                saoEdgeChecked(c, src, x1 - 1, yy, ax, ay, x0, y0, x1, y1, pw, ph, base, shift)
+            }
+        }
+    }
+
+    // Edge offset of n samples from `at` whose neighbours are all usable.
+    // Branch-free: the sign of a difference d is (d >> 63) - (-d >> 63),
+    // the offset comes from a table by edgeIdx, every sample is stored.
+    fn saoEdgeRun(_ c: Int, _ src: [Int], _ at0: Int, _ n: Int, _ da: Int, _ db: Int, _ base: Int) {
+        // offTab[sign sum + 2]: SaoOffsetVal of edgeIdx 1, 2, 0, 3, 4.
+        offTab[0] = saoOff[base]
+        offTab[1] = saoOff[base + 1]
+        offTab[2] = 0
+        offTab[3] = saoOff[base + 2]
+        offTab[4] = saoOff[base + 3]
+        let mv = maxVal
+        var at = at0
+        let end = at0 + n
+        if c == 0 {
+            while at < end {
+                let s = src[at]
+                let d1 = s - src[at + da]
+                let d2 = s - src[at + db]
+                let e = (d1 >> 63) - ((-d1) >> 63) + (d2 >> 63) - ((-d2) >> 63)
+                y[at] = max(0, min(mv, s + offTab[e + 2]))
+                at += 1
+            }
+        } else if c == 1 {
+            while at < end {
+                let s = src[at]
+                let d1 = s - src[at + da]
+                let d2 = s - src[at + db]
+                let e = (d1 >> 63) - ((-d1) >> 63) + (d2 >> 63) - ((-d2) >> 63)
+                u[at] = max(0, min(mv, s + offTab[e + 2]))
+                at += 1
+            }
+        } else {
+            while at < end {
+                let s = src[at]
+                let d1 = s - src[at + da]
+                let d2 = s - src[at + db]
+                let e = (d1 >> 63) - ((-d1) >> 63) + (d2 >> 63) - ((-d2) >> 63)
+                v[at] = max(0, min(mv, s + offTab[e + 2]))
+                at += 1
+            }
+        }
+    }
+
+    // Edge offset of one sample with the picture, slice, tile and
+    // PCM / bypass checks of 8.7.3.
+    fn saoEdgeChecked(_ c: Int, _ src: [Int], _ xx: Int, _ yy: Int, _ ax: Int, _ ay: Int, _ x0: Int, _ y0: Int, _ x1: Int, _ y1: Int, _ pw: Int, _ ph: Int, _ base: Int, _ shift: Int) {
+        let at = yy * pw + xx
+        let s = src[at]
+        for side in 0..2 {
+            let nx = if side == 0 { xx + ax } else { xx - ax }
+            let ny = if side == 0 { yy + ay } else { yy - ay }
+            if nx < 0 || ny < 0 || nx >= pw || ny >= ph {
+                putSao(c, at, s)
+                return
+            }
+            let dx = if nx < x0 { -1 } else if nx >= x1 { 1 } else { 0 }
+            let dy = if ny < y0 { -1 } else if ny >= y1 { 1 } else { 0 }
+            if blocked[(dy + 1) * 3 + dx + 1] == 1 {
+                putSao(c, at, s)
+                return
+            }
+        }
+        if anyNoFilt && noFilt[((yy << shift) >> 2) * w4 + ((xx << shift) >> 2)] == 1 {
+            putSao(c, at, s)
+            return
+        }
+        let a = src[at + ay * pw + ax]
+        let b = src[at - ay * pw - ax]
+        let e = (if s < a { -1 } else if s > a { 1 } else { 0 }) + (if s < b { -1 } else if s > b { 1 } else { 0 })
+        if e == 0 {
+            putSao(c, at, s)
+            return
+        }
+        let o = if e == -2 { saoOff[base] } else if e == -1 { saoOff[base + 1] } else if e == 1 { saoOff[base + 2] } else { saoOff[base + 3] }
+        let r = s + o
+        putSao(c, at, if r < 0 { 0 } else if r > maxVal { maxVal } else { r })
+    }
+}

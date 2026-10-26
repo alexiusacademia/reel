@@ -1,0 +1,104 @@
+// CAVLC residual decoding (ITU-T H.264 9.2): coeff_token, trailing ones
+// signs, levels (level_prefix / level_suffix), total_zeros and run_before.
+//
+// The variable-length codes are decoded through lookup tables made once
+// at start-up from the code tables (tables.tsl): an entry, indexed by the
+// next `bits` of the stream, holds value * 32 + code length (0 = no such
+// code).
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../core"
+
+// Builds a lookup table of 2^bits entries for codes (len, code) -> value.
+fn h264BuildVlc(_ lens: [Int], _ codes: [Int], _ values: [Int], _ bits: Int) -> [Int] {
+    var t = h264Zeros(1 << bits)
+    for i in 0..lens.count {
+        let len = lens[i]
+        if len == 0 || len > bits {
+            continue
+        }
+        let first = codes[i] << (bits - len)
+        let n = 1 << (bits - len)
+        for k in 0..n {
+            t[first + k] = values[i] * 32 + len
+        }
+    }
+    t
+}
+
+fn h264Range(_ n: Int) -> [Int] {
+    var out: [Int] = []
+    for i in 0..n {
+        out.append(i)
+    }
+    out
+}
+
+// coeff_token tables for nC 0-1 (16 bits), 2-3 (14), 4-7 (10), 8+ (6).
+let cavlcTokenBits: [Int] = [16, 14, 10, 6]
+let cavlcTokenTabs: [[Int]] = h264BuildTokenTabs()
+
+fn h264BuildTokenTabs() -> [[Int]] {
+    var out: [[Int]] = []
+    for t in 0..4 {
+        let lens = cavlcCoeffTokenLen.slice(from: t * 68, to: t * 68 + 68)
+        let codes = cavlcCoeffTokenBits.slice(from: t * 68, to: t * 68 + 68)
+        // A length 0 entry with total < trailing is not a code.
+        out.append(h264BuildVlc(lens, codes, h264Range(68), cavlcTokenBits[t]))
+    }
+    out
+}
+
+let cavlcChromaDcTab: [Int] = h264BuildVlc(cavlcChromaDcTokenLen, cavlcChromaDcTokenBits, h264Range(20), 8)
+// total_zeros for TotalCoeff 1..15 (9 bits each), at (tc - 1) * 512.
+let cavlcZerosTab: [Int] = h264BuildZerosTab()
+let cavlcChromaDcZerosTab: [Int] = h264BuildChromaDcZerosTab()
+// run_before for zerosLeft 1..6 (3 bits) at (zl - 1) * 8, and > 6 (11
+// bits) at 48.
+let cavlcRunTab: [Int] = h264BuildRunTab()
+
+fn h264BuildZerosTab() -> [Int] {
+    var out: [Int] = []
+    for tc in 1..16 {
+        let lens = cavlcTotalZerosLen.slice(from: (tc - 1) * 16, to: tc * 16)
+        let codes = cavlcTotalZerosBits.slice(from: (tc - 1) * 16, to: tc * 16)
+        out += h264BuildVlc(lens, codes, h264Range(16), 9)
+    }
+    out
+}
+
+fn h264BuildChromaDcZerosTab() -> [Int] {
+    var out: [Int] = []
+    for tc in 1..4 {
+        let lens = cavlcChromaDcZerosLen.slice(from: (tc - 1) * 4, to: tc * 4)
+        let codes = cavlcChromaDcZerosBits.slice(from: (tc - 1) * 4, to: tc * 4)
+        out += h264BuildVlc(lens, codes, h264Range(4), 3)
+    }
+    out
+}
+
+fn h264BuildRunTab() -> [Int] {
+    var out: [Int] = []
+    for zl in 1..7 {
+        let lens = cavlcRunLen.slice(from: (zl - 1) * 16, to: zl * 16)
+        let codes = cavlcRunBits.slice(from: (zl - 1) * 16, to: zl * 16)
+        out += h264BuildVlc(lens, codes, h264Range(16), 3)
+    }
+    let lens = cavlcRunLen.slice(from: 96, to: 112)
+    let codes = cavlcRunBits.slice(from: 96, to: 112)
+    out += h264BuildVlc(lens, codes, h264Range(16), 11)
+    out
+}
+
+// Reads one code from a lookup table; -1 when the bits match no code.
+fn h264ReadVlc(_ r: bind core.BitReader, _ tab: [Int], _ base: Int, _ bits: Int) -> Int {
+    let e = tab[base + r.peek(bits)]
+    let len = e & 31
+    if len == 0 {
+        return -1
+    }
+    r.skip(len)
+    e >> 5
+}

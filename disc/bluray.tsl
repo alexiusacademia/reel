@@ -1,0 +1,453 @@
+// Blu-ray titles: from the parsed BDMV files (bdmv.tsl) to `disc.Title`s,
+// and the guess of which playlist is the main feature.
+//
+// A playlist plays its play items in order; each is the stretch IN…OUT of
+// a clip (STREAM/nnnnn.m2ts, described by CLIPINF/nnnnn.clpi). The clip's
+// EP map gives the source packet where each entry point (a video random
+// access point) starts, so IN/OUT turn into byte ranges of the m2ts and
+// times into seek positions. Chapters are the playlist's entry marks.
+//
+// Main feature: discs carry many playlists — menus' backgrounds, trailers,
+// copies of the film with other languages or branches, and on some discs
+// dozens of decoy ("obfuscation") playlists that list the film's clips in
+// a wrong order. The guess here (own design): skip short playlists and
+// exact duplicates; score each playlist by its length, lowered for
+// playlists that play the same clip stretch twice or are made of many
+// tiny items, raised a little for the playlist the disc's first title
+// plays and for one with chapters; the best score wins.
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+import "../core"
+
+public struct BlurayInfo {
+    index: BdIndex = BdIndex()
+    objects: [BdMovieObject] = []
+    playlists: [BdPlaylist] = []
+    clips: [String: BdClip] = [:]
+    // Each index title's playlist (-1 when it is BD-J or plays none).
+    titlePlaylists: [Int] = []
+    warnings: [String] = []
+}
+
+// Reads index.bdmv, MovieObject.bdmv, every playlist and the clip infos
+// (BACKUP/ copies when the main ones are missing or damaged).
+public fn readBlurayInfo(_ fs: DiscFs) -> Result<BlurayInfo> {
+    var info = BlurayInfo()
+    var gotIndex = false
+    for name in ["BDMV/index.bdmv", "BDMV/BACKUP/index.bdmv"] {
+        if !gotIndex {
+            if let d = discReadName(fs, name) {
+                match parseIndex(d) {
+                    .ok(x) -> {
+                        info.index = x
+                        gotIndex = true
+                    }
+                    .failure(e) -> info.warnings.append("{name}: {e.message}")
+                }
+            }
+        }
+    }
+    if !gotIndex {
+        info.warnings.append("no readable index.bdmv; listing playlists only")
+    }
+    var gotObjects = false
+    for name in ["BDMV/MovieObject.bdmv", "BDMV/BACKUP/MovieObject.bdmv"] {
+        if !gotObjects {
+            if let d = discReadName(fs, name) {
+                match parseMovieObjects(d) {
+                    .ok(x) -> {
+                        info.objects = x
+                        gotObjects = true
+                    }
+                    .failure(e) -> info.warnings.append("{name}: {e.message}")
+                }
+            }
+        }
+    }
+    for t in info.index.titles {
+        var pl = -1
+        if t.objectType == 1 && t.movieObject >= 0 && t.movieObject < info.objects.count {
+            let ps = info.objects[t.movieObject].playlists
+            if !ps.isEmpty {
+                pl = ps[0]
+            }
+        }
+        info.titlePlaylists.append(pl)
+    }
+    var files = discFilesIn(fs, "BDMV/PLAYLIST")
+    if files.isEmpty {
+        files = discFilesIn(fs, "BDMV/BACKUP/PLAYLIST")
+    }
+    for f in files {
+        if f.name.uppercase().hasSuffix(".MPLS") {
+            let base = f.name.fileName
+            let num = if base.count >= 10 { Int(base.substring(from: 0, to: 5)) ?? -1 } else { -1 }
+            var r = Result<BdPlaylist>.failure(error: Error("unreadable"))
+            if let d = discRead(fs, f) {
+                r = parseMpls(d, number: num)
+            }
+            if !r.isOk() {
+                let bk = "BDMV/BACKUP/PLAYLIST/" + f.name.fileName
+                if let d = discReadName(fs, bk) {
+                    r = parseMpls(d, number: num)
+                }
+            }
+            match r {
+                .ok(p) -> {
+                    info.playlists.append(p)
+                    info.warnings += p.warnings
+                }
+                .failure(e) -> info.warnings.append("{f.name}: {e.message}")
+            }
+        }
+    }
+    var wanted: Set<String> = []
+    for p in info.playlists {
+        for it in p.items {
+            wanted.insert(it.clip)
+            for a in it.angleClips {
+                wanted.insert(a)
+            }
+        }
+    }
+    for clip in wanted.sorted() {
+        var r = Result<BdClip>.failure(error: Error("CLIPINF/{clip}.clpi not found"))
+        if let d = discReadName(fs, "BDMV/CLIPINF/{clip}.clpi") {
+            r = parseClpi(d, name: clip)
+        }
+        if !r.isOk() {
+            if let d = discReadName(fs, "BDMV/BACKUP/CLIPINF/{clip}.clpi") {
+                r = parseClpi(d, name: clip)
+            }
+        }
+        match r {
+            .ok(c) -> {
+                info.clips[clip] = c
+                info.warnings += c.warnings
+            }
+            .failure(e) -> info.warnings.append("clip {clip}: {e.message}")
+        }
+    }
+    if info.playlists.isEmpty {
+        return Result.failure(error: Error("no Blu-ray playlists found (BDMV/PLAYLIST)"))
+    }
+    Result.ok(value: info)
+}
+
+// The seconds a playlist plays.
+public fn bdDuration(_ p: BdPlaylist) -> Float {
+    var t = 0
+    for it in p.items {
+        t += max(0, it.outTime - it.inTime)
+    }
+    Float(t) / 45000.0
+}
+
+// The EP map to cut a clip by: the video stream's, else the first.
+fn bdMainEpMap(_ c: BdClip) -> BdEpMap {
+    var vpid = -1
+    for s in c.streams {
+        if s.kind == core.TrackKind.video && vpid < 0 {
+            vpid = s.pid
+        }
+    }
+    for m in c.epMaps {
+        if m.pid == vpid {
+            return m
+        }
+    }
+    if let m = c.epMaps.first {
+        return m
+    }
+    BdEpMap()
+}
+
+fn bdStream(_ s: BdStream, _ n: Int) -> Stream {
+    var o = Stream(kind: s.kind, codec: s.codec)
+    o.id = s.pid
+    o.number = n
+    o.language = s.language
+    o.languageCode = s.language
+    if s.kind == core.TrackKind.video {
+        let (w, h) = bdVideoSize(s.format)
+        o.width = w
+        o.height = h
+        let (fn0, fd) = bdFps(s.rate)
+        o.fpsNum = fn0
+        o.fpsDen = fd
+        o.aspect = if w >= 1280 { "16:9" } else { "" }
+    } else if s.kind == core.TrackKind.audio {
+        o.channels = bdChannels(s.presentation)
+        o.sampleRate = bdSampleRate(s.rate)
+        if s.role != "primary" {
+            o.note = "Secondary audio"
+        }
+    }
+    o
+}
+
+// A playlist as a title, playing angle `angle`.
+public fn blurayTitle(_ fs: DiscFs, _ info: BlurayInfo, _ p: BdPlaylist, angle: Int = 1) -> Title {
+    var t = Title(number: 0)
+    t.kind = "bluray"
+    t.playlist = p.number
+    let num = "{p.number}".padStart(5, with: "0")
+    t.name = "Playlist {num}"
+    var ti = 0
+    while ti < info.titlePlaylists.count {
+        if info.titlePlaylists[ti] == p.number {
+            t.number = ti + 1
+            t.name = "Title {ti + 1} (playlist {num})"
+            break
+        }
+        ti += 1
+    }
+    for it in p.items {
+        t.angles = max(t.angles, it.angles)
+    }
+    t.angle = max(1, min(angle, t.angles))
+    var time = 0.0
+    var pos = 0
+    var itemStarts: [Float] = []
+    var i = 0
+    while i < p.items.count {
+        let it = p.items[i]
+        var clip = it.clip
+        if t.angle > 1 && t.angle - 2 < it.angleClips.count {
+            clip = it.angleClips[t.angle - 2]
+        }
+        t.clips.append(clip)
+        itemStarts.append(time)
+        let dur = Float(max(0, it.outTime - it.inTime)) / 45000.0
+        let inPts = it.inTime * 2
+        let outPts = it.outTime * 2
+        var file = discFind(fs, "BDMV/STREAM/{clip}.m2ts")
+        if file == nil {
+            file = discFind(fs, "BDMV/STREAM/{clip}.mts")
+        }
+        let ep = if let c = info.clips[clip] { bdMainEpMap(c) } else { BdEpMap() }
+        if info.clips[clip] == nil {
+            t.warnings.append("item {i}: no clip info for {clip}")
+        }
+        // Bytes: from the entry point at or before IN to the first one
+        // after OUT (or the end of the file). EP maps are in time order.
+        let firstEp = bdFirstAfter(ep.pts, inPts)
+        let after = bdFirstAfter(ep.pts, outPts)
+        let fromSpn = if firstEp > 0 { ep.spn[firstEp - 1] } else { 0 }
+        let toSpn = if after < ep.pts.count { ep.spn[after] } else { -1 }
+        var size = 0
+        var pieces: [(String, Int, Int)] = []
+        if let f = file {
+            size = f.size
+        } else {
+            t.warnings.append("item {i}: STREAM/{clip}.m2ts not found")
+        }
+        let from = min(size, fromSpn * 192)
+        let to = if toSpn < 0 { size } else { max(from, min(size, toSpn * 192)) }
+        if let f = file {
+            pieces = discFileRanges(f, from, to)
+        }
+        if pieces.isEmpty {
+            pieces.append(("", 0, 0))
+        }
+        var pp = pos
+        var first = true
+        for (path, a, b) in pieces {
+            var seg = Segment(path: path, from: a, to: b)
+            seg.start = time
+            seg.duration = if first { dur } else { 0.0 }
+            seg.pos = pp
+            seg.cell = i
+            seg.pgc = -1
+            seg.discontinuity = first
+            seg.inPts = inPts
+            seg.outPts = outPts
+            t.segments.append(seg)
+            pp += b - a
+            first = false
+        }
+        // Seek points: the entry points inside IN…OUT.
+        var k = max(0, firstEp - 1)
+        while k < after && k < ep.pts.count {
+            let pts = ep.pts[k]
+            let at = ep.spn[k] * 192
+            if pts >= inPts && pts <= outPts && at >= from && at < to {
+                t.points.append(SeekPoint(time: time + Float(pts - inPts) / 90000.0, pos: pos + at - from))
+            }
+            k += 1
+        }
+        pos += max(0, to - from)
+        time += dur
+        i += 1
+    }
+    t.duration = time
+    // Chapters: entry marks, in time order.
+    var starts: [Float] = []
+    for m in p.marks {
+        if m.type == 1 && m.item >= 0 && m.item < p.items.count {
+            let it = p.items[m.item]
+            let s = itemStarts[m.item] + Float(max(0, m.time - it.inTime)) / 45000.0
+            if s < time + 0.001 {
+                starts.append(s)
+            }
+        }
+    }
+    starts = starts.sorted()
+    var n = 1
+    for s in starts {
+        if t.chapters.isEmpty || s - t.chapters[t.chapters.count - 1].start > 0.001 {
+            t.chapters.append(core.Chapter(start: s, title: "Chapter {n}"))
+            n += 1
+        }
+    }
+    var c = 0
+    while c < t.chapters.count {
+        t.chapters[c].end = if c + 1 < t.chapters.count { t.chapters[c + 1].start } else { t.duration }
+        c += 1
+    }
+    // Streams of the first play item's STN table.
+    if let first = p.items.first {
+        var counts: [core.TrackKind: Int] = [:]
+        for s in first.streams {
+            let k = counts[s.kind] ?? 0
+            counts[s.kind] = k + 1
+            t.streams.append(bdStream(s, k))
+        }
+    }
+    for s in t.streams {
+        if s.kind == core.TrackKind.video && t.width == 0 {
+            t.width = s.width
+            t.height = s.height
+            t.aspect = s.aspect
+        }
+    }
+    discFinishTitle(t)
+}
+
+// The index of the first value greater than `x` in an ascending list.
+fn bdFirstAfter(_ list: [Int], _ x: Int) -> Int {
+    var lo = 0
+    var hi = list.count
+    while lo < hi {
+        let mid = (lo + hi) / 2
+        if list[mid] <= x {
+            lo = mid + 1
+        } else {
+            hi = mid
+        }
+    }
+    lo
+}
+
+// A key for "plays the same thing": the clips with their in/out times.
+fn bdSignature(_ p: BdPlaylist) -> String {
+    var parts: [String] = []
+    for it in p.items {
+        parts.append("{it.clip}:{it.inTime}:{it.outTime}")
+    }
+    parts.joined(separator: ",")
+}
+
+// How likely a playlist is the main feature (bigger is likelier).
+fn bdScore(_ info: BlurayInfo, _ p: BdPlaylist, _ crowd: Int) -> Float {
+    var score = bdDuration(p)
+    // The same stretch of a clip played twice: a decoy or a loop.
+    var seen: Set<String> = []
+    var repeats = 0
+    for it in p.items {
+        let key = "{it.clip}:{it.inTime}"
+        if seen.contains(key) {
+            repeats += 1
+        }
+        seen.insert(key)
+    }
+    if repeats > 0 {
+        score *= 0.5
+    }
+    // Many tiny items (under 10 s on average) in a long playlist.
+    if p.items.count > 20 && bdDuration(p) / Float(p.items.count) < 10.0 {
+        score *= 0.8
+    }
+    // Among many playlists of the same length, prefer the one the disc's
+    // titles play.
+    let referenced = info.titlePlaylists.contains(p.number)
+    if referenced {
+        score *= if crowd >= 3 { 1.1 } else { 1.02 }
+    } else if crowd >= 3 {
+        score *= 0.95
+    }
+    if !p.marks.isEmpty {
+        score *= 1.01
+    }
+    score
+}
+
+// Playlists at least `minDuration` long, without exact duplicates, in
+// number order.
+fn bdKeep(_ info: BlurayInfo, _ minDuration: Float) -> [BdPlaylist] {
+    var keep: [BdPlaylist] = []
+    var sigs: [String] = []
+    let sorted = info.playlists.sorted(by: { a, b in a.number < b.number })
+    for p in sorted {
+        if bdDuration(p) < minDuration || p.items.isEmpty {
+            continue
+        }
+        let sig = bdSignature(p)
+        var dup = -1
+        var i = 0
+        while i < sigs.count {
+            if sigs[i] == sig {
+                dup = i
+                break
+            }
+            i += 1
+        }
+        if dup < 0 {
+            keep.append(p)
+            sigs.append(sig)
+        } else if info.titlePlaylists.contains(p.number) && !info.titlePlaylists.contains(keep[dup].number) {
+            keep[dup] = p
+        }
+    }
+    keep
+}
+
+// The playlists worth listing: at least `minDuration` seconds, without
+// exact duplicates (the first one listed, or the one a title plays, is
+// kept); in playlist number order, with the main feature marked.
+public fn blurayTitles(_ fs: DiscFs, _ info: BlurayInfo, minDuration: Float = 20.0) -> [Title] {
+    var keep = bdKeep(info, minDuration)
+    if keep.isEmpty {
+        // Everything is short (a sample disc): list them all.
+        keep = bdKeep(info, 0.0)
+    }
+    var best = -1
+    var bestScore = -1.0
+    var i = 0
+    while i < keep.count {
+        let d = bdDuration(keep[i])
+        var crowd = 0
+        for q in keep {
+            if abs(bdDuration(q) - d) < 1.0 {
+                crowd += 1
+            }
+        }
+        let s = bdScore(info, keep[i], crowd)
+        if s > bestScore {
+            bestScore = s
+            best = i
+        }
+        i += 1
+    }
+    var out: [Title] = []
+    i = 0
+    while i < keep.count {
+        var t = blurayTitle(fs, info, keep[i])
+        t.mainFeature = i == best
+        out.append(t)
+        i += 1
+    }
+    out
+}

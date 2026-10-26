@@ -1,0 +1,101 @@
+// Small RGBA thumbnails of decoded pictures, for seek previews, the media
+// library and the scene strip: a fast area average down to the
+// thumbnail's size (each output sample the mean of a sparse grid of at
+// most 6×6 samples spread evenly over its area, which is a box filter on
+// the source sampled with a step; for the sizes thumbnails shrink by,
+// that is close to a full area average at a fraction of the reads), made
+// into a small 4:4:4 picture of the same matrix, range and depth, and
+// colour converted by the render module.
+//
+// The thumbnail keeps the picture's display shape (its sample aspect
+// ratio included): thumbnailHeight gives the height for a width.
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+import "../core"
+import "../render"
+
+// The height of a thumbnail `width` samples wide.
+public fn thumbnailHeight(_ p: core.Picture, width: Int) -> Int {
+    let sar = if p.sarNum > 0 && p.sarDen > 0 { Float(p.sarNum) / Float(p.sarDen) } else { 1.0 }
+    let dw = Float(p.width) * sar
+    if dw <= 0.0 || width <= 0 {
+        return 0
+    }
+    max(1, Int(floor(Float(width) * Float(p.height) / dw + 0.5)))
+}
+
+// A thumbnail `width` pixels wide (height: thumbnailHeight), packed RGBA
+// r<<24|g<<16|b<<8|255, row by row. Empty for a broken picture.
+public fn thumbnail(_ p: core.Picture, width: Int) -> [Int] {
+    let tw = max(1, width)
+    let th = thumbnailHeight(p, width: tw)
+    if th <= 0 || !render.planesFit(p) {
+        return []
+    }
+    var small = core.Picture(width: tw, height: th, chroma: .yuv444, depth: p.depth)
+    small.yStride = tw
+    small.cStride = tw
+    small.matrix = render.effectiveMatrix(p)
+    small.fullRange = p.fullRange
+    small.y = thumbPlane(p.y, p.yOffset, p.yStride, p.width, p.height, tw, th)
+    if p.chroma == .gray || p.u.isEmpty || p.v.isEmpty {
+        small.chroma = .gray
+    } else {
+        let cw = p.chromaWidth
+        let ch = p.chromaHeight
+        small.u = thumbPlane(p.u, p.cOffset, p.cStride, cw, ch, tw, th)
+        small.v = thumbPlane(p.v, p.cOffset, p.cStride, cw, ch, tw, th)
+    }
+    if small.matrix == .rgb {
+        // G, B, R planes: the renderer takes Y'CbCr only; show as gray.
+        small.chroma = .gray
+        small.u = []
+        small.v = []
+        small.matrix = .bt709
+    }
+    render.toRgba(small, width: tw, height: th)
+}
+
+// A sw×sh plane averaged down to tw×th (sparse grid area average; when
+// the thumbnail is larger than the plane, nearest).
+fn thumbPlane(_ plane: [Int], _ off: Int, _ stride: Int, _ sw: Int, _ sh: Int, _ tw: Int, _ th: Int) -> [Int] {
+    var out = core.zeros(tw * th)
+    // Each output column's first sample, step and count, worked out once.
+    var xs: [Int] = []
+    var xstep: [Int] = []
+    var xn: [Int] = []
+    for ox in 0..tw {
+        let x0 = ox * sw / tw
+        let x1 = max(x0 + 1, (ox + 1) * sw / tw)
+        let n = min(x1 - x0, 6)
+        let step = max(1, (x1 - x0) / n)
+        xs.append(x0 + ((x1 - x0) - (n - 1) * step) / 2)
+        xstep.append(step)
+        xn.append(n)
+    }
+    for oy in 0..th {
+        let y0 = oy * sh / th
+        let y1 = max(y0 + 1, (oy + 1) * sh / th)
+        let ny = min(y1 - y0, 6)
+        let sy = max(1, (y1 - y0) / ny)
+        let yfirst = y0 + ((y1 - y0) - (ny - 1) * sy) / 2
+        for ox in 0..tw {
+            let n = xn[ox]
+            let st = xstep[ox]
+            let first = xs[ox]
+            var sum = 0
+            for k in 0..ny {
+                var i = off + (yfirst + k * sy) * stride + first
+                for _ in 0..n {
+                    sum += plane[i]
+                    i += st
+                }
+            }
+            let count = n * ny
+            out[oy * tw + ox] = (sum + count / 2) / count
+        }
+    }
+    out
+}

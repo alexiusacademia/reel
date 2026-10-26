@@ -1,0 +1,1235 @@
+// JPEG decoding (ITU-T T.81) for Motion-JPEG video and cover art:
+// baseline and extended sequential Huffman (SOF0, SOF1) and progressive
+// Huffman (SOF2) with spectral selection and successive approximation,
+// 8-bit samples, any sampling factors, restart intervals, JFIF (pixel
+// shape), Adobe (RGB, CMYK and YCCK colour transforms), EXIF orientation
+// and AVI1 Motion-JPEG frames, which may leave out their Huffman tables
+// (the Annex K tables are used then) or hold two fields.
+//
+// The picture comes out as full-range BT.601 Y'CbCr (JFIF): 4:2:0, 4:2:2,
+// 4:4:4 or gray as coded; other samplings (4:1:1, 4:4:0, …) are spread
+// to the nearest of those by repeating chroma samples, and RGB or CMYK
+// images are converted to 4:4:4.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../core"
+
+public struct Decoder {
+    warnings: [String] = []
+    // Every JPEG frame is a key frame; there is nothing to skip.
+    skipNonReference: Bool = false
+    // EXIF orientation of the last image (1 = as stored; 6 = turn 90°
+    // clockwise to show, 3 = 180°, 8 = 270°; 2, 4, 5, 7 are mirrored).
+    orientation: Int = 1
+
+    timescale: Int = 1000
+    trackW: Int = 0
+    trackH: Int = 0
+    trackSarNum: Int = 1
+    trackSarDen: Int = 1
+    frameDur: Int = 0
+
+    // Tables, kept from image to image (Motion-JPEG may rely on that).
+    dcT: [[Int]] = []
+    acT: [[Int]] = []
+    qt: [[Int]] = []
+    restartInterval: Int = 0
+
+    // The frame (SOF).
+    width: Int = 0
+    height: Int = 0
+    ncomp: Int = 0
+    progressive: Bool = false
+    compId: [Int] = []
+    compH: [Int] = []
+    compV: [Int] = []
+    compQ: [Int] = []
+    hmax: Int = 1
+    vmax: Int = 1
+    mcusX: Int = 0
+    mcusY: Int = 0
+    // A plane per component, whole MCUs, and its width (stride).
+    planes: [[Int]] = []
+    pw: [Int] = []
+    ph: [Int] = []
+    // Progressive images: every block's coefficients (64 per block).
+    coefs: [[Int]] = []
+    adobe: Int = -1
+    jfifSarNum: Int = 0
+    jfifSarDen: Int = 0
+    avi1: Int = -1
+    frameOk: Bool = false
+    scans: Int = 0
+
+    // Scan state.
+    br: core.BitReader = core.bitReader(Data())
+    blk: [Int] = []
+    dcPred: [Int] = [0, 0, 0, 0]
+    eobrun: Int = 0
+    rst: [Int] = []
+    rstAt: Int = 0
+    damaged: Bool = false
+
+    last: core.Picture = core.Picture(width: 0, height: 0)
+    haveLast: Bool = false
+
+    // Decodes one packet: a JPEG image (or two, the fields of an
+    // interlaced Motion-JPEG frame). Returns its picture.
+    fn decode(_ packet: Data, pts: Int, dts: Int, key: Bool) -> [core.Picture] {
+        var pics: [core.Picture] = []
+        var pos = 0
+        while pics.count < 2 {
+            let soi = jpgFindSoi(packet, pos)
+            if soi < 0 {
+                break
+            }
+            let (end, ok) = decodeImageAt(packet, soi)
+            if ok {
+                pics.append(makePicture())
+            }
+            if end <= soi {
+                break
+            }
+            pos = end
+            // A second image only makes a frame of two fields.
+            if pics.count == 1 && !(trackH > 0 && height * 2 <= trackH + 16 && height * 2 >= trackH - 16) {
+                break
+            }
+        }
+        if pics.isEmpty {
+            warn("no picture in the packet")
+            if !haveLast {
+                return []
+            }
+            var p = last
+            p.pts = pts
+            p.key = true
+            return [p]
+        }
+        var pic = pics[0]
+        if pics.count == 2 && pics[1].width == pic.width && pics[1].height == pic.height {
+            // Motion-JPEG with one field per image: weave them (AVI1
+            // polarity 2 puts the first image on the even field).
+            let topFirst = avi1 != 2
+            pic = if topFirst { jpgWeave(pics[0], pics[1]) } else { jpgWeave(pics[1], pics[0]) }
+        }
+        pic.pts = pts
+        pic.key = true
+        pic.duration = frameDur
+        last = pic
+        haveLast = true
+        [pic]
+    }
+
+    fn flush() -> [core.Picture] {
+        []
+    }
+
+    fn reset() {
+        haveLast = false
+    }
+
+    fn warn(_ s: String) {
+        if warnings.count < 100 {
+            warnings.append(s)
+        }
+    }
+
+    // ---- Markers (Annex B) ----
+
+    // Decodes the image whose SOI is at data[at]. Returns where it ended
+    // and whether a picture came out.
+    fn decodeImageAt(_ d: Data, _ at: Int) -> (Int, Bool) {
+        let n = d.count
+        var i = at + 2
+        frameOk = false
+        scans = 0
+        adobe = -1
+        damaged = false
+        restartInterval = 0
+        jfifSarNum = 0
+        jfifSarDen = 0
+        orientation = 1
+        while i + 1 < n {
+            if d[i] != 0xFF {
+                i += 1
+                continue
+            }
+            let m = d[i + 1]
+            if m == 0xFF || m == 0x00 || m == 0x01 || (m >= 0xD0 && m <= 0xD7) || m == 0xD8 {
+                i += if m == 0xFF { 1 } else { 2 }
+                continue
+            }
+            if m == 0xD9 {
+                return (i + 2, finishImage())
+            }
+            if i + 4 > n {
+                break
+            }
+            let len = d.uint16(at: i + 2, bigEndian: true)
+            let from = i + 4
+            let to = min(i + 2 + len, n)
+            if len < 2 {
+                warn("bad segment length")
+                return (n, finishImage())
+            }
+            if m == 0xC4 {
+                parseDht(d, from, to)
+            } else if m == 0xDB {
+                parseDqt(d, from, to)
+            } else if m == 0xDD {
+                if to - from >= 2 {
+                    restartInterval = d.uint16(at: from, bigEndian: true)
+                }
+            } else if m == 0xC0 || m == 0xC1 || m == 0xC2 {
+                if !parseSof(d, from, to, m == 0xC2) {
+                    return (to, false)
+                }
+            } else if (m >= 0xC3 && m <= 0xCF) && m != 0xC4 && m != 0xC8 && m != 0xCC {
+                warn("JPEG process SOF{m - 0xC0} (lossless, hierarchical or arithmetic coding) is not supported")
+                return (to, false)
+            } else if m == 0xDA {
+                if !frameOk {
+                    warn("scan before the frame header")
+                    return (to, false)
+                }
+                i = decodeScan(d, from, to)
+                scans += 1
+                continue
+            } else if m == 0xE0 {
+                parseApp0(d, from, to)
+            } else if m == 0xE1 {
+                let o = jpgExifOrientation(d, from, to)
+                if o > 0 {
+                    orientation = o
+                }
+            } else if m == 0xEE {
+                if to - from >= 12 && d.slice(from: from, to: from + 5).latin1 == "Adobe" {
+                    adobe = d[from + 11]
+                }
+            }
+            i = to
+        }
+        // No EOI: show what was decoded.
+        (n, finishImage())
+    }
+
+    fn parseApp0(_ d: Data, _ from: Int, _ to: Int) {
+        if to - from >= 14 && d.slice(from: from, to: from + 4).latin1 == "JFIF" {
+            let xd = d.uint16(at: from + 8, bigEndian: true)
+            let yd = d.uint16(at: from + 10, bigEndian: true)
+            jfifSarNum = xd
+            jfifSarDen = yd
+        } else if to - from >= 5 && d.slice(from: from, to: from + 4).latin1 == "AVI1" {
+            avi1 = d[from + 4]
+        }
+    }
+
+    // DHT (B.2.4.2): Huffman tables, two classes (DC, AC) of four.
+    fn parseDht(_ d: Data, _ from: Int, _ to: Int) {
+        var p = from
+        while p + 17 <= to {
+            let tc = d[p] >> 4
+            let th = d[p] & 15
+            var bits: [Int] = []
+            var count = 0
+            for k in 0..16 {
+                bits.append(d[p + 1 + k])
+                count += d[p + 1 + k]
+            }
+            p += 17
+            if p + count > to || th > 3 || tc > 1 {
+                warn("bad Huffman table")
+                return
+            }
+            var vals: [Int] = []
+            for k in 0..count {
+                vals.append(d[p + k])
+            }
+            p += count
+            let codes = jpgCodes(bits, vals)
+            if codes.isEmpty {
+                warn("bad Huffman table")
+                continue
+            }
+            let t = jpgBuild(codes, rootBits: 9)
+            if tc == 0 {
+                dcT[th] = t
+            } else {
+                acT[th] = t
+            }
+        }
+    }
+
+    // DQT (B.2.4.1): quantisation tables in zig-zag order, 8 or 16 bits.
+    fn parseDqt(_ d: Data, _ from: Int, _ to: Int) {
+        var p = from
+        while p < to {
+            let pq = d[p] >> 4
+            let tq = d[p] & 3
+            p += 1
+            var q: [Int] = []
+            for k in 0..64 {
+                if pq == 0 {
+                    q.append(if p < to { d[p] } else { 1 })
+                    p += 1
+                } else {
+                    q.append(if p + 1 < to { d.uint16(at: p, bigEndian: true) } else { 1 })
+                    p += 2
+                }
+                if q[k] == 0 {
+                    q[k] = 1
+                }
+            }
+            qt[tq] = q
+        }
+    }
+
+    // SOF0/1/2 (B.2.2): size, components and their sampling factors.
+    fn parseSof(_ d: Data, _ from: Int, _ to: Int, _ prog: Bool) -> Bool {
+        if to - from < 6 {
+            warn("short frame header")
+            return false
+        }
+        let precision = d[from]
+        if precision != 8 {
+            warn("{precision}-bit JPEG is not supported")
+            return false
+        }
+        let h = d.uint16(at: from + 1, bigEndian: true)
+        let w = d.uint16(at: from + 3, bigEndian: true)
+        let nf = d[from + 5]
+        if w * h > jpgMaxArea {
+            warn("image {w}×{h} is too large")
+            return false
+        }
+        if h == 0 || w == 0 || (nf != 1 && nf != 3 && nf != 4) || to - from < 6 + nf * 3 {
+            warn("frame header: {w}×{h}, {nf} components not supported")
+            return false
+        }
+        var ids: [Int] = []
+        var hs: [Int] = []
+        var vs: [Int] = []
+        var qs: [Int] = []
+        for c in 0..nf {
+            let p = from + 6 + c * 3
+            ids.append(d[p])
+            let hv = d[p + 1]
+            hs.append(max(1, min(4, hv >> 4)))
+            vs.append(max(1, min(4, hv & 15)))
+            qs.append(d[p + 2] & 3)
+        }
+        width = w
+        height = h
+        ncomp = nf
+        progressive = prog
+        compId = ids
+        compH = if nf == 1 { [1] } else { hs }
+        compV = if nf == 1 { [1] } else { vs }
+        compQ = qs
+        hmax = 1
+        vmax = 1
+        for c in 0..nf {
+            hmax = max(hmax, compH[c])
+            vmax = max(vmax, compV[c])
+        }
+        mcusX = (w + 8 * hmax - 1) / (8 * hmax)
+        mcusY = (h + 8 * vmax - 1) / (8 * vmax)
+        // Planes are kept from frame to frame when the size stays: a
+        // damaged scan then leaves the previous frame's samples.
+        var same = planes.count == nf
+        for c in 0..nf {
+            let wc = mcusX * compH[c] * 8
+            let hc = mcusY * compV[c] * 8
+            if !same || pw[c] != wc || ph[c] != hc {
+                same = false
+            }
+        }
+        if !same {
+            planes = []
+            pw = []
+            ph = []
+            for c in 0..nf {
+                let wc = mcusX * compH[c] * 8
+                let hc = mcusY * compV[c] * 8
+                pw.append(wc)
+                ph.append(hc)
+                planes.append(core.filled(wc * hc, if c == 0 { 0 } else { 128 }))
+            }
+        }
+        coefs = []
+        if prog {
+            for c in 0..nf {
+                coefs.append(core.zeros(pw[c] * ph[c]))
+            }
+        }
+        frameOk = true
+        true
+    }
+
+    // ---- Scans (Annex F and G) ----
+
+    // Takes the entropy-coded data after a SOS header at data[from] out
+    // of its byte stuffing (FF 00 → FF) and restart markers, recording
+    // where each restart interval starts. Returns the clean bytes and
+    // where the data ended (the next marker).
+    fn unstuff(_ d: Data, _ from: Int) -> (Data, Int) {
+        var out = Data()
+        rst = [0]
+        let n = d.count
+        var i = from
+        var run = from
+        while i + 1 < n {
+            if d[i] != 0xFF {
+                i += 1
+                continue
+            }
+            let m = d[i + 1]
+            if m == 0x00 {
+                out += d.slice(from: run, to: i + 1)
+                i += 2
+                run = i
+            } else if m >= 0xD0 && m <= 0xD7 {
+                out += d.slice(from: run, to: i)
+                rst.append(out.count)
+                i += 2
+                run = i
+            } else if m == 0xFF {
+                // Fill bytes before a marker.
+                out += d.slice(from: run, to: i)
+                i += 1
+                run = i
+            } else {
+                out += d.slice(from: run, to: i)
+                return (out, i)
+            }
+        }
+        out += d.slice(from: run, to: n)
+        (out, n)
+    }
+
+    // SOS (B.2.3) and the scan's data. Returns the position after it.
+    fn decodeScan(_ d: Data, _ from: Int, _ to: Int) -> Int {
+        let ns = d[from]
+        if ns < 1 || ns > 4 || to - from < 4 + ns * 2 {
+            warn("bad scan header")
+            return to
+        }
+        var comps: [Int] = []
+        var tds: [Int] = []
+        var tas: [Int] = []
+        for k in 0..ns {
+            let id = d[from + 1 + k * 2]
+            let t = d[from + 2 + k * 2]
+            var c = -1
+            for j in 0..ncomp {
+                if compId[j] == id {
+                    c = j
+                }
+            }
+            if c < 0 {
+                warn("scan of an unknown component")
+                return to
+            }
+            comps.append(c)
+            tds.append(t >> 4 & 3)
+            tas.append(t & 3)
+        }
+        let p = from + 1 + ns * 2
+        let ss = d[p]
+        let se = d[p + 1]
+        let ah = d[p + 2] >> 4
+        let al = d[p + 2] & 15
+        let (ecs, end) = unstuff(d, to)
+        br = core.bitReader(ecs)
+        rstAt = 0
+        eobrun = 0
+        for k in 0..4 {
+            dcPred[k] = 1024
+        }
+        for k in 0..ns {
+            let c = comps[k]
+            if qt[compQ[c]].isEmpty {
+                qt[compQ[c]] = core.filled(64, 1)
+                warn("missing quantisation table")
+            }
+            if (!progressive || (ss == 0 && ah == 0)) && dcT[tds[k]].isEmpty {
+                warn("missing Huffman table")
+                return end
+            }
+            if (!progressive || ss > 0) && acT[tas[k]].isEmpty {
+                warn("missing Huffman table")
+                return end
+            }
+        }
+        if !progressive {
+            if !sequentialScan(comps, tds, tas) {
+                damaged = true
+                warn("damaged scan data")
+            }
+        } else if ss == 0 {
+            if !dcScan(comps, tds, ah, al) {
+                damaged = true
+                warn("damaged scan data")
+            }
+        } else {
+            if ns != 1 || se > 63 || ss > se {
+                warn("bad progressive scan")
+                return end
+            }
+            if !acScan(comps[0], tas[0], ss, se, ah, al) {
+                damaged = true
+                warn("damaged scan data")
+            }
+        }
+        end
+    }
+
+    // At the start of restart interval k: the next clean byte position.
+    fn restart(_ count: Int) {
+        if restartInterval > 0 && count > 0 && count % restartInterval == 0 {
+            rstAt += 1
+            if rstAt < rst.count {
+                br.seek(toBit: rst[rstAt] * 8)
+            }
+            for k in 0..4 {
+                dcPred[k] = 1024
+            }
+            eobrun = 0
+        }
+    }
+
+    // A Huffman code of table t: its symbol, or -1.
+    fn huff(_ t: [Int]) -> Int {
+        let r = t[0]
+        let l = t[1]
+        let p = br.peek(l)
+        var e = t[2 + (p >> (l - r))]
+        if e < 0 {
+            let s = -e
+            let k = s & 31
+            e = t[(s >> 5) + ((p >> (l - r - k)) & ((1 << k) - 1))]
+        }
+        let len = e & 31
+        if len == 0 {
+            return -1
+        }
+        br.skip(len)
+        e >> 5
+    }
+
+    // A magnitude category's extra bits as a signed value (F.2.2.1).
+    fn receive(_ s: Int) -> Int {
+        if s == 0 {
+            return 0
+        }
+        let v = br.bits(s)
+        if v < (1 << (s - 1)) { v - (1 << s) + 1 } else { v }
+    }
+
+    // A sequential block (F.2.2): DC difference and AC run/size codes,
+    // dequantised into blk.
+    fn sequentialBlock(_ c: Int, _ dct: [Int], _ act: [Int], _ q: [Int]) -> Bool {
+        let s = huff(dct)
+        if s < 0 || s > 11 {
+            return false
+        }
+        var dc = receive(s) * q[0] + dcPred[c]
+        dcPred[c] = dc
+        if dc > 32767 {
+            dc = 32767
+        } else if dc < -32768 {
+            dc = -32768
+        }
+        blk[0] = dc
+        var k = 1
+        while k < 64 {
+            let rs = huff(act)
+            if rs < 0 {
+                return false
+            }
+            let r = rs >> 4
+            let size = rs & 15
+            if size == 0 {
+                if r == 15 {
+                    k += 16
+                    continue
+                }
+                break
+            }
+            k += r
+            if k > 63 {
+                return false
+            }
+            blk[jpgZigZag[k]] = receive(size) * q[k]
+            k += 1
+        }
+        true
+    }
+
+    fn sequentialScan(_ comps: [Int], _ tds: [Int], _ tas: [Int]) -> Bool {
+        let ns = comps.count
+        var count = 0
+        if ns == 1 {
+            // One component: its blocks in raster order, each its own MCU.
+            let c = comps[0]
+            let (bw, bh) = blocksOf(c)
+            let q = qt[compQ[c]]
+            let dct = dcT[tds[0]]
+            let act = acT[tas[0]]
+            let stride = pw[c]
+            for by in 0..bh {
+                for bx in 0..bw {
+                    restart(count)
+                    count += 1
+                    if !sequentialBlock(0, dct, act, q) || br.overrun {
+                        jpgClearBlock(blk)
+                        return false
+                    }
+                    jpgIdctPut(blk, planes[c], by * 8 * stride + bx * 8, stride)
+                }
+            }
+            return true
+        }
+        for my in 0..mcusY {
+            for mx in 0..mcusX {
+                restart(count)
+                count += 1
+                for k in 0..ns {
+                    let c = comps[k]
+                    let q = qt[compQ[c]]
+                    let dct = dcT[tds[k]]
+                    let act = acT[tas[k]]
+                    let stride = pw[c]
+                    for v in 0..compV[c] {
+                        for h in 0..compH[c] {
+                            if !sequentialBlock(k, dct, act, q) || br.overrun {
+                                jpgClearBlock(blk)
+                                return false
+                            }
+                            let off = (my * compV[c] + v) * 8 * stride + (mx * compH[c] + h) * 8
+                            jpgIdctPut(blk, planes[c], off, stride)
+                        }
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    // Blocks across and down of component c in a scan of it alone
+    // (A.2.2): only those covering the image, not the MCU padding.
+    fn blocksOf(_ c: Int) -> (Int, Int) {
+        let cw = (width * compH[c] + hmax - 1) / hmax
+        let chh = (height * compV[c] + vmax - 1) / vmax
+        ((cw + 7) / 8, (chh + 7) / 8)
+    }
+
+    // Progressive DC scans, first and refinement (G.1.2.1).
+    fn dcScan(_ comps: [Int], _ tds: [Int], _ ah: Int, _ al: Int) -> Bool {
+        let ns = comps.count
+        var count = 0
+        if ns == 1 {
+            let c = comps[0]
+            let (bw, bh) = blocksOf(c)
+            let bpr = pw[c] / 8
+            for by in 0..bh {
+                for bx in 0..bw {
+                    restart(count)
+                    count += 1
+                    if !dcBlock(0, c, (by * bpr + bx) * 64, tds[0], ah, al) {
+                        return false
+                    }
+                }
+            }
+            return true
+        }
+        for my in 0..mcusY {
+            for mx in 0..mcusX {
+                restart(count)
+                count += 1
+                for k in 0..ns {
+                    let c = comps[k]
+                    let bpr = pw[c] / 8
+                    for v in 0..compV[c] {
+                        for h in 0..compH[c] {
+                            let b = ((my * compV[c] + v) * bpr + mx * compH[c] + h) * 64
+                            if !dcBlock(k, c, b, tds[k], ah, al) {
+                                return false
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    fn dcBlock(_ k: Int, _ c: Int, _ b: Int, _ td: Int, _ ah: Int, _ al: Int) -> Bool {
+        let q0 = qt[compQ[c]][0] << al
+        if ah == 0 {
+            let s = huff(dcT[td])
+            if s < 0 || s > 11 {
+                return false
+            }
+            let v = receive(s) * q0 + dcPred[k]
+            dcPred[k] = v
+            coefs[c][b] = v
+        } else {
+            if br.bits(1) == 1 {
+                coefs[c][b] = coefs[c][b] + q0
+            }
+        }
+        !br.overrun
+    }
+
+    // Progressive AC scans of one component, first and refinement
+    // (G.1.2.2 and G.1.2.3), with end-of-band runs.
+    fn acScan(_ c: Int, _ ta: Int, _ ss: Int, _ se: Int, _ ah: Int, _ al: Int) -> Bool {
+        let (bw, bh) = blocksOf(c)
+        let bpr = pw[c] / 8
+        let t = acT[ta]
+        let q = qt[compQ[c]]
+        var count = 0
+        for by in 0..bh {
+            for bx in 0..bw {
+                restart(count)
+                count += 1
+                let b = (by * bpr + bx) * 64
+                let ok = if ah == 0 { acFirst(c, b, t, q, ss, se, al) } else { acRefine(c, b, t, q, ss, se, al) }
+                if !ok || br.overrun {
+                    return false
+                }
+            }
+        }
+        true
+    }
+
+    fn acFirst(_ c: Int, _ b: Int, _ t: [Int], _ q: [Int], _ ss: Int, _ se: Int, _ al: Int) -> Bool {
+        if eobrun > 0 {
+            eobrun -= 1
+            return true
+        }
+        var k = ss
+        while k <= se {
+            let rs = huff(t)
+            if rs < 0 {
+                return false
+            }
+            let r = rs >> 4
+            let s = rs & 15
+            if s != 0 {
+                k += r
+                if k > se {
+                    return false
+                }
+                coefs[c][b + jpgZigZag[k]] = receive(s) * (q[k] << al)
+                k += 1
+            } else if r == 15 {
+                k += 16
+            } else {
+                eobrun = (1 << r) - 1
+                if r > 0 {
+                    eobrun += br.bits(r)
+                }
+                break
+            }
+        }
+        true
+    }
+
+    fn acRefine(_ c: Int, _ b: Int, _ t: [Int], _ q: [Int], _ ss: Int, _ se: Int, _ al: Int) -> Bool {
+        var k = ss
+        if eobrun == 0 {
+            while k <= se {
+                let rs = huff(t)
+                if rs < 0 {
+                    return false
+                }
+                var r = rs >> 4
+                let s = rs & 15
+                var val = 0
+                if s != 0 {
+                    val = if br.bits(1) == 1 { 1 } else { -1 }
+                } else if r != 15 {
+                    eobrun = 1 << r
+                    if r > 0 {
+                        eobrun += br.bits(r)
+                    }
+                    break
+                }
+                // Skip r coefficients that are still zero (refining the
+                // non-zero ones passed), then place the new one.
+                while k <= se {
+                    let j = b + jpgZigZag[k]
+                    let x = coefs[c][j]
+                    if x != 0 {
+                        if br.bits(1) == 1 {
+                            let dq = q[k] << al
+                            coefs[c][j] = if x > 0 { x + dq } else { x - dq }
+                        }
+                    } else {
+                        if r == 0 {
+                            if val != 0 {
+                                coefs[c][j] = val * (q[k] << al)
+                            }
+                            break
+                        }
+                        r -= 1
+                    }
+                    k += 1
+                }
+                k += 1
+            }
+        }
+        if eobrun > 0 {
+            // In an end-of-band run: only refinement bits of the non-zero
+            // coefficients.
+            while k <= se {
+                let j = b + jpgZigZag[k]
+                let x = coefs[c][j]
+                if x != 0 {
+                    if br.bits(1) == 1 {
+                        let dq = q[k] << al
+                        coefs[c][j] = if x > 0 { x + dq } else { x - dq }
+                    }
+                }
+                k += 1
+            }
+            eobrun -= 1
+        }
+        true
+    }
+
+    // ---- The picture ----
+
+    fn finishImage() -> Bool {
+        if !frameOk || scans == 0 {
+            if frameOk {
+                warn("image without scans")
+            }
+            return false
+        }
+        if progressive {
+            for c in 0..ncomp {
+                let stride = pw[c]
+                let bpr = stride / 8
+                let rows = ph[c] / 8
+                for by in 0..rows {
+                    for bx in 0..bpr {
+                        let b = (by * bpr + bx) * 64
+                        for i in 0..64 {
+                            blk[i] = coefs[c][b + i]
+                        }
+                        jpgIdctPut(blk, planes[c], by * 8 * stride + bx * 8, stride)
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    // The decoded planes as a core.Picture (copies, so the decoder can
+    // reuse its planes).
+    fn makePicture() -> core.Picture {
+        var p = core.Picture(width: width, height: height)
+        p.fullRange = true
+        p.matrix = .bt601
+        p.key = true
+        let (sn, sd) = sarOf()
+        p.sarNum = sn
+        p.sarDen = sd
+        if ncomp == 1 {
+            p.chroma = .gray
+            p.y = planes[0]
+            p.yStride = pw[0]
+            return p
+        }
+        let rgb = (ncomp == 3 && (adobe == 0 || (compId[0] == 82 && compId[1] == 71 && compId[2] == 66)))
+        if ncomp == 4 || rgb {
+            return jpgFromRgb(self, p)
+        }
+        let h1 = compH[1]
+        let v1 = compV[1]
+        let sameChroma = compH[2] == h1 && compV[2] == v1
+        if sameChroma && compH[0] == hmax && compV[0] == vmax && hmax % h1 == 0 && vmax % v1 == 0 {
+            let sx = hmax / h1
+            let sy = vmax / v1
+            if sy == 1 && (sx == 1 || sx == 2) || (sx == 2 && sy == 2) {
+                p.chroma = if sx == 1 { core.Chroma.yuv444 } else if sy == 1 { core.Chroma.yuv422 } else { core.Chroma.yuv420 }
+                p.y = planes[0]
+                p.u = planes[1]
+                p.v = planes[2]
+                p.yStride = pw[0]
+                p.cStride = pw[1]
+                return p
+            }
+            if sy == 1 && sx > 2 && sx % 2 == 0 {
+                // 4:1:1 and the like: chroma spread to 4:2:2.
+                p.chroma = .yuv422
+                p.y = planes[0]
+                p.yStride = pw[0]
+                p.cStride = pw[0] / 2
+                p.u = jpgSpread(planes[1], pw[1], ph[1], sx / 2, 1)
+                p.v = jpgSpread(planes[2], pw[2], ph[2], sx / 2, 1)
+                return p
+            }
+        }
+        // Anything else: every component spread to the full grid, 4:4:4.
+        p.chroma = .yuv444
+        let gw = mcusX * hmax * 8
+        let gh = mcusY * vmax * 8
+        p.yStride = gw
+        p.cStride = gw
+        p.y = jpgResample(planes[0], pw[0], compH[0], compV[0], hmax, vmax, gw, gh)
+        p.u = jpgResample(planes[1], pw[1], compH[1], compV[1], hmax, vmax, gw, gh)
+        p.v = jpgResample(planes[2], pw[2], compH[2], compV[2], hmax, vmax, gw, gh)
+        p
+    }
+
+    fn sarOf() -> (Int, Int) {
+        if jfifSarNum > 0 && jfifSarDen > 0 {
+            let g = jpgGcd(jfifSarNum, jfifSarDen)
+            return (jfifSarNum / g, jfifSarDen / g)
+        }
+        (trackSarNum, trackSarDen)
+    }
+}
+
+fn jpgGcd(_ a: Int, _ b: Int) -> Int {
+    var x = a
+    var y = b
+    while y != 0 {
+        let t = x % y
+        x = y
+        y = t
+    }
+    max(x, 1)
+}
+
+fn jpgClearBlock(_ b: bind [Int]) {
+    for i in 0..64 {
+        b[i] = 0
+    }
+}
+
+// The position of the next SOI marker (FF D8) at or after `from`, or -1.
+fn jpgFindSoi(_ d: Data, _ from: Int) -> Int {
+    var i = from
+    while i + 1 < d.count {
+        if d[i] == 0xFF && d[i + 1] == 0xD8 {
+            return i
+        }
+        i += 1
+    }
+    -1
+}
+
+// A plane repeated sx times across and sy times down.
+fn jpgSpread(_ plane: [Int], _ w: Int, _ h: Int, _ sx: Int, _ sy: Int) -> [Int] {
+    if sx == 1 && sy == 1 {
+        return plane
+    }
+    var out: [Int] = []
+    for y in 0..(h * sy) {
+        let row = (y / sy) * w
+        for x in 0..(w * sx) {
+            out.append(plane[row + x / sx])
+        }
+    }
+    out
+}
+
+// A component plane (stride w, sampled h of hmax across and v of vmax
+// down) on the full gw × gh grid, nearest sample.
+fn jpgResample(_ plane: [Int], _ w: Int, _ h: Int, _ v: Int, _ hmax: Int, _ vmax: Int, _ gw: Int, _ gh: Int) -> [Int] {
+    if h == hmax && v == vmax {
+        return plane
+    }
+    var out: [Int] = []
+    for y in 0..gh {
+        let row = (y * v / vmax) * w
+        for x in 0..gw {
+            out.append(plane[row + x * h / hmax])
+        }
+    }
+    out
+}
+
+// The largest image decoded, in samples (8192 × 6144, 50 megapixels).
+let jpgMaxArea = 8192 * 6144
+
+// Two field pictures woven into one frame, `top` on the even lines.
+fn jpgWeave(_ top: core.Picture, _ bottom: core.Picture) -> core.Picture {
+    var p = top
+    p.height = top.height * 2
+    var y: [Int] = []
+    var u: [Int] = []
+    var v: [Int] = []
+    let rows = top.y.count / top.yStride
+    for r in 0..(rows * 2) {
+        let src = if r % 2 == 0 { top } else { bottom }
+        let at = (r / 2) * top.yStride
+        y += src.y.slice(from: at, to: at + top.yStride)
+    }
+    if top.chroma != .gray {
+        let crows = top.u.count / top.cStride
+        for r in 0..(crows * 2) {
+            let src = if r % 2 == 0 { top } else { bottom }
+            let at = (r / 2) * top.cStride
+            u += src.u.slice(from: at, to: at + top.cStride)
+            v += src.v.slice(from: at, to: at + top.cStride)
+        }
+    }
+    p.y = y
+    p.u = u
+    p.v = v
+    p
+}
+
+// RGB (Adobe transform 0, or components named R, G, B), CMYK and YCCK
+// images as 4:4:4 Y'CbCr. Adobe stores CMYK inverted (255 = no ink).
+fn jpgFromRgb(_ d: Decoder, _ base: core.Picture) -> core.Picture {
+    var p = base
+    p.chroma = .yuv444
+    let w = d.width
+    let h = d.height
+    p.yStride = w
+    p.cStride = w
+    var ys: [Int] = []
+    var us: [Int] = []
+    var vs: [Int] = []
+    let ycck = d.ncomp == 4 && d.adobe == 2
+    for yy in 0..h {
+        for xx in 0..w {
+            var s = [0, 0, 0, 255]
+            for c in 0..d.ncomp {
+                let cx = xx * d.compH[c] / d.hmax
+                let cy = yy * d.compV[c] / d.vmax
+                s[c] = d.planes[c][cy * d.pw[c] + cx]
+            }
+            var r = s[0]
+            var g = s[1]
+            var b = s[2]
+            if ycck {
+                let yv = Float(s[0])
+                let cb = Float(s[1]) - 128.0
+                let cr = Float(s[2]) - 128.0
+                r = jpgClip(Int(round(yv + 1.402 * cr)))
+                g = jpgClip(Int(round(yv - 0.344136 * cb - 0.714136 * cr)))
+                b = jpgClip(Int(round(yv + 1.772 * cb)))
+            }
+            if d.ncomp == 4 {
+                let k = s[3]
+                r = (r * k + 127) / 255
+                g = (g * k + 127) / 255
+                b = (b * k + 127) / 255
+            }
+            let fr = Float(r)
+            let fg = Float(g)
+            let fb = Float(b)
+            ys.append(jpgClip(Int(round(0.299 * fr + 0.587 * fg + 0.114 * fb))))
+            us.append(jpgClip(Int(round(-0.168736 * fr - 0.331264 * fg + 0.5 * fb + 128.0))))
+            vs.append(jpgClip(Int(round(0.5 * fr - 0.418688 * fg - 0.081312 * fb + 128.0))))
+        }
+    }
+    p.y = ys
+    p.u = us
+    p.v = vs
+    p
+}
+
+// The orientation tag (0x0112) of an APP1 Exif segment's first IFD, or 0.
+fn jpgExifOrientation(_ d: Data, _ from: Int, _ to: Int) -> Int {
+    if to - from < 14 || d.slice(from: from, to: from + 4).latin1 != "Exif" {
+        return 0
+    }
+    let t = from + 6
+    let little = d[t] == 0x49
+    fn u16(_ at: Int) -> Int {
+        if at + 2 > to {
+            return 0
+        }
+        d.uint16(at: at, bigEndian: !little)
+    }
+    fn u32(_ at: Int) -> Int {
+        if at + 4 > to {
+            return 0
+        }
+        d.uint32(at: at, bigEndian: !little)
+    }
+    let ifd = t + u32(t + 4)
+    let count = u16(ifd)
+    for i in 0..count {
+        let e = ifd + 2 + i * 12
+        if e + 12 > to {
+            break
+        }
+        if u16(e) == 0x0112 {
+            return u16(e + 8)
+        }
+    }
+    0
+}
+
+// A decoder for "mjpeg" tracks (and cover art, through decodeImage).
+public fn newDecoder(_ track: core.Track) -> Result<Decoder> {
+    if track.codec != "mjpeg" && track.codec != "jpeg" {
+        return .failure(error: Error("not a Motion-JPEG track: {track.codec}"))
+    }
+    var d = Decoder()
+    d.timescale = if track.timescale > 0 { track.timescale } else { 1000 }
+    d.trackW = track.width
+    d.trackH = track.height
+    d.trackSarNum = max(track.sarNum, 1)
+    d.trackSarDen = max(track.sarDen, 1)
+    if track.fpsNum > 0 && track.fpsDen > 0 {
+        d.frameDur = d.timescale * track.fpsDen / track.fpsNum
+    }
+    d.dcT = [jpgDefaultDcLuma, jpgDefaultDcChroma, [], []]
+    d.acT = [jpgDefaultAcLuma, jpgDefaultAcChroma, [], []]
+    d.qt = [[], [], [], []]
+    d.blk = core.zeros(64)
+    return .ok(value: d)
+}
+
+// Decodes a JPEG file (cover art, thumbnails).
+public fn decodeImage(_ data: Data) -> Result<core.Picture> {
+    var d = newDecoder(core.Track(index: 0, kind: .video, codec: "jpeg")).value() ?? Decoder()
+    let pics = d.decode(data, pts: 0, dts: 0, key: true)
+    if pics.isEmpty {
+        let why = d.warnings.first ?? "not a JPEG image"
+        return .failure(error: Error(why))
+    }
+    return .ok(value: pics[0])
+}
+
+// A JPEG file's EXIF orientation (1 when it has none).
+public fn exifOrientation(_ data: Data) -> Int {
+    var i = 2
+    while i + 4 <= data.count && data[i] == 0xFF {
+        let m = data[i + 1]
+        if m == 0xDA || m == 0xD9 {
+            break
+        }
+        let len = data.uint16(at: i + 2, bigEndian: true)
+        if m == 0xE1 {
+            let o = jpgExifOrientation(data, i + 4, min(i + 2 + len, data.count))
+            if o > 0 {
+                return o
+            }
+        }
+        i += 2 + len
+    }
+    1
+}
+
+// A picture as packed RGBA pixels (r << 24 | g << 16 | b << 8 | 255), row
+// by row, with its matrix and range, chroma taken from the nearest
+// sample. Simple and slow: for cover art and thumbnails.
+public fn toRgbaPixels(_ p: core.Picture) -> [Int] {
+    var out: [Int] = []
+    var m = p.matrix
+    if m == .unknown {
+        m = core.guessMatrix(width: p.width, height: p.height)
+    }
+    let kr = if m == .bt709 { 0.2126 } else if m == .bt2020 { 0.2627 } else { 0.299 }
+    let kb = if m == .bt709 { 0.0722 } else if m == .bt2020 { 0.0593 } else { 0.114 }
+    let kg = 1.0 - kr - kb
+    let maxV = Float((1 << p.depth) - 1)
+    let scale = Float(1 << (p.depth - 8))
+    for yy in 0..p.height {
+        for xx in 0..p.width {
+            var yv = Float(p.luma(xx, yy))
+            var cb = 0.0
+            var cr = 0.0
+            if p.chroma != .gray {
+                let cx = if p.chroma == .yuv444 { xx } else { xx / 2 }
+                let cy = if p.chroma == .yuv420 { yy / 2 } else { yy }
+                cb = Float(p.cb(cx, cy)) - 128.0 * scale
+                cr = Float(p.cr(cx, cy)) - 128.0 * scale
+            }
+            if p.fullRange {
+                yv = yv / maxV
+                cb = cb / maxV
+                cr = cr / maxV
+            } else {
+                yv = (yv - 16.0 * scale) / (219.0 * scale)
+                cb = cb / (224.0 * scale)
+                cr = cr / (224.0 * scale)
+            }
+            let r = yv + 2.0 * (1.0 - kr) * cr
+            let b = yv + 2.0 * (1.0 - kb) * cb
+            let g = (yv - kr * r - kb * b) / kg
+            let ri = jpgClip(Int(round(r * 255.0)))
+            let gi = jpgClip(Int(round(g * 255.0)))
+            let bi = jpgClip(Int(round(b * 255.0)))
+            out.append((ri << 24) | (gi << 16) | (bi << 8) | 255)
+        }
+    }
+    out
+}
+
+// What a JPEG file holds, for the media info window.
+public struct ImageInfo {
+    width: Int = 0
+    height: Int = 0
+    components: Int = 0
+    progressive: Bool = false
+    // "4:2:0", "4:2:2", "4:4:4", "4:1:1", "4:4:0", "gray", "RGB", "CMYK"…
+    sampling: String = ""
+    orientation: Int = 1
+}
+
+public fn imageInfo(_ data: Data) -> ImageInfo {
+    var info = ImageInfo()
+    info.orientation = exifOrientation(data)
+    var i = 2
+    var adobe = -1
+    while i + 4 <= data.count && data[i] == 0xFF {
+        let m = data[i + 1]
+        let len = data.uint16(at: i + 2, bigEndian: true)
+        if m == 0xEE && len >= 14 {
+            adobe = data[i + 15]
+        }
+        if (m == 0xC0 || m == 0xC1 || m == 0xC2) && i + 10 <= data.count {
+            info.height = data.uint16(at: i + 5, bigEndian: true)
+            info.width = data.uint16(at: i + 7, bigEndian: true)
+            info.components = data[i + 9]
+            info.progressive = m == 0xC2
+            if info.components == 1 {
+                info.sampling = "gray"
+            } else if info.components == 4 {
+                info.sampling = if adobe == 2 { "YCCK" } else { "CMYK" }
+            } else if info.components == 3 && i + 19 <= data.count {
+                let h0 = data[i + 11] >> 4
+                let v0 = data[i + 11] & 15
+                let h1 = data[i + 14] >> 4
+                let v1 = data[i + 14] & 15
+                if adobe == 0 {
+                    info.sampling = "RGB"
+                } else if h0 == h1 && v0 == v1 {
+                    info.sampling = "4:4:4"
+                } else if v0 == v1 && h0 == 2 * h1 {
+                    info.sampling = "4:2:2"
+                } else if v0 == v1 && h0 == 4 * h1 {
+                    info.sampling = "4:1:1"
+                } else if h0 == 2 * h1 && v0 == 2 * v1 {
+                    info.sampling = "4:2:0"
+                } else if h0 == h1 && v0 == 2 * v1 {
+                    info.sampling = "4:4:0"
+                } else {
+                    info.sampling = "{h0}x{v0},{h1}x{v1}"
+                }
+            }
+            break
+        }
+        if m == 0xDA {
+            break
+        }
+        i += 2 + len
+    }
+    info
+}

@@ -1,0 +1,396 @@
+// DVD-Video information files (IFO): the Video Manager (VIDEO_TS.IFO, VMG)
+// and each Video Title Set (VTS_nn_0.IFO), parsed into plain structs.
+//
+// Followed: the public DVD-Video information descriptions ("DVD-Video
+// Information" pages, dvd.sourceforge.net / mpucoder: IFO, PGC, cell
+// playback, audio and subpicture attributes, VTS_PTT_SRPT, VTS_TMAPTI,
+// C_ADT). Own code; no player library source was read.
+//
+// Layout used (byte offsets, big-endian):
+//   VMGI_MAT  0 "DVDVIDEO-VMG", 0x0C last sector of VMG, 0x20 version,
+//             0x26 volumes, 0x28 volume no., 0x3E number of title sets,
+//             0x40 provider id (32), 0xC4 sector of TT_SRPT
+//   TT_SRPT   0 titles (2), 4 end address, 8 + 12·i: type, angles,
+//             chapters (2), parental mask (2), VTS no., VTS title no.,
+//             VTS start sector (4)
+//   VTSI_MAT  0 "DVDVIDEO-VTS", 0xC4 sector of VTSTT_VOBS, 0xC8 VTS_PTT_SRPT,
+//             0xCC VTS_PGCI, 0xD4 VTS_TMAPTI, 0xE0 VTS_C_ADT,
+//             0xE4 VTS_VOBU_ADMAP, 0x200 video attributes, 0x202 audio
+//             streams (2) + 8 × 8 bytes attributes, 0x254 subpicture
+//             streams (2) + 32 × 6 bytes attributes
+//   PTT_SRPT  0 titles (2), 4 end address, 8 + 4·i offset of title i's
+//             list of (PGC no. (2), program no. (2))
+//   PGCI      0 PGCs (2), 4 end address, 8 + 8·i: category (4; bit 31 =
+//             entry PGC, bits 30–24 title no.), offset of the PGC (4)
+//   PGC       2 programs, 3 cells, 4 playback time, 0x0C 8 audio stream
+//             controls (2), 0x1C 32 subpicture controls (4), 0x9C next /
+//             0x9E prev / 0xA0 up PGC, 0xA4 16 colours (0, Y, Cr, Cb),
+//             0xE4 commands, 0xE6 program map, 0xE8 cell playback,
+//             0xEA cell position offsets
+//   cell playback (24 bytes): flags (block mode 2 bits, block type 2,
+//             seamless, interleaved, STC discontinuity, seamless angle),
+//             …, 4 playback time, 8 first VOBU sector, 12 first ILVU end,
+//             16 last VOBU start, 20 last sector — sectors relative to the
+//             title VOBs (VTSTT_VOBS)
+//   TMAPTI    0 PGCs (2), 4 end, 8 + 4·i offset; map: time unit (1, s),
+//             entries (2), entries of 4 bytes (bit 31 discontinuity,
+//             sector)
+//
+// Author: Alexius Academia
+// Date: 2026-10-26
+
+public struct DvdAudioAttr {
+    // 0 AC-3, 2 MPEG-1, 3 MPEG-2 extended, 4 LPCM, 6 DTS.
+    coding: Int = 0
+    languageCode: String = ""
+    // 0 unspecified, 1 normal, 2 visually impaired, 3 director's comments,
+    // 4 alternate director's comments.
+    extension: Int = 0
+    channels: Int = 2
+    sampleRate: Int = 48000
+    // LPCM: 16, 20 or 24 bits.
+    bits: Int = 0
+    // 0 none, 1 karaoke, 2 surround.
+    application: Int = 0
+}
+
+public struct DvdSubAttr {
+    languageCode: String = ""
+    // 1 normal, 2 large, 3 children, 5 normal captions, 6 large captions,
+    // 7 children's captions, 9 forced, 13–15 director's comments.
+    extension: Int = 0
+}
+
+public struct DvdVideoAttr {
+    // 0 MPEG-1, 1 MPEG-2.
+    coding: Int = 1
+    // 0 NTSC (525/60), 1 PAL (625/50).
+    standard: Int = 0
+    // 0 4:3, 3 16:9.
+    aspect: Int = 0
+    width: Int = 720
+    height: Int = 480
+    letterboxed: Bool = false
+    film: Bool = false
+}
+
+public struct DvdCell {
+    // 0 not in a block, 1 first cell of a block, 2 inside, 3 last.
+    blockMode: Int = 0
+    // 1 = angle block.
+    blockType: Int = 0
+    seamless: Bool = false
+    interleaved: Bool = false
+    stcDiscontinuity: Bool = false
+    seamlessAngle: Bool = false
+    duration: Float = 0.0
+    firstSector: Int = 0
+    firstIlvuEnd: Int = 0
+    lastVobuStart: Int = 0
+    lastSector: Int = 0
+    vobId: Int = 0
+    cellId: Int = 0
+}
+
+public struct DvdPgc {
+    programs: Int = 0
+    duration: Float = 0.0
+    // Raw controls: audio (bit 15 available, bits 10–8 stream number),
+    // subpicture (bit 31 available, 28–24 4:3, 20–16 wide, 12–8 letterbox,
+    // 4–0 pan-scan stream numbers).
+    audioControl: [Int] = []
+    subControl: [Int] = []
+    next: Int = 0
+    prev: Int = 0
+    up: Int = 0
+    // 16 entries packed Y << 16 | Cr << 8 | Cb.
+    palette: [Int] = []
+    // Entry cell (1-based) of each program.
+    programMap: [Int] = []
+    cells: [DvdCell] = []
+    entry: Bool = false
+    // The title number the category names (VTS title, 1-based), 0 if not.
+    titleNumber: Int = 0
+}
+
+public struct DvdTimeMap {
+    // Seconds per entry, 0 when there's no map.
+    unit: Int = 0
+    // Sector (relative to VTSTT_VOBS) of each entry: entry i is (i+1)·unit
+    // seconds into the PGC.
+    sectors: [Int] = []
+}
+
+public struct DvdVts {
+    number: Int = 0
+    video: DvdVideoAttr = DvdVideoAttr()
+    audio: [DvdAudioAttr] = []
+    subs: [DvdSubAttr] = []
+    // Per VTS title: list of (PGC number, program number) pairs, flat.
+    ptts: [[Int]] = []
+    pgcs: [DvdPgc] = []
+    timeMaps: [DvdTimeMap] = []
+    // VOBU start sectors (VTS_VOBU_ADMAP), relative to VTSTT_VOBS.
+    vobus: [Int] = []
+    titleVobSector: Int = 0
+    warnings: [String] = []
+}
+
+public struct DvdTitleEntry {
+    // 1-based.
+    number: Int
+    angles: Int = 1
+    chapters: Int = 0
+    titleSet: Int = 0
+    vtsTitle: Int = 0
+    startSector: Int = 0
+}
+
+public struct DvdVmg {
+    titleSets: Int = 0
+    provider: String = ""
+    volumes: Int = 1
+    volume: Int = 1
+    titles: [DvdTitleEntry] = []
+    warnings: [String] = []
+}
+
+// The Video Manager information file (VIDEO_TS.IFO or .BUP).
+public fn parseVmg(_ d: Data) -> Result<DvdVmg> {
+    if d.count < 0x100 || dAscii(d, 0, 12) != "DVDVIDEO-VMG" {
+        return Result.failure(error: Error("not a DVD video manager file (no DVDVIDEO-VMG)"))
+    }
+    var v = DvdVmg()
+    v.volumes = dU16(d, 0x26)
+    v.volume = dU16(d, 0x28)
+    v.titleSets = dU16(d, 0x3E)
+    v.provider = dAscii(d, 0x40, 32)
+    let tt = dU32(d, 0xC4) * 2048
+    if tt <= 0 || tt + 8 > d.count {
+        v.warnings.append("VMG: no title table")
+        return Result.ok(value: v)
+    }
+    let n = dU16(d, tt)
+    let end = tt + dU32(d, tt + 4) + 1
+    var i = 0
+    while i < n && i < 99 {
+        let e = tt + 8 + 12 * i
+        if e + 12 > d.count || e + 12 > end + 1 {
+            v.warnings.append("VMG: title table cut short at title {i + 1}")
+            break
+        }
+        var t = DvdTitleEntry(number: i + 1)
+        t.angles = max(1, dU8(d, e + 1))
+        t.chapters = dU16(d, e + 2)
+        t.titleSet = dU8(d, e + 6)
+        t.vtsTitle = dU8(d, e + 7)
+        t.startSector = dU32(d, e + 8)
+        v.titles.append(t)
+        i += 1
+    }
+    Result.ok(value: v)
+}
+
+fn dvdAudioAttr(_ d: Data, _ at: Int) -> DvdAudioAttr {
+    var a = DvdAudioAttr()
+    let b0 = dU8(d, at)
+    let b1 = dU8(d, at + 1)
+    a.coding = b0 >> 5
+    a.application = b0 & 3
+    if (b0 >> 2) & 3 == 1 {
+        a.languageCode = dAscii(d, at + 2, 2).lowercase()
+    }
+    let q = b1 >> 6
+    if a.coding == 4 {
+        a.bits = [16, 20, 24, 0][q]
+    }
+    a.sampleRate = if (b1 >> 4) & 3 == 1 { 96000 } else { 48000 }
+    a.channels = (b1 & 7) + 1
+    a.extension = dU8(d, at + 5)
+    a
+}
+
+fn dvdSubAttr(_ d: Data, _ at: Int) -> DvdSubAttr {
+    var s = DvdSubAttr()
+    if dU8(d, at) & 3 == 1 {
+        s.languageCode = dAscii(d, at + 2, 2).lowercase()
+    }
+    s.extension = dU8(d, at + 5)
+    s
+}
+
+fn dvdVideoAttr(_ d: Data, _ at: Int) -> DvdVideoAttr {
+    var v = DvdVideoAttr()
+    let b0 = dU8(d, at)
+    let b1 = dU8(d, at + 1)
+    v.coding = b0 >> 6
+    v.standard = (b0 >> 4) & 3
+    v.aspect = (b0 >> 2) & 3
+    let res = (b1 >> 3) & 3
+    let full = if v.standard == 1 { 576 } else { 480 }
+    v.width = [720, 704, 352, 352][res]
+    v.height = if res == 3 { full / 2 } else { full }
+    v.letterboxed = (b1 >> 2) & 1 == 1
+    v.film = b1 & 1 == 1
+    v
+}
+
+// One program chain at byte `at` of `d`.
+fn dvdPgc(_ d: Data, _ at: Int, _ w: [String]) -> (DvdPgc, [String]) {
+    var warn = w
+    var p = DvdPgc()
+    if at < 0 || at + 0xEC > d.count {
+        warn.append("PGC at {at} is outside the file")
+        return (p, warn)
+    }
+    p.programs = dU8(d, at + 2)
+    let ncells = dU8(d, at + 3)
+    p.duration = dDvdTime(d, at + 4)
+    for i in 0..8 {
+        p.audioControl.append(dU16(d, at + 0x0C + 2 * i))
+    }
+    for i in 0..32 {
+        p.subControl.append(dU32(d, at + 0x1C + 4 * i))
+    }
+    p.next = dU16(d, at + 0x9C)
+    p.prev = dU16(d, at + 0x9E)
+    p.up = dU16(d, at + 0xA0)
+    for i in 0..16 {
+        let e = at + 0xA4 + 4 * i
+        p.palette.append(dU8(d, e + 1) << 16 | dU8(d, e + 2) << 8 | dU8(d, e + 3))
+    }
+    let pmap = dU16(d, at + 0xE6)
+    let cplay = dU16(d, at + 0xE8)
+    let cpos = dU16(d, at + 0xEA)
+    if pmap > 0 {
+        for i in 0..p.programs {
+            p.programMap.append(dU8(d, at + pmap + i))
+        }
+    }
+    if cplay > 0 {
+        for i in 0..ncells {
+            let c = at + cplay + 24 * i
+            if c + 24 > d.count {
+                warn.append("PGC: cell {i + 1} is outside the file")
+                break
+            }
+            var cell = DvdCell()
+            let f = dU8(d, c)
+            cell.blockMode = f >> 6
+            cell.blockType = (f >> 4) & 3
+            cell.seamless = (f >> 3) & 1 == 1
+            cell.interleaved = (f >> 2) & 1 == 1
+            cell.stcDiscontinuity = (f >> 1) & 1 == 1
+            cell.seamlessAngle = f & 1 == 1
+            cell.duration = dDvdTime(d, c + 4)
+            cell.firstSector = dU32(d, c + 8)
+            cell.firstIlvuEnd = dU32(d, c + 12)
+            cell.lastVobuStart = dU32(d, c + 16)
+            cell.lastSector = dU32(d, c + 20)
+            if cpos > 0 {
+                cell.vobId = dU16(d, at + cpos + 4 * i)
+                cell.cellId = dU8(d, at + cpos + 4 * i + 3)
+            }
+            p.cells.append(cell)
+        }
+    }
+    (p, warn)
+}
+
+// A video title set information file (VTS_nn_0.IFO or .BUP).
+public fn parseVts(_ d: Data, number: Int = 0) -> Result<DvdVts> {
+    if d.count < 0x400 || dAscii(d, 0, 12) != "DVDVIDEO-VTS" {
+        return Result.failure(error: Error("not a DVD title set file (no DVDVIDEO-VTS)"))
+    }
+    var v = DvdVts(number: number)
+    v.titleVobSector = dU32(d, 0xC4)
+    v.video = dvdVideoAttr(d, 0x200)
+    let na = min(8, dU16(d, 0x202))
+    for i in 0..na {
+        v.audio.append(dvdAudioAttr(d, 0x204 + 8 * i))
+    }
+    let ns = min(32, dU16(d, 0x254))
+    for i in 0..ns {
+        v.subs.append(dvdSubAttr(d, 0x256 + 6 * i))
+    }
+
+    // Chapters of each title (VTS_PTT_SRPT).
+    let ptt = dU32(d, 0xC8) * 2048
+    if ptt > 0 && ptt + 8 <= d.count {
+        let nt = min(99, dU16(d, ptt))
+        let end = ptt + dU32(d, ptt + 4) + 1
+        var offs: [Int] = []
+        for i in 0..nt {
+            offs.append(dU32(d, ptt + 8 + 4 * i))
+        }
+        for i in 0..nt {
+            let a = ptt + offs[i]
+            var b = if i + 1 < nt { ptt + offs[i + 1] } else { end }
+            b = min(b, d.count)
+            var list: [Int] = []
+            var p = a
+            while p + 4 <= b && list.count < 2000 {
+                list.append(dU16(d, p))
+                list.append(dU16(d, p + 2))
+                p += 4
+            }
+            v.ptts.append(list)
+        }
+    } else {
+        v.warnings.append("VTS {number}: no chapter table")
+    }
+
+    // Program chains (VTS_PGCI).
+    let pgci = dU32(d, 0xCC) * 2048
+    if pgci > 0 && pgci + 8 <= d.count {
+        let np = min(999, dU16(d, pgci))
+        for i in 0..np {
+            let e = pgci + 8 + 8 * i
+            if e + 8 > d.count {
+                v.warnings.append("VTS {number}: PGC table cut short")
+                break
+            }
+            let cat = dU32(d, e)
+            let (pgc, w) = dvdPgc(d, pgci + dU32(d, e + 4), v.warnings)
+            v.warnings = w
+            var p = pgc
+            p.entry = (cat >> 31) & 1 == 1
+            p.titleNumber = (cat >> 24) & 0x7F
+            v.pgcs.append(p)
+        }
+    } else {
+        v.warnings.append("VTS {number}: no program chains")
+    }
+
+    // Time maps (VTS_TMAPTI), one per PGC.
+    let tm = dU32(d, 0xD4) * 2048
+    if tm > 0 && tm + 8 <= d.count {
+        let n = min(999, dU16(d, tm))
+        for i in 0..n {
+            let at = tm + dU32(d, tm + 8 + 4 * i)
+            var map = DvdTimeMap()
+            if at + 4 <= d.count {
+                map.unit = dU8(d, at)
+                let ne = dU16(d, at + 2)
+                var k = 0
+                while k < ne && at + 4 + 4 * k + 4 <= d.count {
+                    map.sectors.append(dU32(d, at + 4 + 4 * k) & 0x7FFFFFFF)
+                    k += 1
+                }
+            }
+            v.timeMaps.append(map)
+        }
+    }
+
+    // VOBU start sectors (VTS_VOBU_ADMAP): end address, then 4 bytes each.
+    let am = dU32(d, 0xE4) * 2048
+    if am > 0 && am + 4 <= d.count {
+        let end = min(d.count, am + dU32(d, am) + 1)
+        var p = am + 4
+        while p + 4 <= end {
+            v.vobus.append(dU32(d, p))
+            p += 4
+        }
+    }
+    Result.ok(value: v)
+}

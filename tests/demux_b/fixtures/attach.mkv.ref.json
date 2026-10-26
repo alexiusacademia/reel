@@ -1,0 +1,135 @@
+{
+ "format": "matroska,webm",
+ "duration": 0.2,
+ "tags": {
+  "title": "Attached",
+  "date": "2026",
+  "artist": "Reel",
+  "encoder": "Lavf62.12.102"
+ },
+ "tracks": [
+  {
+   "index": 0,
+   "kind": "video",
+   "codec": "h264",
+   "ffCodec": "h264",
+   "profile": "High",
+   "timescale": 1000,
+   "duration": -9223372036854775807,
+   "extraHex": "0164000affe100186764000aacd9447b011000000300100000030320f122596001000668ebe3cb22c0fdf8f800",
+   "width": 64,
+   "height": 48,
+   "sarNum": 1,
+   "sarDen": 1,
+   "fpsNum": 25,
+   "fpsDen": 1,
+   "rotation": 0,
+   "pixFmt": "yuv420p",
+   "sampleRate": 0,
+   "channels": 0,
+   "channelLayout": "",
+   "bitsPerSample": 8,
+   "pcm": {
+    "bits": 16,
+    "float": false,
+    "bigEndian": false,
+    "signed": true
+   },
+   "language": "",
+   "title": "",
+   "isDefault": false,
+   "isCover": false,
+   "frames": -1
+  },
+  {
+   "index": 1,
+   "kind": "video",
+   "codec": "mjpeg",
+   "ffCodec": "mjpeg",
+   "profile": "Baseline",
+   "timescale": 90000,
+   "duration": 18000,
+   "extraHex": "",
+   "width": 200,
+   "height": 200,
+   "sarNum": 1,
+   "sarDen": 1,
+   "fpsNum": 90000,
+   "fpsDen": 1,
+   "rotation": 0,
+   "pixFmt": "yuvj420p",
+   "sampleRate": 0,
+   "channels": 0,
+   "channelLayout": "",
+   "bitsPerSample": 8,
+   "pcm": {
+    "bits": 16,
+    "float": false,
+    "bigEndian": false,
+    "signed": true
+   },
+   "language": "",
+   "title": "",
+   "isDefault": false,
+   "isCover": true,
+   "frames": -1
+  }
+ ],
+ "packets": [
+  {
+   "track": 1,
+   "pts": -9223372036854775807,
+   "dts": -9223372036854775807,
+   "duration": 0,
+   "key": true,
+   "pos": -1,
+   "size": 7703
+  },
+  {
+   "track": 0,
+   "pts": 0,
+   "dts": -9223372036854775807,
+   "duration": 40,
+   "key": true,
+   "pos": 8411,
+   "size": 1530
+  },
+  {
+   "track": 0,
+   "pts": 160,
+   "dts": -9223372036854775807,
+   "duration": 40,
+   "key": false,
+   "pos": 9947,
+   "size": 40
+  },
+  {
+   "track": 0,
+   "pts": 80,
+   "dts": 0,
+   "duration": 40,
+   "key": false,
+   "pos": 9993,
+   "size": 13
+  },
+  {
+   "track": 0,
+   "pts": 40,
+   "dts": 40,
+   "duration": 40,
+   "key": false,
+   "pos": 10012,
+   "size": 12
+  },
+  {
+   "track": 0,
+   "pts": 120,
+   "dts": 80,
+   "duration": 40,
+   "key": false,
+   "pos": 10030,
+   "size": 13
+  }
+ ],
+ "chapters": []
+}

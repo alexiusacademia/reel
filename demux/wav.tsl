@@ -1,0 +1,443 @@
+// WAV and AIFF files: uncompressed sound with a small header.
+//
+// WAV (Microsoft RIFF, "Multimedia Programming Interface and Data
+// Specifications 1.0") is a list of little-endian chunks after "RIFF"
+// size "WAVE": `fmt ` says how the samples are stored (WAVEFORMATEX, or
+// WAVEFORMATEXTENSIBLE with a channel mask), `data` holds them, `LIST`
+// INFO and `id3 ` hold tags. RF64 (EBU Tech 3306) is the same with 64-bit
+// sizes in a `ds64` chunk, for files over 4 GB.
+//
+// AIFF (Apple "Audio Interchange File Format 1.3") and AIFF-C are
+// big-endian chunks after "FORM" size "AIFF"/"AIFC": `COMM` (channels,
+// frames, bits, an 80-bit float sample rate, and for AIFF-C a compression
+// type), `SSND` (the samples), NAME/AUTH/(c)/ANNO text and `ID3 ` tags.
+//
+// Packets are runs of whole frames: for WAV about a tenth of a second
+// (a power of two of frames, as ffmpeg makes them); for AIFF 4096 bytes.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../core"
+import "../dts"
+
+public fn wavOpen(_ file: Data) -> Result<core.Media> {
+    if file.count < 12 {
+        return Result.failure(error: Error("this file is too short to be WAV or AIFF"))
+    }
+    let magic = file.slice(from: 0, to: 4).latin1
+    if magic == "FORM" {
+        return wavAiff(file)
+    }
+    if magic != "RIFF" && magic != "RF64" {
+        return Result.failure(error: Error("this isn't a WAV or AIFF file"))
+    }
+    var m = core.Media(format: "wav")
+    let n = file.count
+    var fmtStart = -1
+    var fmtEnd = -1
+    var dataStart = -1
+    var dataEnd = -1
+    var bigData = -1
+    var factSamples = -1
+    var p = 12
+    while p + 8 <= n {
+        let id = file.slice(from: p, to: p + 4).latin1
+        var size = file.uint32(at: p + 4)
+        let body = p + 8
+        if id == "ds64" && size >= 24 && body + 24 <= n {
+            // ds64: RIFF size, data size, sample count (64-bit each).
+            bigData = min(wavU64le(file, body + 8), n)
+        }
+        if id == "data" {
+            if size == 0xffffffff && bigData >= 0 {
+                size = bigData
+            } else if size == 0xffffffff || size == 0 {
+                // A file written while streaming: the data runs to the end.
+                size = n - body
+            }
+            dataStart = body
+            dataEnd = min(n, body + size)
+            if body + size > n {
+                m.warnings.append("the file is cut short: {body + size - n} bytes of sound are missing")
+            }
+        } else if id == "fact" && size >= 4 && body + 4 <= n {
+            // fact: the length in frames (for compressed formats).
+            factSamples = file.uint32(at: body)
+        } else if id == "fmt " {
+            fmtStart = body
+            fmtEnd = min(n, body + size)
+        } else if id == "LIST" && body + 4 <= n && file.slice(from: body, to: body + 4).latin1 == "INFO" {
+            wavInfo(file, body + 4, min(n, body + size), m)
+        } else if id == "id3 " || id == "ID3 " {
+            rawId3(file, body, min(n, body + size), m)
+        }
+        if body + size >= n || size < 0 {
+            break
+        }
+        // Chunks are padded to an even size.
+        p = body + size + (size & 1)
+    }
+    if fmtStart < 0 || fmtEnd - fmtStart < 16 {
+        return Result.failure(error: Error("this WAV file has no format chunk"))
+    }
+    if dataStart < 0 {
+        return Result.failure(error: Error("this WAV file has no sound data"))
+    }
+    // WAVEFORMATEX: format tag, channels, rate, bytes per second, block
+    // align, bits per sample; EXTENSIBLE adds valid bits, channel mask and
+    // the real format as the first two bytes of a GUID.
+    var tag = file.uint16(at: fmtStart)
+    let channels = file.uint16(at: fmtStart + 2)
+    let rate = file.uint32(at: fmtStart + 4)
+    let byteRate = file.uint32(at: fmtStart + 8)
+    var align = file.uint16(at: fmtStart + 12)
+    let bits = file.uint16(at: fmtStart + 14)
+    var extensible = false
+    if tag == 0xfffe && fmtEnd - fmtStart >= 40 {
+        tag = file.uint16(at: fmtStart + 24)
+        extensible = true
+    }
+    if channels <= 0 || rate <= 0 {
+        return Result.failure(error: Error("this WAV file's format chunk is damaged"))
+    }
+    var track = core.Track(index: 0, kind: .audio, codec: "pcm")
+    track.timescale = rate
+    track.sampleRate = rate
+    track.channels = channels
+    track.blockAlign = align
+    track.bitsPerSample = bits
+    if extensible {
+        // The fmt chunk, so the channel mask can be read again (wavLayout).
+        track.extra = file.slice(from: fmtStart, to: fmtEnd)
+    }
+    track.layout = wavLayout(track)
+    var compressed = false
+    match tag {
+        1 -> {
+            // 8-bit WAV is unsigned; wider samples are signed.
+            let b = if bits <= 8 { 8 } else if bits <= 16 { 16 } else if bits <= 24 { 24 } else { 32 }
+            track.pcm = core.PcmFormat(bits: b, float: false, bigEndian: false, signed: b > 8)
+            if align <= 0 {
+                align = channels * b / 8
+            }
+            // Samples are stored in whole bytes: bits per sample says how
+            // many of them count.
+            if align == channels * b / 8 {
+                track.bitsPerSample = b
+            }
+        }
+        3 -> { track.pcm = core.PcmFormat(bits: if bits == 64 { 64 } else { 32 }, float: true, bigEndian: false, signed: true) }
+        6 -> { track.codec = "alaw" }
+        7 -> { track.codec = "ulaw" }
+        0x55 -> {
+            track.codec = "mp3"
+            compressed = true
+        }
+        0x50 -> {
+            track.codec = "mp2"
+            compressed = true
+        }
+        0x2000 -> {
+            track.codec = "ac3"
+            compressed = true
+        }
+        _ -> {
+            track.codec = "unknown:wav{tag}"
+            compressed = true
+        }
+    }
+    if align <= 0 {
+        align = max(1, channels * max(8, bits) / 8)
+    }
+    // DTS in WAV: format tag 0x2001 (WAVE_FORMAT_DTS), or a DTS CD rip
+    // stored as 16-bit stereo PCM whose data is a DTS stream (14- or
+    // 16-bit form, found by its sync words). Packets are its frames.
+    if tag == 0x2001 || (tag == 1 && bits == 16 && channels == 2 && wavLooksLikeDts(file, dataStart, dataEnd)) {
+        if let r = dtsFrames(file, dataStart, dataEnd, m).value() {
+            var out = r
+            out.format = "wav"
+            return Result.ok(value: out)
+        }
+        if tag == 0x2001 {
+            return Result.failure(error: Error("no DTS frames in this WAV file"))
+        }
+    }
+    if compressed && (tag == 0x55 || tag == 0x50 || tag == 0x2000) {
+        // MPEG audio or AC-3 inside WAV: the data is a raw stream.
+        let inner = if tag == 0x2000 { rawAc3(file, dataStart, dataEnd, m) } else { rawMpegAudio(file, dataStart, dataEnd, m) }
+        match inner {
+            .ok(r) -> {
+                var out = r
+                out.format = "wav"
+                // MPEGLAYER3WAVEFORMAT and the like: the bytes after cbSize.
+                if fmtEnd - fmtStart > 18 {
+                    out.tracks[0].extra = file.slice(from: fmtStart + 18, to: fmtEnd)
+                }
+                if factSamples > 0 {
+                    out.tracks[0].duration = factSamples
+                    out.duration = Float(factSamples) / Float(out.tracks[0].sampleRate)
+                }
+                return Result.ok(value: out)
+            }
+            .failure(e) -> { return Result.failure(error: e) }
+        }
+    }
+    // Packets of a power of two of frames, about a tenth of a second
+    // (ffmpeg's ff_pcm_default_packet_size); 4096 bytes when the rate
+    // isn't known.
+    var frames = 1
+    let bitsPerFrame = if compressed { 0 } else { align * 8 }
+    if bitsPerFrame > 0 {
+        let target = max(1, rate / 10)
+        while frames * 2 <= target {
+            frames *= 2
+        }
+    } else {
+        frames = max(1, 4096 / align)
+    }
+    let packetBytes = frames * align
+    let total = (dataEnd - dataStart) / align
+    var pts = 0
+    var q = dataStart
+    while q < dataEnd {
+        let size = min(packetBytes, dataEnd - q)
+        let k = size / align
+        if k == 0 {
+            break
+        }
+        m.packets.append(core.PacketRef(track: 0, pts: pts, dts: pts, duration: k, key: true, offset: q, size: k * align))
+        pts += k
+        q += k * align
+    }
+    track.duration = total
+    track.bitrate = byteRate * 8
+    m.duration = Float(total) / Float(rate)
+    m.tracks = [track]
+    Result.ok(value: m)
+}
+
+// Whether PCM data is really a DTS stream: two DTS frames in a row near
+// its start.
+fn wavLooksLikeDts(_ d: Data, _ s: Int, _ e: Int) -> Bool {
+    let starts = dts.syncFramesIn(d, from: s, to: min(e, s + 65536))
+    starts.count >= 2 && starts[0] < s + 4096
+}
+
+fn wavU64le(_ d: Data, _ p: Int) -> Int {
+    let lo = d.uint32(at: p)
+    let hi = d.uint32(at: p + 4)
+    if hi >= 0x80000000 {
+        return 9223372036854775807
+    }
+    (hi << 32) | lo
+}
+
+// LIST INFO subchunks (RIFF spec §2.4, "INFO list chunk").
+fn wavInfo(_ d: Data, _ s: Int, _ e: Int, _ m: bind core.Media) {
+    var p = s
+    while p + 8 <= e {
+        let id = d.slice(from: p, to: p + 4).latin1
+        let size = d.uint32(at: p + 4)
+        let text = rawUtf8(d.slice(from: p + 8, to: min(e, p + 8 + size))).trim()
+        let key = match id {
+            "INAM" -> "title"
+            "IART" -> "artist"
+            "IPRD" -> "album"
+            "ICMT" -> "comment"
+            "ICRD" -> "date"
+            "IGNR" -> "genre"
+            "ISFT" -> "encoder"
+            "ICOP" -> "copyright"
+            "ITRK", "IPRT" -> "track"
+            "IENG" -> "engineer"
+            "ISBJ" -> "subject"
+            "ILNG" -> "language"
+            _ -> ""
+        }
+        if !key.isEmpty && !text.isEmpty {
+            m.tags[key] = text
+        }
+        p += 8 + size + (size & 1)
+    }
+}
+
+// The speaker names of a WAV track's channels, from the
+// WAVEFORMATEXTENSIBLE channel mask (its bits 0… are FL FR FC LFE BL BR
+// FLC FRC BC SL SR TC TFL TFC TFR TBL TBC TBR), or the usual layout for
+// the channel count when the file doesn't say. wavOpen puts it in
+// Track.layout; it's public for tracks made elsewhere.
+public fn wavLayout(_ track: core.Track) -> [String] {
+    let names = ["FL", "FR", "FC", "LFE", "BL", "BR", "FLC", "FRC", "BC", "SL", "SR", "TC", "TFL", "TFC", "TFR", "TBL", "TBC", "TBR"]
+    let x = track.extra
+    if x.count >= 24 && x.uint16(at: 0) == 0xfffe {
+        let mask = x.uint32(at: 20)
+        var out: [String] = []
+        for i in 0..names.count {
+            if (mask & (1 << i)) != 0 && out.count < track.channels {
+                out.append(names[i])
+            }
+        }
+        if out.count == track.channels {
+            return out
+        }
+    }
+    core.defaultLayout(track.channels)
+}
+
+// ---------------------------------------------------------------------------
+// AIFF and AIFF-C.
+
+fn wavAiff(_ file: Data) -> Result<core.Media> {
+    let n = file.count
+    let form = file.slice(from: 8, to: 12).latin1
+    if form != "AIFF" && form != "AIFC" {
+        return Result.failure(error: Error("this IFF file isn't AIFF"))
+    }
+    var m = core.Media(format: "aiff")
+    var channels = 0
+    var frames = 0
+    var bits = 0
+    var rate = 0.0
+    var compression = "NONE"
+    var dataStart = -1
+    var dataEnd = -1
+    var p = 12
+    while p + 8 <= n {
+        let id = file.slice(from: p, to: p + 4).latin1
+        let size = file.uint32(at: p + 4, bigEndian: true)
+        let body = p + 8
+        let end = min(n, body + size)
+        match id {
+            "COMM" -> {
+                channels = mp4U16(file, body)
+                frames = mp4U32(file, body + 2)
+                bits = mp4U16(file, body + 6)
+                rate = wavExtended(file, body + 8)
+                if form == "AIFC" && body + 22 <= end {
+                    compression = file.slice(from: body + 18, to: body + 22).latin1
+                }
+            }
+            "SSND" -> {
+                // offset, block size, then the samples from offset.
+                let offset = mp4U32(file, body)
+                dataStart = body + 8 + offset
+                dataEnd = end
+                if body + size > n {
+                    m.warnings.append("the file is cut short")
+                }
+            }
+            "NAME" -> wavIffText(file, body, end, "title", m)
+            "AUTH" -> wavIffText(file, body, end, "artist", m)
+            "(c) " -> wavIffText(file, body, end, "copyright", m)
+            "ANNO" -> wavIffText(file, body, end, "comment", m)
+            "ID3 ", "id3 " -> rawId3(file, body, end, m)
+            _ -> {}
+        }
+        if body + size >= n {
+            break
+        }
+        p = body + size + (size & 1)
+    }
+    if channels <= 0 || !rate.isFinite || rate < 1.0 || rate > 10000000.0 {
+        return Result.failure(error: Error("this AIFF file has no COMM chunk"))
+    }
+    if dataStart < 0 {
+        return Result.failure(error: Error("this AIFF file has no sound data"))
+    }
+    let sampleRate = Int(rate + 0.5)
+    var track = core.Track(index: 0, kind: .audio, codec: "pcm")
+    track.timescale = sampleRate
+    track.sampleRate = sampleRate
+    track.channels = channels
+    track.bitsPerSample = bits
+    // AIFF's own order for more channels (AIFF §5) isn't WAV's: only mono
+    // and stereo are named.
+    if channels <= 2 {
+        track.layout = core.defaultLayout(channels)
+    }
+    // Sample bytes: whole bytes per sample, big-endian, signed (AIFF §4).
+    let b = if bits <= 8 { 8 } else if bits <= 16 { 16 } else if bits <= 24 { 24 } else { 32 }
+    track.pcm = core.PcmFormat(bits: b, float: false, bigEndian: true, signed: true)
+    var bytesPerSample = b / 8
+    match compression {
+        "NONE", "twos" -> {}
+        "sowt" -> { track.pcm.bigEndian = false }
+        "fl32", "FL32" -> {
+            track.pcm = core.PcmFormat(bits: 32, float: true, bigEndian: true, signed: true)
+            bytesPerSample = 4
+            track.bitsPerSample = 32
+        }
+        "fl64", "FL64" -> {
+            track.pcm = core.PcmFormat(bits: 64, float: true, bigEndian: true, signed: true)
+            bytesPerSample = 8
+            track.bitsPerSample = 64
+        }
+        "in24" -> {
+            track.pcm.bits = 24
+            bytesPerSample = 3
+        }
+        "in32" -> {
+            track.pcm.bits = 32
+            bytesPerSample = 4
+        }
+        "raw " -> {
+            track.pcm = core.PcmFormat(bits: 8, float: false, bigEndian: true, signed: false)
+            bytesPerSample = 1
+        }
+        "alaw", "ALAW" -> {
+            track.codec = "alaw"
+            bytesPerSample = 1
+        }
+        "ulaw", "ULAW" -> {
+            track.codec = "ulaw"
+            bytesPerSample = 1
+        }
+        _ -> {
+            track.codec = "unknown:aifc-{compression}"
+            m.warnings.append("AIFF-C compression '{compression}' isn't supported")
+        }
+    }
+    let align = max(1, channels * bytesPerSample)
+    // ffmpeg's AIFF packets: 4096 bytes, in whole frames.
+    let packetBytes = max(align, 4096 / align * align)
+    let available = (dataEnd - dataStart) / align
+    let total = if frames > 0 { min(frames, available) } else { available }
+    let stop = dataStart + total * align
+    var pts = 0
+    var q = dataStart
+    while q < stop {
+        let size = min(packetBytes, stop - q)
+        let k = size / align
+        m.packets.append(core.PacketRef(track: 0, pts: pts, dts: pts, duration: k, key: true, offset: q, size: k * align))
+        pts += k
+        q += k * align
+    }
+    track.duration = total
+    track.bitrate = sampleRate * align * 8
+    m.duration = Float(total) / Float(sampleRate)
+    m.tracks = [track]
+    Result.ok(value: m)
+}
+
+// An 80-bit IEEE 754 extended float (Apple SANE): sign and 15-bit
+// exponent, then a 64-bit mantissa with its leading 1 written out.
+fn wavExtended(_ d: Data, _ p: Int) -> Float {
+    if p + 10 > d.count {
+        return 0.0
+    }
+    let se = d.uint16(at: p, bigEndian: true)
+    let hi = d.uint32(at: p + 2, bigEndian: true)
+    let lo = d.uint32(at: p + 6, bigEndian: true)
+    let exponent = (se & 0x7fff) - 16383
+    let mantissa = Float(hi) * 4294967296.0 + Float(lo)
+    let v = mantissa * pow(2.0, Float(exponent - 63))
+    if (se & 0x8000) != 0 { -v } else { v }
+}
+
+fn wavIffText(_ d: Data, _ s: Int, _ e: Int, _ key: String, _ m: bind core.Media) {
+    let text = rawUtf8(d.slice(from: s, to: e)).trim()
+    if !text.isEmpty && m.tags[key] == nil {
+        m.tags[key] = text
+    }
+}

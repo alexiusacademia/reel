@@ -1,0 +1,217 @@
+// Tests for the lossless module: FLAC, ALAC, PCM, A-law and µ-law must
+// match ffmpeg's decoded samples bit for bit (testkit.snr gives 150 for
+// identical signals). Shared fixtures come from tests/fixtures; extra ones
+// (every FLAC stereo mode, LPC order 32, odd block sizes, wasted bits,
+// noise, 32-bit; ALAC 24-bit, mono, 5.1, noise; more PCM forms) from
+// tests/lossless/fixtures, made by tests/lossless/make_fixtures.sh.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import "../../lossless"
+import "../../core"
+import "../../testkit"
+
+struct Run {
+    data: [Float] = []
+    rate: Int = 0
+    channels: Int = 0
+    layout: [String] = []
+    warnings: [String] = []
+    seconds: Float = 0.0
+    failed: String = ""
+}
+
+// Decodes every packet of the first audio track of `media`.
+fn decodeTrack(_ file: Data, _ media: core.Media) -> Run {
+    var run = Run()
+    var index = -1
+    for t in media.tracks {
+        if t.kind == .audio && index < 0 {
+            index = t.index
+        }
+    }
+    if index < 0 {
+        run.failed = "no audio track"
+        return run
+    }
+    match lossless.newDecoder(media.tracks[index]) {
+        .ok(dec) -> {
+            var d = dec
+            let start = now()
+            for p in media.packets {
+                if p.track == index {
+                    let s = d.decode(core.packetBytes(file, media, p), pts: p.pts)
+                    run.data += s.data
+                }
+            }
+            run.data += d.flush().data
+            run.seconds = now() - start
+            run.rate = d.rate
+            run.channels = d.channels
+            run.layout = d.layout
+            run.warnings = d.warnings
+        }
+        .failure(e) -> {
+            run.failed = e.message
+        }
+    }
+    run
+}
+
+fn main() {
+    var passed = 0
+    var total = 0
+    fn check(_ ok: Bool, _ what: String) {
+        total += 1
+        if ok { passed += 1 } else { print("FAIL: {what}") }
+    }
+
+    // name, folder ("" = the shared fixtures), lowest acceptable SNR.
+    // 32-bit integer sources can't be held exactly in ffmpeg's 32-bit
+    // float reference, so they're compared at 140 dB.
+    let cases: [(String, String, Float)] = [
+        ("flac.flac", "", 150.0), ("flac_24.flac", "", 150.0), ("flac_51.flac", "", 150.0),
+        ("cover.flac", "", 150.0),
+        ("flac_ms.flac", "lossless", 150.0), ("flac_ls.flac", "lossless", 150.0),
+        ("flac_rs.flac", "lossless", 150.0), ("flac_lpc32.flac", "lossless", 150.0),
+        ("flac_fixed.flac", "lossless", 150.0), ("flac_odd.flac", "lossless", 150.0),
+        ("flac_tiny.flac", "lossless", 150.0), ("flac_noise.flac", "lossless", 150.0),
+        ("flac_s32.flac", "lossless", 140.0), ("flac_wasted.flac", "lossless", 150.0),
+        ("alac.m4a", "", 150.0),
+        ("alac_24.m4a", "lossless", 150.0), ("alac_mono.m4a", "lossless", 150.0),
+        ("alac_51.m4a", "lossless", 150.0), ("alac_noise.m4a", "lossless", 150.0),
+        ("pcm_s16.wav", "", 150.0), ("pcm_s24.wav", "", 150.0), ("pcm_f32.wav", "", 150.0),
+        ("pcm_u8.wav", "", 150.0), ("pcm_51.wav", "", 150.0), ("pcm.aiff", "", 150.0),
+        ("mov.mov", "", 150.0), ("mjpeg.avi", "", 150.0),
+        ("pcm_s32.wav", "lossless", 140.0), ("pcm_f64.wav", "lossless", 140.0),
+        ("pcm_s24be.aiff", "lossless", 150.0), ("pcm_s8.aiff", "lossless", 150.0),
+        ("pcm_s16be.mov", "lossless", 150.0),
+        ("alaw.wav", "lossless", 150.0), ("ulaw.wav", "lossless", 150.0),
+    ]
+    var flacSeconds = 0.0
+    var flacAudio = 0.0
+    var alacSeconds = 0.0
+    var alacAudio = 0.0
+    for (name, folder, want) in cases {
+        // testkit reads from tests/fixtures; our own clips are next door.
+        let refName = if folder == "" { name } else { "../{folder}/fixtures/{name}" }
+        let file = testkit.fixture(refName)
+        if file.isEmpty {
+            check(false, "{name}: fixture missing")
+            continue
+        }
+        let ref = testkit.loadRef(refName)
+        let media = testkit.mediaFromRef(file, ref)
+        let run = decodeTrack(file, media)
+        if run.failed != "" {
+            check(false, "{name}: {run.failed}")
+            continue
+        }
+        let expected = testkit.referenceSamples(refName)
+        let snr = testkit.snr(run.data, expected)
+        check(run.data.count == expected.count, "{name}: {run.data.count} samples, ffmpeg has {expected.count}")
+        check(snr >= want, "{name}: SNR {snr.formatted(decimals: 1)} dB, want {want}")
+        var refTrack = testkit.RefTrack()
+        for t in ref.tracks {
+            if t.kind == "audio" && refTrack.channels == 0 {
+                refTrack = t
+            }
+        }
+        check(run.rate == refTrack.sampleRate && run.channels == refTrack.channels, "{name}: {run.rate} Hz {run.channels} ch, want {refTrack.sampleRate} Hz {refTrack.channels} ch")
+        check(run.layout.count == run.channels, "{name}: layout names every channel")
+        check(run.warnings.isEmpty, "{name}: warnings {run.warnings.joined(separator: "; ")}")
+        let audio = Float(run.data.count / max(run.channels, 1)) / Float(max(run.rate, 1))
+        if name.hasSuffix(".flac") {
+            flacSeconds += run.seconds
+            flacAudio += audio
+        } else if name.hasPrefix("alac") {
+            alacSeconds += run.seconds
+            alacAudio += audio
+        }
+        // Raw FLAC files frame themselves: our finder must agree with ffprobe.
+        if name.hasSuffix(".flac") {
+            let offsets = lossless.flacFrameOffsets(file)
+            var same = offsets.count == media.packets.count
+            if same {
+                for i in 0..offsets.count {
+                    if offsets[i] != media.packets[i].offset {
+                        same = false
+                    }
+                }
+            }
+            check(same, "{name}: found {offsets.count} frames, ffprobe {media.packets.count}")
+        }
+    }
+    print("time flac decode: {Int(flacSeconds * 1000.0)} ms for {flacAudio.formatted(decimals: 1)} s of audio ({Int(flacAudio / max(flacSeconds, 0.000001))}x real time)")
+    print("time alac decode: {Int(alacSeconds * 1000.0)} ms for {alacAudio.formatted(decimals: 1)} s of audio ({Int(alacAudio / max(alacSeconds, 0.000001))}x real time)")
+
+    // STREAMINFO.
+    let flacFile = testkit.fixture("flac.flac")
+    let extra = lossless.flacExtraFromFile(flacFile)
+    if let info = lossless.parseFlacInfo(extra) {
+        check(info.rate == 44100 && info.channels == 2 && info.bits == 16 && info.totalFrames == 88200, "STREAMINFO of flac.flac: {info.rate} {info.channels} {info.bits} {info.totalFrames}")
+    } else {
+        check(false, "STREAMINFO of flac.flac")
+    }
+
+    // A FLAC stream decoded from our own framing, with the setup from the
+    // file itself (what a raw demuxer gives).
+    let track = core.Track(index: 0, kind: .audio, codec: "flac", extra: extra)
+    match lossless.newDecoder(track) {
+        .ok(dec) -> {
+            var d = dec
+            let offsets = lossless.flacFrameOffsets(flacFile)
+            var all: [Float] = []
+            for i in 0..offsets.count {
+                let end = if i + 1 < offsets.count { offsets[i + 1] } else { flacFile.count }
+                all += d.decode(flacFile.slice(from: offsets[i], to: end), pts: 0).data
+            }
+            check(testkit.snr(all, testkit.referenceSamples("flac.flac")) == 150.0, "flac.flac through flacFrameOffsets")
+            check(d.rate == 44100 && d.channels == 2, "rate and channels from STREAMINFO")
+
+            // Damage: a changed residual byte is caught by the CRC-16; a
+            // broken header gives no samples; neither stops the decoder.
+            let first = flacFile.slice(from: offsets[0], to: offsets[1])
+            var bytes = first.bytes
+            bytes[bytes.count / 2] = bytes[bytes.count / 2] ^ 0x10
+            d.warnings = []
+            let s1 = d.decode(Data(bytes: bytes), pts: 0)
+            check(!d.warnings.isEmpty, "damaged FLAC frame is reported ({s1.frames} frames came out)")
+            var bad = first.bytes
+            bad[1] = 0x00
+            d.warnings = []
+            let s2 = d.decode(Data(bytes: bad), pts: 0)
+            check(s2.frames == 0 && !d.warnings.isEmpty, "frame without a sync code gives nothing and a warning")
+            let s3 = d.decode(first.slice(from: 0, to: 20), pts: 0)
+            check(s3.frames == 0, "a frame cut short gives nothing")
+            let s4 = d.decode(first, pts: 0)
+            check(s4.frames == 4608, "decoding goes on after damage")
+        }
+        .failure(e) -> check(false, "flac decoder from file setup: {e.message}")
+    }
+
+    // ALAC without its cookie is refused; unknown codecs too.
+    let noCookie = core.Track(index: 0, kind: .audio, codec: "alac", channels: 2)
+    check(!lossless.newDecoder(noCookie).isOk(), "ALAC needs a magic cookie")
+    let other = core.Track(index: 0, kind: .audio, codec: "mp3", channels: 2)
+    check(!lossless.newDecoder(other).isOk(), "mp3 isn't lossless")
+
+    // PCM split across packets mid-frame: the partial frame is carried.
+    var pt = core.Track(index: 0, kind: .audio, codec: "pcm", sampleRate: 8000, channels: 2)
+    pt.pcm = core.PcmFormat(bits: 24, float: false, bigEndian: false, signed: true)
+    match lossless.newDecoder(pt) {
+        .ok(dec) -> {
+            var d = dec
+            // Two frames: L=1, R=-1, L=0x400000, R=-0x800000.
+            let all = Data(bytes: [1, 0, 0, 0xff, 0xff, 0xff, 0, 0, 0x40, 0, 0, 0x80])
+            let a = d.decode(all.slice(from: 0, to: 5), pts: 0)
+            let b = d.decode(all.slice(from: 5, to: 12), pts: 0)
+            let got = a.data + b.data
+            check(got.count == 4 && got[0] == 1.0 / 8388608.0 && got[1] == -1.0 / 8388608.0 && got[2] == 0.5 && got[3] == -1.0, "24-bit PCM across packets")
+        }
+        .failure(e) -> check(false, "pcm decoder: {e.message}")
+    }
+
+    print("lossless: {passed} of {total} passed")
+}
