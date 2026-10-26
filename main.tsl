@@ -2042,7 +2042,10 @@ app Reel(title: "Reel", width: 960, height: 600, documentTypes: ["mp4", "m4v", "
             chooseAudio(a)
         }
         let s = library.chooseTrack(fs.subtitle, p.media, kind: .subtitle) ?? library.preferredSubtitle(p.media, audioIndex: p.audio, mode: prefs.subtitleMode, languages: prefs.subtitleLanguages)
-        if s != p.subtitle && (s >= 0 || p.hasSubtitles) {
+        // (A subtitle file found beside the video stays unless the user
+        // turned subtitles off for this file before.)
+        let keepFile = p.subtitle == -2 && p.hasSubtitles && !(fs.subtitle.chosen && fs.subtitle.off)
+        if s != p.subtitle && (s >= 0 || p.hasSubtitles) && !keepFile {
             chooseSubtitle(s)
         }
         if fs.volume >= 0.0 {

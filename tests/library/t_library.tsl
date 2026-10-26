@@ -114,7 +114,8 @@ fn testLibrary(_ c: bind Checker, _ root: String) {
     if let it = lib.item(am) {
         c.check(it.duration > 0.0 && it.codecs.contains("h264") && it.width > 0, "report fills duration, codecs, size ({it.codecs})")
         c.sameInt(it.details, 2, "details from the player")
-        c.same(it.group, "other", "a short clip moves to Other once its duration is known")
+        // A name with a year is a film, short or not.
+        c.same(it.group, "movies", "a short film named with its year stays in Movies")
     }
 
     // Rescan: one file removed, one changed, one added.

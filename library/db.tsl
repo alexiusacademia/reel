@@ -232,7 +232,7 @@ public struct Library {
     private fn insertFound(_ f: FoundFile, added: Float) {
         let kind = mediaKindOf(f.path)
         let e = parseEpisode(f.path)
-        let group = groupFor(kind: kind, isEpisode: e.isEpisode, duration: -1.0, hasVideo: kind == "video")
+        let group = groupFor(kind: kind, isEpisode: e.isEpisode, duration: -1.0, hasVideo: kind == "video", hasYear: e.year > 0)
         let name = f.path.fileName
         let title = if e.isEpisode { e.title } else { "" }
         let search = searchText([episodeStem(name), e.series])
@@ -266,7 +266,7 @@ public struct Library {
         let name = rows[0].text("name")
         let e = parseEpisode(rep.path)
         let kind = if rep.hasVideo { "video" } else if rep.hasAudio { "audio" } else { mediaKindOf(rep.path) }
-        let group = groupFor(kind: kind, isEpisode: e.isEpisode, duration: rep.duration, hasVideo: rep.hasVideo || (kind == "video" && !rep.hasAudio))
+        let group = groupFor(kind: kind, isEpisode: e.isEpisode, duration: rep.duration, hasVideo: rep.hasVideo || (kind == "video" && !rep.hasAudio), hasYear: e.year > 0)
         let title = if !rep.title.isEmpty { rep.title } else if e.isEpisode { e.title } else { rows[0].text("title") }
         let search = searchText([episodeStem(name), title, rep.artist, rep.album, rep.albumArtist, rows[0].text("series")])
         db.execute("UPDATE media SET kind = ?, container = ?, duration = ?, title = ?, artist = ?, album = ?, albumartist = ?, genre = ?, year = CASE WHEN ? > 0 THEN ? ELSE year END, track = ?, disc = ?, codecs = ?, width = ?, height = ?, grp = ?, search = ?, details = MAX(details, ?) WHERE path = ?", [kind, rep.container, rep.duration, title, rep.artist, rep.album, rep.albumArtist, rep.genre, rep.year, rep.year, rep.track, rep.disc, rep.codecs, rep.width, rep.height, group, search, details, rep.path])
@@ -278,7 +278,9 @@ public struct Library {
     }
 
     // Which group a file goes in.
-    private fn groupFor(kind: String, isEpisode: Bool, duration: Float, hasVideo: Bool) -> String {
+    // A name with a film's year ("Big Buck Bunny (2008)") is a movie
+    // whatever its length; other short videos go to Other.
+    private fn groupFor(kind: String, isEpisode: Bool, duration: Float, hasVideo: Bool, hasYear: Bool = false) -> String {
         if kind == "audio" && !hasVideo {
             return "music"
         }
@@ -286,7 +288,7 @@ public struct Library {
             if isEpisode {
                 return "tv"
             }
-            if duration > 0.0 && duration < shortVideo {
+            if duration > 0.0 && duration < shortVideo && !hasYear {
                 return "other"
             }
             return "movies"
