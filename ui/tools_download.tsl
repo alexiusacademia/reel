@@ -1,0 +1,128 @@
+// The Download Video window: a YouTube (or any HLS/DASH stream) link, the
+// quality, the format (MP4, Matroska, or the sound alone as .m4a) and where
+// to save it; the app does the downloading and the writing (without
+// re-encoding) and passes the progress in.
+//
+// Author: Alexius Academia
+// Date: 2026-10-27
+
+public struct DownloadForm {
+    link: String = ""
+    // Index into the qualities passed to the view.
+    quality: Int = 0
+    // "mp4", "mkv" or "m4a" (the sound alone).
+    container: String = "mp4"
+    // The output file (its extension follows the container).
+    output: String = ""
+}
+
+// A file name for a title: characters file systems refuse are replaced,
+// spaces are kept, at most 120 characters, "Video" when nothing is left.
+public fn downloadFileName(_ title: String, container: String) -> String {
+    var out = ""
+    for c in title.characters {
+        if "/\\:*?\"<>|".contains(c) || c == "\n" || c == "\t" {
+            out += " "
+        } else {
+            out += c
+        }
+    }
+    var name = out.trim()
+    while name.contains("  ") {
+        name = name.replace("  ", with: " ")
+    }
+    if name.count > 120 {
+        name = name.substring(from: 0, to: 120).trim()
+    }
+    while name.hasSuffix(".") {
+        name = name.substring(from: 0, to: name.count - 1)
+    }
+    if name.isEmpty {
+        name = "Video"
+    }
+    "{name}.{container}"
+}
+
+// Why Download can't start yet ("" when it can).
+public fn downloadProblem(_ form: DownloadForm, qualities: Int) -> String {
+    if form.link.trim().isEmpty {
+        return "Paste a YouTube link or the address of an HLS or DASH stream."
+    }
+    if qualities == 0 {
+        return "Press Find to look the link up."
+    }
+    if form.output.isEmpty {
+        return "Choose where to save it."
+    }
+    ""
+}
+
+public view DownloadView(form: bind DownloadForm, title: String = "", qualities: [String] = [], finding: Bool = false, busy: Bool = false, progress: Float = -1.0, status: String = "", onFind: fn(), onChooseOutput: fn(), onDownload: fn(), onCancel: fn(), onClose: fn()) {
+    let problem = downloadProblem(form, qualities: qualities.count)
+
+    VStack(spacing: 10, alignment: .leading) {
+        Text("Download Video").font(size: 15, weight: .semibold)
+        Text("Saves a YouTube video or a stream as a file, without re-encoding.").font(size: 12).color(.secondary)
+        HStack {
+            TextField("https://www.youtube.com/watch?v=…", text: form.link)
+                .onSubmit { onFind() }
+                .accessibilityLabel("Video link")
+            Button("Find") { onFind() }.disabled(form.link.trim().isEmpty || finding || busy)
+        }
+        if !title.isEmpty {
+            Text(title).font(size: 13, weight: .semibold).lineLimit(2)
+        }
+        if !qualities.isEmpty {
+            Grid(spacing: 8) {
+                GridRow {
+                    Text("Quality").gridColumnAlignment(.trailing)
+                    Picker(selection: form.quality) {
+                        for i in 0..qualities.count {
+                            Text(qualities[i]).tag(i)
+                        }
+                    }
+                    .disabled(busy || form.container == "m4a")
+                    .accessibilityLabel("Quality")
+                }
+                GridRow {
+                    Text("Format")
+                    Picker(selection: form.container) {
+                        Text("MP4 (.mp4)").tag("mp4")
+                        Text("Matroska (.mkv)").tag("mkv")
+                        Text("Sound only (.m4a)").tag("m4a")
+                    }
+                    .disabled(busy)
+                    .accessibilityLabel("Format")
+                }
+            }
+            HStack {
+                Text("Save as")
+                Text(if form.output.isEmpty { "—" } else { exportOutputPath(form.output, container: form.container) })
+                    .lineLimit(1)
+                    .color(.secondary)
+                    .tooltip(exportOutputPath(form.output, container: form.container))
+                Spacer()
+                Button("Choose…") { onChooseOutput() }.disabled(busy)
+            }
+        }
+        if progress >= 0.0 {
+            ProgressBar(value: progress)
+        }
+        if !status.isEmpty {
+            Text(status).font(size: 12).selectable()
+        } else if !problem.isEmpty && !finding {
+            Text(problem).font(size: 12).color(.secondary)
+        }
+        Spacer()
+        HStack {
+            Spacer()
+            if busy {
+                Button("Cancel") { onCancel() }
+            } else {
+                Button("Close") { onClose() }
+            }
+            Button("Download") { onDownload() }.disabled(!problem.isEmpty || busy || finding)
+        }
+    }
+    .padding(16)
+}

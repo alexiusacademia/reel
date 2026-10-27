@@ -525,6 +525,37 @@ fn exportClipJob(_ file: Data, _ media: core.Media, _ tracks: [Int], _ from: Flo
     }
 }
 
+// Background work: a downloaded stream (its whole buffer) written to a
+// file without re-encoding: every video and audio track for "mp4" and
+// "mkv", the audio alone for "m4a" (an MP4 file).
+fn downloadSaveJob(_ file: Data, _ media: core.Media, _ container: String, _ out: String) -> String {
+    var tracks: [Int] = []
+    for t in media.tracks {
+        if t.kind == core.TrackKind.audio || (t.kind == core.TrackKind.video && container != "m4a") {
+            tracks.append(t.index)
+        }
+    }
+    if tracks.isEmpty {
+        return if container == "m4a" { "There's no sound to save." } else { "Nothing to save: no video or sound arrived." }
+    }
+    match export.planClip(media, tracks: tracks, from: 0.0, to: -1.0, exactStart: false) {
+        .ok(plan) -> {
+            let r = if container == "mkv" { export.writeMkv(file, plan, path: out) } else { export.writeMp4(file, plan, path: out) }
+            match r {
+                .ok(w) -> {
+                    var text = "Saved {out.fileName} ({Float(w.bytes / 100000) / 10.0} MB)"
+                    if !w.warnings.isEmpty {
+                        text += ". " + w.warnings.joined(separator: " ")
+                    }
+                    text
+                }
+                .failure(e) -> "Can't write the file: {e.message}"
+            }
+        }
+        .failure(e) -> "Can't save it: {e.message}"
+    }
+}
+
 // Background work: a GIF of a range.
 fn exportGifJob(_ file: Data, _ media: core.Media, _ track: Int, _ from: Float, _ to: Float, _ fps: Int, _ width: Int, _ height: Int, _ options: export.GifOptions, _ out: String) -> String {
     let frames = play.rangeFrames(file, media, track: track, from: from, to: to, fps: fps, width: width, height: height)

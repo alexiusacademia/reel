@@ -57,6 +57,7 @@ fn main() {
     discs(c)
     sleep(c)
     info(c)
+    downloads(c)
     print("ui_tools: {c.passed} of {c.total} passed")
 }
 
@@ -426,4 +427,20 @@ fn info(_ c: bind Checks) {
     c.same(ui.languageText("fre"), "French (fre)", "language 639-2")
     c.same(ui.languageText("pt-BR"), "Portuguese (Brazil) (pt-BR)", "language region")
     c.same(ui.languageText(""), "", "language none")
+}
+
+// Download Video: file names from titles, and when Download can start.
+fn downloads(_ c: bind Checks) {
+    c.same(ui.downloadFileName("A film: part 1/2", container: "mp4"), "A film part 1 2.mp4", "name: refused characters")
+    c.same(ui.downloadFileName("  Tabs\tand   spaces  ", container: "mkv"), "Tabs and spaces.mkv", "name: spaces squeezed")
+    c.same(ui.downloadFileName("Ends with dots...", container: "m4a"), "Ends with dots.m4a", "name: no trailing dots")
+    c.same(ui.downloadFileName("", container: "mp4"), "Video.mp4", "name: empty title")
+    c.check(ui.downloadFileName("x".repeated(300), container: "mp4").count == 124, "name: long titles cut to 120")
+    var f = ui.DownloadForm()
+    c.check(!ui.downloadProblem(f, qualities: 0).isEmpty, "needs a link")
+    f.link = "https://youtu.be/AbCdEfGhI_-"
+    c.check(ui.downloadProblem(f, qualities: 0).contains("Find"), "needs Find first")
+    c.check(ui.downloadProblem(f, qualities: 3).contains("save"), "needs a place to save")
+    f.output = "/tmp/a.mp4"
+    c.same(ui.downloadProblem(f, qualities: 3), "", "ready")
 }

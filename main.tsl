@@ -94,6 +94,19 @@ app Reel(title: "Reel", width: 960, height: 600, documentTypes: ["mp4", "m4v", "
     // When the tick last ran (now()): job callbacks start the next job at
     // once only while the tick is getting its turns (see feedSoon).
     state lastTickAt = 0.0
+    // Download Video: the form, what the link was found to be (title,
+    // qualities, its own session), progress, and a serial that cancels.
+    state showDownload = false
+    state dlForm = ui.DownloadForm()
+    state dlTitle = ""
+    state dlSeconds = 0.0
+    state dlQualities: [String] = []
+    state dlSession: [net.Session] = []
+    state dlFinding = false
+    state dlBusy = false
+    state dlProgress = -1.0
+    state dlStatus = ""
+    state dlSerial = 0
     // Trace only: milliseconds of main-thread work by kind since the last
     // trace line.
     state traceCost: [String: Float] = [:]
@@ -249,6 +262,7 @@ app Reel(title: "Reel", width: 960, height: 600, documentTypes: ["mp4", "m4v", "
             MenuItem("Open File…", shortcut: sc("open-file")) { chooseFiles() }
             MenuItem("Open Folder…", shortcut: sc("open-folder")) { chooseFolderToPlay() }
             MenuItem("Open Network Stream…", shortcut: "cmd+n") { openURLWindow() }
+            MenuItem("Download Video…") { openDownload() }
             MenuItem("Open Disc…") { openDiscFolder() }
             MenuItem("Save Playlist…") { savePlaylistFile() }
                 .disabled(playlist.isEmpty)
@@ -463,6 +477,32 @@ app Reel(title: "Reel", width: 960, height: 600, documentTypes: ["mp4", "m4v", "
                 onNeedPoster: { it in needPoster(it.path, it.size) },
                 onChanged: { refreshHome() })
         }
+    }
+
+    Window("Download Video", isOpen: showDownload, width: 560, height: 330) {
+        ui.DownloadView(form: dlForm, title: dlTitle, qualities: dlQualities, finding: dlFinding, busy: dlBusy, progress: dlProgress, status: dlStatus,
+            onFind: {
+                after(seconds: 0.0) {
+                    await dlFind()
+                }
+            },
+            onChooseOutput: {
+                if let f = saveFile(name: ui.exportOutputPath(dlForm.output, container: dlForm.container).fileName, types: [dlForm.container]) {
+                    dlForm.output = f
+                }
+            },
+            onDownload: {
+                after(seconds: 0.0) {
+                    await dlRun()
+                }
+            },
+            onCancel: {
+                dlSerial += 1
+                dlBusy = false
+                dlProgress = -1.0
+                dlStatus = "Cancelled"
+            },
+            onClose: { showDownload = false })
     }
 
     Window("Open Network Stream", isOpen: showOpenURL, width: 520, height: 170) {
@@ -1796,6 +1836,159 @@ app Reel(title: "Reel", width: 960, height: 600, documentTypes: ["mp4", "m4v", "
                 p.file = b.file
                 p.media = m2
             }
+        }
+    }
+
+    // --- Download Video ---
+
+    // Opens the window, with the playing YouTube video's link when there is one.
+    fn openDownload() {
+        if !dlBusy {
+            let playing = if current >= 0 && current < playlist.count { playlist[current] } else { "" }
+            if !playing.isEmpty && isStreamAddress(playing) && playing != dlForm.link {
+                dlForm.link = playing
+                dlQualities = []
+                dlTitle = ""
+                dlStatus = ""
+                dlProgress = -1.0
+                after(seconds: 0.0) {
+                    await dlFind()
+                }
+            }
+        }
+        showDownload = true
+    }
+
+    // Looks the link up: a YouTube video's stream, or the stream itself;
+    // lists its qualities (best first chosen) and names the file.
+    async fn dlFind() {
+        let link = dlForm.link.trim()
+        if link.isEmpty || dlFinding || dlBusy {
+            return
+        }
+        dlFinding = true
+        dlStatus = "Looking it up…"
+        dlQualities = []
+        dlTitle = ""
+        dlSession = []
+        var streamUrl = link
+        var title = ""
+        dlSeconds = 0.0
+        if net.isYouTube(link) {
+            match await net.resolveYouTube(link) {
+                .ok(v) -> {
+                    streamUrl = v.hlsUrl
+                    title = v.title
+                    dlSeconds = v.seconds
+                    if v.live {
+                        dlFinding = false
+                        dlStatus = "Live streams can't be downloaded."
+                        return
+                    }
+                }
+                .failure(e) -> {
+                    dlFinding = false
+                    dlStatus = e.message
+                    return
+                }
+            }
+        } else if !isStreamAddress(link) {
+            dlFinding = false
+            dlStatus = "That isn't a link Reel can download."
+            return
+        }
+        match await net.openSession(streamUrl) {
+            .ok(s) -> {
+                if s.presentation.live {
+                    dlFinding = false
+                    dlStatus = "Live streams can't be downloaded."
+                    return
+                }
+                dlSession = [s]
+                dlQualities = s.presentation.variants.map { v in qualityLabel(v) }
+                dlForm.quality = max(0, dlQualities.count - 1)
+                if title.isEmpty {
+                    let name = net.urlFileName(link)
+                    title = if let dot = name.findLast(".") { name.substring(from: 0, to: dot) } else { name }
+                }
+                dlTitle = title
+                let folder = joinPath(homeFolder(), "Downloads")
+                dlForm.output = joinPath(if fileExists(folder) { folder } else { homeFolder() }, ui.downloadFileName(title, container: dlForm.container))
+                dlStatus = ""
+            }
+            .failure(e) -> { dlStatus = "Can't open the stream: {e.message}" }
+        }
+        dlFinding = false
+    }
+
+    // Downloads every segment of the chosen quality (and its sound), then
+    // writes the file in the background.
+    async fn dlRun() {
+        if dlSession.isEmpty || dlBusy || dlForm.output.isEmpty {
+            return
+        }
+        dlBusy = true
+        dlSerial += 1
+        let serial = dlSerial
+        dlStatus = "Downloading…"
+        dlProgress = 0.0
+        let out = ui.exportOutputPath(dlForm.output, container: dlForm.container)
+        let container = dlForm.container
+        var s = dlSession[0]
+        s.bufferAhead = 1.0e9
+        s.keepBehind = 1.0e9
+        let q = min(max(dlForm.quality, 0), max(s.presentation.variants.count - 1, 0))
+        s.abr.fixed = q
+        s.variant = q
+        // Sound only: skip the pictures when the sound has a playlist of its own.
+        let soundOnly = container == "m4a" && s.audioIndex() >= 0
+        if soundOnly {
+            s.doneMain = true
+        }
+        var idle = 0
+        var problems: [String] = []
+        while !s.finished {
+            if serial != dlSerial {
+                return
+            }
+            if let f = s.nextFetch(now: now()) {
+                idle = 0
+                let r = await net.fetch(f)
+                if serial != dlSerial {
+                    return
+                }
+                if let e = s.deliver(f, r, now: now()) {
+                    if problems.count < 5 {
+                        problems.append(e.message)
+                    }
+                }
+                let total = if dlSeconds > 0.0 { dlSeconds } else { s.presentation.duration }
+                let got = s.buffer.bufferedEnd(stream: if soundOnly { 1 } else { 0 })
+                if total > 0.0 && got > 0.0 {
+                    dlProgress = min(0.99, got / total)
+                    dlStatus = "Downloading… {ui.formatClock(got)} of {ui.formatClock(total)}"
+                }
+            } else {
+                idle += 1
+                if idle > 100 {
+                    dlBusy = false
+                    dlProgress = -1.0
+                    dlStatus = "The download stopped before the end{if problems.isEmpty { "" } else { ": " + problems[0] }}"
+                    return
+                }
+                await after(seconds: 0.1)
+            }
+        }
+        dlStatus = "Writing {out.fileName}…"
+        let file = s.buffer.file
+        let media = s.buffer.media
+        background(work: { downloadSaveJob(file, media, container, out) }) { text in
+            if serial != dlSerial {
+                return
+            }
+            dlBusy = false
+            dlProgress = -1.0
+            dlStatus = text
         }
     }
 
