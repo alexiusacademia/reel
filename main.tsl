@@ -86,6 +86,18 @@ app Reel(title: "Reel", width: 960, height: 600, documentTypes: ["mp4", "m4v", "
     state stream: [net.Session] = []
     state streamLoading = false
     state streamOpening = false
+    // When the stream's opening began (now()), to stop waiting for a
+    // separate audio track that doesn't come.
+    state streamOpenedAt = 0.0
+    // When the running parse job was sent (trace only).
+    state parseSentAt = 0.0
+    // When the tick last ran (now()): job callbacks start the next job at
+    // once only while the tick is getting its turns (see feedSoon).
+    state lastTickAt = 0.0
+    // Trace only: milliseconds of main-thread work by kind since the last
+    // trace line.
+    state traceCost: [String: Float] = [:]
+    state parseSentNext = 0
     state streamTrimAt = 0.0
     state showOpenURL = false
     // The Effects and Filters window.
@@ -455,7 +467,7 @@ app Reel(title: "Reel", width: 960, height: 600, documentTypes: ["mp4", "m4v", "
 
     Window("Open Network Stream", isOpen: showOpenURL, width: 520, height: 170) {
         VStack(spacing: 10, alignment: .leading) {
-            Text("Address of a video, an HLS (.m3u8) or DASH (.mpd) stream, or a radio station:")
+            Text("Address of a video, a YouTube video, an HLS (.m3u8) or DASH (.mpd) stream, or a radio station:")
                 .font(size: 12)
                 .color(.secondary)
             TextField("https://…", text: urlText)
@@ -464,7 +476,7 @@ app Reel(title: "Reel", width: 960, height: 600, documentTypes: ["mp4", "m4v", "
                 Spacer()
                 Button("Cancel") { showOpenURL = false }
                 Button("Open") { openTypedURL() }
-                    .disabled(!net.isHttp(urlText.trim()))
+                    .disabled(!isStreamAddress(urlText.trim()))
             }
         }
         .padding(16)
@@ -1170,7 +1182,7 @@ app Reel(title: "Reel", width: 960, height: 600, documentTypes: ["mp4", "m4v", "
             }
             return
         }
-        if library.isPlaylistPath(path) {
+        if !isStreamAddress(path) && library.isPlaylistPath(path) {
             openPlaylistFile(path)
             return
         }
@@ -1643,7 +1655,33 @@ app Reel(title: "Reel", width: 960, height: 600, documentTypes: ["mp4", "m4v", "
         status = ""
         redraw += 1
         setWindowTitle(net.urlFileName(url))
-        match await net.openSession(url) {
+        // A YouTube link: find the video's HLS stream first.
+        var streamUrl = url
+        if net.isYouTube(url) {
+            setWindowTitle("YouTube")
+            match await net.resolveYouTube(url) {
+                .ok(v) -> {
+                    if serial != openSerial {
+                        return
+                    }
+                    streamUrl = v.hlsUrl
+                    setWindowTitle(if v.title.isEmpty { "YouTube" } else { v.title })
+                    if traceOn {
+                        traceLine("youtube: {v.id} \"{v.title}\" {v.seconds} s live {v.live}")
+                    }
+                }
+                .failure(e) -> {
+                    if serial != openSerial {
+                        return
+                    }
+                    opening = false
+                    p.error = e.message
+                    flash("Can't open {url}: {e.message}")
+                    return
+                }
+            }
+        }
+        match await net.openSession(streamUrl) {
             .ok(s) -> {
                 if serial != openSerial {
                     return
@@ -1653,6 +1691,7 @@ app Reel(title: "Reel", width: 960, height: 600, documentTypes: ["mp4", "m4v", "
                 }
                 stream = [s]
                 streamOpening = true
+                streamOpenedAt = now()
             }
             .failure(e) -> {
                 if serial != openSerial {
@@ -1684,6 +1723,7 @@ app Reel(title: "Reel", width: 960, height: 600, documentTypes: ["mp4", "m4v", "
                 streamLoading = false
                 return
             }
+            let d0 = now()
             if let e = stream[0].deliver(f, r, now: now()) {
                 p.warnings.append(e.message)
                 if traceOn {
@@ -1694,6 +1734,7 @@ app Reel(title: "Reel", width: 960, height: 600, documentTypes: ["mp4", "m4v", "
                 traceLine("stream: fetched {f.url.fileName}, {stream[0].buffer.media.packets.count} packets, {stream[0].buffer.media.tracks.count} tracks, buffered {stream[0].buffered} s")
             }
             streamArrived()
+            costAdd("stream", d0)
         }
         streamLoading = false
     }
@@ -1706,6 +1747,14 @@ app Reel(title: "Reel", width: 960, height: 600, documentTypes: ["mp4", "m4v", "
         media.duration = s.presentation.duration
         if streamOpening {
             if media.tracks.isEmpty || (s.buffered < 2.0 && !s.buffer.ended) {
+                return
+            }
+            // Audio in playlists of its own (YouTube, many HLS and DASH
+            // streams) often arrives after the first video segment: wait for
+            // it, so playback doesn't start without sound (up to 8 s).
+            let separateAudio = s.audioIndex() >= 0
+            let hasAudio = !media.tracks.filter { t in t.kind == core.TrackKind.audio }.isEmpty
+            if separateAudio && !hasAudio && !s.buffer.ended && now() - streamOpenedAt < 8.0 {
                 return
             }
             streamOpening = false
@@ -1760,7 +1809,7 @@ app Reel(title: "Reel", width: 960, height: 600, documentTypes: ["mp4", "m4v", "
 
     fn openTypedURL() {
         let u = urlText.trim()
-        if !net.isHttp(u) {
+        if !isStreamAddress(u) {
             return
         }
         showOpenURL = false
@@ -1881,7 +1930,7 @@ app Reel(title: "Reel", width: 960, height: 600, documentTypes: ["mp4", "m4v", "
     }
 
     fn openPath(_ path: String) {
-        if net.isHttp(path) {
+        if isStreamAddress(path) {
             after(seconds: 0.0) {
                 await openStreamURL(path)
             }
@@ -2194,6 +2243,18 @@ app Reel(title: "Reel", width: 960, height: 600, documentTypes: ["mp4", "m4v", "
         traceN += 1
         if traceN == 200 {
             traceLine("trace: tick gap mean {Float(Int(traceGap / 2.0)) / 100.0} ms, max {Float(Int(traceGapMax * 100.0)) / 100.0} ms; tick work mean {Float(Int(traceWork / 2.0)) / 100.0} ms; clock {Int(p.clock * 100.0)} cs, shown {p.shownCount}, dropped {p.dropped}, playing {p.playing}, audio {p.hasAudio}, ended {p.ended}, frames {p.frames.count}, raws {p.raws.count}")
+            if p.staged {
+                let at = if p.sparser.isEmpty { -1 } else { p.sparser[0].next }
+                traceLine("trace: parser at {at} of {p.media.packets.count} packets, busy {p.parseBusy} (job from packet {parseSentNext}, {Int((now() - parseSentAt) * 1000.0)} ms ago), done {p.parseDone}, parsed queue {p.parsedQ.count}, luma busy {p.lumaBusy}, chroma busy {p.chromaBusy}, converting {p.convertBusy}, behind {p.videoBehind()}")
+            }
+            var costs: [String] = []
+            for k in ["feed", "video", "parse", "luma", "chroma", "convert", "audio", "stream"] {
+                if let v = traceCost[k] {
+                    costs.append("{k} {Float(Int(v / 2.0)) / 100.0}")
+                }
+            }
+            traceLine("trace: main thread ms per tick: {costs.joined(separator: ", ")}")
+            traceCost = [:]
             traceN = 0
             traceGap = 0.0
             traceGapMax = 0.0
@@ -2202,6 +2263,7 @@ app Reel(title: "Reel", width: 960, height: 600, documentTypes: ["mp4", "m4v", "
     }
 
     fn tickBody() {
+        lastTickAt = now()
         tickControls()
         if !p.loaded {
             return
@@ -2343,7 +2405,29 @@ app Reel(title: "Reel", width: 960, height: 600, documentTypes: ["mp4", "m4v", "
         !stream.isEmpty && !stream[0].buffer.ended
     }
 
+    // From a background job's callback: starts the next jobs at once while
+    // the tick timer is running normally; when it hasn't run for 20 ms (fast
+    // jobs finishing back to back can keep the run loop so busy that the
+    // timer never fires, and then no frame is shown), leaves it to the tick.
+    fn feedSoon() {
+        if now() - lastTickAt < 0.02 {
+            feed()
+        }
+    }
+
+    fn costAdd(_ name: String, _ start: Float) {
+        if traceOn {
+            traceCost[name] = (traceCost[name] ?? 0.0) + (now() - start) * 1000.0
+        }
+    }
+
     fn feed() {
+        let t0 = now()
+        feedBody()
+        costAdd("feed", t0)
+    }
+
+    fn feedBody() {
         if p.wantVideo() {
             var pump = p.vpump[0]
             pump.growing = streamGrowing()
@@ -2355,6 +2439,7 @@ app Reel(title: "Reel", width: 960, height: 600, documentTypes: ["mp4", "m4v", "
             let gen = p.gen
             let serial = openSerial
             background(work: { decodeVideoBatch(pump, file, media, count: 4) }) { b in
+                let cbStart = now()
                 if serial != openSerial {
                     return
                 }
@@ -2365,7 +2450,8 @@ app Reel(title: "Reel", width: 960, height: 600, documentTypes: ["mp4", "m4v", "
                     p.videoDone = b.pump.done
                 }
                 p.settle()
-                feed()
+                costAdd("video", cbStart)
+                feedSoon()
             }
         }
         if p.wantParse() {
@@ -2378,18 +2464,27 @@ app Reel(title: "Reel", width: 960, height: 600, documentTypes: ["mp4", "m4v", "
             let media = p.media
             let gen = p.gen
             let serial = openSerial
+            let parseSent = now()
+            parseSentAt = parseSent
+            parseSentNext = sp.next
+            let parseMsBefore = sp.parseMs
             background(work: { play.parseStage(sp, file, media, count: 3) }) { r in
+                let cbStart = now()
                 if serial != openSerial {
                     return
                 }
                 p.parseBusy = false
                 p.sparser = [r.parser]
+                if traceOn {
+                    traceLine("parse: next {r.parser.next} of {media.packets.count}, done {r.parser.done}, gen {gen}/{p.gen}, round trip {Int((now() - parseSent) * 1000.0)} ms, parsing {Int(r.parser.parseMs - parseMsBefore)} ms, file {file.count / 1024} KB")
+                }
                 if gen == p.gen {
                     p.parsedQ.append(r.batch)
                     p.parseDone = r.parser.done
                 }
                 p.settle()
-                feed()
+                costAdd("parse", cbStart)
+                feedSoon()
             }
         }
         if p.wantReconstruct() {
@@ -2408,6 +2503,7 @@ app Reel(title: "Reel", width: 960, height: 600, documentTypes: ["mp4", "m4v", "
             let gen = p.gen
             let serial = openSerial
             background(work: { play.reconstructStage(lr, batch) }) { r in
+                let cbStart = now()
                 if serial != openSerial {
                     return
                 }
@@ -2420,10 +2516,12 @@ app Reel(title: "Reel", width: 960, height: 600, documentTypes: ["mp4", "m4v", "
                     p.joinHalves()
                 }
                 p.settle()
-                feed()
+                costAdd("luma", cbStart)
+                feedSoon()
             }
             if split {
             background(work: { play.reconstructStage(cr, batch) }) { r in
+                let cbStart = now()
                 if serial != openSerial {
                     return
                 }
@@ -2435,7 +2533,8 @@ app Reel(title: "Reel", width: 960, height: 600, documentTypes: ["mp4", "m4v", "
                     p.joinHalves()
                 }
                 p.settle()
-                feed()
+                costAdd("chroma", cbStart)
+                feedSoon()
             }
             }
         }
@@ -2455,6 +2554,7 @@ app Reel(title: "Reel", width: 960, height: 600, documentTypes: ["mp4", "m4v", "
             let serial = openSerial
             let last = p.videoDone
             background(work: { convertBatch(conv, raws, gen: gen, last: last) }) { b in
+                let cbStart = now()
                 if serial != openSerial {
                     return
                 }
@@ -2463,7 +2563,8 @@ app Reel(title: "Reel", width: 960, height: 600, documentTypes: ["mp4", "m4v", "
                 if gen == p.gen {
                     p.frames.appendAll(b.frames)
                 }
-                feed()
+                costAdd("convert", cbStart)
+                feedSoon()
             }
         }
         if p.wantAudio() {
@@ -2477,6 +2578,7 @@ app Reel(title: "Reel", width: 960, height: 600, documentTypes: ["mp4", "m4v", "
             let gen = p.gen
             let serial = openSerial
             background(work: { decodeAudioBatch(pump, file, media) }) { b in
+                let cbStart = now()
                 if serial != openSerial {
                     if b.has {
                         forgetChunkFile(b.chunk.path)
@@ -2498,7 +2600,8 @@ app Reel(title: "Reel", width: 960, height: 600, documentTypes: ["mp4", "m4v", "
                     }
                 }
                 p.settle()
-                feed()
+                costAdd("audio", cbStart)
+                feedSoon()
             }
         }
     }
@@ -3264,6 +3367,16 @@ fn traceLine(_ text: String) {
     if target.count > 1 {
         appendFile(path: target, text: text + "\n")
     }
+}
+
+// Whether an address opens as a stream: http(s), or a local HLS or DASH
+// presentation given as a file:// address.
+fn isStreamAddress(_ u: String) -> Bool {
+    if net.isHttp(u) {
+        return true
+    }
+    let l = u.lowercase()
+    l.hasPrefix("file://") && (l.hasSuffix(".m3u8") || l.hasSuffix(".mpd"))
 }
 
 // The app's name as the statistics service knows it.

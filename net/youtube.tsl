@@ -1,0 +1,215 @@
+// YouTube links: recognising them (watch pages, youtu.be, Shorts, embeds,
+// live), and finding the video's HLS stream, which the rest of net/ then
+// plays like any other HLS stream.
+//
+// How the stream is found: YouTube's watch page gives a new viewer a
+// visitor id (`VISITOR_DATA`); with it, YouTube's player service
+// (youtubei/v1/player) answers as it does for YouTube's visionOS app, whose
+// answer has an HLS playlist with plain segment addresses (no scrambled
+// addresses, so no YouTube JavaScript has to run). YouTube changes these
+// services from time to time; when it does, `resolveYouTube` fails with the
+// reason YouTube gave, and the client details below are what to update.
+//
+// Author: Alexius Academia
+// Date: 2026-10-27
+
+// What Reel needs to play a YouTube video.
+public struct YouTubeVideo {
+    id: String = ""
+    title: String = ""
+    author: String = ""
+    // Length in seconds, 0 when YouTube doesn't say (live streams).
+    seconds: Float = 0.0
+    live: Bool = false
+    // The HLS master playlist (several qualities, audio and captions).
+    hlsUrl: String = ""
+}
+
+// The client Reel presents itself as to the player service.
+let ytClientName = "VISIONOS"
+let ytClientNumber = "101"
+let ytClientVersion = "1.02"
+let ytAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15"
+
+// The parts of the player service's answer Reel reads (fromJson ignores
+// the rest).
+struct YtStatus {
+    status: String = ""
+    reason: String = ""
+}
+
+struct YtStreaming {
+    hlsManifestUrl: String = ""
+}
+
+struct YtDetails {
+    title: String = ""
+    author: String = ""
+    lengthSeconds: String = ""
+    isLive: Bool = false
+    isLiveContent: Bool = false
+}
+
+struct YtPlayer {
+    playabilityStatus: YtStatus = YtStatus()
+    streamingData: YtStreaming = YtStreaming()
+    videoDetails: YtDetails = YtDetails()
+}
+
+// The request to the player service.
+struct YtClient {
+    clientName: String
+    clientVersion: String
+    deviceMake: String = "Apple"
+    deviceModel: String = "RealityDevice17,1"
+    userAgent: String
+    osName: String = "visionOS"
+    osVersion: String = "26.5.23O471"
+    hl: String = "en"
+    visitorData: String = ""
+}
+
+struct YtContext {
+    client: YtClient
+}
+
+struct YtPlayerRequest {
+    context: YtContext
+    videoId: String
+    contentCheckOk: Bool = true
+    racyCheckOk: Bool = true
+}
+
+// Whether a character can be part of a video id.
+fn ytIdChar(_ c: String) -> Bool {
+    let allowed = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+    c.count == 1 && allowed.contains(c)
+}
+
+// Whether `s` is a video id: 11 characters of letters, digits, '-' and '_'.
+public fn isYouTubeId(_ s: String) -> Bool {
+    if s.count != 11 {
+        return false
+    }
+    for c in s.characters {
+        if !ytIdChar(c) {
+            return false
+        }
+    }
+    true
+}
+
+// The value of `key` in a query string ("v=abc&t=10" → "abc" for "v").
+fn ytQueryValue(_ query: String, _ key: String) -> String {
+    for part in query.split("&") {
+        if let eq = part.find("=") {
+            if part.substring(from: 0, to: eq) == key {
+                return percentDecode(part.substring(from: eq + 1, to: part.count))
+            }
+        }
+    }
+    ""
+}
+
+// The video id of a YouTube link, "" when it isn't one. Knows
+// youtube.com/watch?v=…, youtu.be/…, /shorts/…, /embed/…, /live/…, /v/…,
+// on www., m. and music. hosts and youtube-nocookie.com.
+public fn youtubeId(_ link: String) -> String {
+    let u = parseUrl(link.trim())
+    if u.scheme != "http" && u.scheme != "https" {
+        return ""
+    }
+    var host = u.host.lowercase()
+    for prefix in ["www.", "m.", "music."] {
+        if host.hasPrefix(prefix) {
+            host = host.substring(from: prefix.count, to: host.count)
+        }
+    }
+    let segments = u.path.split("/").filter { s in !s.isEmpty }
+    var id = ""
+    if host == "youtu.be" {
+        if !segments.isEmpty {
+            id = segments[0]
+        }
+    } else if host == "youtube.com" || host == "youtube-nocookie.com" {
+        if segments.count == 1 && segments[0] == "watch" {
+            id = ytQueryValue(u.query, "v")
+        } else if segments.count >= 2 && ["shorts", "embed", "live", "v"].contains(segments[0]) {
+            id = segments[1]
+        }
+    }
+    if isYouTubeId(id) { id } else { "" }
+}
+
+public fn isYouTube(_ link: String) -> Bool {
+    !youtubeId(link).isEmpty
+}
+
+// The visitor id in a watch page ("" when it isn't there).
+public fn ytVisitorData(_ html: String) -> String {
+    let key = "\"VISITOR_DATA\":\""
+    if let a = html.find(key) {
+        let rest = html.substring(from: a + key.count, to: min(html.count, a + key.count + 2000))
+        if let b = rest.find("\"") {
+            return rest.substring(from: 0, to: b)
+        }
+    }
+    ""
+}
+
+// The player service's request body for a video.
+public fn ytPlayerBody(id: String, visitorData: String) -> String {
+    let client = YtClient(clientName: ytClientName, clientVersion: ytClientVersion, userAgent: ytAgent, visitorData: visitorData)
+    toJson(YtPlayerRequest(context: YtContext(client: client), videoId: id))
+}
+
+// Reads the player service's answer: the video, or why it can't be played.
+public fn ytParsePlayer(_ text: String, id: String) -> Result<YouTubeVideo> {
+    let p: YtPlayer = fromJson(text) ?? YtPlayer()
+    let st = p.playabilityStatus
+    if st.status.isEmpty {
+        return Result.failure(error: Error("YouTube's answer couldn't be read"))
+    }
+    if st.status != "OK" {
+        let why = if st.reason.isEmpty { st.status.lowercase() } else { st.reason }
+        return Result.failure(error: Error("YouTube: {why}"))
+    }
+    if p.streamingData.hlsManifestUrl.isEmpty {
+        return Result.failure(error: Error("YouTube didn't offer a stream Reel can play for this video"))
+    }
+    let d = p.videoDetails
+    Result.ok(value: YouTubeVideo(id: id, title: d.title, author: d.author,
+        seconds: Float(parseInt(d.lengthSeconds).valueOr(0)), live: d.isLive,
+        hlsUrl: p.streamingData.hlsManifestUrl))
+}
+
+// Finds the stream of a YouTube link: the watch page for the visitor id,
+// then the player service.
+public async fn resolveYouTube(_ link: String) -> Result<YouTubeVideo> {
+    let id = youtubeId(link)
+    if id.isEmpty {
+        return Result.failure(error: Error("not a YouTube video link: {link}"))
+    }
+    let page = await request(url: "https://www.youtube.com/watch?v={id}&hl=en",
+        headers: ["User-Agent": ytAgent, "Accept-Language": "en"])
+    if page.status == 0 {
+        return Result.failure(error: Error("can't reach YouTube: {page.error}"))
+    }
+    let visitor = ytVisitorData(page.text)
+    var headers = [
+        "Content-Type": "application/json",
+        "User-Agent": ytAgent,
+        "X-YouTube-Client-Name": ytClientNumber,
+        "X-YouTube-Client-Version": ytClientVersion,
+        "Origin": "https://www.youtube.com",
+    ]
+    if !visitor.isEmpty {
+        headers["X-Goog-Visitor-Id"] = visitor
+    }
+    let r = await request(url: "https://www.youtube.com/youtubei/v1/player?prettyPrint=false", method: "POST",
+        headers: headers, body: ytPlayerBody(id: id, visitorData: visitor))
+    if r.status == 0 {
+        return Result.failure(error: Error("can't reach YouTube: {r.error}"))
+    }
+    ytParsePlayer(r.text, id: id)
+}

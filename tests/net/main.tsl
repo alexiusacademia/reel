@@ -672,5 +672,41 @@ async fn main() {
     t.check(net.httpRangeTotal("bytes 0-0/12345") == 12345 && net.httpRangeTotal("bytes 0-0/*") == -1, "Content-Range total")
     t.check(net.mimeForName("http://h/a/index.m3u8?x") == "application/vnd.apple.mpegurl" && net.mimeForName("x.mpd") == "application/dash+xml", "MIME from names")
 
+    // ---------------------------------------------------------------
+    // YouTube links and the player service's answer (made-up answers).
+    let vid = "AbCdEfGhI_-"
+    t.check(net.youtubeId("https://www.youtube.com/watch?v={vid}&t=42s") == vid, "watch link")
+    t.check(net.youtubeId("https://youtu.be/{vid}?si=x") == vid, "youtu.be link")
+    t.check(net.youtubeId("https://m.youtube.com/watch?feature=share&v={vid}") == vid, "mobile link, v not first")
+    t.check(net.youtubeId("https://www.youtube.com/shorts/{vid}") == vid && net.youtubeId("https://youtube.com/live/{vid}?feature=x") == vid, "Shorts and live links")
+    t.check(net.youtubeId("https://www.youtube-nocookie.com/embed/{vid}") == vid && net.youtubeId("https://music.youtube.com/watch?v={vid}") == vid, "embed and Music links")
+    t.check(net.youtubeId("https://www.youtube.com/watch?v=short") == "" && net.youtubeId("https://example.com/watch?v={vid}") == "" && net.youtubeId("https://www.youtube.com/@channel") == "", "not video links")
+    t.check(net.ytVisitorData("x\"VISITOR_DATA\":\"Cgt4eXo%3D\",\"y\":1") == "Cgt4eXo%3D" && net.ytVisitorData("<html>") == "", "visitor id from a page")
+    let body = net.ytPlayerBody(id: vid, visitorData: "V1")
+    t.check(body.contains("\"videoId\":\"{vid}\"") && body.contains("\"visitorData\":\"V1\"") && body.contains("\"clientName\":\"VISIONOS\""), "player request body")
+    let okAnswer = "\{\"playabilityStatus\":\{\"status\":\"OK\"},\"streamingData\":\{\"hlsManifestUrl\":\"https://example.com/master.m3u8\",\"adaptiveFormats\":[]},\"videoDetails\":\{\"title\":\"A film\",\"author\":\"Someone\",\"lengthSeconds\":\"597\",\"isLive\":false}}"
+    match net.ytParsePlayer(okAnswer, id: vid) {
+        .ok(v) -> t.check(v.title == "A film" && v.author == "Someone" && v.seconds == 597.0 && !v.live && v.hlsUrl == "https://example.com/master.m3u8", "player answer read")
+        .failure(e) -> t.check(false, "player answer: {e.message}")
+    }
+    let botAnswer = "\{\"playabilityStatus\":\{\"status\":\"LOGIN_REQUIRED\",\"reason\":\"Sign in to confirm you're not a bot\"}}"
+    match net.ytParsePlayer(botAnswer, id: vid) {
+        .ok(_) -> t.check(false, "a refused video should fail")
+        .failure(e) -> t.check(e.message == "YouTube: Sign in to confirm you're not a bot", "a refusal gives YouTube's reason: {e.message}")
+    }
+    t.check(!net.ytParsePlayer("not json", id: vid).isOk(), "an unreadable answer fails")
+
+    // A YouTube-like master: H.264 qualities, then the same in VP9, not in
+    // bandwidth order. One family is kept (H.264), lowest first.
+    var mixed: [net.Rendition] = []
+    for (bw, c) in [(394233, "avc1.4D4015,mp4a.40.2"), (2566638, "avc1.4D401F,mp4a.40.2"), (168746, "avc1.4D400C,mp4a.40.5"), (612723, "vp09.00.21.08,mp4a.40.2"), (1931139, "vp09.00.31.08,mp4a.40.2")] {
+        mixed.append(net.Rendition(id: "{mixed.count}", kind: "main", bandwidth: bw, codecs: c))
+    }
+    let ordered = net.sessionVariantOrder(mixed)
+    t.check(ordered.map { r in r.bandwidth } == [168746, 394233, 2566638], "variants: H.264 kept, sorted: {ordered.map { r in r.bandwidth }}")
+    let vp9only = net.sessionVariantOrder([mixed[4], mixed[3]])
+    t.check(vp9only.map { r in r.bandwidth } == [612723, 1931139], "variants of one family are only sorted")
+    t.check(net.sessionVideoFamily("mp4a.40.2") == "" && net.sessionVideoFamily("hvc1.2.4.L123.B0,ec-3") == "hevc", "video codec families")
+
     print("net: {t.passed} of {t.total} passed")
 }

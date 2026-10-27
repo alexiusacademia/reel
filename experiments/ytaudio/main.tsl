@@ -1,0 +1,63 @@
+// Feeds a downloaded HLS video segment (TS, video only) and audio segment
+// (packed AAC with an ID3 timestamp) into net.StreamBuffer the way the
+// player does, and prints the tracks and packet times, to see why YouTube
+// streams play without sound.
+//
+//   tessel run experiments/ytaudio -- <video.ts> <audio.aac>
+//
+// Author: Alexius Academia
+// Date: 2026-10-27
+
+import "../../core"
+import "../../net"
+import "../../demux"
+
+fn main() {
+    let args = arguments()
+    if args.count < 2 {
+        print("usage: ytaudio <video segment> <audio segment>")
+        return
+    }
+    let video = readData(args[args.count - 2]) ?? Data()
+    let audio = readData(args[args.count - 1]) ?? Data()
+    print("audio id3 timestamp: {net.id3TransportTimestamp(audio)}")
+    match demux.open(audio, name: "seg.aac") {
+        .ok(m) -> {
+            print("audio alone: format {m.format}, {m.tracks.count} tracks, {m.packets.count} packets")
+            for t in m.tracks {
+                print("  track {t.index}: {t.kind} {t.codec} {t.sampleRate} Hz {t.channels} ch, timescale {t.timescale}")
+            }
+            if !m.packets.isEmpty {
+                print("  first pts {m.packets[0].pts}, last {m.packets[m.packets.count - 1].pts}")
+            }
+        }
+        .failure(e) -> print("audio alone: {e.message}")
+    }
+    var b = net.StreamBuffer()
+    if let e = b.append(video, start: 0.0, duration: 3.0, stream: 0, sequence: 0, name: "seg.ts") {
+        print("video append: {e.message}")
+    }
+    if let e = b.append(audio, start: 0.0, duration: 3.0, stream: 1, sequence: 0, name: "seg.aac") {
+        print("audio append: {e.message}")
+    }
+    print("buffer: {b.media.tracks.count} tracks, {b.media.packets.count} packets")
+    for t in b.media.tracks {
+        var first = -1.0
+        var last = -1.0
+        var n = 0
+        for p in b.media.packets {
+            if p.track == t.index {
+                let s = core.seconds(p.pts, t.timescale)
+                if first < 0.0 {
+                    first = s
+                }
+                last = s
+                n += 1
+            }
+        }
+        print("  track {t.index}: {t.kind} {t.codec}, {n} packets, {first} … {last} s")
+    }
+    for w in b.warnings {
+        print("warning: {w}")
+    }
+}

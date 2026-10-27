@@ -1,0 +1,71 @@
+// Runs net.Session over a local copy of an HLS presentation the way the
+// player's download loop does before playback starts (nothing playing,
+// position 0), and prints each fetch: which stream, how long the delivery
+// took on this thread, and what the buffer holds. For finding why a stream
+// with separate audio (YouTube's) can freeze the window while opening.
+//
+//   tessel run experiments/ytstream -- file:///…/master.m3u8 [fetches]
+//
+// Author: Alexius Academia
+// Date: 2026-10-27
+
+import "../../core"
+import "../../net"
+
+async fn run(_ url: String, _ limit: Int) {
+    match await net.openSession(url) {
+        .ok(s0) -> {
+            var s = s0
+            print("opened {s.presentation.kind}: {s.presentation.variants.count} variants, {s.presentation.audios.count} audio, audioIndex {s.audioIndex()}")
+            var n = 0
+            while n < limit {
+                n += 1
+                if let f = s.nextFetch(now: now()) {
+                    let r = await net.fetch(f)
+                    let t0 = now()
+                    let err = s.deliver(f, r, now: now())
+                    let ms = (now() - t0) * 1000.0
+                    var audioTracks = 0
+                    for t in s.buffer.media.tracks {
+                        if t.kind == core.TrackKind.audio {
+                            audioTracks += 1
+                        }
+                    }
+                    print("{n}: {f.kind} stream {f.stream} {f.url.fileName}: deliver {Int(ms)} ms, {s.buffer.media.packets.count} packets, tracks {s.buffer.media.tracks.count} (audio {audioTracks}), buffered {s.buffered} s{if let e = err { ", " + e.message } else { "" }}")
+                } else {
+                    print("{n}: nothing to fetch (buffered {s.buffered} s, finished {s.finished})")
+                    break
+                }
+            }
+            // What the app's timer does on every tick when the session sits
+            // in a list, while the player holds the buffer's file and media
+            // too: set the position and ask for the next fetch.
+            var holder = [s]
+            let keptFile = s.buffer.file
+            let keptMedia = s.buffer.media
+            let t0 = now()
+            for i in 0..100 {
+                holder[0].position = Float(i) * 0.01
+                let f = holder[0].nextFetch(now: now())
+            }
+            let per = (now() - t0) * 1000.0 / 100.0
+            print("per tick (position + nextFetch on stream[0]): {per} ms; file {keptFile.count / 1024} KB, {keptMedia.packets.count} packets")
+            let t1 = now()
+            for i in 0..100 {
+                let copy = holder[0]
+                holder[0].position = Float(i) * 0.01
+            }
+            print("per tick with a copy of the session alive (let s = stream[0]): {(now() - t1) * 1000.0 / 100.0} ms")
+        }
+        .failure(e) -> print("open: {e.message}")
+    }
+}
+
+fn main() {
+    let args = arguments()
+    let url = args[args.count - 2]
+    let limit = parseInt(args[args.count - 1]).valueOr(40)
+    after(seconds: 0.0) {
+        await run(url, limit)
+    }
+}

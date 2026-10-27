@@ -863,6 +863,51 @@ fn sessionUtc(_ now: Float) -> Float {
     now
 }
 
+// The variants to choose qualities from, lowest bandwidth first. When a
+// master lists the same qualities in several video codecs (YouTube lists
+// H.264 and then VP9), only one family is kept, so a quality step never
+// switches codec: H.264 when it's there (Reel's fastest decoder), else
+// HEVC, else the first one listed. Variants without codecs are kept.
+public fn sessionVariantOrder(_ vs: [Rendition]) -> [Rendition] {
+    var families: [String] = []
+    for v in vs {
+        let f = sessionVideoFamily(v.codecs)
+        if !f.isEmpty && !families.contains(f) {
+            families.append(f)
+        }
+    }
+    var keep = ""
+    if families.count > 1 {
+        keep = if families.contains("avc") { "avc" } else if families.contains("hevc") { "hevc" } else { families[0] }
+    }
+    let kept = vs.filter { v in keep.isEmpty || sessionVideoFamily(v.codecs).isEmpty || sessionVideoFamily(v.codecs) == keep }
+    kept.sorted(by: { a, b in a.bandwidth < b.bandwidth })
+}
+
+// The video codec family of an HLS CODECS attribute ("avc1.4D401F,mp4a.40.2"
+// → "avc"), "" when it names no video codec.
+public fn sessionVideoFamily(_ codecs: String) -> String {
+    for c in codecs.split(",") {
+        let t = c.trim().lowercase()
+        if t.hasPrefix("avc1") || t.hasPrefix("avc3") {
+            return "avc"
+        }
+        if t.hasPrefix("hvc1") || t.hasPrefix("hev1") {
+            return "hevc"
+        }
+        if t.hasPrefix("vp09") || t.hasPrefix("vp9") {
+            return "vp9"
+        }
+        if t.hasPrefix("av01") {
+            return "av1"
+        }
+        if t.hasPrefix("vp08") || t.hasPrefix("vp8") {
+            return "vp8"
+        }
+    }
+    ""
+}
+
 // Builds the presentation of an HLS master or media playlist.
 public fn hlsPresentation(_ pl: HlsPlaylist) -> Presentation {
     var p = Presentation(kind: "hls", url: pl.url)
@@ -887,6 +932,7 @@ public fn hlsPresentation(_ pl: HlsPlaylist) -> Presentation {
         r.name = if v.height > 0 { "{v.height}p" } else { "{v.bandwidth / 1000} kbit/s" }
         p.variants.append(r)
     }
+    p.variants = sessionVariantOrder(p.variants)
     for x in pl.renditions {
         if x.uri.isEmpty {
             continue
