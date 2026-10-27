@@ -13,6 +13,9 @@ find in dialogue and lossless clip export.
 **Playback**
 - Plays local files, folders, playlists, network streams (HLS, DASH, plain
   http/https) and DVD and Blu-ray folders or `.iso` images.
+- Plays YouTube links (watch, youtu.be, Shorts, live, YouTube Music), and
+  **downloads** YouTube videos and streams as MP4, MKV or sound-only M4A
+  without re-encoding.
 - Frame-exact stepping forwards **and backwards**, A-B loop, bookmarks,
   chapters, jump to time, speed 0.25–4× with pitch kept, sleep timer.
 - Thumbnail previews when hovering over the seek bar, and a **scene strip**

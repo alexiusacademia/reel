@@ -1,0 +1,314 @@
+<!doctype html>
+<!--
+  Reel website: the user guide. Keep the menus and keys true to main.tsl
+  and library/keymap.tsl (defaultBindings) when either changes.
+  Author: Alexius Academia
+  Date: 2026-10-27
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Guide — Reel</title>
+<meta name="description" content="How to use Reel: playing files and YouTube videos, downloading, the library, subtitles, effects, clips, discs and every keyboard shortcut.">
+<link rel="icon" href="assets/icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<header class="top">
+  <div class="wrap top-in">
+    <a class="brand" href="/"><img src="assets/icon.svg" alt="" width="28" height="28"> Reel</a>
+    <nav>
+      <a href="/#features">Features</a>
+      <a href="/guide.html">Guide</a>
+      <a href="/#download">Download</a>
+      <a href="https://github.com/alexiusacademia/reel">Source</a>
+    </nav>
+  </div>
+</header>
+
+<main class="guide wrap">
+  <aside class="toc" aria-label="Contents">
+    <p class="toc-title">Contents</p>
+    <ol>
+      <li><a href="#start">Getting started</a></li>
+      <li><a href="#playing">Playing</a></li>
+      <li><a href="#youtube">YouTube and streams</a></li>
+      <li><a href="#downloading">Downloading videos</a></li>
+      <li><a href="#library">Library and home screen</a></li>
+      <li><a href="#subtitles">Subtitles</a></li>
+      <li><a href="#effects">Sound and picture</a></li>
+      <li><a href="#moments">Bookmarks, loops and chapters</a></li>
+      <li><a href="#export">Clips, GIFs and snapshots</a></li>
+      <li><a href="#discs">DVDs and Blu-rays</a></li>
+      <li><a href="#keys">Keyboard shortcuts</a></li>
+      <li><a href="#help">Settings and help</a></li>
+    </ol>
+  </aside>
+
+  <article class="prose guide-body">
+    <h1>Reel guide</h1>
+    <p class="lead">Everything Reel does, and where to find it. On Windows, read <kbd>Ctrl</kbd> wherever this guide
+      says <kbd>⌘</kbd>, and <kbd>Alt</kbd> for <kbd>⌥</kbd>.</p>
+
+    <section id="start">
+      <h2>1. Getting started</h2>
+      <p><strong>macOS:</strong> open the disk image and drag Reel to Applications. <strong>Windows:</strong> run the
+        installer; Reel goes in the Start menu.</p>
+      <p>To play something:</p>
+      <ul>
+        <li>Drop a video, song or folder on Reel's window, or open one with <strong>Media ▸ Open File…</strong>
+          (<kbd>⌘O</kbd>) or <strong>Open Folder…</strong> (<kbd>⇧⌘O</kbd>). A folder plays all its media in order.</li>
+        <li>Open video and audio files with Reel from Finder or Explorer (it registers for them).</li>
+        <li>Paste a link with <strong>Media ▸ Open Network Stream…</strong> (<kbd>⌘N</kbd>): see
+          <a href="#youtube">YouTube and streams</a>.</li>
+      </ul>
+      <p>When nothing is playing, the window shows the <a href="#library">home screen</a> with what you were
+        watching.</p>
+    </section>
+
+    <section id="playing">
+      <h2>2. Playing</h2>
+      <figure class="shot"><img src="assets/player.jpg" width="1600" height="950" loading="lazy"
+        alt="Reel playing with captions, the scene strip and a preview above the seek bar"></figure>
+      <ul>
+        <li><strong>Play and pause</strong> with <kbd>Space</kbd>. Jump back and forward 10 seconds with <kbd>←</kbd>
+          <kbd>→</kbd>, 3 seconds with <kbd>⇧←</kbd> <kbd>⇧→</kbd>, a minute with <kbd>⌥←</kbd> <kbd>⌥→</kbd>.</li>
+        <li><strong>Seek previews:</strong> hover over the seek bar to see the picture at that time, then click to go
+          there.</li>
+        <li><strong>Scene strip</strong> (<strong>View ▸ Scene Strip</strong>): thumbnails of every scene; click one to
+          jump to it. For files without chapters, the scenes also become chapters.</li>
+        <li><strong>Frame by frame:</strong> <kbd>E</kbd> or <kbd>.</kbd> steps forward one frame,
+          <kbd>⇧E</kbd> or <kbd>,</kbd> steps back.</li>
+        <li><strong>Jump to a time</strong> with <kbd>⌘T</kbd>: type <code>1:23:45</code>, <code>83:45</code>,
+          <code>45s</code>, or <code>+30</code> / <code>-1:00</code> to move from where you are.</li>
+        <li><strong>Speed:</strong> <kbd>]</kbd> faster, <kbd>[</kbd> slower, <kbd>=</kbd> normal, from 0.25× to 4×,
+          with the pitch kept.</li>
+        <li><strong>Full screen</strong> with <kbd>F</kbd> (<kbd>Esc</kbd> to leave). The controls fade out after a
+          moment and come back when you move the mouse.</li>
+        <li><strong>Audio and subtitle tracks:</strong> <kbd>B</kbd> cycles audio tracks, <kbd>V</kbd> subtitles; or
+          pick one in the <strong>Audio</strong> and <strong>Subtitle</strong> menus.</li>
+        <li><strong>Playlist</strong> (<kbd>⌘L</kbd>): drag to reorder; <kbd>N</kbd> and <kbd>P</kbd> go to the next and
+          previous item. Loop and shuffle are in the <strong>Playback</strong> menu.</li>
+        <li><strong>Mini player</strong> (<kbd>⇧⌘M</kbd>): a small window that stays out of the way.</li>
+      </ul>
+    </section>
+
+    <section id="youtube">
+      <h2>3. YouTube and streams</h2>
+      <p>Choose <strong>Media ▸ Open Network Stream…</strong> (<kbd>⌘N</kbd>), paste the address and press
+        <strong>Open</strong>. If an address is on the clipboard, it's already filled in. Reel plays:</p>
+      <ul>
+        <li><strong>YouTube videos:</strong> <code>youtube.com/watch?v=…</code>, <code>youtu.be/…</code>, Shorts, live
+          and embed links, and YouTube Music. The window shows the video's title.</li>
+        <li><strong>HLS and DASH streams</strong> (<code>.m3u8</code>, <code>.mpd</code>), including live ones.</li>
+        <li><strong>Video and audio files</strong> on the web, and <strong>internet radio</strong>.</li>
+      </ul>
+      <p>Reel starts at a quality that suits most connections. Change it in <strong>Video ▸ Quality</strong>.</p>
+      <p class="note">YouTube changes how its videos are delivered from time to time. If YouTube links stop working,
+        a newer version of Reel will fix it. Videos that need you to sign in (age-restricted or members-only) can't be
+        played.</p>
+    </section>
+
+    <section id="downloading">
+      <h2>4. Downloading videos</h2>
+      <p>Choose <strong>Media ▸ Download Video…</strong>. If a YouTube video or stream is playing, its link is
+        filled in and looked up straight away; otherwise paste a link and press <strong>Find</strong>. Then:</p>
+      <ol>
+        <li>Pick the <strong>quality</strong>. The best one is chosen for you.</li>
+        <li>Pick the <strong>format</strong>: MP4, Matroska (<code>.mkv</code>), or <strong>Sound only</strong>
+          (<code>.m4a</code>), which downloads just the audio.</li>
+        <li>Check where it's saved: your Downloads folder, named after the video. <strong>Choose…</strong> saves it
+          elsewhere.</li>
+        <li>Press <strong>Download</strong>. A bar shows how far it's got; <strong>Cancel</strong> stops it.</li>
+      </ol>
+      <p>Nothing is re-encoded, so the file has exactly the quality of the stream. Live streams can't be
+        downloaded.</p>
+      <p class="note">Only download videos you have the right to keep: your own, ones under a licence that allows
+        it, or ones the owner lets you save. YouTube's terms don't allow downloading other videos.</p>
+    </section>
+
+    <section id="library">
+      <h2>5. Library and home screen</h2>
+      <figure class="shot"><img src="assets/home.jpg" width="1600" height="950" loading="lazy"
+        alt="The home screen with Continue watching and Recently added"></figure>
+      <p>Add your folders in <strong>Reel ▸ Preferences… ▸ Library</strong>. Reel sorts what it finds into
+        <strong>Movies</strong>, <strong>TV Shows</strong> (by series and season), <strong>Music</strong> (by artist
+        and album) and <strong>Other</strong>, and keeps your <strong>History</strong> and
+        <strong>Playlists</strong>. Open the library with <kbd>⇧⌘L</kbd>.</p>
+      <ul>
+        <li><strong>Picking up where you left off:</strong> a file you were watching starts from the beginning, with a
+          <strong>Continue from …</strong> button for a few seconds. The home screen's
+          <strong>Continue watching</strong> row resumes directly.</li>
+        <li><strong>Episodes</strong> get watched marks and progress bars, and the next episode plays on its own at
+          the end of one (<kbd>⇧N</kbd> skips to it).</li>
+        <li>Reel remembers each file's tracks, volume, speed, delays, picture settings and equalizer.</li>
+        <li>Right-click an item to play it next, add it to a playlist, mark it watched, or show it in Finder.</li>
+        <li>Playlists open and save as M3U, PLS, XSPF, WPL and CUE.</li>
+      </ul>
+      <figure class="shot"><img src="assets/library.png" width="1600" height="1045" loading="lazy"
+        alt="The library on a TV season, with watched marks and progress"></figure>
+    </section>
+
+    <section id="subtitles">
+      <h2>6. Subtitles</h2>
+      <ul>
+        <li>Reel loads subtitles inside the file and ones beside it: same name, language codes like
+          <code>Movie.en.srt</code>, and <code>Subs/</code> folders. All of them are listed in
+          <strong>Subtitle ▸ Beside the Video</strong>.</li>
+        <li><strong>Subtitle ▸ Add Subtitle File…</strong> loads any SRT, ASS/SSA, WebVTT or PGS file. Dropping one on
+          the window works too.</li>
+        <li><strong>Second Subtitle Track</strong> shows another language at the top, for learning or for two
+          viewers.</li>
+        <li>Out of sync? <kbd>H</kbd> delays subtitles by 0.1 s, <kbd>G</kbd> brings them earlier.</li>
+        <li>Garbled letters? Pick the right <strong>Text Encoding</strong>, or leave it on Detect Automatically.</li>
+        <li>Change the font, size, colour and outline in <strong>Preferences ▸ Subtitles</strong>, with a live
+          preview.</li>
+      </ul>
+      <h3>Find in dialogue and the transcript</h3>
+      <figure class="shot"><img src="assets/find.jpg" width="1600" height="950" loading="lazy"
+        alt="Find in dialogue beside the picture, with the search word highlighted"></figure>
+      <p><kbd>⌘F</kbd> searches every subtitle track for a word or phrase and lists each line with the ones around
+        it; click one, or use the arrow keys and <kbd>Enter</kbd>, to go there. <kbd>⇧⌘T</kbd> shows the whole
+        transcript, which follows along as the film plays.</p>
+      <h3>Downloading subtitles</h3>
+      <p><strong>Subtitle ▸ Download Subtitles…</strong> searches OpenSubtitles. It needs a free API key from
+        opensubtitles.com, entered in <strong>Preferences ▸ OpenSubtitles</strong>, and a login for downloads.
+        Results that match your file exactly are marked.</p>
+    </section>
+
+    <section id="effects">
+      <h2>7. Sound and picture</h2>
+      <figure class="shot"><img src="assets/effects.png" width="1600" height="1411" loading="lazy"
+        alt="Effects and Filters: the equalizer"></figure>
+      <p><strong>Tools ▸ Effects and Filters</strong> (<kbd>⌘E</kbd>) has five tabs:</p>
+      <ul>
+        <li><strong>Equalizer:</strong> ten bands with presets and a curve of what you've set.</li>
+        <li><strong>Loudness &amp; dynamics:</strong> normalisation that evens out quiet dialogue and loud scenes,
+          a compressor and a limiter.</li>
+        <li><strong>Stereo:</strong> mono, swapped channels, width, balance and headphone crossfeed.</li>
+        <li><strong>Video:</strong> brightness, contrast, saturation, hue and gamma; crop (with black-bar detection),
+          aspect ratio, zoom, flip and rotate; deinterlacing, sharpening and denoising.</li>
+        <li><strong>Synchronisation:</strong> audio delay (<kbd>J</kbd>/<kbd>K</kbd> in 50 ms steps), subtitle delays
+          and speed.</li>
+      </ul>
+      <p>Changes to the sound are heard after a second or two.</p>
+    </section>
+
+    <section id="moments">
+      <h2>8. Bookmarks, loops and chapters</h2>
+      <ul>
+        <li><strong>Bookmarks:</strong> <kbd>⌘B</kbd> marks the moment; <kbd>⇧.</kbd> and <kbd>⇧,</kbd> go to the next
+          and previous one. <strong>View ▸ Bookmarks</strong> lists, renames and deletes them.</li>
+        <li><strong>A-B loop:</strong> press <kbd>L</kbd> at the start, again at the end, and the part between repeats.
+          Press it a third time to stop.</li>
+        <li><strong>Chapters:</strong> <kbd>⇧⌘→</kbd> and <kbd>⇧⌘←</kbd>, or <strong>Playback ▸ Chapter</strong>.</li>
+        <li><strong>Sleep timer</strong> (<kbd>⌥S</kbd>): stop after 15 to 90 minutes, at the end of what's playing, or
+          after a time you choose.</li>
+      </ul>
+    </section>
+
+    <section id="export">
+      <h2>9. Clips, GIFs and snapshots</h2>
+      <figure class="shot"><img src="assets/export.png" width="1600" height="1156" loading="lazy"
+        alt="Export Clip: start and end, format and tracks"></figure>
+      <ul>
+        <li><strong>Media ▸ Export Clip…</strong> (<kbd>⇧⌘E</kbd>) saves part of a file as MKV or MP4 without
+          re-encoding: set the start and end (or use an A-B loop), choose the tracks, and export. Turn on
+          <strong>Start exactly at the start time</strong> to cut on the exact frame.</li>
+        <li><strong>Media ▸ Export GIF…</strong> makes a GIF of a few seconds, at the width and frame rate you
+          choose.</li>
+        <li><strong>Video ▸ Snapshot</strong> (<kbd>⇧⌘S</kbd>) saves the current picture.</li>
+      </ul>
+    </section>
+
+    <section id="discs">
+      <h2>10. DVDs and Blu-rays</h2>
+      <p><strong>Media ▸ Open Disc…</strong> opens a DVD or Blu-ray folder, or an <code>.iso</code> image. Reel lists
+        the titles with their length, chapters, angles and languages, and marks the main feature. Encrypted
+        commercial discs aren't supported.</p>
+    </section>
+
+    <section id="keys">
+      <h2>11. Keyboard shortcuts</h2>
+      <p>Every shortcut can be changed in <strong>Preferences ▸ Shortcuts</strong>: click an action, press the new
+        keys, and Reel warns about clashes.</p>
+      <div class="table-scroll">
+        <table class="keys">
+          <thead><tr><th>Action</th><th>Keys</th></tr></thead>
+          <tbody>
+            <tr class="group"><td colspan="2">Playback</td></tr>
+            <tr><td>Play / Pause</td><td><kbd>Space</kbd></td></tr>
+            <tr><td>Stop</td><td><kbd>S</kbd></td></tr>
+            <tr><td>Next / Previous item</td><td><kbd>N</kbd> · <kbd>P</kbd></td></tr>
+            <tr><td>Next episode</td><td><kbd>⇧N</kbd></td></tr>
+            <tr><td>Jump 10 s</td><td><kbd>→</kbd> <kbd>←</kbd></td></tr>
+            <tr><td>Jump 3 s</td><td><kbd>⇧→</kbd> <kbd>⇧←</kbd></td></tr>
+            <tr><td>Jump 1 min</td><td><kbd>⌥→</kbd> <kbd>⌥←</kbd></td></tr>
+            <tr><td>Next / Previous frame</td><td><kbd>E</kbd> or <kbd>.</kbd> · <kbd>⇧E</kbd> or <kbd>,</kbd></td></tr>
+            <tr><td>Jump to time</td><td><kbd>⌘T</kbd></td></tr>
+            <tr><td>Next / Previous chapter</td><td><kbd>⇧⌘→</kbd> · <kbd>⇧⌘←</kbd></td></tr>
+            <tr><td>Faster / Slower / Normal speed</td><td><kbd>]</kbd> · <kbd>[</kbd> · <kbd>=</kbd></td></tr>
+            <tr><td>A-B loop</td><td><kbd>L</kbd></td></tr>
+            <tr><td>Add bookmark</td><td><kbd>⌘B</kbd></td></tr>
+            <tr><td>Next / Previous bookmark</td><td><kbd>⇧.</kbd> · <kbd>⇧,</kbd></td></tr>
+            <tr><td>Sleep timer</td><td><kbd>⌥S</kbd></td></tr>
+            <tr class="group"><td colspan="2">Sound</td></tr>
+            <tr><td>Volume up / down</td><td><kbd>↑</kbd> · <kbd>↓</kbd></td></tr>
+            <tr><td>Mute</td><td><kbd>M</kbd></td></tr>
+            <tr><td>Next audio track</td><td><kbd>B</kbd></td></tr>
+            <tr><td>Audio delay +50 ms / −50 ms</td><td><kbd>K</kbd> · <kbd>J</kbd></td></tr>
+            <tr class="group"><td colspan="2">Picture</td></tr>
+            <tr><td>Full screen / Leave</td><td><kbd>F</kbd> · <kbd>Esc</kbd></td></tr>
+            <tr><td>Snapshot</td><td><kbd>⇧⌘S</kbd></td></tr>
+            <tr class="group"><td colspan="2">Subtitles</td></tr>
+            <tr><td>Next subtitle track / second track</td><td><kbd>V</kbd> · <kbd>⇧V</kbd></td></tr>
+            <tr><td>Subtitle delay +0.1 s / −0.1 s</td><td><kbd>H</kbd> · <kbd>G</kbd></td></tr>
+            <tr><td>Find in dialogue</td><td><kbd>⌘F</kbd></td></tr>
+            <tr><td>Transcript</td><td><kbd>⇧⌘T</kbd></td></tr>
+            <tr class="group"><td colspan="2">Media and windows</td></tr>
+            <tr><td>Open file / folder</td><td><kbd>⌘O</kbd> · <kbd>⇧⌘O</kbd></td></tr>
+            <tr><td>Open network stream</td><td><kbd>⌘N</kbd></td></tr>
+            <tr><td>Close</td><td><kbd>⌘W</kbd></td></tr>
+            <tr><td>Export clip</td><td><kbd>⇧⌘E</kbd></td></tr>
+            <tr><td>Media information</td><td><kbd>I</kbd> or <kbd>⌘I</kbd></td></tr>
+            <tr><td>Playlist / Library</td><td><kbd>⌘L</kbd> · <kbd>⇧⌘L</kbd></td></tr>
+            <tr><td>Effects and filters</td><td><kbd>⌘E</kbd></td></tr>
+            <tr><td>Mini player</td><td><kbd>⇧⌘M</kbd></td></tr>
+            <tr><td>Preferences</td><td><kbd>⌘,</kbd></td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section id="help">
+      <h2>12. Settings and help</h2>
+      <ul>
+        <li><strong>Reel ▸ Preferences…</strong> (<kbd>⌘,</kbd>) has General, Playback, Audio, Video, Subtitles,
+          Library, Network, OpenSubtitles and Shortcuts.</li>
+        <li><strong>Tools ▸ Media Information</strong> (<kbd>I</kbd>) shows each track's codec, the file's metadata
+          and chapters. <strong>Tools ▸ Statistics</strong> shows decoding speed and dropped frames as the video
+          plays.</li>
+        <li><strong>Reel ▸ Send Anonymous Usage Statistics</strong> turns the usage counts off. The
+          <a href="privacy.html">privacy page</a> says exactly what they contain.</li>
+        <li>A file won't play, or something looks wrong? Report it with the file's Media Information on
+          <a href="https://github.com/alexiusacademia/reel/issues">GitHub</a>.</li>
+      </ul>
+    </section>
+  </article>
+</main>
+
+<footer>
+  <div class="wrap foot-in">
+    <span>Reel · © 2026 Alexius Academia · <a href="privacy.html">Privacy</a> · <a href="https://github.com/alexiusacademia/reel">Source</a></span>
+    <span>Alexius Academia · <a href="https://syncster.dev">syncster.dev</a></span>
+  </div>
+  <div class="wrap credit">
+    Screenshots show <em>Big Buck Bunny</em> © Blender Foundation,
+    <a href="https://peach.blender.org">peach.blender.org</a>, under
+    <a href="https://creativecommons.org/licenses/by/3.0/">CC BY 3.0</a>.
+  </div>
+</footer>
+</body>
+</html>

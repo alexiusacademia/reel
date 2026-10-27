@@ -161,3 +161,34 @@ footer { padding: 30px 0 40px; color: var(--muted); font-size: 14px; }
 .formats strong { color: var(--text); }
 .credit { font-size: 13px; margin-top: 10px; }
 .tessel p.open { margin-top: 14px; font-size: 15px; }
+
+/* Guide */
+.guide { display: grid; grid-template-columns: 220px 1fr; gap: 48px; align-items: start; }
+.toc { position: sticky; top: 78px; padding-top: 56px; font-size: 14px; }
+.toc-title { font-weight: 700; margin: 0 0 8px; color: var(--text); }
+.toc ol { margin: 0; padding-left: 18px; color: var(--muted); }
+.toc li { margin: 5px 0; }
+.toc a { color: var(--muted); }
+.toc a:hover { color: var(--accent); text-decoration: none; }
+.guide-body { min-width: 0; }
+.guide-body section { scroll-margin-top: 76px; }
+.guide-body h3 { font-size: 18px; margin: 26px 0 8px; }
+.guide-body .shot { margin: 18px 0 22px; }
+.guide-body li { margin: 6px 0; }
+kbd {
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 0.82em; color: var(--text);
+  background: var(--code-bg); border: 1px solid var(--line); border-bottom-width: 2px;
+  border-radius: 5px; padding: 0.05em 0.4em; white-space: nowrap;
+}
+.note {
+  border-left: 3px solid var(--accent); background: var(--bg-alt);
+  padding: 10px 14px; border-radius: 0 8px 8px 0; font-size: 15px;
+}
+.keys td:last-child { white-space: nowrap; }
+.keys tr.group td { color: var(--accent); font-weight: 700; padding-top: 18px; font-size: 13px; text-transform: uppercase; letter-spacing: 0.05em; }
+@media (max-width: 860px) {
+  .guide { grid-template-columns: 1fr; gap: 0; }
+  .toc { position: static; padding-top: 32px; }
+  .keys td:last-child { white-space: normal; }
+}
