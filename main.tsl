@@ -567,7 +567,7 @@ app Reel(title: "Reel", width: 960, height: 600, documentTypes: ["mp4", "m4v", "
         VStack(spacing: 8) {
             Text("Reel").font(size: 26, weight: .bold)
             Text("A media player written entirely in Tessel").color(.secondary)
-            Text("Version 0.1.0").font(size: 12).color(.secondary)
+            Text("Version {appInfo().version}").font(size: 12).color(.secondary)
             Divider()
             Text("Alexius Academia")
             Link("syncster.dev", url: "https://syncster.dev")
