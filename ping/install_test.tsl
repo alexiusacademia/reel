@@ -1,0 +1,147 @@
+// Tests of the usage ping's pieces: ids, the tidying of what's sent, the
+// system details read from what the system's commands print, the query
+// each kind of ping makes, and what's kept in stats.json. Sending is
+// tried by the app's scripts (tests/ping*.script), against a file in
+// place of the service.
+//
+// Author: Alexius Academia
+// Date: 2026-10-27
+
+let known = "3f0c8a52-91d4-4c1e-8b7a-5d2e6f104b99"
+
+test "ids" {
+    let id = newId()
+    expect(validId(id))
+    expect(id.count == 36)
+    expect(id != newId())
+    expect(!validId("abc-123"))
+    expect(!validId("0123456789abcdeg"))
+    expect(validId("0123456789ABCDEF"))
+    expect(!validId("a".repeated(65)))
+}
+
+test "versions and names are tidied" {
+    expect(tidy("0.1.0") == "0.1.0")
+    expect(tidy("1.0_b-rc") == "1.0_b-rc")
+    expect(tidy("1.0+2") == "1.0-2")
+    expect(tidy("1.0 beta/2&x=1") == "1.0-beta-2-x-1")
+    expect(tidy("9".repeated(40)).count == 32)
+    expect(tidy(" ") == "unknown")
+}
+
+test "the processor" {
+    expect(archName("arm64\n") == "arm64")
+    expect(archName("aarch64") == "arm64")
+    expect(archName("x86_64") == "x64")
+    expect(archName("AMD64") == "x64")
+    expect(archName("riscv64") == "riscv64")
+    expect(archName("") == "unknown")
+}
+
+test "the system's version" {
+    expect(osVersionFrom("15.4.1\n") == "15.4.1")
+    expect(osVersionFrom("26.5.2") == "26.5.2")
+    expect(osVersionFrom("Microsoft Windows [Version 10.0.26100.4061]") == "10.0.26100")
+    expect(osVersionFrom("Microsoft Windows [Version 10.0.19045]") == "10.0.19045")
+    expect(osVersionFrom("") == "")
+    expect(osVersionFrom("error: can't start sw_vers") == "")
+}
+
+test "the locale" {
+    expect(localeFrom("en_PH") == "en-PH")
+    expect(localeFrom("en_US@rg=phzzzz\n") == "en-US")
+    expect(localeFrom("zh-Hans_CN") == "zh-Hans-CN")
+    expect(localeFrom("    LocaleName    REG_SZ    en-PH") == "en-PH")
+    expect(localeFrom("") == "")
+    expect(localeFrom("x") == "")
+    expect(localeFrom("de_DE; rm -rf") == "de-DE--rm--rf")
+}
+
+test "the screen" {
+    expect(screenFrom("1512 x 982 @ 120.00Hz") == "1512x982")
+    expect(screenFrom("1920x1080") == "1920x1080")
+    expect(screenFrom("") == "")
+    expect(screenFrom("wide") == "")
+    expect(screenFrom("12 x 9") == "")
+    let lines = [
+        "  \"SPDisplaysDataType\" : [",
+        "      \"_name\" : \"Apple M5 Pro\",",
+        "      \"spdisplays_ndrvs\" : [",
+        "          \"_name\" : \"DELL U2720Q\",",
+        "          \"_spdisplays_pixels\" : \"3840 x 2160\",",
+        "          \"_spdisplays_resolution\" : \"1920 x 1080 @ 60.00Hz\",",
+        "          \"spdisplays_mirror\" : \"spdisplays_off\",",
+        "          \"_name\" : \"Color LCD\",",
+        "          \"_spdisplays_pixels\" : \"3024 x 1964\",",
+        "          \"_spdisplays_resolution\" : \"1512 x 982 @ 120.00Hz\",",
+        "          \"spdisplays_main\" : \"spdisplays_yes\",",
+    ]
+    expect(macScreenFrom(lines) == "1512x982")
+    // No display says it's the main one: the first.
+    expect(macScreenFrom(lines.filter { l in !l.contains("spdisplays_main") }) == "1920x1080")
+    expect(macScreenFrom([]) == "")
+}
+
+test "what to send" {
+    expect(whatToSend(Installation(), version: "0.1.0") == "install")
+    expect(whatToSend(Installation(id: known), version: "0.1.0") == "install")
+    expect(whatToSend(Installation(id: "me@example.com", reported: "0.1.0"), version: "0.1.0") == "install")
+    expect(whatToSend(Installation(id: known, reported: "0.1.0"), version: "0.1.0") == "")
+    expect(whatToSend(Installation(id: known, reported: "0.0.9"), version: "0.1.0") == "update")
+    expect(whatToSend(Installation(id: known, reported: "0.2.0"), version: "0.1.0") == "update")
+    expect(activeDue(Installation(id: known), day: "2026-10-25"))
+    expect(activeDue(Installation(id: known, active: "2026-10-24"), day: "2026-10-25"))
+    expect(!activeDue(Installation(id: known, active: "2026-10-25"), day: "2026-10-25"))
+    expect(utcDay(0.0) == "1970-01-01")
+    expect(utcDay(86400.0 * 365.0 - 1.0) == "1970-12-31")
+}
+
+test "the query of each kind of ping" {
+    let sys = SystemInfo(os: "macos", arch: "arm64", osv: "15.4.1", lang: "en-PH", screen: "1512x982")
+    expect(pingQuery(name: "keystone", kind: "install", Installation(id: known), version: "0.1.0", sys)
+        == "?app=keystone&type=install&id={known}&v=0.1.0&os=macos&arch=arm64&osv=15.4.1&lang=en-PH&screen=1512x982")
+    expect(pingQuery(name: "keystone", kind: "update", Installation(id: known, reported: "0.0.9"), version: "0.1.0", sys)
+        == "?app=keystone&type=update&id={known}&v=0.1.0&os=macos&arch=arm64&prev=0.0.9&osv=15.4.1&lang=en-PH&screen=1512x982")
+    expect(pingQuery(name: "keystone", kind: "active", Installation(id: known, reported: "0.1.0"), version: "0.1.0", sys)
+        == "?app=keystone&type=active&id={known}&v=0.1.0&os=macos&arch=arm64&osv=15.4.1&lang=en-PH&screen=1512x982")
+    // What couldn't be found out is left out.
+    let windows = SystemInfo(os: "windows", arch: "x64", osv: "10.0.26100")
+    expect(pingQuery(name: "keystone", kind: "active", Installation(id: known), version: "0.1.0", windows)
+        == "?app=keystone&type=active&id={known}&v=0.1.0&os=windows&arch=x64&osv=10.0.26100")
+    // Nothing but letters, digits and the allowed marks gets in.
+    let odd = SystemInfo(os: "macos", arch: "arm64", osv: "15.4&x=1", lang: "en_PH?", screen: "9 x 9")
+    expect(pingQuery(name: "keystone", kind: "active", Installation(id: known), version: "0.1.0", odd)
+        == "?app=keystone&type=active&id={known}&v=0.1.0&os=macos&arch=arm64&osv=15.4-x-1&lang=en-PH")
+    expect(pingURL(base: "https://stats.syncster.dev/v1/ping", query: "?app=keystone")
+        == "https://stats.syncster.dev/v1/ping?app=keystone")
+    expect(pingURL(base: "file:///tmp/taken", query: "?app=keystone") == "file:///tmp/taken")
+    expect(statsURL(name: "keystone-unit-test") == "https://stats.syncster.dev/v1/ping")
+}
+
+test "what's kept" {
+    let folder = joinPath(tempFolder(), "keystone-ping-test-{newId()}")
+    expect(createFolder(folder))
+    expect(loadInstallation(folder: folder).id == "")
+    expect(!saveInstallation(folder: "", Installation(id: known)))
+    expect(stateFile(folder: "") == "")
+    expect(saveInstallation(folder: folder, Installation(id: known, reported: "0.1.0", active: "2026-10-25")))
+    expect(standing(folder: folder, version: "0.1.0", day: "2026-10-25") == "an id, this version reported, active today")
+    expect(standing(folder: folder, version: "0.1.1", day: "2026-10-26") == "an id, version 0.1.0 reported, last active another day")
+    // The switch keeps the rest.
+    expect(setOff(folder: folder, true))
+    expect(isOff(folder: folder))
+    let kept = loadInstallation(folder: folder)
+    expect(kept.id == known && kept.reported == "0.1.0" && kept.active == "2026-10-25")
+    expect(standing(folder: folder, version: "0.1.0", day: "2026-10-25") == "an id, this version reported, active today, turned off")
+    expect(setOff(folder: folder, false))
+    expect(!isOff(folder: folder))
+    // A file with an id the service wouldn't take keeps only the switch.
+    expect(writeFile(path: stateFile(folder: folder), text: "\{\"id\":\"me@example.com\",\"reported\":\"0.1.0\",\"off\":true}"))
+    let bad = loadInstallation(folder: folder)
+    expect(bad.id == "" && bad.reported == "" && bad.off)
+    // A file from before the active ping and the switch reads as one.
+    expect(writeFile(path: stateFile(folder: folder), text: "\{\"id\":\"{known}\",\"reported\":\"0.0.9\"}"))
+    let old = loadInstallation(folder: folder)
+    expect(old.id == known && old.reported == "0.0.9" && old.active == "" && !old.off)
+    let gone = deleteFile(stateFile(folder: folder))
+}

@@ -10,7 +10,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Privacy — Reel</title>
-<meta name="description" content="Reel doesn't go on the network by itself. It connects only to streams you open and to OpenSubtitles when you search. Your library and history stay on your computer.">
+<meta name="description" content="Reel sends anonymous counts of how many copies are installed and in use, which you can turn off. Otherwise it connects only to streams you open and to OpenSubtitles when you search. Your files, library and history stay on your computer.">
 <link rel="icon" href="assets/icon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="styles.css">
 </head>
@@ -30,10 +30,41 @@
 <main class="prose">
   <div class="wrap narrow">
     <h1>Privacy</h1>
-    <p class="lead">Reel doesn't go on the network by itself. There are no usage counts, no accounts and no
-      advertising. It connects only when you ask it to.</p>
+    <p class="lead">Reel goes on the network by itself for one thing: anonymous counts of how many copies are
+      installed and in use, which you can turn off. Otherwise it connects only when you ask it to. There are no
+      accounts and no advertising, and nothing about what you watch is ever sent.</p>
 
-    <h2>When Reel connects</h2>
+    <h2>Usage counts</h2>
+    <p>Reel sends a short message to <code>stats.syncster.dev</code>, a service we run:</p>
+    <ul>
+      <li><strong>When it's installed or updated:</strong> once, the first time it runs on a computer, and once
+        more the first time it runs as a new version.</li>
+      <li><strong>When it's used:</strong> at most once a day, on a day you use it.</li>
+    </ul>
+    <p>Each message carries:</p>
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>What</th><th>For example</th></tr></thead>
+        <tbody>
+          <tr><td>The app and its version</td><td><code>reel</code>, <code>0.1.0</code></td></tr>
+          <tr><td>The operating system and its version</td><td><code>macos</code>, <code>26.1</code></td></tr>
+          <tr><td>The chip</td><td><code>arm64</code> or <code>x64</code></td></tr>
+          <tr><td>The system's language</td><td><code>en-US</code></td></tr>
+          <tr><td>The screen's size</td><td><code>1512×982</code></td></tr>
+          <tr><td>A random id made on that computer</td><td><code>3f0c8a52-91d4-4c1e-8b7a-5d2e6f104b99</code></td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>The id is random digits made the first time Reel runs. Nothing about you or your computer goes into
+      it: it only tells one copy of Reel from another, so each is counted once. No file names, titles or
+      anything about what you play are ever part of a message.</p>
+    <p>The service works out the country from the network address a message comes from, and stores the
+      country only. The address itself is never stored.</p>
+    <p><strong>To turn them off,</strong> untick Reel ▸ Send Anonymous Usage Statistics. They're also never
+      sent when the environment variable <code>DO_NOT_TRACK=1</code> or <code>REEL_NO_STATS=1</code> is set.
+      Reel 0.1.0 doesn't send them; they start with the next version.</p>
+
+    <h2>When you ask Reel to connect</h2>
     <ul>
       <li><strong>Network streams.</strong> When you open a web address (Media ▸ Open Network Stream),
         Reel downloads it from that address, like a browser would.</li>

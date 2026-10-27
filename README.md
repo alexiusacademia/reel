@@ -3,7 +3,8 @@
 A media player written entirely in [Tessel](https://tessel-lang.syncster.dev):
 every container, every video and audio decoder, the effects, the library and
 the interface, with no FFmpeg and no native media libraries. It plays the
-files VLC plays, and adds a few things VLC doesn't.
+films, shows and music you have, in nearly every format, and adds seek previews,
+find in dialogue and lossless clip export.
 
 ![Reel playing Big Buck Bunny, with captions, the scene strip and a seek-bar preview](docs/screenshots/player.jpg)
 

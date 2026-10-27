@@ -21,6 +21,7 @@ import "render"
 import "vfx"
 import "export"
 import "disc"
+import "ping"
 
 let tickSeconds = 0.01
 let mediaExtensions = ["mp4", "m4v", "mov", "mkv", "webm", "avi", "ts", "m2ts", "mts", "mpg", "mpeg", "vob", "ogv", "ivf", "wmv", "asf", "wma", "thd", "mlp", "dts", "dtshd", "mp3", "m4a", "aac", "flac", "ogg", "oga", "opus", "wav", "aif", "aiff", "mka", "ac3", "eac3", "mp2"]
@@ -45,6 +46,13 @@ app Reel(title: "Reel", width: 960, height: 600, documentTypes: ["mp4", "m4v", "
     state splitSize = 680.0
     state showInfo = false
     state showAbout = false
+    // The usage ping (ping/install.tsl): a report under way, the system's
+    // details once asked, the UTC day last reported, and the user's switch.
+    state statsBusy = false
+    state statsSys = ping.SystemInfo()
+    state statsSysKnown = false
+    state statsDay = ""
+    state statsOff = false
     state showStats = false
     state loopMode = 0
     state shuffle = false
@@ -407,6 +415,7 @@ app Reel(title: "Reel", width: 960, height: 600, documentTypes: ["mp4", "m4v", "
         Menu("Reel") {
             MenuItem("About Reel") { showAbout = true }
             MenuItem("Preferences…", shortcut: sc("preferences")) { openPrefs("general") }
+            MenuItem("Send Anonymous Usage Statistics", checked: !statsOff && !ping.turnedOffByEnvironment(name: statsName)) { toggleStats() }
         }
     }
 
@@ -1099,6 +1108,14 @@ app Reel(title: "Reel", width: 960, height: 600, documentTypes: ["mp4", "m4v", "
         }
         clearSoundFolder()
         traceOn = environment("REEL_TRACE") != nil
+        statsOff = ping.isOff(folder: data)
+        statsSend()
+        // A new UTC day while Reel runs counts as another day it's used.
+        every(seconds: 60.0) {
+            if !statsBusy && ping.utcDay(now()) != statsDay {
+                statsSend()
+            }
+        }
         timer = every(seconds: tickSeconds) {
             tick()
             // Stream downloads run in blocks of their own (the timer must
@@ -2796,6 +2813,51 @@ app Reel(title: "Reel", width: 960, height: 600, documentTypes: ["mp4", "m4v", "
         p.boxH = max(Int(h), 16)
     }
 
+    // --- Usage statistics (see ping/install.tsl and the website's privacy page) ---
+
+    // Sends what's due: install or update, and today's active ping. Nothing
+    // goes out when switched off, with REEL_NO_STATS or DO_NOT_TRACK, or in a
+    // scripted run.
+    fn statsSend() {
+        if statsBusy || statsOff || !ping.statsAllowed(name: statsName) {
+            return
+        }
+        statsBusy = true
+        let day = ping.utcDay(now())
+        statsDay = day
+        if statsSysKnown {
+            statsReport(day)
+            return
+        }
+        ping.gatherSystem() { info in
+            statsSys = info
+            statsSysKnown = true
+            statsReport(day)
+        }
+    }
+
+    fn statsReport(_ day: String) {
+        ping.report(name: statsName, version: appInfo().version, folder: dataFolder(), base: ping.statsURL(name: statsName), sys: statsSys, day: day) { _ in
+            statsBusy = false
+        }
+    }
+
+    // Reel ▸ Send Anonymous Usage Statistics: off, or on again.
+    fn toggleStats() {
+        let off = !statsOff
+        if !ping.setOff(folder: dataFolder(), off) {
+            flash("Couldn't save the setting")
+            return
+        }
+        statsOff = off
+        if off {
+            flash("Reel won't send usage statistics")
+        } else {
+            flash("Reel sends anonymous usage statistics")
+            statsSend()
+        }
+    }
+
     fn flash(_ text: String) {
         status = text
         let shown = text
@@ -3203,6 +3265,9 @@ fn traceLine(_ text: String) {
         appendFile(path: target, text: text + "\n")
     }
 }
+
+// The app's name as the statistics service knows it.
+let statsName = "reel"
 
 // Where Reel keeps its library, settings and sound chunks; REEL_DATA
 // points it elsewhere (for tests).
