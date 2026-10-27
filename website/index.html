@@ -1,0 +1,228 @@
+<!doctype html>
+<!--
+  Reel website: the landing page.
+  Author: Alexius Academia
+  Date: 2026-10-27
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Reel — a media player that plays everything</title>
+<meta name="description" content="Reel is a media player for macOS and Windows that plays the files VLC plays: H.264, HEVC, AV1, VP9, DTS-HD, TrueHD and more, every decoder written from scratch in Tessel. Library, subtitles, effects, find in dialogue and lossless clip export.">
+<meta property="og:title" content="Reel — a media player that plays everything">
+<meta property="og:description" content="Every container and codec written from scratch in Tessel. A library, subtitles, find in dialogue, effects and lossless clip export.">
+<meta property="og:image" content="https://reel.syncster.dev/assets/player.jpg">
+<meta property="og:url" content="https://reel.syncster.dev/">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="assets/icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<header class="top">
+  <div class="wrap top-in">
+    <a class="brand" href="#"><img src="assets/icon.svg" alt="" width="28" height="28"> Reel</a>
+    <nav>
+      <a href="#features">Features</a>
+      <a href="#formats">Formats</a>
+      <a href="#download">Download</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="wrap">
+    <p class="eyebrow">macOS · Windows · coming soon</p>
+    <h1>Plays everything.<br>Built from scratch.</h1>
+    <p class="lede">Reel opens the films, shows and music VLC opens, from 4K HEVC to DTS-HD Master Audio,
+      and adds a library, find in dialogue and lossless clip export. Every container and every decoder
+      is written from scratch in Tessel, with no FFmpeg inside.</p>
+    <div class="cta">
+      <a class="btn primary" href="#download">Download</a>
+      <a class="btn" href="#features">See what it does</a>
+    </div>
+    <figure class="shot hero-shot">
+      <img src="assets/player.jpg" width="1600" height="950"
+        alt="Reel playing Big Buck Bunny with captions, a strip of scene thumbnails and a preview above the seek bar">
+    </figure>
+  </div>
+</section>
+
+<section id="features" class="features">
+  <div class="wrap">
+
+    <article class="feature">
+      <div class="text">
+        <h2>Picks up where you left off</h2>
+        <p>The home screen shows what you were watching, how much is left, and the next episode of each
+          show. Reel remembers every file's position, audio and subtitle tracks, volume, speed, delays,
+          picture settings and equalizer.</p>
+        <ul>
+          <li>Start over or continue, your choice each time</li>
+          <li>The next episode starts on its own at the end of this one</li>
+          <li>Recently added files from your library folders</li>
+        </ul>
+      </div>
+      <figure class="shot"><img src="assets/home.jpg" width="1600" height="950" loading="lazy"
+        alt="The home screen with Continue watching, Up next and Recently added rows"></figure>
+    </article>
+
+    <article class="feature flip">
+      <div class="text">
+        <h2>Your library, sorted for you</h2>
+        <p>Point Reel at your folders. Films go under Movies, episodes under their show and season with
+          watched marks and progress, and music under artist and album. History and playlists sit
+          alongside.</p>
+        <ul>
+          <li>M3U, PLS, XSPF, WPL and CUE playlists</li>
+          <li>Search, sort, grid or list, mark watched or unwatched</li>
+        </ul>
+      </div>
+      <figure class="shot"><img src="assets/library.png" width="1600" height="1045" loading="lazy"
+        alt="The library on a TV season: episodes with watched marks and progress bars"></figure>
+    </article>
+
+    <article class="feature">
+      <div class="text">
+        <h2>Find any line of dialogue</h2>
+        <p>Search every subtitle track for a word, see each match with the lines around it, and jump
+          straight there. Or open the transcript, which follows along as the film plays.</p>
+        <ul>
+          <li>SRT, ASS/SSA, WebVTT, MP4 text, Blu-ray PGS and DVD subtitles</li>
+          <li>A second subtitle track at the top, in a style you choose</li>
+          <li>Text encoding detected, Chinese, Japanese and Korean included</li>
+          <li>Search and download from OpenSubtitles</li>
+        </ul>
+      </div>
+      <figure class="shot"><img src="assets/find.jpg" width="1600" height="950" loading="lazy"
+        alt="Find in dialogue beside the picture: results for “rabbit” with the word highlighted"></figure>
+    </article>
+
+    <article class="feature flip">
+      <div class="text">
+        <h2>Sound and picture, your way</h2>
+        <p>A 10-band equalizer with presets, loudness normalisation for quiet dialogue and loud
+          explosions, a compressor and limiter, and headphone crossfeed. For the picture: brightness,
+          contrast, colour, crop, aspect ratio, zoom, rotation, sharpening and denoising.</p>
+        <ul>
+          <li>Black bars detected and cropped</li>
+          <li>Interlaced TV and DVDs deinterlaced automatically</li>
+          <li>Audio and subtitle delay, speed from 0.25× to 4× with the pitch kept</li>
+        </ul>
+      </div>
+      <figure class="shot"><img src="assets/effects.png" width="1600" height="1411" loading="lazy"
+        alt="The equalizer on the Rock preset, with sliders for ten bands and the response curve"></figure>
+    </article>
+
+    <article class="feature">
+      <div class="text">
+        <h2>Cut a clip without losing quality</h2>
+        <p>Pick a start and an end, and Reel writes that part to MKV or MP4 without re-encoding, in
+          seconds. Or make a GIF of it.</p>
+        <ul>
+          <li>Choose which audio and subtitle tracks go in</li>
+          <li>Start on the exact frame, or at the keyframe before</li>
+        </ul>
+      </div>
+      <figure class="shot"><img src="assets/export.png" width="1600" height="1156" loading="lazy"
+        alt="Export Clip: start and end times, tracks, MKV or MP4, and the output file"></figure>
+    </article>
+
+    <div class="grid">
+      <div class="card"><h3>Seek previews</h3><p>Hover over the seek bar to see the picture at that time.</p></div>
+      <div class="card"><h3>Scene strip</h3><p>Thumbnails of every scene, and chapters for files that have none.</p></div>
+      <div class="card"><h3>Frame by frame</h3><p>Step forwards and backwards one frame at a time.</p></div>
+      <div class="card"><h3>A-B loop and bookmarks</h3><p>Repeat a passage, or mark moments to come back to.</p></div>
+      <div class="card"><h3>Network streams</h3><p>HLS, DASH and plain web addresses, with a quality menu.</p></div>
+      <div class="card"><h3>DVD and Blu-ray</h3><p>Disc folders and <code>.iso</code> images, with titles, angles and languages.</p></div>
+      <div class="card"><h3>Sleep timer</h3><p>Stop after a while, or at the end of what's playing.</p></div>
+      <div class="card"><h3>Mini player</h3><p>A small window that stays out of the way.</p></div>
+      <div class="card"><h3>Your shortcuts</h3><p>Every action has a key you can change.</p></div>
+    </div>
+  </div>
+</section>
+
+<section id="formats" class="formats">
+  <div class="wrap">
+    <h2>Every decoder checked against the reference</h2>
+    <p class="sub">Each decoder is compared picture by picture and sample by sample with the official
+      conformance streams and reference decoders.</p>
+    <div class="cols">
+      <div class="card table">
+        <h3>Video</h3>
+        <table>
+          <tr><td>H.264</td><td>180 of 185 JVT conformance streams bit-exact</td></tr>
+          <tr><td>HEVC (H.265), 8 and 10-bit</td><td>all 146 Main and Main10 streams bit-exact</td></tr>
+          <tr><td>AV1, with film grain</td><td>all 242 libaom test vectors bit-exact</td></tr>
+          <tr><td>VP9, 8 to 12-bit</td><td>all 314 libvpx test vectors bit-exact</td></tr>
+          <tr><td>VP8</td><td>all 62 libvpx test vectors bit-exact</td></tr>
+          <tr><td>MPEG-1, MPEG-2, MPEG-4 (DivX, Xvid)</td><td>bit-exact</td></tr>
+          <tr><td>WMV 7/8/9, VC-1, DivX 3</td><td>bit-exact</td></tr>
+          <tr><td>Theora, ProRes, DNxHD, Motion JPEG</td><td>bit-exact</td></tr>
+        </table>
+      </div>
+      <div class="card table">
+        <h3>Audio</h3>
+        <table>
+          <tr><td>DTS, DTS-HD Master Audio</td><td>bit-exact</td></tr>
+          <tr><td>Dolby TrueHD, Atmos bed</td><td>bit-exact</td></tr>
+          <tr><td>FLAC, ALAC, WMA Lossless, PCM</td><td>bit-exact</td></tr>
+          <tr><td>AC-3, E-AC-3 up to 7.1</td><td>matches to 90 dB or better</td></tr>
+          <tr><td>AAC (LC, HE, HEv2), MP3, MP2</td><td>matches to 90 dB or better</td></tr>
+          <tr><td>Vorbis, Opus, WMA 1/2, WMA Pro</td><td>matches to 90 dB or better</td></tr>
+        </table>
+      </div>
+    </div>
+    <p class="sub containers"><strong>Containers:</strong> MP4/MOV, MKV/WebM, AVI, Ogg, MPEG-TS/M2TS,
+      MPEG-PS/VOB, ASF (WMV/WMA), WAV/AIFF, IVF, and raw MP3, AAC, AC-3, DTS and TrueHD.</p>
+  </div>
+</section>
+
+<section class="tessel">
+  <div class="wrap">
+    <h2>Written entirely in Tessel</h2>
+    <p>Every part of Reel, from the MKV reader and the HEVC decoder to the equalizer and the interface,
+      is written in <a href="https://tessel-lang.syncster.dev">Tessel</a>, a programming language for
+      native desktop apps. No FFmpeg, no native media libraries, one small program.</p>
+  </div>
+</section>
+
+<section id="download" class="download">
+  <div class="wrap">
+    <h2>Download</h2>
+    <div class="cols">
+      <div class="card dl">
+        <h3>macOS</h3>
+        <p class="muted">Apple silicon · <span data-size="macos">disk image</span></p>
+        <span class="btn disabled" data-download="macos" aria-disabled="true">Not released yet</span>
+        <p class="fine">Signed and notarized by Apple. Open the disk image and drag Reel to Applications.</p>
+      </div>
+      <div class="card dl">
+        <h3>Windows</h3>
+        <p class="muted">Windows 10 and 11, 64-bit · <span data-size="windows">installer</span></p>
+        <span class="btn disabled" data-download="windows" aria-disabled="true">Not released yet</span>
+        <p class="fine">If Windows warns about the installer the first time, choose More info ▸ Run anyway.</p>
+      </div>
+    </div>
+    <p class="sub" id="release-line">Downloads appear here when a release is out.</p>
+  </div>
+</section>
+</main>
+
+<footer>
+  <div class="wrap foot-in">
+    <span>Reel · © 2026 Alexius Academia · <a href="privacy.html">Privacy</a></span>
+    <span>Alexius Academia · <a href="https://syncster.dev">syncster.dev</a></span>
+  </div>
+  <div class="wrap credit">
+    Screenshots show <em>Big Buck Bunny</em> © Blender Foundation,
+    <a href="https://peach.blender.org">peach.blender.org</a>, under
+    <a href="https://creativecommons.org/licenses/by/3.0/">CC BY 3.0</a>.
+  </div>
+</footer>
+
+<script src="downloads.js"></script>
+</body>
+</html>

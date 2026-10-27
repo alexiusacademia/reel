@@ -1,0 +1,69 @@
+<!doctype html>
+<!--
+  Reel website: what Reel sends over the network and keeps on your computer.
+  Keep it true to the app (net/, subs/opensubtitles.tsl, library/) when either changes.
+  Author: Alexius Academia
+  Date: 2026-10-27
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Privacy — Reel</title>
+<meta name="description" content="Reel doesn't go on the network by itself. It connects only to streams you open and to OpenSubtitles when you search. Your library and history stay on your computer.">
+<link rel="icon" href="assets/icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<header class="top">
+  <div class="wrap top-in">
+    <a class="brand" href="/"><img src="assets/icon.svg" alt="" width="28" height="28"> Reel</a>
+    <nav>
+      <a href="/#features">Features</a>
+      <a href="/#formats">Formats</a>
+      <a href="/#download">Download</a>
+    </nav>
+  </div>
+</header>
+
+<main class="prose">
+  <div class="wrap narrow">
+    <h1>Privacy</h1>
+    <p class="lead">Reel doesn't go on the network by itself. There are no usage counts, no accounts and no
+      advertising. It connects only when you ask it to.</p>
+
+    <h2>When Reel connects</h2>
+    <ul>
+      <li><strong>Network streams.</strong> When you open a web address (Media ▸ Open Network Stream),
+        Reel downloads it from that address, like a browser would.</li>
+      <li><strong>OpenSubtitles.</strong> When you search for subtitles, Reel sends the search to
+        <code>api.opensubtitles.com</code> with the API key you entered in Preferences: the title, season,
+        episode and languages, and a hash of the video file that identifies the film without revealing
+        anything else about it. Logging in and downloading go there too. What OpenSubtitles keeps is covered by their own privacy policy at
+        <a href="https://www.opensubtitles.com">opensubtitles.com</a>.</li>
+    </ul>
+
+    <h2>What stays on your computer</h2>
+    <p>Your library, history, playback positions, bookmarks, playlists, per-file settings and preferences
+      are kept in Reel's own folder on your computer and never sent anywhere. The thumbnails it makes for
+      seek previews and the scene strip stay there too. You can clear the history in Preferences ▸ General.</p>
+
+    <h2>This website</h2>
+    <p>The site has no cookies and no tracking. When you press a download button, the page counts the
+      download by sending the product, its version and the system (macOS or Windows) to
+      <code>stats.syncster.dev</code>, a service we run. Nothing about you or your computer is sent.</p>
+
+    <h2>Questions</h2>
+    <p>Reel is made by Alexius Academia. See <a href="https://syncster.dev">syncster.dev</a>.</p>
+  </div>
+</main>
+
+<footer>
+  <div class="wrap foot-in">
+    <span>Reel · © 2026 Alexius Academia · <a href="privacy.html">Privacy</a></span>
+    <span>Alexius Academia · <a href="https://syncster.dev">syncster.dev</a></span>
+  </div>
+</footer>
+</body>
+</html>
