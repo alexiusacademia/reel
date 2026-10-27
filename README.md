@@ -159,10 +159,15 @@ checks that need them are skipped when they're missing.
 
 ## Licence
 
-Reel is not released yet. Several decoders (TrueHD, DTS, VC-1/WMV, WMA,
+Reel is free software under the [GNU Lesser General Public License, version
+2.1 or later](LICENSE). Several decoders (TrueHD, DTS, VC-1/WMV, WMA,
 Theora, VP9, and parts of AAC, AC-3, MP3, ALAC, MPEG-4, ProRes and DNxHD)
-follow FFmpeg's source code, which is licensed under the LGPL 2.1 or later;
-that has to be settled before Reel is distributed.
+follow FFmpeg's source code, which is under the same licence.
+
+Downloads for macOS and Windows are at
+[reel.syncster.dev](https://reel.syncster.dev); this repository is their
+complete source. Some test files are short cuts of FFmpeg's public FATE
+samples and of the codecs' published conformance streams.
 
 ## Credits
 
@@ -171,4 +176,4 @@ that has to be settled before Reel is distributed.
   [peach.blender.org](https://peach.blender.org), licensed under
   [CC BY 3.0](https://creativecommons.org/licenses/by/3.0/); the captions are
   ours.
-- Icons from [Lucide](https://lucide.dev) (ISC licence).
+- Icons from [Lucide](https://lucide.dev) (ISC licence; see [NOTICES.md](NOTICES.md)).

@@ -25,7 +25,7 @@
     const version = ((feed || {}).macos || {}).version || ((feed || {}).windows || {}).version
     const line = document.getElementById('release-line')
     if (version && line) {
-      line.textContent = 'Reel ' + version + '. Free to download.'
+      line.textContent = 'Reel ' + version + '. Free to download and open source.'
     }
   }
 

@@ -554,7 +554,7 @@ app Reel(title: "Reel", width: 960, height: 600, documentTypes: ["mp4", "m4v", "
         }
     }
 
-    Window("About Reel", isOpen: showAbout, width: 340, height: 220) {
+    Window("About Reel", isOpen: showAbout, width: 360, height: 300) {
         VStack(spacing: 8) {
             Text("Reel").font(size: 26, weight: .bold)
             Text("A media player written entirely in Tessel").color(.secondary)
@@ -562,6 +562,10 @@ app Reel(title: "Reel", width: 960, height: 600, documentTypes: ["mp4", "m4v", "
             Divider()
             Text("Alexius Academia")
             Link("syncster.dev", url: "https://syncster.dev")
+            Divider()
+            Text("Free software under the GNU LGPL 2.1 or later. Some decoders follow FFmpeg's code (LGPL); icons from Lucide (ISC).")
+                .font(size: 11).color(.secondary)
+            Link("Source code", url: "https://github.com/alexiusacademia/reel")
         }
         .padding(20)
     }
