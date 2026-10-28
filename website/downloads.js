@@ -1,7 +1,7 @@
 // Reel website: fills the download buttons from downloads.json (written by
 // tools/publish.sh), and counts a download when one is pressed: the product,
 // version and system go to the statistics service, nothing about the visitor
-// (see privacy.html).
+// (see privacy.html). It also shows how many installs there are so far.
 //
 // Author: Alexius Academia
 // Date: 2026-10-27
@@ -32,6 +32,19 @@
   fetch('downloads.json', { cache: 'no-cache' })
     .then((r) => (r.ok ? r.json() : {}))
     .then(fill)
+    .catch(() => {})
+
+  // The number of installations so far, from the stats service.
+  fetch('https://stats.syncster.dev/v1/installs')
+    .then((r) => (r.ok ? r.json() : null))
+    .then((d) => {
+      const n = d && d.installs && d.installs['reel']
+      if (typeof n !== 'number') return
+      document.querySelectorAll('[data-installs]').forEach((el) => {
+        el.textContent = n.toLocaleString('en-US') + (n === 1 ? ' install' : ' installs')
+        el.hidden = false
+      })
+    })
     .catch(() => {})
 
   document.addEventListener('click', (event) => {
