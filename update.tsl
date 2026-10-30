@@ -1,0 +1,459 @@
+// Updating Reel from inside it: asking the release feed whether a
+// newer version is out, downloading it, checking it, and handing over to
+// a small script that puts it in once Reel has quit. Ported from
+// C-Tessel's update.tsl (itself from Tally's and MathPad's); the app's
+// part (checking, downloading, the bar and the menu) is in main.tsl.
+//
+// The feed is a JSON file the publish scripts write beside the
+// installers (tools/publish.sh): for each
+// system the newest version, where its installer is, and the installer's
+// SHA-256. Fetching it and downloading what it names is all the updater
+// does on the network.
+//
+// Left alone, all of this happens without a word: Reel looks as it
+// starts (unless it looked in the last hour) and every six hours while
+// it stays open, downloads a newer version in the
+// background, checks it, and puts it in when the user quits. Nothing is
+// shown unless the user asks (Reel ▸ Check for Updates…), or has turned
+// "Install Updates Automatically" off, when a bar at the top of the window
+// offers the update instead. An update that doesn't download or doesn't
+// match its checksum is dropped quietly, and looked for again at the
+// next check.
+//
+// On macOS the new app is swapped in only when it's signed by the same
+// developer (Developer ID team MGUT6927DK); on Windows the installer
+// Tessel makes (`Reel Setup.exe`) is run with /S.
+//
+// The settings are `updates.json` in the data folder. In a scripted run
+// nothing is looked for unless REEL_UPDATE_FEED names a feed (a
+// file:// one works), and nothing is ever installed.
+//
+// Author: Alexius Academia
+// Date: 2026-10-27
+
+// One system's newest release, as the feed has it. (What else the feed
+// may say about a release is passed over.)
+struct FeedEntry {
+    version: String = ""
+    url: String = ""
+    sha256: String = ""
+    size: Int = 0
+    notes: String = ""
+}
+
+struct Feed {
+    macos: FeedEntry = FeedEntry()
+    windows: FeedEntry = FeedEntry()
+}
+
+// What's remembered between runs: whether to look for updates when
+// Reel starts, whether a newer version found then is downloaded and
+// installed without asking (at the next quit), when it last looked
+// (seconds since 1970), and a version the user chose to skip.
+struct UpdateSettings {
+    autoCheck: Bool = true
+    autoInstall: Bool = true
+    lastCheck: Float = 0.0
+    skip: String = ""
+}
+
+// Where an update stands. `stage`: "" nothing to show, "checking",
+// "available" (offered in the bar), "downloading", "installing",
+// "current" (asked by hand, and there's nothing newer), "failed" (asked
+// by hand, with `message`), and the two of an update put in without
+// asking, which show only when the user asks about updates meanwhile:
+// "quiet" (downloading) and "ready" (downloaded and checked: installed
+// when Reel quits). `manual`: the user asked. `dropped`: why the
+// last quiet update was dropped ("" none), for the tests' dump.
+struct Updater {
+    stage: String = ""
+    entry: FeedEntry = FeedEntry()
+    progress: Float = 0.0
+    message: String = ""
+    manual: Bool = false
+    dropped: String = ""
+    job: Int = 0
+    // The running program's own file, to find the app bundle to replace.
+    appPath: String = ""
+    settings: UpdateSettings = UpdateSettings()
+}
+
+// The Developer ID team every Reel release is signed by: a new app
+// signed by anyone else is never swapped in.
+let releaseTeam = "MGUT6927DK"
+
+// Where the feed is. REEL_UPDATE_FEED names another (a file://
+// address works), for trying an update without publishing one.
+fn updateFeed() -> String {
+    if let other = environment("REEL_UPDATE_FEED") {
+        if !other.isEmpty {
+            return other
+        }
+    }
+    "https://storage.googleapis.com/reel-releases/updates/latest.json"
+}
+
+// Whether updates may be looked for at all: not in a run driven by a
+// test script, unless it names a feed of its own.
+fn updatesAllowed() -> Bool {
+    !scripted() || (environment("REEL_UPDATE_FEED") ?? "") != ""
+}
+
+fn currentVersion() -> String {
+    appInfo().version
+}
+
+// -1, 0 or 1 as version `a` is older than, the same as or newer than
+// `b`: numbers between dots, compared in turn ("0.10.0" is newer than
+// "0.9.2").
+fn compareVersions(_ a: String, _ b: String) -> Int {
+    let x = a.split(".")
+    let y = b.split(".")
+    for i in 0..max(x.count, y.count) {
+        let p = if i < x.count { Int(x[i].trim()) ?? 0 } else { 0 }
+        let q = if i < y.count { Int(y[i].trim()) ?? 0 } else { 0 }
+        if p != q {
+            return if p < q { -1 } else { 1 }
+        }
+    }
+    0
+}
+
+fn updateSettingsFile() -> String {
+    let folder = dataFolder()
+    if folder.isEmpty { "" } else { joinPath(folder, "updates.json") }
+}
+
+// Where the updater keeps its files (the downloaded installer and the
+// script that puts it in): Reel's data folder, or the system's
+// folder for temporary files when it keeps none.
+fn updateFolder() -> String {
+    let folder = dataFolder()
+    if folder.isEmpty { tempFolder() } else { folder }
+}
+
+fn loadUpdateSettings(_ up: bind Updater) {
+    let file = updateSettingsFile()
+    if file.isEmpty {
+        return
+    }
+    if let text = readFile(file) {
+        if let saved: UpdateSettings = fromJson(text) {
+            up.settings = saved
+        }
+    }
+}
+
+fn saveUpdateSettings(_ up: Updater) {
+    let file = updateSettingsFile()
+    if !file.isEmpty {
+        let ok = writeFile(path: file, text: toJson(up.settings, pretty: true))
+    }
+}
+
+// How long after a check Reel looks again by itself: as it starts,
+// and while it stays open. (Once a day was too seldom: a version
+// released a few hours after a check waited a day to be found.)
+let checkAtStart = 3600.0
+let checkWhileOpen = 21600.0
+
+// Whether Reel should look for an update by itself: when `after`
+// seconds have gone by since it last looked, and the user hasn't turned
+// that off.
+fn shouldAutoCheck(_ up: Updater, after: Float) -> Bool {
+    updatesAllowed() && up.settings.autoCheck && now() - up.settings.lastCheck > after
+}
+
+// Marks a check as begun. False when one is under way already (or an
+// update is being downloaded), or checking isn't allowed.
+fn beginCheck(_ up: bind Updater, manual: Bool) -> Bool {
+    if up.stage == "checking" || up.stage == "quiet" || up.stage == "ready" {
+        // A check or a quiet update is under way: asked by hand, its
+        // answer is shown either way.
+        if manual {
+            up.manual = true
+        }
+        return false
+    }
+    if up.stage == "downloading" || up.stage == "installing" {
+        return false
+    }
+    if !updatesAllowed() {
+        if manual {
+            up.manual = true
+            up.stage = "failed"
+            up.message = "Updates aren't looked for in a scripted run"
+        }
+        return false
+    }
+    up.manual = manual
+    up.stage = "checking"
+    true
+}
+
+// What the feed said (nil when it couldn't be read).
+fn takeFeed(_ up: bind Updater, _ text: String?) {
+    up.settings.lastCheck = now()
+    saveUpdateSettings(up)
+    var entry = FeedEntry()
+    var read = false
+    if let body = text {
+        if let feed: Feed = fromJson(body) {
+            entry = if platform() == "windows" { feed.windows } else { feed.macos }
+            read = true
+        }
+    }
+    if !read {
+        up.stage = if up.manual { "failed" } else { "" }
+        up.message = "Couldn't reach the update server. Check your connection and try again."
+        return
+    }
+    let newer = !entry.version.isEmpty && !entry.url.isEmpty && compareVersions(entry.version, currentVersion()) > 0
+    if newer && (up.manual || entry.version != up.settings.skip) {
+        up.entry = entry
+        up.stage = if !up.manual && up.settings.autoInstall && canInstallQuietly(up) { "quiet" } else { "available" }
+    } else {
+        up.stage = if up.manual { "current" } else { "" }
+    }
+}
+
+// Whether a newer Reel can be put in without the user doing
+// anything: on macOS only when Reel runs from an app bundle, which
+// is what gets replaced. (A scripted run goes through the steps, short
+// of installing.)
+fn canInstallQuietly(_ up: Updater) -> Bool {
+    platform() == "windows" || !runningBundle(up).isEmpty || scripted()
+}
+
+// Where the installer is downloaded to.
+fn updateFile(_ entry: FeedEntry) -> String {
+    let name = entry.url.split("/").last ?? "Reel-update"
+    joinPath(updateFolder(), name.split("?")[0])
+}
+
+fn skipUpdate(_ up: bind Updater) {
+    up.settings.skip = up.entry.version
+    saveUpdateSettings(up)
+    up.stage = ""
+}
+
+// The app bundle Reel is running from ("…/Reel.app"), or "" when
+// it isn't running from one (a build run from the terminal).
+fn runningBundle(_ up: Updater) -> String {
+    if let at = up.appPath.find(".app/Contents/MacOS/") {
+        return up.appPath.substring(from: 0, to: at + 4)
+    }
+    ""
+}
+
+// A path as one word of a shell command, whatever is in it.
+fn shellWord(_ path: String) -> String {
+    "'" + path.replace("'", with: "'\\''") + "'"
+}
+
+// The script that puts the new app in the old one's place on macOS,
+// once Reel has quit: it checks the new app's signature and that it
+// is signed by Reel's developer (team `releaseTeam`), swaps the
+// bundles, and (with `relaunch`) starts Reel again. If anything
+// fails, an update asked for by hand opens the disk image, so the app
+// can be dragged over by hand; a quiet one fails without a word, and is
+// offered again another day.
+fn macInstallScript(bundle: String, image: String, relaunch: Bool) -> String {
+    let failed = if relaunch { "open \"$DMG\"; exit 1" } else { "rm -f \"$DMG\"; exit 1" }
+    var lines = [
+        "#!/bin/sh",
+        "APP={shellWord(bundle)}",
+        "DMG={shellWord(image)}",
+        "TEAM={releaseTeam}",
+        "n=0",
+        "while pgrep -f \"$APP/Contents/MacOS/\" >/dev/null 2>&1 && [ $n -lt 900 ]; do sleep 1; n=$((n+1)); done",
+        "MNT=$(mktemp -d)",
+        "fail() \{ hdiutil detach \"$MNT\" >/dev/null 2>&1; {failed}; }",
+        "hdiutil attach \"$DMG\" -nobrowse -readonly -mountpoint \"$MNT\" >/dev/null 2>&1 || \{ {failed}; }",
+        "NEW=\"$MNT/Reel.app\"",
+        "[ -d \"$NEW\" ] || fail",
+        "codesign --verify --deep --strict \"$NEW\" >/dev/null 2>&1 || fail",
+        "NEWTEAM=$(codesign -dv \"$NEW\" 2>&1 | sed -n 's/^TeamIdentifier=//p')",
+        "[ \"$NEWTEAM\" = \"$TEAM\" ] || fail",
+        "rm -rf \"$APP.update\" \"$APP.old\"",
+        "ditto \"$NEW\" \"$APP.update\" || fail",
+        "mv \"$APP\" \"$APP.old\" || \{ rm -rf \"$APP.update\"; fail; }",
+        "mv \"$APP.update\" \"$APP\" || \{ mv \"$APP.old\" \"$APP\"; fail; }",
+        "rm -rf \"$APP.old\"",
+        "hdiutil detach \"$MNT\" >/dev/null 2>&1",
+        "rm -f \"$DMG\"",
+    ]
+    if relaunch {
+        lines.append("open \"$APP\"")
+    }
+    lines.joined(separator: "\n") + "\n"
+}
+
+// A path as one PowerShell string.
+fn psWord(_ path: String) -> String {
+    "'" + path.replace("'", with: "''") + "'"
+}
+
+// Windows: the installer is Tessel's ("Reel Setup.exe", from Tessel
+// 0.13), which installs for the user in AppData\Local\Programs\Reel.
+// `/S` installs without asking. The script waits for Reel to quit
+// first, and with `relaunch` starts the new Reel when the install
+// worked; when it didn't, an update asked for by hand opens the
+// installer to be run by hand, and a quiet one is dropped (and offered
+// again another day).
+fn windowsInstallScript(setup: String, relaunch: Bool) -> String {
+    var lines = [
+        "$setup = {psWord(setup)}",
+        "$n = 0",
+        "while ((Get-Process -Name 'Reel' -ErrorAction SilentlyContinue) -and $n -lt 1800) \{ Start-Sleep -Milliseconds 500; $n++ }",
+        "$p = Start-Process -FilePath $setup -ArgumentList '/S' -Wait -PassThru",
+        "if ($p.ExitCode -eq 0) \{",
+        "    Remove-Item -LiteralPath $setup -Force -ErrorAction SilentlyContinue",
+    ]
+    if relaunch {
+        lines.append("    Start-Process -FilePath (Join-Path $env:LOCALAPPDATA 'Programs\\Reel\\Reel.exe')")
+        lines.append("} else \{")
+        lines.append("    Start-Process -FilePath $setup")
+    } else {
+        lines.append("} else \{")
+        lines.append("    Remove-Item -LiteralPath $setup -Force -ErrorAction SilentlyContinue")
+    }
+    lines.append("}")
+    lines.joined(separator: "\r\n") + "\r\n"
+}
+
+// Starts a PowerShell script on its own (hidden), so that it outlives
+// Reel.
+fn startWindowsScript(_ script: String) {
+    let inner = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File \"" + script + "\""
+    let started = runCommand(path: "powershell.exe", args: ["-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-Command",
+        "Start-Process -FilePath powershell.exe -WindowStyle Hidden -ArgumentList " + psWord(inner)], onOutput: { line in }) { code in }
+}
+
+// Starts a shell script on its own, so that it outlives Reel.
+fn startMacScript(_ script: String) {
+    let started = runCommand(path: "/bin/sh", args: ["-c", "nohup /bin/sh {shellWord(script)} >/dev/null 2>&1 &"], onOutput: { line in }) { code in }
+}
+
+// Whether the downloaded installer is the one the feed told of (by its
+// SHA-256). One that isn't is deleted.
+fn downloadChecksOut(_ up: Updater) -> Bool {
+    let file = updateFile(up.entry)
+    let sum = readData(file)?.hash("sha256").hex ?? ""
+    if up.entry.sha256.isEmpty || sum.lowercase() != up.entry.sha256.lowercase() {
+        let gone = deleteFile(file)
+        return false
+    }
+    true
+}
+
+// The download asked for by hand is over: the installer is checked
+// against the feed's SHA-256 and started. True when Reel should now
+// quit to let it work.
+fn finishDownload(_ up: bind Updater, _ ok: Bool) -> Bool {
+    if !ok {
+        up.stage = "failed"
+        up.message = "The download didn't finish. Try again later."
+        return false
+    }
+    if !downloadChecksOut(up) {
+        up.stage = "failed"
+        up.message = "The downloaded update didn't match its checksum, so it wasn't installed."
+        return false
+    }
+    startInstall(up)
+}
+
+// Starts the downloaded (and checked) installer, which waits for
+// Reel to quit and starts it again. True when Reel should now
+// quit.
+fn startInstall(_ up: bind Updater) -> Bool {
+    let file = updateFile(up.entry)
+    if scripted() {
+        // A test: everything up to here was real, the swap isn't done.
+        up.stage = "failed"
+        up.message = "Checked Reel {up.entry.version} ({file.fileName}); not installed in a scripted run"
+        return false
+    }
+    up.stage = "installing"
+    if platform() == "windows" {
+        let script = joinPath(updateFolder(), "reel-update.ps1")
+        if !writeFile(path: script, text: windowsInstallScript(setup: file, relaunch: true)) {
+            up.stage = "failed"
+            up.message = "Couldn't prepare the update."
+            return false
+        }
+        startWindowsScript(script)
+        return true
+    }
+    let bundle = runningBundle(up)
+    if bundle.isEmpty {
+        // Not running from an app bundle: show the disk image instead.
+        let opened = runCommand(path: "/usr/bin/open", args: [file], onOutput: { line in }) { code in }
+        up.stage = "failed"
+        up.message = "Reel {up.entry.version} is downloaded: drag it from the window that opened to Applications."
+        return false
+    }
+    let script = joinPath(updateFolder(), "reel-update.sh")
+    if !writeFile(path: script, text: macInstallScript(bundle: bundle, image: file, relaunch: true)) {
+        up.stage = "failed"
+        up.message = "Couldn't prepare the update."
+        return false
+    }
+    startMacScript(script)
+    true
+}
+
+// The quiet download is over. When it checks out, the answer is what to
+// run as Reel quits (see installAtQuit): a script on either system.
+// Otherwise "", and the update is dropped without a word (`dropped`
+// says why), to be looked for again the next day.
+fn finishQuietDownload(_ up: bind Updater, _ ok: Bool) -> String {
+    if !ok || !downloadChecksOut(up) {
+        up.dropped = if ok { "didn't match its checksum" } else { "didn't download" }
+        up.stage = if up.manual { "failed" } else { "" }
+        up.message = if ok { "The downloaded update didn't match its checksum, so it wasn't installed." } else { "The download didn't finish. Try again later." }
+        return ""
+    }
+    let file = updateFile(up.entry)
+    up.stage = "ready"
+    up.dropped = ""
+    if scripted() {
+        // A test: nothing is installed.
+        return ""
+    }
+    if platform() == "windows" {
+        let script = joinPath(updateFolder(), "reel-update-quiet.ps1")
+        if !writeFile(path: script, text: windowsInstallScript(setup: file, relaunch: false)) {
+            up.stage = ""
+            return ""
+        }
+        return script
+    }
+    let script = joinPath(updateFolder(), "reel-update-quiet.sh")
+    if !writeFile(path: script, text: macInstallScript(bundle: runningBundle(up), image: file, relaunch: false)) {
+        up.stage = ""
+        return ""
+    }
+    script
+}
+
+// Run as Reel quits (the window's close request, main.tsl): starts what finishQuietDownload
+// left to run, which replaces Reel once it's gone and doesn't start
+// it again.
+fn installAtQuit(_ what: String) {
+    if what.isEmpty {
+        return
+    }
+    if platform() == "windows" {
+        startWindowsScript(what)
+    } else {
+        startMacScript(what)
+    }
+}
+
+
+// Whether this run is driven by a test script (TESSEL_SCRIPT).
+fn scripted() -> Bool {
+    environment("TESSEL_SCRIPT") != nil
+}

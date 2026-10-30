@@ -51,6 +51,8 @@ find in dialogue and lossless clip export.
   GIF export.
 - Customisable shortcuts, a mini player, a statistics overlay and a media
   information window.
+- Updates itself: new versions download in the background and go in when you
+  quit (Reel ▸ Check for Updates…; both steps can be turned off).
 
 ## Screenshots
 

@@ -207,8 +207,15 @@ app Reel(title: "Reel", width: 960, height: 600, documentTypes: ["mp4", "m4v", "
     state traceGap = 0.0
     state traceGapMax = 0.0
     state traceWork = 0.0
+    // The updater (update.tsl), and what's to be run as Reel quits (an
+    // update downloaded without asking).
+    state up = Updater()
+    state quitInstall = ""
 
     VStack(spacing: 0) {
+        if !fullScreen {
+            updateBar()
+        }
         if fullScreen {
             ZStack(alignment: .bottom) {
                 screen()
@@ -255,6 +262,7 @@ app Reel(title: "Reel", width: 960, height: 600, documentTypes: ["mp4", "m4v", "
     .onKeyEvent { e in key(e) }
     .onCloseRequest {
         savePosition()
+        installAtQuit(quitInstall)
         quit()
     }
     .menuBar {
@@ -442,6 +450,21 @@ app Reel(title: "Reel", width: 960, height: 600, documentTypes: ["mp4", "m4v", "
             MenuItem("About Reel") { showAbout = true }
             MenuItem("Preferences…", shortcut: sc("preferences")) { openPrefs("general") }
             MenuItem("Send Anonymous Usage Statistics", checked: !statsOff && !ping.turnedOffByEnvironment(name: statsName)) { toggleStats() }
+            MenuDivider()
+            MenuItem("Check for Updates…") { checkForUpdates(manual: true) }
+            MenuItem("Check for Updates Automatically", checked: up.settings.autoCheck) {
+                up.settings.autoCheck = !up.settings.autoCheck
+                saveUpdateSettings(up)
+                askBeforeInstalling()
+                flash(if up.settings.autoCheck { "Reel looks for updates as it starts and every few hours" } else { "Reel doesn't look for updates by itself" })
+            }
+            MenuItem("Install Updates Automatically", checked: up.settings.autoCheck && up.settings.autoInstall) {
+                up.settings.autoInstall = !up.settings.autoInstall
+                saveUpdateSettings(up)
+                askBeforeInstalling()
+                flash(if up.settings.autoInstall { "Updates are installed when you quit" } else { "Updates are offered before they're installed" })
+            }
+            .disabled(!up.settings.autoCheck)
         }
     }
 
@@ -1162,11 +1185,13 @@ app Reel(title: "Reel", width: 960, height: 600, documentTypes: ["mp4", "m4v", "
         traceOn = environment("REEL_TRACE") != nil
         statsOff = ping.isOff(folder: data)
         statsSend()
+        updateStartUp()
         // A new UTC day while Reel runs counts as another day it's used.
         every(seconds: 60.0) {
             if !statsBusy && ping.utcDay(now()) != statsDay {
                 statsSend()
             }
+            updateTick()
         }
         timer = every(seconds: tickSeconds) {
             tick()
@@ -3107,6 +3132,140 @@ app Reel(title: "Reel", width: 960, height: 600, documentTypes: ["mp4", "m4v", "
     fn resized(_ w: Float, _ h: Float) {
         p.boxW = max(Int(w), 16)
         p.boxH = max(Int(h), 16)
+    }
+
+    // --- Updates (the steps are in update.tsl) ---
+
+    // As Reel starts: reads the settings, finds which file Reel runs from,
+    // and looks for an update when one is due.
+    fn updateStartUp() {
+        loadUpdateSettings(up)
+        if !updatesAllowed() {
+            return
+        }
+        if platform() != "windows" {
+            let asked = runCommand(path: "/bin/sh", args: ["-c", "ps -o comm= -p $PPID"], onOutput: { line in up.appPath = line.trim() }) { code in }
+        }
+        if shouldAutoCheck(up, after: checkAtStart) {
+            checkForUpdates(manual: false)
+        }
+    }
+
+    // Once a minute: looks again when the last check is six hours old and
+    // nothing is under way or on offer.
+    fn updateTick() {
+        if up.stage == "" && shouldAutoCheck(up, after: checkWhileOpen) {
+            checkForUpdates(manual: false)
+        }
+    }
+
+    fn checkForUpdates(manual: Bool) {
+        if beginCheck(up, manual: manual) {
+            fetch(url: updateFeed()) { text in
+                takeFeed(up, text)
+                if up.stage == "quiet" {
+                    installQuietly()
+                }
+            }
+        }
+    }
+
+    // Downloads the newer Reel without a word, to be installed when it quits.
+    fn installQuietly() {
+        up.progress = 0.0
+        up.job = download(url: up.entry.url, to: updateFile(up.entry), progress: { fraction in
+            up.progress = fraction
+        }) { ok in
+            quitInstall = finishQuietDownload(up, ok)
+        }
+    }
+
+    // Downloads the newer Reel (asked for in the bar), checks it, and quits
+    // to let it in; Reel starts again afterwards.
+    fn installUpdate() {
+        up.stage = "downloading"
+        up.progress = 0.0
+        up.job = download(url: up.entry.url, to: updateFile(up.entry), progress: { fraction in
+            up.progress = fraction
+        }) { ok in
+            if finishDownload(up, ok) {
+                savePosition()
+                quit()
+            }
+        }
+    }
+
+    // Installs the update that's waiting for Reel to quit now, and starts
+    // Reel again.
+    fn restartToUpdate() {
+        quitInstall = ""
+        if startInstall(up) {
+            savePosition()
+            quit()
+        }
+    }
+
+    // Installing without asking was switched off: an update downloaded and
+    // waiting is offered in the bar instead.
+    fn askBeforeInstalling() {
+        if up.stage == "ready" && !(up.settings.autoCheck && up.settings.autoInstall) {
+            quitInstall = ""
+            up.stage = "available"
+        }
+    }
+
+    fn cancelUpdate() {
+        cancelRequest(up.job)
+        up.stage = ""
+        quitInstall = ""
+    }
+
+    // The bar at the top of the window: only when the user asked, or asked
+    // to be asked (a quiet update shows nothing unless asked about).
+    fn updateBar() -> View {
+        let quietStage = up.stage == "quiet" || up.stage == "ready"
+        let shown = up.stage == "available" || up.stage == "downloading" || up.stage == "installing" || up.stage == "current" || up.stage == "failed" || (quietStage && up.manual)
+        let text = Color.rgb(217, 217, 217)
+        let accent = Color.rgb(242, 140, 26)
+        HStack(spacing: 8) {
+            if shown {
+                if up.stage == "available" {
+                    Icon(.download).color(accent)
+                    Text("Reel {up.entry.version} is available (you have {currentVersion()}).").color(text)
+                    Spacer()
+                    Button("Skip This Version") { skipUpdate(up) }
+                    Button("Later") { up.stage = "" }
+                    Button("Install and Restart") { installUpdate() }
+                } else if up.stage == "ready" {
+                    Icon(.circleCheck).color(.green)
+                    Text("Reel {up.entry.version} is downloaded: it will be installed when you quit Reel.").color(text)
+                    Spacer()
+                    Button("OK") { up.manual = false }
+                    Button("Restart Now") { restartToUpdate() }
+                } else if up.stage == "downloading" || up.stage == "quiet" {
+                    Icon(.download).color(accent)
+                    Text("Downloading Reel {up.entry.version}… {Int(up.progress * 100.0)}%").color(text)
+                    Spacer()
+                    Button("Cancel") { cancelUpdate() }
+                } else if up.stage == "installing" {
+                    Icon(.refresh).color(accent)
+                    Text("Reel {up.entry.version} will be installed as soon as Reel quits, and Reel will start again.").color(text)
+                    Spacer()
+                } else if up.stage == "current" {
+                    Icon(.circleCheck).color(.green)
+                    Text("Reel {currentVersion()} is the newest version.").color(text)
+                    Spacer()
+                    Button("OK") { up.stage = "" }
+                } else {
+                    Icon(.warning).color(accent)
+                    Text(up.message).color(text)
+                    Spacer()
+                    Button("OK") { up.stage = "" }
+                }
+            }
+        }
+        .padding(horizontal: if shown { 12 } else { 0 }, vertical: if shown { 6 } else { 0 })
+        .background(.rgb(31, 31, 31))
     }
 
     // --- Usage statistics (see ping/install.tsl and the website's privacy page) ---

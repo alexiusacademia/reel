@@ -30,8 +30,8 @@
 <main class="prose">
   <div class="wrap narrow">
     <h1>Privacy</h1>
-    <p class="lead">Reel goes on the network by itself for one thing: anonymous counts of how many copies are
-      installed and in use, which you can turn off. Otherwise it connects only when you ask it to. There are no
+    <p class="lead">Reel goes on the network by itself for two things: anonymous counts of how many copies are
+      installed and in use, and a check for updates. Both can be turned off. Otherwise it connects only when you ask it to. There are no
       accounts and no advertising, and nothing about what you watch is ever sent.</p>
 
     <h2>Usage counts</h2>
@@ -63,6 +63,16 @@
     <p><strong>To turn them off,</strong> untick Reel ▸ Send Anonymous Usage Statistics. They're also never
       sent when the environment variable <code>DO_NOT_TRACK=1</code> or <code>REEL_NO_STATS=1</code> is set.
       They start with Reel 0.1.1; 0.1.0 doesn't send them.</p>
+
+    <h2>Updates</h2>
+    <p>From version 0.3.0, Reel looks for new versions by reading its update feed from Google Cloud Storage
+      (<code>storage.googleapis.com</code>, in the <code>reel-releases</code> bucket): as it starts, at most once an
+      hour, and every six hours while it's open. When there's a newer version, it downloads it in the background,
+      checks it against the feed's checksum (and on macOS, that Apple's signature is ours), and installs it when
+      you quit. The request asks for the feed and the update and carries nothing about you; like any web host,
+      Google sees the network address it comes from, under its own terms.</p>
+    <p><strong>To turn it off,</strong> untick Reel ▸ Check for Updates Automatically. Untick Reel ▸ Install
+      Updates Automatically and Reel tells you about a new version instead of installing it by itself.</p>
 
     <h2>When you ask Reel to connect</h2>
     <ul>
